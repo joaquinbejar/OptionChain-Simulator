@@ -1,6 +1,4 @@
-# optionchain_simulator
-
-## OptionChain-Simulator
+# OptionChain-Simulator
 
 <div style="text-align: center;">
 <img src="https://raw.githubusercontent.com/joaquinbejar/OptionChain-Simulator/main/doc/images/logo.png" alt="OptionChain-Simulator" style="width: 100%; height: 200px;">
