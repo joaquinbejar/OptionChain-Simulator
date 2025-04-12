@@ -1,5 +1,5 @@
 [package]
-name = "OptionChain_Simulator"
+name = "optionchain_simulator"
 version = "0.0.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]

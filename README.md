@@ -1,4 +1,4 @@
-# OptionChain_Simulator
+# optionchain_simulator
 
 ## OptionChain-Simulator
 
