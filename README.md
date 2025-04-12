@@ -1,8 +1,9 @@
-# OptionChain-Simulator
 
 <div style="text-align: center;">
 <img src="https://raw.githubusercontent.com/joaquinbejar/OptionChain-Simulator/main/doc/images/logo.png" alt="OptionChain-Simulator" style="width: 100%; height: 200px;">
 </div>
+
+##
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![Build](https://img.shields.io/github/actions/workflow/status/joaquinbejar/OptionChain-Simulator/ci.yml)](https://github.com/joaquinbejar/OptionChain-Simulator/actions)
