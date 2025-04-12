@@ -18,6 +18,7 @@
 #### Table of Contents
 1. [Introduction](#introduction)
 2. [Features](#features)
+3. [Project Structure](#project-structure)
 4. [Setup Instructions](#setup-instructions)
 5. [API Usage](#api-usage)
 6. [Development](#development)
