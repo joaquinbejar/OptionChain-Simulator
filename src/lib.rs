@@ -109,5 +109,3 @@
 //! 🔗 [GitHub Profile](https://github.com/joaquinbejar)
 //!
 //! ---
-//!
-//! License: MIT
