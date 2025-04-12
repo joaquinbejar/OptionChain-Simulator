@@ -1,0 +1,15 @@
+[package]
+name = "OptionChain_Simulator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+optionstratlib = { path = "../OptionStratLib" }
+tracing = "0.1.41"
+rust_decimal = { version = "1.36.0", features = ["maths", "serde"] }
+rust_decimal_macros = "1.36.0"
+serde_json = "1.0.139"
+serde = "1.0.218"
+rayon = "1.10.0"
+num_cpus = "1.16.0"
+itertools = "0.14.0"
