@@ -1,4 +1,6 @@
-# OptionChain-Simulator
+# OptionChain_Simulator
+
+## OptionChain-Simulator
 
 <div style="text-align: center;">
 <img src="https://raw.githubusercontent.com/joaquinbejar/OptionChain-Simulator/main/doc/images/logo.png" alt="OptionChain-Simulator" style="width: 100%; height: 200px;">
@@ -11,22 +13,21 @@
 [![Stars](https://img.shields.io/github/stars/joaquinbejar/OptionChain-Simulator.svg)](https://github.com/joaquinbejar/OptionChain-Simulator/stargazers)
 [![Issues](https://img.shields.io/github/issues/joaquinbejar/OptionChain-Simulator.svg)](https://github.com/joaquinbejar/OptionChain-Simulator/issues)
 
-## OptionChain-Simulator: RESTful Option Chain Time Simulator
+### OptionChain-Simulator: RESTful Option Chain Time Simulator
 
-### Table of Contents
+#### Table of Contents
 1. [Introduction](#introduction)
 2. [Features](#features)
-3. [Project Structure](#project-structure)
 4. [Setup Instructions](#setup-instructions)
 5. [API Usage](#api-usage)
 6. [Development](#development)
 7. [Contribution and Contact](#contribution-and-contact)
 
-## Introduction
+### Introduction
 
 **OptionChain-Simulator** is a lightweight REST API service that simulates an evolving option chain with every request. It is designed for developers building or testing trading systems, backtesters, and visual tools that depend on option data streams but want to avoid relying on live data feeds.
 
-## Features
+### Features
 
 - 📡 REST API to fetch a simulated option chain.
 - ⏱ Each API request advances the simulation one time step.
@@ -36,27 +37,8 @@
 - 📦 JSON output for easy integration with other tools.
 - 📁 Static data support (CSV/JSON-based initial chains).
 
-## Project Structure
 
-```
-option-chain-simulator/
-├── Cargo.toml
-├── src/
-│   ├── main.rs          # API server launcher
-│   ├── api.rs           # API routes and handlers
-│   ├── simulator.rs     # Core simulation engine
-│   ├── models.rs        # Structs for options, chains, etc.
-│   └── pricing.rs       # Pricing logic (e.g., Black-Scholes)
-├── data/
-│   └── initial_chain.json
-├── tests/
-│   └── integration.rs
-├── Makefile
-├── README.md
-└── LICENSE
-```
-
-## Setup Instructions
+### Setup Instructions
 
 1. Clone the repository:
 ```bash
@@ -79,13 +61,13 @@ cargo run
 GET http://localhost:8080/chain
 ```
 
-## API Usage
+### API Usage
 
-### `GET /chain`
+#### `GET /chain`
 
 Returns the current option chain and advances the simulation.
 
-#### Response Example:
+##### Response Example:
 ```json
 {
   "underlying_price": 102.5,
@@ -101,7 +83,7 @@ Returns the current option chain and advances the simulation.
 }
 ```
 
-## Development
+### Development
 
 Run the server with:
 ```bash
@@ -119,12 +101,12 @@ cargo fmt
 cargo clippy
 ```
 
-## Contribution and Contact
+### Contribution and Contact
 
 Contributions are welcome! Please submit pull requests, issues, or suggestions.
 
-Maintainer: **Joaquín Béjar García**  
-📧 jb@taunais.com  
+Maintainer: **Joaquín Béjar García**
+📧 jb@taunais.com
 🔗 [GitHub Profile](https://github.com/joaquinbejar)
 
 ---
