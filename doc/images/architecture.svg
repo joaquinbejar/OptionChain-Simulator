@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 800 850" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background Styles -->
+  <defs>
+    <linearGradient id="apiGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#4285f4;stop-opacity:0.2" />
+      <stop offset="100%" style="stop-color:#4285f4;stop-opacity:0.1" />
+    </linearGradient>
+    <linearGradient id="appGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#34a853;stop-opacity:0.2" />
+      <stop offset="100%" style="stop-color:#34a853;stop-opacity:0.1" />
+    </linearGradient>
+    <linearGradient id="domainGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#ea4335;stop-opacity:0.2" />
+      <stop offset="100%" style="stop-color:#ea4335;stop-opacity:0.1" />
+    </linearGradient>
+    <linearGradient id="infraGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#fbbc05;stop-opacity:0.2" />
+      <stop offset="100%" style="stop-color:#fbbc05;stop-opacity:0.1" />
+    </linearGradient>
+    <linearGradient id="sessionGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#9c27b0;stop-opacity:0.2" />
+      <stop offset="100%" style="stop-color:#9c27b0;stop-opacity:0.1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Client Layer -->
+  <rect x="100" y="30" width="600" height="50" rx="8" ry="8" fill="#e8eaed" stroke="#9aa0a6" stroke-width="1"/>
+  <text x="400" y="60" text-anchor="middle" font-family="Arial" font-size="16" font-weight="bold">Clients / Users</text>
+
+  <!-- API Layer -->
+  <rect x="80" y="110" width="640" height="130" rx="10" ry="10" fill="url(#apiGradient)" stroke="#4285f4" stroke-width="2"/>
+  <text x="400" y="135" text-anchor="middle" font-family="Arial" font-size="18" font-weight="bold" fill="#4285f4">API Layer</text>
+
+  <!-- API Components -->
+  <rect x="100" y="150" width="180" height="70" rx="5" ry="5" fill="white" stroke="#4285f4" stroke-width="1"/>
+  <text x="190" y="175" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">REST Controller</text>
+  <text x="190" y="195" text-anchor="middle" font-family="Arial" font-size="11">HTTP Methods Lifecycle</text>
+
+  <rect x="310" y="150" width="180" height="70" rx="5" ry="5" fill="white" stroke="#4285f4" stroke-width="1"/>
+  <text x="400" y="185" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold">Authentication / Authorization</text>
+
+  <rect x="520" y="150" width="180" height="70" rx="5" ry="5" fill="white" stroke="#4285f4" stroke-width="1"/>
+  <text x="610" y="185" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">API Models</text>
+
+  <!-- Session Management Layer -->
+  <rect x="80" y="270" width="640" height="90" rx="10" ry="10" fill="url(#sessionGradient)" stroke="#9c27b0" stroke-width="2"/>
+  <text x="400" y="295" text-anchor="middle" font-family="Arial" font-size="18" font-weight="bold" fill="#9c27b0">Session Management Layer</text>
+
+  <!-- Session Management Components -->
+  <rect x="100" y="310" width="180" height="40" rx="5" ry="5" fill="white" stroke="#9c27b0" stroke-width="1"/>
+  <text x="190" y="335" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Session Store</text>
+
+  <rect x="310" y="310" width="180" height="40" rx="5" ry="5" fill="white" stroke="#9c27b0" stroke-width="1"/>
+  <text x="400" y="335" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Session Manager</text>
+
+  <rect x="520" y="310" width="180" height="40" rx="5" ry="5" fill="white" stroke="#9c27b0" stroke-width="1"/>
+  <text x="610" y="335" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">State Progression Handler</text>
+
+  <!-- Application Layer -->
+  <rect x="80" y="390" width="640" height="160" rx="10" ry="10" fill="url(#appGradient)" stroke="#34a853" stroke-width="2"/>
+  <text x="400" y="415" text-anchor="middle" font-family="Arial" font-size="18" font-weight="bold" fill="#34a853">Application Layer</text>
+
+  <!-- Application Components -->
+  <rect x="100" y="430" width="180" height="50" rx="5" ry="5" fill="white" stroke="#34a853" stroke-width="1"/>
+  <text x="190" y="460" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Chain Service</text>
+
+  <rect x="310" y="430" width="180" height="50" rx="5" ry="5" fill="white" stroke="#34a853" stroke-width="1"/>
+  <text x="400" y="460" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Simulator Service</text>
+
+  <rect x="520" y="430" width="180" height="50" rx="5" ry="5" fill="white" stroke="#34a853" stroke-width="1"/>
+  <text x="610" y="460" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Historical Data Service</text>
+
+  <rect x="100" y="490" width="180" height="50" rx="5" ry="5" fill="white" stroke="#34a853" stroke-width="1"/>
+  <text x="190" y="520" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Scheduler Service</text>
+
+  <rect x="310" y="490" width="180" height="50" rx="5" ry="5" fill="white" stroke="#34a853" stroke-width="1"/>
+  <text x="400" y="520" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Config Service</text>
+
+  <!-- Domain Layer -->
+  <rect x="80" y="580" width="640" height="160" rx="10" ry="10" fill="url(#domainGradient)" stroke="#ea4335" stroke-width="2"/>
+  <text x="400" y="605" text-anchor="middle" font-family="Arial" font-size="18" font-weight="bold" fill="#ea4335">Domain Layer</text>
+
+  <!-- Domain Components - Row 1 -->
+  <rect x="100" y="620" width="180" height="50" rx="5" ry="5" fill="white" stroke="#ea4335" stroke-width="1"/>
+  <text x="190" y="650" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Option Chain Model</text>
+
+  <rect x="310" y="620" width="180" height="50" rx="5" ry="5" fill="white" stroke="#ea4335" stroke-width="1"/>
+  <text x="400" y="650" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Option Contract Model</text>
+
+  <rect x="520" y="620" width="180" height="50" rx="5" ry="5" fill="white" stroke="#ea4335" stroke-width="1"/>
+  <text x="610" y="650" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Pricing Models</text>
+
+  <!-- Domain Components - Row 2 -->
+  <rect x="100" y="680" width="180" height="50" rx="5" ry="5" fill="white" stroke="#ea4335" stroke-width="1"/>
+  <text x="190" y="710" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Simulation Domain</text>
+
+  <rect x="310" y="680" width="180" height="50" rx="5" ry="5" fill="white" stroke="#ea4335" stroke-width="1"/>
+  <text x="400" y="710" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Market Data Domain</text>
+
+  <rect x="520" y="680" width="180" height="50" rx="5" ry="5" fill="white" stroke="#ea4335" stroke-width="1"/>
+  <text x="610" y="697" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Session Model &amp;</text>
+  <text x="610" y="717" text-anchor="middle" font-family="Arial" font-size="14" font-weight="bold">Configuration Domain</text>
+
+  <!-- Infrastructure Layer -->
+  <rect x="80" y="770" width="640" height="70" rx="10" ry="10" fill="url(#infraGradient)" stroke="#fbbc05" stroke-width="2"/>
+  <text x="400" y="795" text-anchor="middle" font-family="Arial" font-size="18" font-weight="bold" fill="#fbbc05">Infrastructure Layer</text>
+
+  <!-- Infrastructure Components -->
+  <rect x="90" y="810" width="110" height="20" rx="5" ry="5" fill="white" stroke="#fbbc05" stroke-width="1"/>
+  <text x="145" y="825" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold">Data Store</text>
+
+  <rect x="210" y="810" width="110" height="20" rx="5" ry="5" fill="white" stroke="#fbbc05" stroke-width="1"/>
+  <text x="265" y="825" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold">Historical Data</text>
+
+  <rect x="330" y="810" width="110" height="20" rx="5" ry="5" fill="white" stroke="#fbbc05" stroke-width="1"/>
+  <text x="385" y="825" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold">Telemetry</text>
+
+  <rect x="450" y="810" width="110" height="20" rx="5" ry="5" fill="white" stroke="#fbbc05" stroke-width="1"/>
+  <text x="505" y="825" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold">Session Storage</text>
+
+  <rect x="570" y="810" width="110" height="20" rx="5" ry="5" fill="white" stroke="#fbbc05" stroke-width="1"/>
+  <text x="625" y="825" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold">Cache</text>
+
+  <!-- HTTP Methods Information -->
+  <rect x="10" y="150" width="70" height="150" rx="5" ry="5" fill="white" stroke="#4285f4" stroke-width="1"/>
+  <text x="45" y="170" text-anchor="middle" font-family="Arial" font-size="12" font-weight="bold">HTTP</text>
+  <text x="45" y="190" text-anchor="middle" font-family="Arial" font-size="11">POST</text>
+  <text x="45" y="210" text-anchor="middle" font-family="Arial" font-size="11">GET</text>
+  <text x="45" y="230" text-anchor="middle" font-family="Arial" font-size="11">PUT</text>
+  <text x="45" y="250" text-anchor="middle" font-family="Arial" font-size="11">PATCH</text>
+  <text x="45" y="270" text-anchor="middle" font-family="Arial" font-size="11">DELETE</text>
+
+  <!-- Connecting Arrows -->
+  <!-- Client to API -->
+  <line x1="400" y1="80" x2="400" y2="110" stroke="#666" stroke-width="2" stroke-dasharray="5,5"/>
+  
+  <!-- API to Session Management -->
+  <line x1="190" y1="220" x2="190" y2="270" stroke="#666" stroke-width="2"/>
+  
+  <!-- Session Management to Application -->
+  <line x1="190" y1="360" x2="190" y2="390" stroke="#666" stroke-width="2"/>
+  <line x1="400" y1="360" x2="400" y2="390" stroke="#666" stroke-width="2"/>
+  <line x1="610" y1="360" x2="610" y2="390" stroke="#666" stroke-width="2"/>
+  
+  <!-- Application to Domain -->
+  <line x1="190" y1="550" x2="190" y2="580" stroke="#666" stroke-width="2"/>
+  <line x1="400" y1="550" x2="400" y2="580" stroke="#666" stroke-width="2"/>
+  <line x1="610" y1="550" x2="610" y2="580" stroke="#666" stroke-width="2"/>
+  
+  <!-- Domain to Infrastructure -->
+  <line x1="190" y1="740" x2="190" y2="770" stroke="#666" stroke-width="2"/>
+  <line x1="400" y1="740" x2="400" y2="770" stroke="#666" stroke-width="2"/>
+  <line x1="610" y1="740" x2="610" y2="770" stroke="#666" stroke-width="2"/>
+  
+  <!-- HTTP Methods to REST Controller -->
+  <line x1="80" y1="185" x2="100" y2="185" stroke="#666" stroke-width="2"/>
+</svg>
