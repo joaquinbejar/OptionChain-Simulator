@@ -537,9 +537,9 @@ Error responses follow a consistent format:
 ```json
 {
   "error": {
-    "code": "string",           // Error code
-    "message": "string",        // Human-readable message
-    "details": {}               // Optional additional details
+    "code": "string",    
+    "message": "string", 
+    "details": {}        
   }
 }
 ```
