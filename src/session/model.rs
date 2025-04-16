@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 use crate::utils::UuidGenerator;
+pub use optionstratlib::simulation::WalkType as SimulationMethod;
 
 /// Possible states a simulation session can be in
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -13,14 +14,6 @@ pub enum SessionState {
     Reinitialized,
     Completed,
     Error,
-}
-
-/// Method used for pricing options in the simulation
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub enum SimulationMethod { // TODO: Add more methods
-    BlackScholes,
-    MonteCarlo,
-    HistoricalReplication,
 }
 
 /// Parameters for configuring a simulation
