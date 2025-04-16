@@ -1,8 +1,7 @@
 use std::sync::Arc;
 use optionstratlib::chains::OptionChain;
 use uuid::Uuid;
-
-
+use crate::domain::Simulator;
 use crate::session::model::{Session, SimulationParameters};
 use crate::session::state_handler::StateProgressionHandler;
 use crate::session::store::SessionStore;
@@ -38,7 +37,7 @@ impl SessionManager {
 
         // Generate option chain for current step
         let chain = self.simulator.simulate_next_step(&session)
-            .map_err(|e| ChainError::Internal(format!("Simulation error: {}", e)))?;
+            .map_err(|e| ChainError::SimulatorError(format!("Simulation error: {}", e)))?;
 
         // Save updated session
         self.store.save(session.clone())?;

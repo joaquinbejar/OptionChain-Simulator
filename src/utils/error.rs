@@ -8,6 +8,7 @@ pub enum ChainError<'a> {
     InvalidState(&'a str),
     Internal(&'a str),
     NotFound(String),
+    SimulatorError(String),
 }
 
 impl<'a> From<&'a str> for ChainError<'a> {
@@ -32,6 +33,7 @@ impl fmt::Display for ChainError<'_> {
             ChainError::InvalidState(msg) => write!(f, "Invalid State: {}", msg),
             ChainError::Internal(msg) => write!(f, "Internal Error: {}", msg),
             ChainError::NotFound(msg) => write!(f, "Not Found: {}", msg),
+            ChainError::SimulatorError(msg) => write!(f, "Simulator Error: {}", msg),
         }
         
     }
