@@ -12,7 +12,8 @@ keywords = ["finance", "options", "trading"]
 categories = ["finance", "data-structures"]
 
 [dependencies]
-#optionstratlib = { path = "../OptionStratLib" }
+optionstratlib = { path = "../OptionStratLib" }
+#optionstratlib = "0.4.3"
 tracing = "0.1.41"
 rust_decimal = { version = "1.36.0", features = ["maths", "serde"] }
 rust_decimal_macros = "1.36.0"
@@ -21,3 +22,4 @@ serde = "1.0.218"
 rayon = "1.10.0"
 num_cpus = "1.16.0"
 itertools = "0.14.0"
+uuid = { version = "1.16.0", features = ["v4", "v5", "serde"] }
