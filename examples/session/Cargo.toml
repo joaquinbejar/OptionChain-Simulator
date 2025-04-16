@@ -1,0 +1,11 @@
+[package]
+name = "examples_session"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+optionchain_simulator = { path = "../../" }
+optionstratlib = "0.4.3"
+tracing = "0.1.41"
+uuid = { version = "1.16.0", features = ["v4", "serde"] }
+rust_decimal_macros = "1.24.1"

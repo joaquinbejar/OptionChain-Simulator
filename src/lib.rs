@@ -111,6 +111,6 @@
 //! ---
 
 mod domain;
-mod session;
+pub mod session;
 pub mod utils;
 

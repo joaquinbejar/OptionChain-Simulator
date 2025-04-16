@@ -23,3 +23,12 @@ rayon = "1.10.0"
 num_cpus = "1.16.0"
 itertools = "0.14.0"
 uuid = { version = "1.16.0", features = ["v4", "v5", "serde"] }
+
+[workspace]
+members = [
+    "examples/session",
+]
+
+[workspace.dependencies]
+optionstratlib = { path = "../OptionStratLib" }
+tracing = "0.1.41"
