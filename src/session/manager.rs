@@ -23,8 +23,8 @@ impl SessionManager {
         }
     }
 
-    pub fn create_session(&self, params: SimulationParameters, total_steps: u32) -> Result<Session, ChainError> {
-        let session = Session::new(params, total_steps);
+    pub fn create_session(&self, params: SimulationParameters) -> Result<Session, ChainError> {
+        let session = Session::new(params);
         self.store.save(session.clone())?;
         Ok(session)
     }
@@ -57,7 +57,7 @@ impl SessionManager {
         Ok(session)
     }
 
-    pub fn reinitialize_session(&self, id: Uuid, params: SimulationParameters, total_steps: u32) -> Result<Session, ChainError> {
+    pub fn reinitialize_session(&self, id: Uuid, params: SimulationParameters, total_steps: usize) -> Result<Session, ChainError> {
         let mut session = self.store.get(id)?;
 
         // Reinitialize session
