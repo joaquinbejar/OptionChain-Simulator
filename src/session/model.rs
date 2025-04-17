@@ -1,11 +1,11 @@
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime};
-use optionstratlib::Positive;
-use uuid::Uuid;
 use crate::utils::UuidGenerator;
+use optionstratlib::Positive;
 pub use optionstratlib::simulation::WalkType as SimulationMethod;
 use optionstratlib::utils::TimeFrame;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use std::time::SystemTime;
+use uuid::Uuid;
 
 /// Possible states a simulation session can be in
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -18,33 +18,75 @@ pub enum SessionState {
     Error,
 }
 
-/// Parameters for configuring a simulation
+/// `SimulationParameters` is a struct that encapsulates the configuration parameters
+/// required for simulating the behavior of a financial asset or instrument.
+/// It includes details about the asset, simulation parameters, and optional refinements
+/// for advanced scenarios.
+///
+/// # Notes
+/// - This struct implements the `Debug`, `Clone`, `Serialize`, and `Deserialize` traits, allowing it to be easily logged, duplicated, and serialized/deserialized for storage and transmission.
+///
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationParameters {
+    /// - `symbol` (`String`): The name or ticker symbol of the asset being simulated.
     pub symbol: String,
+    /// - `steps` (`usize`): The number of discrete time steps or intervals in the simulation process.
     pub steps: usize,
+    /// - `initial_price` (`Positive`): The initial starting price of the asset. This must be a positive value.
     pub initial_price: Positive,
+    /// - `days_to_expiration` (`Positive`): The number of days until the expiration of the asset or contract. This must be a positive value.
     pub days_to_expiration: Positive,
+    /// - `volatility` (`Positive`): The expected volatility (standard deviation) of the asset's returns.
     pub volatility: Positive,
+    /// - `risk_free_rate` (`Decimal`): The risk-free rate of return, typically represented as an annualized percentage.
     pub risk_free_rate: Decimal,
+    /// - `dividend_yield` (`Positive`): The annualized dividend yield of the asset, expressed as a positive value.
     pub dividend_yield: Positive,
+    /// - `method` (`SimulationMethod`): The simulation method or algorithm to be used, defining the behavior of the simulation process.
     pub method: SimulationMethod,
+    /// - `time_frame` (`TimeFrame`): The time frame for the simulation intervals, such as daily, weekly, or hourly.
     pub time_frame: TimeFrame,
+    /// - `chain_size` (`Option<usize>`): The optional size of the option chain being simulated. If `None`, this is not specified.
     pub chain_size: Option<usize>,
+    /// - `strike_interval` (`Option<Positive>`): The optional interval between strike prices for options. If `None`, this is not specified.
     pub strike_interval: Option<Positive>,
+    /// - `skew_factor` (`Option<Decimal>`): An optional factor that adjusts the skew of the distribution. For example, it can be used to bias option pricing.
     pub skew_factor: Option<Decimal>,
+    /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     pub spread: Option<Positive>,
 }
 
-/// Represents a stateful simulation session
+/// Represents a simulation session with its current state and parameters.
+///
+/// This struct holds information about a simulation session, including its
+/// unique identifier, timestamps for creation and the last update, simulation
+/// parameters, and progress details like the current step and total steps.
+/// Additionally, it tracks the overall session state.
+///
+/// # Traits
+///
+/// * `Debug` - Allows for formatting the `Session` object using the `{:?}`
+///   formatter for debugging purposes.
+/// * `Clone` - Enables the `Session` object to be cloned, creating an identical
+///   copy of the session.
+/// * `Serialize, Deserialize` - Allows the `Session` object to be serialized
+///   (converted to a format like JSON) and deserialized (converted back to the
+///   struct) for storage or communication purposes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// * `id` - A universally unique identifier (UUID) for the session.
     pub id: Uuid,
+    /// * `created_at` - The timestamp indicating when the session was created.
     pub created_at: SystemTime,
+    /// * `updated_at` - The timestamp indicating the last time the session was updated.
     pub updated_at: SystemTime,
+    /// * `parameters` - The parameters associated with the simulation session,
     pub parameters: SimulationParameters,
+    /// * `current_step` - The current step or iteration of the simulation session.
     pub current_step: usize,
+    /// * `total_steps` - The total number of steps or iterations required for the
     pub total_steps: usize,
+    /// * `state` - The current state of the session, represented by an instance
     pub state: SessionState,
 }
 
