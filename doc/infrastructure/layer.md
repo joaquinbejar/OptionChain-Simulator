@@ -77,7 +77,8 @@ flowchart TB
 
         subgraph "Infrastructure Layer"
             Redis[(Redis\nSession Store & Cache)]
-            MongoDB[(MongoDB\nConfig & Historical Data)]
+            ClickHouse[(ClickHouse\nHistorical Data)]
+            MongoDB[(MongoDB\nConfig)]
             Prometheus[Prometheus\nMetrics]
             Jaeger[Jaeger\nTracing]
             TaskQueue[Task Queue]
@@ -86,6 +87,7 @@ flowchart TB
         API --> App
         App --> Domain
         App --> Redis
+        App --> ClickHouse
         App --> MongoDB
         App --> Prometheus
         App --> Jaeger
@@ -93,7 +95,7 @@ flowchart TB
     end
 
     Client[Client Applications] --> API
-    DataSources[External Data Sources] --> MongoDB
+    DataSources[External Data Sources] --> ClickHouse
 ```
 
 ## 3. Session Management with Infrastructure Components
@@ -107,7 +109,8 @@ sequenceDiagram
     participant AppLayer as Application Layer
     participant DomainLayer as Domain Layer
     participant Redis as Session Store & Cache (Redis)
-    participant MongoDB as Config & Historical (MongoDB)
+    participant ClickHouse as Historical Data (ClickHouse)
+    participant MongoDB as Config (MongoDB)
     participant Metrics as Metrics Collector
     participant Logs as Logging Service
 
@@ -154,9 +157,9 @@ flowchart LR
 
     subgraph "Historical Data Storage"
         direction TB
-        MongoHistorical[(MongoDB\nHistorical Collections)]
+        ClickHouseHistorical[(ClickHouse\nOHLCV Tables)]
         HistoricalDataService[Historical Data Service]
-        HistoricalDataService --> MongoHistorical
+        HistoricalDataService --> ClickHouseHistorical
     end
 
     subgraph "Configuration Storage"
@@ -264,10 +267,8 @@ classDiagram
         +getDateRangeForAsset(asset) DateRange
     }
 
-    class MongoHistoricalRepository {
-        -mongoClient MongoClient
-        -db Database
-        -collection Collection
+    class ClickHouseHistoricalRepository {
+        -clickhouseClient ClickHouseClient
         +getHistoricalChain(asset, date) OptionChain
         +saveHistoricalChain(OptionChain) void
         +listAvailableAssets() Asset[]
@@ -314,7 +315,7 @@ classDiagram
 
     SessionStore <|-- RedisSessionStore
     CacheService <|-- RedisCacheService
-    HistoricalDataRepository <|-- MongoHistoricalRepository
+    HistoricalDataRepository <|-- ClickHouseHistoricalRepository
     ConfigRepository <|-- MongoConfigRepository
     MetricsService <|-- PrometheusMetricsService
 ```
@@ -324,107 +325,38 @@ classDiagram
 ### Storage Technologies
 
 1. **Session Storage & Cache**
-    - **Redis**: Fast, in-memory data store for both session management and caching
-    - Configuration:
-        - Enable persistence with RDB snapshots and AOF logs
-        - Use Redis Cluster for high availability in production
-        - Configure appropriate eviction policies for cache data
+   - **Redis**: Fast, in-memory data store for both session management and caching
+   - Configuration:
+      - Enable persistence with RDB snapshots and AOF logs
+      - Use Redis Cluster for high availability in production
+      - Configure appropriate eviction policies for cache data
 
-2. **Historical & Configuration Data**
-    - **MongoDB**: Document-oriented database ideal for JSON-like data structures
-    - Configuration:
-        - Create separate collections for historical data and configurations
-        - Use time-series collections for historical option chains (MongoDB 5.0+)
-        - Implement appropriate indexing on asset, date, and expiration fields
-        - Enable sharding for horizontal scaling in production
+2. **Historical Data**
+   - **ClickHouse**: Column-oriented database for time-series OHLCV data
+   - Configuration:
+      - Use `MergeTree` engine with `ORDER BY (symbol, timestamp)`
+      - Partition by date for faster queries
+      - Enable compression and deduplication as needed
 
-### Observability Stack
-
-1. **Metrics**: Prometheus for metrics collection and alerting
-2. **Logging**: OpenTelemetry + Loki for structured, centralized logging
-3. **Tracing**: Jaeger for distributed tracing across service boundaries
-4. **Dashboards**: Grafana for visualization of metrics, logs, and traces
-
-### Redis Implementation
-
-1. **Session Management**:
-    - Use Hash data structures for session storage
-    - Implement automatic TTL for session cleanup
-    - Use Redis transactions for atomic operations on sessions
-
-2. **Caching Strategy**:
-    - Cache frequently accessed option chains and configurations
-    - Implement cache invalidation on configuration updates
-    - Use tiered caching with shorter TTL for volatile data
-
-### MongoDB Implementation
-
-1. **Data Modeling**:
-    - Design document schemas that reflect domain models
-    - Use embedded documents for closely related data
-    - Implement versioning for configuration documents
-
-2. **Query Optimization**:
-    - Create compound indexes for common query patterns
-    - Use aggregation pipeline for analytics
-    - Implement proper projection to retrieve only needed fields
+3. **Configuration Data**
+   - **MongoDB**: Document-oriented store for config JSON
+   - Configuration:
+      - Create indexed collections per config type
+      - Use versioned documents for config history
 
 ## 8. Scaling Considerations
 
-1. **Horizontal Scaling**
-    - Redis Cluster for distributed session data and caching
-    - MongoDB sharding for historical data partitioned by asset and time period
-    - Stateless API layer can be scaled with load balancing
-
-2. **Vertical Scaling**
-    - Optimize Rust code for multi-threading to utilize available CPU cores
-    - Configure appropriate connection pools for database connections
-    - Implement efficient memory usage patterns
-
-3. **Caching Strategies**
-    - Implement intelligent cache warming for predictable data access patterns
-    - Use staggered TTLs to prevent cache stampedes
-    - Implement circuit breakers for database fallbacks when cache misses occur
-
-4. **Read/Write Separation**
-    - Configure MongoDB read preferences to utilize secondary nodes
-    - Implement write-through cache for Redis to ensure consistency
+- ClickHouse clustering with `ReplicatedMergeTree`, distributed tables
+- Use materialized views for aggregated rollups
 
 ## 9. Infrastructure Security
 
-1. **Database Security**
-    - Enable authentication for Redis and MongoDB
-    - Implement TLS for all database connections
-    - Use network isolation with VPC/subnets
-
-2. **Authentication/Authorization**
-    - API Key validation via middleware
-    - Role-based access control for administrative endpoints
-    - JWT or OAuth2 for user authentication in multi-tenant scenarios
-
-3. **Data Security**
-    - Encrypt sensitive data at rest
-    - Implement proper data sanitization for all inputs
-    - Regular security audits and dependency scanning
-
-4. **Rate Limiting and Abuse Prevention**
-    - Implement rate limiting using Redis
-    - Set up monitoring for unusual access patterns
-    - Implement IP-based throttling for public-facing endpoints
+- ClickHouse user authentication and TLS configuration
+- Proper access roles and IP whitelisting
 
 ## 10. Disaster Recovery
 
-1. **Backup Strategies**
-    - Regular snapshots of Redis data
-    - MongoDB replica sets with automated backups
-    - Geographically distributed backups
+- Use `clickhouse-backup` for snapshots
+- Replicated tables for HA
+- Scheduled backup to cloud storage or offsite location
 
-2. **Failover Mechanisms**
-    - Redis Sentinel for automatic failover
-    - MongoDB replica sets with automatic primary election
-    - Automated recovery procedures with health checks
-
-3. **Monitoring and Alerting**
-    - Implement heartbeat monitoring for all services
-    - Set up alerts for database performance degradation
-    - Create runbooks for common recovery scenarios
