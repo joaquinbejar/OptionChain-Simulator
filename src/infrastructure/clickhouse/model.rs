@@ -1,8 +1,10 @@
 use chrono::{DateTime, Utc};
 use optionstratlib::Positive;
+use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// OHLCV data structure representing historical financial data
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OHLCVData {
     /// Symbol or ticker
     pub symbol: String,
@@ -20,9 +22,24 @@ pub struct OHLCVData {
     pub volume: u32,
 }
 
+impl fmt::Display for OHLCVData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} @ {} [O: {}, H: {}, L: {}, C: {}, V: {}]",
+            self.symbol,
+            self.timestamp.format("%Y-%m-%d %H:%M:%S"),
+            self.open,
+            self.high,
+            self.low,
+            self.close,
+            self.volume
+        )
+    }
+}
 
 /// Price types that can be extracted from OHLCV data
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PriceType {
     /// Opening price
     Open,
@@ -34,4 +51,130 @@ pub enum PriceType {
     Close,
     /// Typical price (high + low + close) / 3
     Typical,
+}
+
+impl fmt::Display for PriceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PriceType::Open => write!(f, "Open"),
+            PriceType::High => write!(f, "High"),
+            PriceType::Low => write!(f, "Low"),
+            PriceType::Close => write!(f, "Close"),
+            PriceType::Typical => write!(f, "Typical"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use optionstratlib::pos;
+    use serde_json::{from_str, to_string};
+
+    #[test]
+    fn test_ohlcv_data_serialization() {
+        let sample_data = OHLCVData {
+            symbol: "AAPL".to_string(),
+            timestamp: Utc.with_ymd_and_hms(2023, 5, 15, 14, 30, 0).unwrap(),
+            open: pos!(150.25),
+            high: pos!(152.75),
+            low: pos!(149.50),
+            close: pos!(151.80),
+            volume: 1_000_000,
+        };
+
+        // Serialization
+        let serialized = to_string(&sample_data).expect("Failed to serialize OHLCVData");
+
+        // Ensure serialized contains expected fields
+        assert!(serialized.contains("AAPL"));
+        assert!(serialized.contains("2023-05-15T14:30:00Z"));
+        assert!(serialized.contains("150.25"));
+        assert!(serialized.contains("152.75"));
+        assert!(serialized.contains("149.5"));
+        assert!(serialized.contains("151.8"));
+        assert!(serialized.contains("1000000"));
+
+        // Deserialization
+        let deserialized: OHLCVData =
+            from_str(&serialized).expect("Failed to deserialize OHLCVData");
+
+        // Verify equality
+        assert_eq!(deserialized, sample_data);
+    }
+
+    #[test]
+    fn test_price_type_serialization() {
+        // Test all price types
+        let price_types = vec![
+            PriceType::Open,
+            PriceType::High,
+            PriceType::Low,
+            PriceType::Close,
+            PriceType::Typical,
+        ];
+
+        for price_type in price_types {
+            // Serialization
+            let serialized = to_string(&price_type).expect("Failed to serialize PriceType");
+
+            // Deserialization
+            let deserialized: PriceType =
+                from_str(&serialized).expect("Failed to deserialize PriceType");
+
+            // Verify equality
+            assert_eq!(deserialized, price_type);
+        }
+    }
+
+    #[test]
+    fn test_ohlcv_data_display_format() {
+        let sample_data = OHLCVData {
+            symbol: "AAPL".to_string(),
+            timestamp: Utc.with_ymd_and_hms(2023, 5, 15, 14, 30, 0).unwrap(),
+            open: pos!(150.25),
+            high: pos!(152.75),
+            low: pos!(149.50),
+            close: pos!(151.80),
+            volume: 1_000_000,
+        };
+
+        let displayed = format!("{}", sample_data);
+        let expected =
+            "AAPL @ 2023-05-15 14:30:00 [O: 150.25, H: 152.75, L: 149.5, C: 151.8, V: 1000000]";
+
+        assert_eq!(displayed, expected);
+    }
+
+    #[test]
+    fn test_price_type_display_format() {
+        assert_eq!(format!("{}", PriceType::Open), "Open");
+        assert_eq!(format!("{}", PriceType::High), "High");
+        assert_eq!(format!("{}", PriceType::Low), "Low");
+        assert_eq!(format!("{}", PriceType::Close), "Close");
+        assert_eq!(format!("{}", PriceType::Typical), "Typical");
+    }
+
+    #[test]
+    fn test_invalid_json_deserialization() {
+        let invalid_json = r#"{"symbol": "AAPL", "timestamp": "invalid-date", "open": 150.25, "high": 152.75, "low": 149.50, "close": 151.80, "volume": 1000000}"#;
+
+        let result: Result<OHLCVData, _> = from_str(invalid_json);
+        assert!(
+            result.is_err(),
+            "Expected error when deserializing invalid JSON"
+        );
+    }
+
+    #[test]
+    fn test_missing_fields_deserialization() {
+        let incomplete_json = r#"{"symbol": "AAPL", "timestamp": "2023-05-15T14:30:00Z"}"#;
+
+        let result: Result<OHLCVData, _> = from_str(incomplete_json);
+        assert!(
+            result.is_err(),
+            "Expected error when deserializing JSON with missing fields"
+        );
+    }
 }
