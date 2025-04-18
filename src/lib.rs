@@ -113,4 +113,5 @@
 mod domain;
 pub mod session;
 pub mod utils;
+pub mod infrastructure;
 
