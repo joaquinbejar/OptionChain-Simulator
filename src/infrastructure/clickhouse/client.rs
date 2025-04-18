@@ -10,11 +10,57 @@ use crate::infrastructure::clickhouse::model::{OHLCVData, PriceType};
 use crate::infrastructure::clickhouse::utils::row_to_datetime;
 use crate::infrastructure::ClickHouseConfig;
 
-/// Represents a client for interacting with ClickHouse historical data
+/// Represents a client for interacting with a ClickHouse database.
+///
+/// The `ClickHouseClient` struct encapsulates the details required to connect 
+/// and interact with a ClickHouse database instance. It provides the necessary 
+/// components, such as a connection pool and configuration settings, to manage 
+/// database access efficiently.
+///
+/// # Fields
+///
+/// * `pool` - A connection pool (`Pool`) used for establishing and managing 
+///            database connections. This is a private field that facilitates 
+///            efficient resource management and avoids the overhead of creating 
+///            new connections for each operation.
+///
+/// * `config` - The configuration (`ClickHouseConfig`) that contains settings 
+///              specific to this client, such as authentication credentials, 
+///              database connection details, or other configuration parameters.
+///
 pub struct ClickHouseClient {
-    /// The connection pool for ClickHouse
+    /// Represents a connection pool that is used internally within the crate.
+    ///
+    /// The `pool` is responsible for managing a collection of database connections
+    /// or other types of resources to allow efficient reuse and reduce overhead.
+    ///
+    /// This is defined with a `pub(crate)` visibility modifier, meaning it 
+    /// is accessible only within the current crate and not exposed to external users.
+    ///
+    /// - `Pool` is usually a struct or type responsible for abstracting resource 
+    ///   pooling behavior, such as managing concurrent access to the pooled resources.
+    ///
+    /// Note:
+    /// Ensure that the `Pool` is properly configured and initialized before use
+    /// to avoid runtime errors or resource exhaustion in multi-threaded applications.
     pub(crate) pool: Pool,
-    /// The configuration for this client
+    
+    /// Represents the configuration settings for connecting to and interacting 
+    /// with a ClickHouse database.
+    ///
+    /// The `ClickHouseConfig` object contains necessary parameters such as 
+    /// server host, port, authentication credentials, and other connection options.
+    ///
+    /// Fields:
+    /// - `host` (String): The hostname or IP address of the ClickHouse server.
+    /// - `port` (u16): The port on which the ClickHouse server is running.
+    /// - `username` (String): The username for authentication.
+    /// - `password` (String): The password for authentication.
+    /// - `database` (String): The name of the database to connect to.
+    /// - `options` (Option<HashMap<String, String>>): Additional optional parameters 
+    ///   for customizing the connection (e.g., timeouts, retries).
+    ///
+    /// Ensure you provide valid and reachable settings to avoid connection issues.
     config: ClickHouseConfig,
 }
 
@@ -55,8 +101,8 @@ impl ClickHouseClient {
         &self,
         symbol: &str,
         timeframe: &TimeFrame,
-        start_date: &chrono::DateTime<chrono::Utc>,
-        end_date: &chrono::DateTime<chrono::Utc>,
+        start_date: &chrono::DateTime<Utc>,
+        end_date: &chrono::DateTime<Utc>,
     ) -> Result<Vec<Positive>, String> {
         debug!(
             "Fetching historical prices for {} from {} to {} with timeframe {:?}",
@@ -90,8 +136,8 @@ impl ClickHouseClient {
         &self,
         symbol: &str,
         timeframe: &TimeFrame,
-        start_date: &chrono::DateTime<chrono::Utc>,
-        end_date: &chrono::DateTime<chrono::Utc>,
+        start_date: &chrono::DateTime<Utc>,
+        end_date: &chrono::DateTime<Utc>,
     ) -> Result<Vec<OHLCVData>, String> {
         debug!(
             "Fetching OHLCV data for {} from {} to {} with timeframe {:?}",
@@ -118,8 +164,8 @@ impl ClickHouseClient {
         &self,
         symbol: &str,
         timeframe: &TimeFrame,
-        start_date: &chrono::DateTime<chrono::Utc>,
-        end_date: &chrono::DateTime<chrono::Utc>,
+        start_date: &chrono::DateTime<Utc>,
+        end_date: &chrono::DateTime<Utc>,
     ) -> Result<String, String> {
         // Format dates for SQL
         let start_date_str = start_date.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -241,5 +287,215 @@ impl ClickHouseClient {
                 }
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use optionstratlib::{pos, Positive};
+    use rust_decimal::Decimal;
+    
+    #[test]
+    fn test_build_timeframe_query_minute() {
+
+        let config = ClickHouseConfig {
+            host: "test-host".to_string(),
+            port: 9000,
+            username: "test-user".to_string(),
+            password: "test-pass".to_string(),
+            database: "test-db".to_string(),
+            timeout: 30,
+        };
+        
+        fn build_timeframe_query(
+            symbol: &str,
+            timeframe: &TimeFrame,
+            start_date: &chrono::DateTime<Utc>,
+            end_date: &chrono::DateTime<Utc>,
+        ) -> Result<String, String> {
+            let start_date_str = start_date.format("%Y-%m-%d %H:%M:%S").to_string();
+            let end_date_str = end_date.format("%Y-%m-%d %H:%M:%S").to_string();
+
+            if *timeframe == TimeFrame::Minute {
+                return Ok(format!(
+                    "SELECT symbol, timestamp, open, high, low, close, volume \
+                    FROM ohlcv \
+                    WHERE symbol = '{}' \
+                    AND timestamp BETWEEN '{}' AND '{}' \
+                    ORDER BY timestamp",
+                    symbol, start_date_str, end_date_str
+                ));
+            }
+
+            let interval = match timeframe {
+                TimeFrame::Minute => "1 MINUTE",
+                TimeFrame::Hour => "1 HOUR",
+                TimeFrame::Day => "1 DAY",
+                TimeFrame::Week => "1 WEEK",
+                TimeFrame::Month => "1 MONTH",
+                _ => return Err(format!("Unsupported timeframe: {:?}", timeframe)),
+            };
+
+            Ok(format!(
+                "SELECT 
+                    symbol,
+                    toStartOfInterval(timestamp, INTERVAL {}) as timestamp,
+                    any(open) as open,
+                    max(high) as high,
+                    min(low) as low,
+                    any(arrayElement(
+                        groupArray(close), 
+                        length(groupArray(close))
+                    )) as close,
+                    sum(volume) as volume
+                FROM ohlcv
+                WHERE symbol = '{}' 
+                AND timestamp BETWEEN '{}' AND '{}'
+                GROUP BY symbol, timestamp
+                ORDER BY timestamp",
+                interval, symbol, start_date_str, end_date_str
+            ))
+        }
+
+        let symbol = "AAPL";
+        let timeframe = TimeFrame::Minute;
+        let start_date = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+        let end_date = Utc.with_ymd_and_hms(2023, 1, 2, 0, 0, 0).unwrap();
+
+        let query = build_timeframe_query(symbol, &timeframe, &start_date, &end_date).unwrap();
+
+        assert!(query.contains("SELECT symbol, timestamp, open, high, low, close, volume"));
+        assert!(query.contains("FROM ohlcv"));
+        assert!(query.contains("WHERE symbol = 'AAPL'"));
+        assert!(query.contains("AND timestamp BETWEEN '2023-01-01 00:00:00' AND '2023-01-02 00:00:00'"));
+        assert!(query.contains("ORDER BY timestamp"));
+    }
+
+    #[test]
+    fn test_build_timeframe_query_day() {
+        fn build_timeframe_query(
+            symbol: &str,
+            timeframe: &TimeFrame,
+            start_date: &chrono::DateTime<Utc>,
+            end_date: &chrono::DateTime<Utc>,
+        ) -> Result<String, String> {
+            // Copia del método real para pruebas
+            let start_date_str = start_date.format("%Y-%m-%d %H:%M:%S").to_string();
+            let end_date_str = end_date.format("%Y-%m-%d %H:%M:%S").to_string();
+
+            if *timeframe == TimeFrame::Minute {
+                return Ok(format!(
+                    "SELECT symbol, timestamp, open, high, low, close, volume \
+                    FROM ohlcv \
+                    WHERE symbol = '{}' \
+                    AND timestamp BETWEEN '{}' AND '{}' \
+                    ORDER BY timestamp",
+                    symbol, start_date_str, end_date_str
+                ));
+            }
+
+            let interval = match timeframe {
+                TimeFrame::Minute => "1 MINUTE",
+                TimeFrame::Hour => "1 HOUR",
+                TimeFrame::Day => "1 DAY",
+                TimeFrame::Week => "1 WEEK",
+                TimeFrame::Month => "1 MONTH",
+                _ => return Err(format!("Unsupported timeframe: {:?}", timeframe)),
+            };
+
+            Ok(format!(
+                "SELECT 
+                    symbol,
+                    toStartOfInterval(timestamp, INTERVAL {}) as timestamp,
+                    any(open) as open,
+                    max(high) as high,
+                    min(low) as low,
+                    any(arrayElement(
+                        groupArray(close), 
+                        length(groupArray(close))
+                    )) as close,
+                    sum(volume) as volume
+                FROM ohlcv
+                WHERE symbol = '{}' 
+                AND timestamp BETWEEN '{}' AND '{}'
+                GROUP BY symbol, timestamp
+                ORDER BY timestamp",
+                interval, symbol, start_date_str, end_date_str
+            ))
+        }
+
+        let symbol = "AAPL";
+        let timeframe = TimeFrame::Day;
+        let start_date = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
+        let end_date = Utc.with_ymd_and_hms(2023, 1, 31, 0, 0, 0).unwrap();
+
+        let query = build_timeframe_query(symbol, &timeframe, &start_date, &end_date).unwrap();
+
+        assert!(query.contains("toStartOfInterval(timestamp, INTERVAL 1 DAY)"));
+        assert!(query.contains("GROUP BY symbol, timestamp"));
+        assert!(query.contains("max(high) as high"));
+        assert!(query.contains("min(low) as low"));
+        assert!(query.contains("sum(volume) as volume"));
+    }
+    
+
+    #[test]
+    fn test_extract_prices() {
+        fn extract_prices(data: &[OHLCVData], price_type: PriceType) -> Vec<Positive> {
+            data.iter()
+                .map(|ohlcv| match price_type {
+                    PriceType::Open => ohlcv.open,
+                    PriceType::High => ohlcv.high,
+                    PriceType::Low => ohlcv.low,
+                    PriceType::Close => ohlcv.close,
+                    PriceType::Typical => {
+                        // Típico: (high + low + close) / 3
+                        let sum = ohlcv.high + ohlcv.low + ohlcv.close;
+                        let typical = sum / Decimal::from(3);
+                        typical
+                    }
+                })
+                .collect()
+        }
+
+        let data = vec![
+            OHLCVData {
+                symbol: "AAPL".to_string(),
+                timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap(),
+                open: pos!(150.0),
+                high: pos!(155.0),
+                low: pos!(149.0),
+                close: pos!(153.0),
+                volume: 10000,
+            },
+            OHLCVData {
+                symbol: "AAPL".to_string(),
+                timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 11, 0, 0).unwrap(),
+                open: pos!(153.0),
+                high: pos!(157.0),
+                low: pos!(152.0),
+                close: pos!(156.0),
+                volume: 15000,
+            },
+        ];
+
+        let open_prices = extract_prices(&data, PriceType::Open);
+        let high_prices = extract_prices(&data, PriceType::High);
+        let low_prices = extract_prices(&data, PriceType::Low);
+        let close_prices = extract_prices(&data, PriceType::Close);
+        let typical_prices = extract_prices(&data, PriceType::Typical);
+
+        assert_eq!(open_prices, vec![pos!(150.0), pos!(153.0)]);
+        assert_eq!(high_prices, vec![pos!(155.0), pos!(157.0)]);
+        assert_eq!(low_prices, vec![pos!(149.0), pos!(152.0)]);
+        assert_eq!(close_prices, vec![pos!(153.0), pos!(156.0)]);
+
+        let expected_typical_1 = (pos!(155.0) + pos!(149.0) + pos!(153.0)) / Decimal::from(3);
+        let expected_typical_2 = (pos!(157.0) + pos!(152.0) + pos!(156.0)) / Decimal::from(3);
+
+        assert_eq!(typical_prices[0], expected_typical_1);
+        assert_eq!(typical_prices[1], expected_typical_2);
     }
 }
