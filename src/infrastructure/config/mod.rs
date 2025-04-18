@@ -1,1 +1,1 @@
-pub(crate) mod clickhouse;
+pub mod clickhouse;
