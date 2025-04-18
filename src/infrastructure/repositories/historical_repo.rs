@@ -2,6 +2,7 @@ use std::sync::Arc;
 use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
 use crate::infrastructure::clickhouse::{ClickHouseClient, HistoricalDataRepository};
+use crate::infrastructure::row_to_datetime;
 
 /// Implementation of HistoricalDataRepository using ClickHouse
 pub struct ClickHouseHistoricalRepository {
@@ -84,11 +85,8 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
                 .map_err(|e| format!("Failed to execute ClickHouse query: {}", e))?;
 
             if let Some(row) = block.rows().next() {
-                let min_date: chrono::DateTime<chrono::Utc> = row.get("min_date")
-                    .map_err(|e| format!("Failed to get 'min_date' from row: {}", e))?;
-
-                let max_date: chrono::DateTime<chrono::Utc> = row.get("max_date")
-                    .map_err(|e| format!("Failed to get 'max_date' from row: {}", e))?;
+                let min_date = row_to_datetime(&row, "min_date")?;
+                let max_date = row_to_datetime(&row, "max_date")?;
 
                 Ok((min_date, max_date))
             } else {

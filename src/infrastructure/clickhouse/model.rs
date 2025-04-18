@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use optionstratlib::Positive;
 
 /// OHLCV data structure representing historical financial data
@@ -6,7 +7,7 @@ pub struct OHLCVData {
     /// Symbol or ticker
     pub symbol: String,
     /// Timestamp of the data point
-    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub timestamp: DateTime<Utc>,
     /// Opening price
     pub open: Positive,
     /// Highest price during the period
@@ -18,6 +19,7 @@ pub struct OHLCVData {
     /// Volume traded
     pub volume: u32,
 }
+
 
 /// Price types that can be extracted from OHLCV data
 #[derive(Debug, Clone, Copy)]

@@ -1,16 +1,19 @@
+use std::str::FromStr;
 use std::time::Duration;
-use clickhouse_rs::Pool;
-use optionstratlib::{pos, Options, Positive};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use clickhouse_rs::{Options, Pool};
+use optionstratlib::{pos, Positive};
 use optionstratlib::utils::TimeFrame;
 use rust_decimal::Decimal;
 use tracing::{debug, info, instrument};
 use crate::infrastructure::clickhouse::model::{OHLCVData, PriceType};
+use crate::infrastructure::clickhouse::utils::row_to_datetime;
 use crate::infrastructure::ClickHouseConfig;
 
 /// Represents a client for interacting with ClickHouse historical data
 pub struct ClickHouseClient {
     /// The connection pool for ClickHouse
-    pool: Pool,
+    pub(crate) pool: Pool,
     /// The configuration for this client
     config: ClickHouseConfig,
 }
@@ -19,18 +22,27 @@ impl ClickHouseClient {
     /// Creates a new ClickHouse client with the provided configuration
     #[instrument(name = "clickhouse_client_new", skip(config), level = "debug")]
     pub fn new(config: ClickHouseConfig) -> Result<Self, String> {
-        let opts = Options::new()
-            .addr(format!("{}:{}", config.host, config.port))
-            .username(&config.username)
-            .password(&config.password)
-            .database(&config.database)
-            .timeout(Duration::from_secs(config.timeout));
+        let url = format!(
+            "tcp://{}:{}@{}:{}/{}",
+            config.username,
+            config.password,
+            config.host,
+            config.port,
+            config.database
+        );
+
+        let opts = Options::from_str(&url)
+            .map_err(|e| format!("Failed to parse ClickHouse URL: {}", e))?
+            .ping_timeout(Duration::from_secs(config.timeout))
+            .query_timeout(Duration::from_secs(5))
+            .connection_timeout(Duration::from_secs(1));
 
         let pool = Pool::new(opts);
 
         info!("Created new ClickHouse client for host: {}", config.host);
         Ok(Self { pool, config })
     }
+
 
     /// Creates a new ClickHouse client with default configuration
     pub fn default() -> Result<Self, String> {
@@ -128,9 +140,6 @@ impl ClickHouseClient {
         // For larger timeframes, we need to aggregate the minute data
         let interval = match timeframe {
             TimeFrame::Minute => "1 MINUTE", // Already handled above, but included for completeness
-            TimeFrame::FiveMinutes => "5 MINUTE",
-            TimeFrame::FifteenMinutes => "15 MINUTE",
-            TimeFrame::ThirtyMinutes => "30 MINUTE",
             TimeFrame::Hour => "1 HOUR",
             TimeFrame::Day => "1 DAY",
             TimeFrame::Week => "1 WEEK",
@@ -178,10 +187,9 @@ impl ClickHouseClient {
         for row in block.rows() {
             let symbol: String = row.get("symbol")
                 .map_err(|e| format!("Failed to get 'symbol' from row: {}", e))?;
-
-            let timestamp: chrono::DateTime<chrono::Utc> = row.get("timestamp")
-                .map_err(|e| format!("Failed to get 'timestamp' from row: {}", e))?;
-
+            
+            let timestamp = row_to_datetime(&row, "timestamp")?;
+            
             let open: f32 = row.get("open")
                 .map_err(|e| format!("Failed to get 'open' from row: {}", e))?;
 
@@ -227,10 +235,9 @@ impl ClickHouseClient {
                 PriceType::Close => ohlcv.close,
                 PriceType::Typical => {
                     // Typical price is (high + low + close) / 3
-                    let sum = ohlcv.high.into_inner() + ohlcv.low.into_inner() + ohlcv.close.into_inner();
+                    let sum = ohlcv.high + ohlcv.low + ohlcv.close;
                     let typical = sum / Decimal::from(3);
-                    // Convert back to Positive
-                    pos!(typical.to_f64().unwrap())
+                    typical
                 }
             })
             .collect()
