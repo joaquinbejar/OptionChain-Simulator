@@ -1,25 +1,19 @@
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use optionchain_simulator::infrastructure::{
+    ClickHouseClient, ClickHouseConfig, ClickHouseHistoricalRepository, HistoricalDataRepository,
+    PriceType,
+};
+use optionstratlib::utils::{TimeFrame, setup_logger};
 use optionstratlib::{Positive, pos};
-use optionstratlib::utils::{setup_logger, TimeFrame};
 use std::sync::Arc;
-use tracing::{info, Level};
-use optionchain_simulator::infrastructure::{ClickHouseClient, ClickHouseConfig, ClickHouseHistoricalRepository, HistoricalDataRepository, PriceType};
+use chrono::Duration;
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     setup_logger();
     info!("Starting ClickHouse client example");
-
-    // Create a ClickHouse config for your local database
-    let config = ClickHouseConfig {
-        host: "localhost".to_string(),
-        port: 9000,
-        username: "default".to_string(),
-        password: "".to_string(),  // Default ClickHouse has no password
-        database: "default".to_string(),
-        timeout: 30,
-    };
+    let config = ClickHouseConfig::default();
 
     // Create the ClickHouse client
     info!("Connecting to ClickHouse at {}", config.host);
@@ -30,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check available symbols
     info!("Checking available symbols...");
-    match repo.list_available_symbols() {
+    match repo.list_available_symbols().await {
         Ok(symbols) => {
             info!("Found {} symbols in the database", symbols.len());
             for symbol in &symbols {
@@ -38,20 +32,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Err(e) => {
-            info!("Error listing symbols: {}", e);
+            error!("Error listing symbols: {}", e);
         }
     }
 
     // Define the symbol and date range
-    let symbol = "CL";  // Crude oil
+    let symbol = "CL"; // Crude oil
 
     // Get the date range for the symbol
-    match repo.get_date_range_for_symbol(symbol) {
+    match repo.get_date_range_for_symbol(symbol).await {
         Ok((min_date, max_date)) => {
-            info!("Data available for {} from {} to {}", 
-                  symbol, 
-                  min_date.format("%Y-%m-%d %H:%M:%S"),
-                  max_date.format("%Y-%m-%d %H:%M:%S"));
+            info!(
+                "Data available for {} from {} to {}",
+                symbol,
+                min_date.format("%Y-%m-%d %H:%M:%S"),
+                max_date.format("%Y-%m-%d %H:%M:%S")
+            );
 
             // Set our query date range to the last 30 days of available data
             let end_date = max_date;
@@ -59,7 +55,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Example 1: Get daily prices
             info!("Fetching daily prices for the last 30 days...");
-            match repo.get_historical_prices(symbol, &TimeFrame::Day, &start_date, &end_date) {
+            match repo
+                .get_historical_prices(symbol, &TimeFrame::Day, &start_date, &end_date)
+                .await
+            {
                 Ok(prices) => {
                     info!("Retrieved {} daily price points", prices.len());
 
@@ -81,14 +80,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    info!("Error fetching daily prices: {}", e);
+                    error!("Error fetching daily prices: {}", e);
                 }
             }
 
             // Example 2: Get hourly prices
             info!("Fetching hourly prices for the last 7 days...");
             let hourly_start = end_date - Duration::days(7);
-            match repo.get_historical_prices(symbol, &TimeFrame::Hour, &hourly_start, &end_date) {
+            match repo
+                .get_historical_prices(symbol, &TimeFrame::Hour, &hourly_start, &end_date)
+                .await
+            {
                 Ok(prices) => {
                     info!("Retrieved {} hourly price points", prices.len());
 
@@ -100,14 +102,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    info!("Error fetching hourly prices: {}", e);
+                    error!("Error fetching hourly prices: {}", e);
                 }
             }
 
             // Example 3: Get OHLCV data and extract different price types
             info!("Fetching OHLCV data for the last 14 days...");
             let ohlcv_start = end_date - Duration::days(14);
-            match client.fetch_ohlcv_data(symbol, &TimeFrame::Day, &ohlcv_start, &end_date).await {
+            match client
+                .fetch_ohlcv_data(symbol, &TimeFrame::Day, &ohlcv_start, &end_date)
+                .await
+            {
                 Ok(ohlcv_data) => {
                     info!("Retrieved {} OHLCV data points", ohlcv_data.len());
 
@@ -118,9 +123,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let close_prices = client.extract_prices(&ohlcv_data, PriceType::Close);
                     let typical_prices = client.extract_prices(&ohlcv_data, PriceType::Typical);
 
-                    info!("Price counts - Open: {}, High: {}, Low: {}, Close: {}, Typical: {}", 
-                          open_prices.len(), high_prices.len(), low_prices.len(), 
-                          close_prices.len(), typical_prices.len());
+                    info!(
+                        "Price counts - Open: {}, High: {}, Low: {}, Close: {}, Typical: {}",
+                        open_prices.len(),
+                        high_prices.len(),
+                        low_prices.len(),
+                        close_prices.len(),
+                        typical_prices.len()
+                    );
 
                     // Display a sample OHLCV point
                     if !ohlcv_data.is_empty() {
@@ -137,12 +147,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => {
-                    info!("Error fetching OHLCV data: {}", e);
+                    error!("Error fetching OHLCV data: {}", e);
                 }
             }
         }
         Err(e) => {
-            info!("Error getting date range for {}: {}", symbol, e);
+            error!("Error getting date range for {}: {}", symbol, e);
         }
     }
 
