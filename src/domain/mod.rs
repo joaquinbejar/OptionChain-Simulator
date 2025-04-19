@@ -3,6 +3,6 @@ mod option_contract;
 mod pricing;
 mod session;
 mod simulation;
-mod simulator; 
+mod simulator;
 
 pub use simulator::Simulator;

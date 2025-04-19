@@ -55,9 +55,68 @@ use crate::utils::error::ChainError;
 ///   - `Err(ChainError)`: An error if cleanup fails.
 ///
 pub trait SessionStore: Send + Sync {
+    /// Retrieves a `Session` by its unique identifier.
+    ///
+    /// # Parameters
+    /// - `id`: A `Uuid` that uniquely identifies the `Session` to retrieve.
+    ///
+    /// # Returns
+    /// - `Ok(Session)`: The session corresponding to the provided `id`.
+    /// - `Err(ChainError)`: If the session could not be retrieved due to an error.
+    ///
+    /// # Errors
+    /// This function returns a `ChainError` if:
+    /// - The session with the provided `id` does not exist.
+    /// - There is an issue with the underlying storage or retrieval process.
+    ///
     fn get(&self, id: Uuid) -> Result<Session, ChainError>;
+
+    /// Saves the provided session into persistent storage or memory.
+    ///
+    /// # Parameters
+    /// - `session`: A `Session` object that contains the details to be saved.
+    ///
+    /// # Returns
+    /// - `Ok(())`: If the session is successfully saved.
+    /// - `Err(ChainError)`: If an error occurs during the save operation, wrapped in a `ChainError`.
+    ///
+    /// # Errors
+    /// This function may return a `ChainError` in scenarios such as:
+    /// - Issues with accessing the storage system.
+    /// - Serialization or persistence failures.
+    ///
     fn save(&self, session: Session) -> Result<(), ChainError>;
+
+    /// Deletes an entity identified by the given `id`.
+    ///
+    /// # Parameters
+    /// - `id`: A `Uuid` representing the identifier of the entity to be deleted.
+    ///
+    /// # Returns
+    /// - `Ok(true)`: If the deletion was successful.
+    /// - `Ok(false)`: If the deletion was unsuccessful, but no error occurred (e.g., entity not found).
+    /// - `Err(ChainError)`: If an error occurred during the deletion process.
+    ///
+    /// # Errors
+    /// This function returns a `ChainError` if there is an issue with the deletion process,
+    /// such as database communication errors or invalid input.
+    ///
     fn delete(&self, id: Uuid) -> Result<bool, ChainError>;
+
+    /// Cleans up stale or unnecessary data within the chain and performs housekeeping tasks.
+    ///
+    /// This method is responsible for managing and removing data that is no longer
+    /// needed to ensure the efficient functioning of the chain. It allows the chain
+    /// to remain performant and reduces unnecessary memory or storage usage.
+    ///
+    /// # Returns
+    /// * `Ok(usize)` - The number of items successfully cleaned up.
+    /// * `Err(ChainError)` - If an error occurs during the cleanup process.
+    ///
+    /// # Errors
+    /// This function will return a `ChainError` in case of failures, such as issues
+    /// accessing resources, file system problems, or other internal errors during
+    /// cleanup.
     fn cleanup(&self) -> Result<usize, ChainError>;
 }
 
@@ -81,7 +140,23 @@ pub struct InMemorySessionStore {
     sessions: Arc<Mutex<HashMap<Uuid, Session>>>,
 }
 
+impl Default for InMemorySessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InMemorySessionStore {
+    /// Creates a new instance of the struct.
+    ///
+    /// This function initializes and returns a new instance of the struct with an empty `HashMap`
+    /// wrapped in an `Arc<Mutex<>>`. The `Arc` ensures thread-safe shared ownership of the `Mutex`,
+    /// while the `Mutex` provides interior mutability and thread-safe access to the `HashMap`.
+    ///
+    /// # Returns
+    ///
+    /// * `Self` - A new instance of the struct.
+    ///
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -91,10 +166,9 @@ impl InMemorySessionStore {
 
 impl SessionStore for InMemorySessionStore {
     fn get(&self, id: Uuid) -> Result<Session, ChainError> {
-        let sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store".to_string()))?;
+        let sessions = self.sessions.lock().map_err(|_| {
+            ChainError::Internal("Failed to acquire lock on session store".to_string())
+        })?;
 
         sessions
             .get(&id)
@@ -103,29 +177,26 @@ impl SessionStore for InMemorySessionStore {
     }
 
     fn save(&self, session: Session) -> Result<(), ChainError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store".to_string()))?;
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            ChainError::Internal("Failed to acquire lock on session store".to_string())
+        })?;
 
         sessions.insert(session.id, session);
         Ok(())
     }
 
     fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store".to_string()))?;
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            ChainError::Internal("Failed to acquire lock on session store".to_string())
+        })?;
 
         Ok(sessions.remove(&id).is_some())
     }
 
     fn cleanup(&self) -> Result<usize, ChainError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store".to_string()))?;
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            ChainError::Internal("Failed to acquire lock on session store".to_string())
+        })?;
 
         // Find expired sessions (older than 30 minutes)
         let now = std::time::SystemTime::now();
@@ -152,11 +223,11 @@ impl SessionStore for InMemorySessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::model::{Session, SessionState, SimulationParameters};
     use crate::session::SimulationMethod;
-    use crate::utils::UuidGenerator;
-    use optionstratlib::{pos, Positive};
+    use crate::session::model::{Session, SessionState, SimulationParameters};
+
     use optionstratlib::utils::TimeFrame;
+    use optionstratlib::{Positive, pos};
     use rust_decimal::Decimal;
     use std::thread;
     use std::time::{Duration, SystemTime};
@@ -323,7 +394,9 @@ mod tests {
         let current_id = current_session.id;
 
         // Crear una sesión "antigua" (más de 30 minutos)
-        let expired_time = SystemTime::now().checked_sub(Duration::from_secs(3600)).unwrap();
+        let expired_time = SystemTime::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap();
         let expired_id = Uuid::new_v4();
         let expired_session = Session {
             id: expired_id,

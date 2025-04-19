@@ -1,8 +1,8 @@
+use crate::utils::ChainError;
 use async_trait::async_trait;
-use chrono::{Utc, DateTime};
+use chrono::{DateTime, Utc};
 use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
-use crate::utils::ChainError;
 
 /// A trait that defines the interface for interacting with a repository of historical financial data.
 /// Provides methods to fetch historical prices, get a list of available symbols, and determine the
@@ -21,7 +21,7 @@ pub trait HistoricalDataRepository: Send + Sync {
     ///
     /// # Returns
     ///
-    /// * `Ok(Vec<Positive>)` - A vector of `Positive` values representing the historical prices for the 
+    /// * `Ok(Vec<Positive>)` - A vector of `Positive` values representing the historical prices for the
     ///   specified `symbol` and `timeframe` within the given date range.
     /// * `Err(String)` - Returns an error message if the query fails, such as due to invalid input parameters,
     ///   network issues, or data unavailability.
@@ -50,7 +50,7 @@ pub trait HistoricalDataRepository: Send + Sync {
     ///
     /// This function returns a list of symbols as strings, which might
     /// represent financial instruments, assets, or other entities depending
-    /// on the context of use. The specific semantics of the symbols are 
+    /// on the context of use. The specific semantics of the symbols are
     /// determined by the system where this function is implemented.
     ///
     /// # Returns
@@ -59,7 +59,7 @@ pub trait HistoricalDataRepository: Send + Sync {
     ///
     /// # Errors
     /// If the retrieval process encounters an issue (e.g., network issues,
-    /// unavailable data, or internal errors), this method will return an 
+    /// unavailable data, or internal errors), this method will return an
     /// appropriate error message encapsulated in a `Result::Err`.
     ///
     async fn list_available_symbols(&self) -> Result<Vec<String>, ChainError>;
@@ -84,5 +84,8 @@ pub trait HistoricalDataRepository: Send + Sync {
     /// * If the provided symbol is not found or is invalid.
     /// * If there is an issue retrieving the date range for the symbol.
     ///
-    async fn get_date_range_for_symbol(&self, symbol: &str) -> Result<(DateTime<Utc>, DateTime<Utc>), ChainError>;
+    async fn get_date_range_for_symbol(
+        &self,
+        symbol: &str,
+    ) -> Result<(DateTime<Utc>, DateTime<Utc>), ChainError>;
 }

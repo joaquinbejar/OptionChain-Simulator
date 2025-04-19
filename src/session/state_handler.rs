@@ -15,27 +15,27 @@ impl StateProgressionHandler {
                 session.state = SessionState::InProgress;
                 session.advance_step()?;
                 Ok(())
-            },
+            }
             SessionState::InProgress => {
                 session.advance_step()?;
                 Ok(())
-            },
+            }
             SessionState::Modified => {
                 session.state = SessionState::InProgress;
                 session.advance_step()?;
                 Ok(())
-            },
+            }
             SessionState::Reinitialized => {
                 session.state = SessionState::InProgress;
                 session.advance_step()?;
                 Ok(())
-            },
-            SessionState::Completed => {
-                Err(ChainError::InvalidState("Session has completed all steps".to_string()))
-            },
-            SessionState::Error => {
-                Err(ChainError::InvalidState("Session is in error state".to_string()))
-            },
+            }
+            SessionState::Completed => Err(ChainError::InvalidState(
+                "Session has completed all steps".to_string(),
+            )),
+            SessionState::Error => Err(ChainError::InvalidState(
+                "Session is in error state".to_string(),
+            )),
         }
     }
 

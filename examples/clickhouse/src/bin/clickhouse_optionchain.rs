@@ -9,7 +9,7 @@ use optionchain_simulator::utils::ChainError;
 use optionstratlib::utils::others::calculate_log_returns;
 use optionstratlib::utils::time::convert_time_frame;
 use optionstratlib::utils::{Len, TimeFrame, setup_logger};
-use optionstratlib::volatility::constant_volatility;
+use optionstratlib::volatility::{annualized_volatility, constant_volatility};
 use optionstratlib::{Positive, pos, spos};
 use rust_decimal::Decimal;
 use std::sync::Arc;
@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
 
                             // Step 7: Run through a few simulation steps
-                            run_simulation_steps(&session_manager, session.id, 5)?;
+                            run_simulation_steps(&session_manager, session.id, 7)?;
                         }
                         Err(e) => {
                             error!("Failed to create session: {}", e);
@@ -144,7 +144,7 @@ fn create_simulation_parameters(
             volatility,
         },
         time_frame,
-        chain_size: Some(15),                  // 15 strikes
+        chain_size: Some(30),                  // 15 strikes
         strike_interval: Some(pos!(1.0)),      // $1 intervals
         skew_factor: Some(Decimal::new(5, 4)), // 0.0005
         spread: spos!(0.02),                   // 2% bid-ask spread
@@ -187,7 +187,7 @@ fn run_simulation_steps(
         );
 
         // Display the first few option contracts
-        let display_count = std::cmp::min(3, chain.len());
+        let display_count = std::cmp::min(5, chain.len());
         if display_count > 0 {
             info!("Sample option contracts:");
             for (i, contract) in chain
@@ -215,5 +215,7 @@ fn calculate_historical_volatility(
         .map(|r| r.to_dec())
         .collect::<Vec<Decimal>>();
 
-    constant_volatility(&log_return_dec)
+    let volatility = constant_volatility(&log_return_dec)?;
+    let annualized_volatility = annualized_volatility(volatility, TimeFrame::Day)?.round_to(3);
+    Ok(annualized_volatility)
 }

@@ -21,13 +21,11 @@ use tracing::{debug, info, instrument};
 /// # Fields
 ///
 /// * `pool` - A connection pool (`Pool`) used for establishing and managing
-///            database connections. This is a private field that facilitates
-///            efficient resource management and avoids the overhead of creating
-///            new connections for each operation.
+///   database connections. This is a private field that facilitates efficient resource management
+///   and avoids the overhead of creating new connections for each operation.
 ///
-/// * `config` - The configuration (`ClickHouseConfig`) that contains settings
-///              specific to this client, such as authentication credentials,
-///              database connection details, or other configuration parameters.
+/// * `config` - The configuration (`ClickHouseConfig`) that contains settings specific to this
+///   client, such as authentication credentials, database connection details, or other configuration parameters.
 ///
 pub struct ClickHouseClient {
     /// Represents a connection pool that is used internally within the crate.
@@ -65,6 +63,16 @@ pub struct ClickHouseClient {
     config: ClickHouseConfig,
 }
 
+impl Default for ClickHouseClient {
+    /// Creates a new ClickHouse client with default configuration
+    fn default() -> ClickHouseClient {
+        match Self::new(ClickHouseConfig::default()) {
+            Ok(client) => client,
+            Err(e) => panic!("Failed to create default ClickHouse client: {}", e),
+        }
+    }
+}
+
 impl ClickHouseClient {
     /// Creates a new ClickHouse client with the provided configuration
     #[instrument(name = "clickhouse_client_new", skip(config), level = "debug")]
@@ -86,11 +94,6 @@ impl ClickHouseClient {
 
         info!("Created new ClickHouse client for host: {}", config.host);
         Ok(Self { pool, config })
-    }
-
-    /// Creates a new ClickHouse client with default configuration
-    pub fn default() -> Result<Self, ChainError> {
-        Self::new(ClickHouseConfig::default())
     }
 
     /// Fetches historical price data for a given symbol, time frame, and date range
@@ -146,7 +149,44 @@ impl ClickHouseClient {
         Ok(results)
     }
 
-    /// Builds an appropriate SQL query for the given timeframe
+    /// Constructs an SQL query to retrieve financial market data for a specified time range and timeframe.
+    ///
+    /// Depending on the given timeframe, the query either retrieves raw minute-level data or performs
+    /// aggregation over minute data to compute open, high, low, close prices, and volume for larger timeframes.
+    ///
+    /// ### Parameters
+    /// - `symbol`: A string slice that represents the symbol (e.g., ticker) for the financial instrument to query.
+    /// - `timeframe`: A reference to a `TimeFrame` enum, which specifies the granularity of the data
+    ///   (e.g., Minute, Hour, Day, Week, Month).
+    /// - `start_date`: A reference to a `DateTime<Utc>` indicating the start of the time range for the query.
+    /// - `end_date`: A reference to a `DateTime<Utc>` indicating the end of the time range for the query.
+    ///
+    /// ### Returns
+    /// - On success: A `Result<String, ChainError>` containing the SQL query as a string.
+    /// - On error: A `ChainError::ClickHouseError` if the provided timeframe is unsupported.
+    ///
+    /// ### Behavior
+    /// 1. If the timeframe is `TimeFrame::Minute`, it directly constructs a query to retrieve minute-level data
+    ///    without any aggregation.
+    /// 2. For larger timeframes (e.g., Hour, Day, Week, Month), the query aggregates the data as follows:
+    ///    - `open`: The opening price at the start of the timeframe interval.
+    ///    - `high`: The maximum price within the interval.
+    ///    - `low`: The minimum price within the interval.
+    ///    - `close`: The closing price at the end of the interval.
+    ///    - `volume`: The total volume for the interval.
+    ///
+    /// ### Errors
+    /// - Returns `ChainError::ClickHouseError` with an appropriate error message if the `timeframe` is unsupported.
+    ///   Example: `Unsupported timeframe: Year`.
+    ///
+    /// ### Notes
+    /// - The function makes use of ClickHouse-specific SQL features, such as `toUnixTimestamp`,
+    ///   `toStartOfInterval`, and `any` functions.
+    ///
+    /// ### Assumptions
+    /// - Assumes that the `ohlcv` table exists and contains the necessary columns: `symbol`, `timestamp`, `open`,
+    ///   `high`, `low`, `close`, and `volume`.
+    /// - Assumes that the provided `start_date` and `end_date` values are valid and in the `Utc` timezone.
     fn build_timeframe_query(
         &self,
         symbol: &str,
@@ -212,7 +252,48 @@ impl ClickHouseClient {
         ))
     }
 
-    /// Executes a SQL query and returns OHLCV data
+    /// Executes a ClickHouse query and retrieves data in the form of OHLCV (Open, High, Low, Close, Volume) records.
+    ///
+    /// # Arguments
+    ///
+    /// * `&self` - Reference to the instance of the implementing struct.
+    /// * `query` - A `String` containing the ClickHouse query to execute.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `Result` containing either:
+    /// * A `Vec<OHLCVData>`: A vector of `OHLCVData` records obtained from executing the query.
+    /// * A `ChainError`: An error encountered during execution, which includes issues such as connection errors, query execution errors, or data retrieval errors.
+    ///
+    /// # Errors
+    ///
+    /// This function returns a `ChainError` for the following failure cases:
+    /// * If a ClickHouse connection could not be retrieved from the pool.
+    /// * If an error occurs while executing the query.
+    /// * If any expected column (`symbol`, `timestamp`, `open`, `high`, `low`, `close`, `volume`) is missing from the result set or cannot be parsed.
+    /// * If the conversion of numerical fields into their appropriate types (e.g., `f32` to `Positive<f64>`) fails.
+    ///
+    /// # Implementation Details
+    ///
+    /// 1. A connection to the ClickHouse database is obtained from the connection pool.
+    /// 2. The provided query is executed, and all results are fetched into a block.
+    /// 3. Each row in the retrieved block is parsed to construct an `OHLCVData` object, which includes:
+    ///    * The trading symbol.
+    ///    * The timestamp.
+    ///    * Numerical fields (`open`, `high`, `low`, `close`) are converted into a `Positive<f64>` wrapper to ensure non-negative values.
+    /// 4. A vector of `OHLCVData` objects is returned on success.
+    ///
+    /// # Dependencies
+    ///
+    /// This function relies on:
+    /// * `self.pool.get_handle()`: To get a database connection.
+    /// * `row_to_datetime`: A helper function to parse the `timestamp` from a row.
+    /// * `pos!`: A macro to ensure numerical values are positive, converting `f64` values into `Positive<f64>`.
+    ///
+    /// # Note
+    ///
+    /// Ensure the query fetches all the required fields (`symbol`, `timestamp`, `open`, `high`, `low`, `close`, `volume`)
+    /// to avoid `ChainError` during runtime.
     async fn execute_query(&self, query: String) -> Result<Vec<OHLCVData>, ChainError> {
         debug!("Executing ClickHouse query: {}", query);
 
@@ -273,7 +354,26 @@ impl ClickHouseClient {
         Ok(results)
     }
 
-    /// Converts a vector of OHLCV data to a vector of prices based on selection criteria
+    /// Extracts a vector of prices of a specific type (`PriceType`) from a slice of OHLCV data.
+    ///
+    /// This function iterates through the input slice of `OHLCVData` and extracts the desired
+    /// price based on the specified `PriceType`. It supports extracting the following price types:
+    /// Open, High, Low, Close, and Typical. The Typical price is calculated as the average of
+    /// High, Low, and Close prices.
+    ///
+    /// # Parameters
+    /// - `data`: A slice of `OHLCVData` that contains the OHLCV (Open, High, Low, Close, Volume) information.
+    /// - `price_type`: A `PriceType` enum value indicating which type of price to extract.
+    ///
+    /// # Returns
+    /// `Vec<Positive>`: A vector containing the extracted price values as `Positive`
+    /// for each corresponding entry in the input `data`.
+    ///
+    /// # Panics
+    /// This function assumes that all calculated values (e.g., Typical price) will yield a positive price.
+    /// If this assumption is violated, runtime behavior is undefined or may cause panics if assumptions
+    /// about the `Positive` type are not met.
+    ///
     pub fn extract_prices(&self, data: &[OHLCVData], price_type: PriceType) -> Vec<Positive> {
         data.iter()
             .map(|ohlcv| match price_type {
@@ -284,13 +384,20 @@ impl ClickHouseClient {
                 PriceType::Typical => {
                     // Typical price is (high + low + close) / 3
                     let sum = ohlcv.high + ohlcv.low + ohlcv.close;
-                    let typical = sum / Decimal::from(3);
-                    typical
+
+                    sum / Decimal::from(3)
                 }
             })
             .collect()
     }
-    
+
+    /// Provides a mutable reference to the `ClickHouseConfig` instance.
+    ///
+    /// # Returns
+    /// A mutable reference to the current `ClickHouseConfig` instance
+    /// associated with the object. This allows for modifications
+    /// to the configuration.
+    ///
     pub fn get_config(&mut self) -> &mut ClickHouseConfig {
         &mut self.config
     }
@@ -305,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_build_timeframe_query_minute() {
-        let config = ClickHouseConfig {
+        let _config = ClickHouseConfig {
             host: "test-host".to_string(),
             port: 9000,
             username: "test-user".to_string(),
@@ -468,8 +575,8 @@ mod tests {
                     PriceType::Typical => {
                         // Típico: (high + low + close) / 3
                         let sum = ohlcv.high + ohlcv.low + ohlcv.close;
-                        let typical = sum / Decimal::from(3);
-                        typical
+
+                        sum / Decimal::from(3)
                     }
                 })
                 .collect()

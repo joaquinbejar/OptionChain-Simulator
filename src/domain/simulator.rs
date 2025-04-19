@@ -110,7 +110,7 @@ impl Simulator {
         let risk_free_rate = params.risk_free_rate;
         let dividend_yield = params.dividend_yield;
         let symbol = params.symbol.clone();
-        let time_frame = params.time_frame.clone();
+        let time_frame = params.time_frame;
 
         // Set default values if not provided
         let chain_size = params.chain_size.unwrap_or(10);

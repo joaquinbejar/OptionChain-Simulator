@@ -1,10 +1,10 @@
+mod clickhouse;
 mod config;
 mod repositories;
-mod clickhouse;
 
+pub use clickhouse::ClickHouseClient;
+pub use clickhouse::interface::HistoricalDataRepository;
+pub use clickhouse::model::{OHLCVData, PriceType};
 pub(crate) use clickhouse::utils::row_to_datetime;
 pub use config::clickhouse::ClickHouseConfig;
-pub use clickhouse::ClickHouseClient;
 pub use repositories::historical_repo::ClickHouseHistoricalRepository;
-pub use clickhouse::interface::HistoricalDataRepository;
-pub use clickhouse::model::{PriceType, OHLCVData};

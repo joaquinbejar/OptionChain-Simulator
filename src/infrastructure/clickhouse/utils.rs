@@ -1,5 +1,5 @@
-use chrono::{DateTime,  Utc};
 use crate::utils::ChainError;
+use chrono::{DateTime, Utc};
 
 /// Converts a field in a `Row` object into a `DateTime<Utc>` value.
 ///
@@ -27,19 +27,20 @@ use crate::utils::ChainError;
 ///
 /// Note: Ensure the `clickhouse_rs` and `chrono` crates are added to your `Cargo.toml`
 /// when using this function.
-pub fn row_to_datetime<'a, K>(
-    row: &clickhouse_rs::types::Row<'a, K>,
+pub fn row_to_datetime<K>(
+    row: &clickhouse_rs::types::Row<'_, K>,
     field_name: &str,
 ) -> Result<DateTime<Utc>, ChainError>
 where
     K: clickhouse_rs::types::column::ColumnType,
 {
-    let timestamp_seconds: i64 = row
-        .get(field_name)
-        .map_err(|e| ChainError::ClickHouseError(format!("Failed to get '{}' from row: {}", field_name, e)))?;
+    let timestamp_seconds: i64 = row.get(field_name).map_err(|e| {
+        ChainError::ClickHouseError(format!("Failed to get '{}' from row: {}", field_name, e))
+    })?;
 
-    DateTime::<Utc>::from_timestamp(timestamp_seconds, 0)
-        .ok_or_else(|| ChainError::ClickHouseError(format!("Invalid timestamp value: {}", timestamp_seconds)))
+    DateTime::<Utc>::from_timestamp(timestamp_seconds, 0).ok_or_else(|| {
+        ChainError::ClickHouseError(format!("Invalid timestamp value: {}", timestamp_seconds))
+    })
 }
 
 #[cfg(test)]
@@ -58,8 +59,9 @@ mod tests {
     fn row_to_datetime_test(row: &MockRow, field_name: &str) -> Result<DateTime<Utc>, ChainError> {
         let timestamp_seconds: i64 = row.get(field_name)?;
 
-        DateTime::<Utc>::from_timestamp(timestamp_seconds, 0)
-            .ok_or_else(|| ChainError::ClickHouseError( format!("Invalid timestamp value: {}", timestamp_seconds)))
+        DateTime::<Utc>::from_timestamp(timestamp_seconds, 0).ok_or_else(|| {
+            ChainError::ClickHouseError(format!("Invalid timestamp value: {}", timestamp_seconds))
+        })
     }
 
     #[test]
@@ -88,7 +90,11 @@ mod tests {
         mock_row
             .expect_get::<i64>()
             .with(eq("timestamp"))
-            .returning(|_| Err(ChainError::ClickHouseError( "Column not found: timestamp".to_string())));
+            .returning(|_| {
+                Err(ChainError::ClickHouseError(
+                    "Column not found: timestamp".to_string(),
+                ))
+            });
 
         let result = row_to_datetime_test(&mock_row, "timestamp");
         assert!(result.is_err(), "Should fail when field not found");

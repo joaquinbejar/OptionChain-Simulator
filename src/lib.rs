@@ -110,8 +110,63 @@
 //!
 //! ---
 
+/// The `domain` module is intended to encapsulate and manage all the core business logic
+/// and domain-specific functionality of the application.
+///
+/// This module acts as a boundary for the domain layer, typically containing:
+/// - Structures, enums, and traits that represent core entities and value objects.
+/// - Business rules and invariant logic pertaining to the domain.
+/// - Interactions and transformations for the domain without leaking implementation details.
+///
+/// Other parts of the application (e.g., infrastructure or application layers)
+/// should depend on this module to ensure a clear separation of concerns and maintain
+/// a clean architecture.
+///
+/// The actual implementation of the `domain` module is organized within its internal code.
+///
 mod domain;
-pub mod session;
-pub mod utils;
+
+/// The `infrastructure` module serves as a dedicated module for providing
+/// foundational support and systems required for the application.
+///
+/// This module typically includes components such as database connection
+/// management, caching systems, configuration loading, messaging, or interfaces
+/// to external systems.
+///
+/// It acts as the backbone of the application and ensures that all other
+/// modules and functionalities can leverage these shared infrastructure
+/// resources efficiently and consistently.
+///
+/// Usage:
+/// - Define core infrastructure services here.
+/// - Keep reusable, application-wide systems within this module.
+/// - Encapsulate external integrations to avoid coupling them with the rest
+///   of the codebase.
 pub mod infrastructure;
 
+/// The `session` module provides functionality for managing and maintaining
+/// user sessions within the application. This module may include features such as:
+///
+/// - Creating and initializing sessions.
+/// - Updating session state or data.
+/// - Managing session expiration.
+/// - Supporting user authentication or authorization workflows through sessions.
+///
+/// This module serves as a central location for session-related logic,
+/// aiming to simplify session lifecycle management and enhance code reusability.
+///
+/// Modules, structs, functions, or interfaces within `session` should be used
+/// to handle all operations related to session management efficiently and securely.
+///
+pub mod session;
+/// This module `utils` serves as a container for utility functions, types,
+/// and other reusable components that can be shared across different parts
+/// of the application.
+///
+/// # Purpose
+/// The `utils` module is designed to provide commonly used helper functionality,
+/// simplifying the logic in other parts of the program and avoiding code duplication.
+///
+/// Note that the specific utility helpers and functionality provided will
+/// depend on the implementation within this module.
+pub mod utils;

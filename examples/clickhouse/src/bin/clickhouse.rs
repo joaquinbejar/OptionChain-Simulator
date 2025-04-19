@@ -1,3 +1,4 @@
+use chrono::Duration;
 use optionchain_simulator::infrastructure::{
     ClickHouseClient, ClickHouseConfig, ClickHouseHistoricalRepository, HistoricalDataRepository,
     PriceType,
@@ -5,7 +6,6 @@ use optionchain_simulator::infrastructure::{
 use optionstratlib::utils::{TimeFrame, setup_logger};
 use optionstratlib::{Positive, pos};
 use std::sync::Arc;
-use chrono::Duration;
 use tracing::{error, info};
 
 #[tokio::main]

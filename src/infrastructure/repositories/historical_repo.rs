@@ -16,7 +16,7 @@ use std::sync::Arc;
 /// # Fields
 ///
 /// * `client` - An `Arc`-wrapped instance of the `ClickHouseClient`, enabling shared ownership and
-///              thread-safe access to the ClickHouse database.
+///   thread-safe access to the ClickHouse database.
 ///
 /// # Notes
 ///
@@ -231,7 +231,7 @@ mod tests {
     use optionstratlib::utils::TimeFrame;
     use optionstratlib::{Positive, pos};
     use std::cell::RefCell;
-    use std::sync::Arc;
+    use std::rc::Rc;
 
     #[derive(Clone)]
     struct TestClickHouseClient {
@@ -251,12 +251,12 @@ mod tests {
             }
         }
 
-        fn with_prices(mut self, prices: Vec<Positive>) -> Self {
+        fn with_prices(self, prices: Vec<Positive>) -> Self {
             *self.prices.borrow_mut() = prices;
             self
         }
 
-        fn with_symbols(mut self, symbols: Vec<String>) -> Self {
+        fn with_symbols(self, symbols: Vec<String>) -> Self {
             *self.symbols.borrow_mut() = symbols;
             self
         }
@@ -295,11 +295,11 @@ mod tests {
 
     // ClickHouseHistoricalRepository que se adapta a nuestro TestClickHouseClient
     struct TestHistoricalRepository {
-        client: Arc<TestClickHouseClient>,
+        client: Rc<TestClickHouseClient>,
     }
 
     impl TestHistoricalRepository {
-        fn new(client: Arc<TestClickHouseClient>) -> Self {
+        fn new(client: Rc<TestClickHouseClient>) -> Self {
             Self { client }
         }
 
@@ -347,7 +347,7 @@ mod tests {
 
         let test_client = TestClickHouseClient::new().with_prices(expected_prices.clone());
 
-        let repo = TestHistoricalRepository::new(Arc::new(test_client));
+        let repo = TestHistoricalRepository::new(Rc::new(test_client));
 
         // Act
         let result = repo.get_historical_prices(symbol, &timeframe, &start_date, &end_date);
@@ -367,7 +367,7 @@ mod tests {
 
         let test_client = TestClickHouseClient::new().with_symbols(expected_symbols.clone());
 
-        let repo = TestHistoricalRepository::new(Arc::new(test_client));
+        let repo = TestHistoricalRepository::new(Rc::new(test_client));
 
         // Act
         let result = repo.list_available_symbols();
@@ -390,7 +390,7 @@ mod tests {
         let test_client =
             TestClickHouseClient::new().with_date_range(expected_min_date, expected_max_date);
 
-        let repo = TestHistoricalRepository::new(Arc::new(test_client));
+        let repo = TestHistoricalRepository::new(Rc::new(test_client));
 
         // Act
         let result = repo.get_date_range_for_symbol(symbol);

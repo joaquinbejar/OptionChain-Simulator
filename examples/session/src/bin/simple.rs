@@ -1,10 +1,10 @@
+use optionstratlib::simulation::WalkType;
+use optionstratlib::utils::time::convert_time_frame;
+use optionstratlib::utils::{TimeFrame, setup_logger};
+use optionstratlib::{ExpirationDate, Positive, pos, spos};
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
-use optionstratlib::{pos, spos, ExpirationDate, Positive};
-use optionstratlib::simulation::WalkType;
-use optionstratlib::utils::{setup_logger, TimeFrame};
-use optionstratlib::utils::time::convert_time_frame;
-use rust_decimal::Decimal;
 use tracing::{Level, info};
 use uuid::Uuid;
 
@@ -80,7 +80,7 @@ fn create_simulation_parameters() -> SimulationParameters {
         volatility: pos!(0.2),
         risk_free_rate: Decimal::ZERO,
         dividend_yield: Positive::ZERO,
-        method: SimulationMethod::GeometricBrownian{
+        method: SimulationMethod::GeometricBrownian {
             dt,
             drift: Decimal::ZERO,
             volatility,
@@ -120,7 +120,7 @@ fn run_session_lifecycle(
                     state = ?session.state,
                     "Advanced simulation successfully"
                 );
-            },
+            }
             Err(e) => {
                 info!(session_id = %session_id, "Error advancing simulation: {}", e);
                 return Err(e);
@@ -151,7 +151,7 @@ fn run_session_lifecycle(
                 state = ?modified_session.state,
                 "Session parameters modified"
             );
-        },
+        }
         Err(e) => {
             info!(session_id = %session_id, "Error modifying session: {}", e);
             return Err(e);
@@ -169,7 +169,7 @@ fn run_session_lifecycle(
                     state = ?session.state,
                     "Advanced simulation with modified parameters"
                 );
-            },
+            }
             Err(e) => {
                 info!(session_id = %session_id, "Error advancing simulation: {}", e);
                 return Err(e);
@@ -182,7 +182,7 @@ fn run_session_lifecycle(
     match session_manager.delete_session(session_id) {
         Ok(deleted) => {
             info!(session_id = %session_id, deleted = deleted, "Session deletion result");
-        },
+        }
         Err(e) => {
             info!(session_id = %session_id, "Error deleting session: {}", e);
             return Err(e);
