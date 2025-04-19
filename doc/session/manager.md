@@ -2,35 +2,35 @@
 ```mermaid
 classDiagram
     class SessionManager {
-        -store: Arc<dyn SessionStore>
+        -store: Arc~dyn SessionStore~
         -state_handler: StateProgressionHandler
         -simulator: Simulator
-        +new(store: Arc<dyn SessionStore>) SessionManager
-        +create_session(params, steps) Result<Session, ChainError>
-        +get_next_step(id) Result<(Session, OptionChain), ChainError>
-        +update_session(id, params) Result<Session, ChainError>
-        +reinitialize_session(id, params, steps) Result<Session, ChainError>
-        +delete_session(id) Result<bool, ChainError>
-        +cleanup_sessions() Result<usize, ChainError>
+        +new(store: Arc~dyn SessionStore~) SessionManager
+        +create_session(params: SimulationParameters) Result~Session, ChainError~
+        +get_next_step(id: Uuid) Result~(Session, OptionChain), ChainError~
+        +update_session(id: Uuid, params: SimulationParameters) Result~Session, ChainError~
+        +reinitialize_session(id: Uuid, params: SimulationParameters, total_steps: usize) Result~Session, ChainError~
+        +delete_session(id: Uuid) Result~bool, ChainError~
+        +cleanup_sessions() Result~usize, ChainError~
     }
     
     class SessionStore {
         <<interface>>
-        +get(id: Uuid) Result<Session, ChainError>
-        +save(session: Session) Result<(), ChainError>
-        +delete(id: Uuid) Result<bool, ChainError>
-        +cleanup() Result<usize, ChainError>
+        +get(id: Uuid) Result~Session, ChainError~
+        +save(session: Session) Result~(), ChainError~
+        +delete(id: Uuid) Result~bool, ChainError~
+        +cleanup() Result~usize, ChainError~
     }
     
     class InMemorySessionStore {
-        -sessions: Arc<Mutex<HashMap<Uuid, Session>>>
+        -sessions: Arc~Mutex~HashMap~Uuid, Session~~~
         +new() InMemorySessionStore
     }
     
     class StateProgressionHandler {
         +new() StateProgressionHandler
-        +advance_state(session: &mut Session) Result<(), ChainError>
-        +reset_progression(session: &mut Session) Result<(), ChainError>
+        +advance_state(session: &mut Session) Result~(), ChainError~
+        +reset_progression(session: &mut Session) Result~(), ChainError~
     }
     
     class Session {
@@ -38,24 +38,31 @@ classDiagram
         +created_at: SystemTime
         +updated_at: SystemTime
         +parameters: SimulationParameters
-        +current_step: u32
-        +total_steps: u32
+        +current_step: usize
+        +total_steps: usize
         +state: SessionState
-        +new(parameters, total_steps) Session
-        +new_with_generator(parameters, total_steps, uuid_generator) Session
-        +advance_step() Result<(), ChainError>
-        +modify_parameters(new_params) void
-        +reinitialize(new_params, total_steps) void
+        +new(parameters: SimulationParameters) Session
+        +new_with_generator(parameters: SimulationParameters, uuid_generator: &UuidGenerator) Session
+        +advance_step() Result~(), ChainError~
+        +modify_parameters(new_params: SimulationParameters) void
+        +reinitialize(new_params: SimulationParameters, total_steps: usize) void
         +is_active() bool
     }
     
     class SimulationParameters {
-        +initial_price: Decimal
-        +volatility: Decimal
+        +symbol: String
+        +steps: usize
+        +initial_price: Positive
+        +days_to_expiration: Positive
+        +volatility: Positive
         +risk_free_rate: Decimal
-        +strikes: Vec<Decimal>
-        +expirations: Vec<Duration>
+        +dividend_yield: Positive
         +method: SimulationMethod
+        +time_frame: TimeFrame
+        +chain_size: Option~usize~
+        +strike_interval: Option~Positive~
+        +skew_factor: Option~Decimal~
+        +spread: Option~Positive~
     }
     
     class SessionState {
@@ -68,13 +75,6 @@ classDiagram
         Error
     }
     
-    class SimulationMethod {
-        <<enumeration>>
-        BlackScholes
-        MonteCarlo
-        HistoricalReplication
-    }
-    
     class UuidGenerator {
         -namespace: Uuid
         -counter: AtomicU64
@@ -83,18 +83,22 @@ classDiagram
     }
     
     class Simulator {
+        -simulation_cache: Arc~Mutex~HashMap~Uuid, RandomWalk~Positive, OptionChain~~~
         +new() Simulator
-        +simulate_next_step(session: &Session) Result<OptionChain, ChainError>
+        +simulate_next_step(session: &Session) Result~OptionChain, ChainError~
+        -create_random_walk(session: &Session) Result~RandomWalk~Positive, OptionChain~, ChainError~
+        +cleanup_cache(active_session_ids: &[Uuid]) Result~usize, ChainError~
     }
     
     class ChainError {
         <<enumeration>>
-        SessionError
-        StdError
-        InvalidState
-        Internal
-        NotFound
-        SimulatorError
+        SessionError(String)
+        StdError(String)
+        InvalidState(String)
+        Internal(String)
+        NotFound(String)
+        SimulatorError(String)
+        ClickHouseError(String)
     }
     
     SessionManager --> SessionStore: uses
@@ -106,7 +110,6 @@ classDiagram
     Session --> SessionState: has
     Session --> SimulationParameters: contains
     Session --> UuidGenerator: uses
-    SimulationParameters --> SimulationMethod: has
     StateProgressionHandler ..> Session: modifies
     StateProgressionHandler ..> ChainError: returns
     Simulator ..> OptionChain: produces
