@@ -170,3 +170,5 @@ pub mod session;
 /// Note that the specific utility helpers and functionality provided will
 /// depend on the implementation within this module.
 pub mod utils;
+pub mod api;
+
