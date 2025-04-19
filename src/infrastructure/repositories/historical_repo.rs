@@ -1,11 +1,12 @@
 //! A repository that interacts with ClickHouse to provide historical financial data.
 use crate::infrastructure::clickhouse::{ClickHouseClient, HistoricalDataRepository};
 use crate::infrastructure::row_to_datetime;
+use crate::utils::ChainError;
+use async_trait::async_trait;
+use chrono::Utc;
 use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
 use std::sync::Arc;
-use chrono::Utc;
-use crate::utils::ChainError;
 
 /// Represents a repository for accessing historical data stored in a ClickHouse database.
 ///
@@ -47,6 +48,7 @@ impl ClickHouseHistoricalRepository {
     }
 }
 
+#[async_trait]
 impl HistoricalDataRepository for ClickHouseHistoricalRepository {
     ///
     /// Retrieves historical price data for a given symbol, timeframe, and date range.
@@ -74,22 +76,16 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
     /// - Ensure that the `fetch_historical_prices` method being called on `self.client` is correctly implemented and capable of handling
     ///   the provided parameters.
     ///
-    fn get_historical_prices(
+    async fn get_historical_prices(
         &self,
         symbol: &str,
         timeframe: &TimeFrame,
         start_date: &chrono::DateTime<Utc>,
         end_date: &chrono::DateTime<Utc>,
     ) -> Result<Vec<Positive>, ChainError> {
-        // Use tokio to block on the async operation
-        let mut runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| ChainError::ClickHouseError(format!("Failed to create Tokio runtime: {}", e)))?;
-
-        runtime.block_on(async {
-            self.client
-                .fetch_historical_prices(symbol, timeframe, start_date, end_date)
-                .await
-        })
+        self.client
+            .fetch_historical_prices(symbol, timeframe, start_date, end_date)
+            .await
     }
 
     /// Retrieves a list of distinct symbols from an `ohlcv` table in the ClickHouse database.
@@ -122,36 +118,31 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
     /// - Ensure that the `client.pool` has been properly configured to connect to a ClickHouse database.
     /// - The caller should handle the errors returned to identify or log the specific root cause.
     ///
-    fn list_available_symbols(&self) -> Result<Vec<String>, ChainError> {
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("Failed to create Tokio runtime: {}", e))?;
+    async fn list_available_symbols(&self) -> Result<Vec<String>, ChainError> {
+        let mut conn = self
+            .client
+            .pool
+            .get_handle()
+            .await
+            .map_err(|e| format!("Failed to get ClickHouse connection: {}", e))?;
 
-        runtime.block_on(async {
-            let mut conn = self
-                .client
-                .pool
-                .get_handle()
-                .await
-                .map_err(|e| format!("Failed to get ClickHouse connection: {}", e))?;
+        let query = "SELECT DISTINCT symbol FROM ohlcv ORDER BY symbol";
 
-            let query = "SELECT DISTINCT symbol FROM ohlcv ORDER BY symbol";
+        let block = conn
+            .query(query)
+            .fetch_all()
+            .await
+            .map_err(|e| format!("Failed to execute ClickHouse query: {}", e))?;
 
-            let block = conn
-                .query(query)
-                .fetch_all()
-                .await
-                .map_err(|e| format!("Failed to execute ClickHouse query: {}", e))?;
+        let mut symbols = Vec::new();
+        for row in block.rows() {
+            let symbol: String = row
+                .get("symbol")
+                .map_err(|e| format!("Failed to get 'symbol' from row: {}", e))?;
+            symbols.push(symbol);
+        }
 
-            let mut symbols = Vec::new();
-            for row in block.rows() {
-                let symbol: String = row
-                    .get("symbol")
-                    .map_err(|e| format!("Failed to get 'symbol' from row: {}", e))?;
-                symbols.push(symbol);
-            }
-
-            Ok(symbols)
-        })
+        Ok(symbols)
     }
 
     /// Retrieves the date range (minimum and maximum timestamp) for a given financial symbol
@@ -198,45 +189,38 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
     ///
     /// Ensure the `symbol` passed as an argument exists in the `ohlcv` table of the
     /// ClickHouse database to avoid unexpected errors.
-    fn get_date_range_for_symbol(
+    async fn get_date_range_for_symbol(
         &self,
         symbol: &str,
     ) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError> {
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("Failed to create Tokio runtime: {}", e))?;
+        let mut conn = self.client.pool.get_handle().await.map_err(|e| {
+            ChainError::ClickHouseError(format!("Failed to get ClickHouse connection: {}", e))
+        })?;
 
-        runtime.block_on(async {
-            let mut conn = self
-                .client
-                .pool
-                .get_handle()
-                .await
-                .map_err(|e| ChainError::ClickHouseError( format!("Failed to get ClickHouse connection: {}", e)))?;
+        let query = format!(
+            "SELECT 
+                toInt64(toUnixTimestamp(min(timestamp))) as min_date, 
+                toInt64(toUnixTimestamp(max(timestamp))) as max_date 
+            FROM ohlcv 
+            WHERE symbol = '{}'",
+            symbol
+        );
 
-            let query = format!(
-                "SELECT 
-                    min(timestamp) as min_date, 
-                    max(timestamp) as max_date 
-                FROM ohlcv 
-                WHERE symbol = '{}'",
+        let block = conn.query(query).fetch_all().await.map_err(|e| {
+            ChainError::ClickHouseError(format!("Failed to execute ClickHouse query: {}", e))
+        })?;
+
+        if let Some(row) = block.rows().next() {
+            let min_date = row_to_datetime(&row, "min_date")?;
+            let max_date = row_to_datetime(&row, "max_date")?;
+
+            Ok((min_date, max_date))
+        } else {
+            Err(ChainError::ClickHouseError(format!(
+                "No date range found for symbol: {}",
                 symbol
-            );
-
-            let block = conn
-                .query(query)
-                .fetch_all()
-                .await
-                .map_err(|e| ChainError::ClickHouseError(format!("Failed to execute ClickHouse query: {}", e)))?;
-
-            if let Some(row) = block.rows().next() {
-                let min_date = row_to_datetime(&row, "min_date")?;
-                let max_date = row_to_datetime(&row, "max_date")?;
-
-                Ok((min_date, max_date))
-            } else {
-                Err(ChainError::ClickHouseError(format!("No date range found for symbol: {}", symbol)))
-            }
-        })
+            )))
+        }
     }
 }
 
@@ -244,11 +228,11 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use optionstratlib::{pos, Positive};
     use optionstratlib::utils::TimeFrame;
-    use std::sync::Arc;
+    use optionstratlib::{Positive, pos};
     use std::cell::RefCell;
-    
+    use std::sync::Arc;
+
     #[derive(Clone)]
     struct TestClickHouseClient {
         prices: RefCell<Vec<Positive>>,
@@ -277,12 +261,16 @@ mod tests {
             self
         }
 
-        fn with_date_range(mut self, min_date: chrono::DateTime<Utc>, max_date: chrono::DateTime<Utc>) -> Self {
+        fn with_date_range(
+            mut self,
+            min_date: chrono::DateTime<Utc>,
+            max_date: chrono::DateTime<Utc>,
+        ) -> Self {
             self.min_date = min_date;
             self.max_date = max_date;
             self
         }
-        
+
         async fn fetch_historical_prices(
             &self,
             _symbol: &str,
@@ -298,7 +286,9 @@ mod tests {
             Ok(self.symbols.borrow().clone())
         }
 
-        fn get_date_range(&self) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError> {
+        fn get_date_range(
+            &self,
+        ) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError> {
             Ok((self.min_date, self.max_date))
         }
     }
@@ -327,7 +317,9 @@ mod tests {
 
             // Ejecuta la operación asíncrona
             runtime.block_on(async {
-                self.client.fetch_historical_prices(symbol, timeframe, start_date, end_date).await
+                self.client
+                    .fetch_historical_prices(symbol, timeframe, start_date, end_date)
+                    .await
             })
         }
 
@@ -335,7 +327,10 @@ mod tests {
             self.client.list_symbols()
         }
 
-        fn get_date_range_for_symbol(&self, _symbol: &str) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError> {
+        fn get_date_range_for_symbol(
+            &self,
+            _symbol: &str,
+        ) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError> {
             self.client.get_date_range()
         }
     }
@@ -344,18 +339,13 @@ mod tests {
     fn test_get_historical_prices() {
         // Arrange
         let start_date = Utc.timestamp_opt(1609459200, 0).unwrap(); // 2021-01-01
-        let end_date = Utc.timestamp_opt(1640995200, 0).unwrap();   // 2022-01-01
+        let end_date = Utc.timestamp_opt(1640995200, 0).unwrap(); // 2022-01-01
         let symbol = "AAPL";
         let timeframe = TimeFrame::Day;
 
-        let expected_prices = vec![
-            pos!(150.25),
-            pos!(152.50),
-            pos!(151.75)
-        ];
+        let expected_prices = vec![pos!(150.25), pos!(152.50), pos!(151.75)];
 
-        let test_client = TestClickHouseClient::new()
-            .with_prices(expected_prices.clone());
+        let test_client = TestClickHouseClient::new().with_prices(expected_prices.clone());
 
         let repo = TestHistoricalRepository::new(Arc::new(test_client));
 
@@ -373,14 +363,9 @@ mod tests {
     #[test]
     fn test_list_available_symbols() {
         // Arrange
-        let expected_symbols = vec![
-            "AAPL".to_string(),
-            "GOOG".to_string(),
-            "MSFT".to_string()
-        ];
+        let expected_symbols = vec!["AAPL".to_string(), "GOOG".to_string(), "MSFT".to_string()];
 
-        let test_client = TestClickHouseClient::new()
-            .with_symbols(expected_symbols.clone());
+        let test_client = TestClickHouseClient::new().with_symbols(expected_symbols.clone());
 
         let repo = TestHistoricalRepository::new(Arc::new(test_client));
 
@@ -402,8 +387,8 @@ mod tests {
         let expected_min_date = Utc.timestamp_opt(1609459200, 0).unwrap(); // 2021-01-01
         let expected_max_date = Utc.timestamp_opt(1640995200, 0).unwrap(); // 2022-01-01
 
-        let test_client = TestClickHouseClient::new()
-            .with_date_range(expected_min_date, expected_max_date);
+        let test_client =
+            TestClickHouseClient::new().with_date_range(expected_min_date, expected_max_date);
 
         let repo = TestHistoricalRepository::new(Arc::new(test_client));
 

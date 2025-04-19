@@ -19,7 +19,7 @@ pub struct OHLCVData {
     /// Closing price
     pub close: Positive,
     /// Volume traded
-    pub volume: u32,
+    pub volume: u64,
 }
 
 impl fmt::Display for OHLCVData {

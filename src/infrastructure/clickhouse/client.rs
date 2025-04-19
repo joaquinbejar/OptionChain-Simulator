@@ -1,32 +1,32 @@
-use std::str::FromStr;
-use std::time::Duration;
-use chrono::{DateTime, NaiveDateTime, Utc};
-use clickhouse_rs::{Options, Pool};
-use optionstratlib::{pos, Positive};
-use optionstratlib::utils::TimeFrame;
-use rust_decimal::Decimal;
-use tracing::{debug, info, instrument};
+use crate::infrastructure::ClickHouseConfig;
 use crate::infrastructure::clickhouse::model::{OHLCVData, PriceType};
 use crate::infrastructure::clickhouse::utils::row_to_datetime;
-use crate::infrastructure::ClickHouseConfig;
 use crate::utils::ChainError;
+use chrono::{DateTime, Utc};
+use clickhouse_rs::{Options, Pool};
+use optionstratlib::utils::TimeFrame;
+use optionstratlib::{Positive, pos};
+use rust_decimal::Decimal;
+use std::str::FromStr;
+use std::time::Duration;
+use tracing::{debug, info, instrument};
 
 /// Represents a client for interacting with a ClickHouse database.
 ///
-/// The `ClickHouseClient` struct encapsulates the details required to connect 
-/// and interact with a ClickHouse database instance. It provides the necessary 
-/// components, such as a connection pool and configuration settings, to manage 
+/// The `ClickHouseClient` struct encapsulates the details required to connect
+/// and interact with a ClickHouse database instance. It provides the necessary
+/// components, such as a connection pool and configuration settings, to manage
 /// database access efficiently.
 ///
 /// # Fields
 ///
-/// * `pool` - A connection pool (`Pool`) used for establishing and managing 
-///            database connections. This is a private field that facilitates 
-///            efficient resource management and avoids the overhead of creating 
+/// * `pool` - A connection pool (`Pool`) used for establishing and managing
+///            database connections. This is a private field that facilitates
+///            efficient resource management and avoids the overhead of creating
 ///            new connections for each operation.
 ///
-/// * `config` - The configuration (`ClickHouseConfig`) that contains settings 
-///              specific to this client, such as authentication credentials, 
+/// * `config` - The configuration (`ClickHouseConfig`) that contains settings
+///              specific to this client, such as authentication credentials,
 ///              database connection details, or other configuration parameters.
 ///
 pub struct ClickHouseClient {
@@ -35,21 +35,21 @@ pub struct ClickHouseClient {
     /// The `pool` is responsible for managing a collection of database connections
     /// or other types of resources to allow efficient reuse and reduce overhead.
     ///
-    /// This is defined with a `pub(crate)` visibility modifier, meaning it 
+    /// This is defined with a `pub(crate)` visibility modifier, meaning it
     /// is accessible only within the current crate and not exposed to external users.
     ///
-    /// - `Pool` is usually a struct or type responsible for abstracting resource 
+    /// - `Pool` is usually a struct or type responsible for abstracting resource
     ///   pooling behavior, such as managing concurrent access to the pooled resources.
     ///
     /// Note:
     /// Ensure that the `Pool` is properly configured and initialized before use
     /// to avoid runtime errors or resource exhaustion in multi-threaded applications.
     pub(crate) pool: Pool,
-    
-    /// Represents the configuration settings for connecting to and interacting 
+
+    /// Represents the configuration settings for connecting to and interacting
     /// with a ClickHouse database.
     ///
-    /// The `ClickHouseConfig` object contains necessary parameters such as 
+    /// The `ClickHouseConfig` object contains necessary parameters such as
     /// server host, port, authentication credentials, and other connection options.
     ///
     /// Fields:
@@ -58,7 +58,7 @@ pub struct ClickHouseClient {
     /// - `username` (String): The username for authentication.
     /// - `password` (String): The password for authentication.
     /// - `database` (String): The name of the database to connect to.
-    /// - `options` (Option<HashMap<String, String>>): Additional optional parameters 
+    /// - `options` (Option<HashMap<String, String>>): Additional optional parameters
     ///   for customizing the connection (e.g., timeouts, retries).
     ///
     /// Ensure you provide valid and reachable settings to avoid connection issues.
@@ -71,15 +71,13 @@ impl ClickHouseClient {
     pub fn new(config: ClickHouseConfig) -> Result<Self, ChainError> {
         let url = format!(
             "tcp://{}:{}@{}:{}/{}",
-            config.username,
-            config.password,
-            config.host,
-            config.port,
-            config.database
+            config.username, config.password, config.host, config.port, config.database
         );
 
         let opts = Options::from_str(&url)
-            .map_err(|e| ChainError::ClickHouseError(format!("Failed to parse ClickHouse URL: {}", e)))?
+            .map_err(|e| {
+                ChainError::ClickHouseError(format!("Failed to parse ClickHouse URL: {}", e))
+            })?
             .ping_timeout(Duration::from_secs(config.timeout))
             .query_timeout(Duration::from_secs(5))
             .connection_timeout(Duration::from_secs(1));
@@ -89,7 +87,6 @@ impl ClickHouseClient {
         info!("Created new ClickHouse client for host: {}", config.host);
         Ok(Self { pool, config })
     }
-
 
     /// Creates a new ClickHouse client with default configuration
     pub fn default() -> Result<Self, ChainError> {
@@ -117,16 +114,9 @@ impl ClickHouseClient {
         let results = self.execute_query(query).await?;
 
         // Map results to a vector of Positive prices (usually close prices)
-        let prices: Vec<Positive> = results
-            .into_iter()
-            .map(|data| data.close)
-            .collect();
+        let prices: Vec<Positive> = results.into_iter().map(|data| data.close).collect();
 
-        info!(
-            "Fetched {} historical prices for {}",
-            prices.len(),
-            symbol
-        );
+        info!("Fetched {} historical prices for {}", prices.len(), symbol);
 
         Ok(prices)
     }
@@ -151,11 +141,7 @@ impl ClickHouseClient {
         // Execute the query directly
         let results = self.execute_query(query).await?;
 
-        info!(
-            "Fetched {} OHLCV data points for {}",
-            results.len(),
-            symbol
-        );
+        info!("Fetched {} OHLCV data points for {}", results.len(), symbol);
 
         Ok(results)
     }
@@ -175,11 +161,11 @@ impl ClickHouseClient {
         // Base query for minute data (smallest timeframe supported)
         if *timeframe == TimeFrame::Minute {
             return Ok(format!(
-                "SELECT symbol, timestamp, open, high, low, close, volume \
-                FROM ohlcv \
-                WHERE symbol = '{}' \
-                AND timestamp BETWEEN '{}' AND '{}' \
-                ORDER BY timestamp",
+                "SELECT symbol, toInt64(toUnixTimestamp(timestamp)) as timestamp, open, high, low, close, volume \
+        FROM ohlcv \
+        WHERE symbol = '{}' \
+        AND timestamp BETWEEN '{}' AND '{}' \
+        ORDER BY timestamp",
                 symbol, start_date_str, end_date_str
             ));
         }
@@ -191,27 +177,36 @@ impl ClickHouseClient {
             TimeFrame::Day => "1 DAY",
             TimeFrame::Week => "1 WEEK",
             TimeFrame::Month => "1 MONTH",
-            _ => return Err(ChainError::ClickHouseError(format!("Unsupported timeframe: {:?}", timeframe))),
+            _ => {
+                return Err(ChainError::ClickHouseError(format!(
+                    "Unsupported timeframe: {:?}",
+                    timeframe
+                )));
+            }
         };
 
         // Query with aggregation for larger timeframes
         Ok(format!(
-            "SELECT 
-                symbol,
-                toStartOfInterval(timestamp, INTERVAL {}) as timestamp,
-                any(open) as open,
-                max(high) as high,
-                min(low) as low,
-                any(arrayElement(
-                    groupArray(close), 
-                    length(groupArray(close))
-                )) as close,
-                sum(volume) as volume
-            FROM ohlcv
-            WHERE symbol = '{}' 
-            AND timestamp BETWEEN '{}' AND '{}'
-            GROUP BY symbol, timestamp
-            ORDER BY timestamp",
+            "WITH intervals AS (
+        SELECT 
+            symbol,
+            toStartOfInterval(timestamp, INTERVAL {}) as interval_start,
+            any(open) as open,
+            max(high) as high,
+            min(low) as low,
+            any(close) as close,
+            sum(volume) as volume
+        FROM ohlcv
+        WHERE symbol = '{}' 
+        AND timestamp BETWEEN '{}' AND '{}'
+        GROUP BY symbol, interval_start
+        ORDER BY interval_start
+    )
+    SELECT 
+        symbol,
+        toInt64(toUnixTimestamp(interval_start)) as timestamp,
+        open, high, low, close, volume
+    FROM intervals",
             interval, symbol, start_date_str, end_date_str
         ))
     }
@@ -220,37 +215,42 @@ impl ClickHouseClient {
     async fn execute_query(&self, query: String) -> Result<Vec<OHLCVData>, ChainError> {
         debug!("Executing ClickHouse query: {}", query);
 
-        let mut conn = self.pool.get_handle()
-            .await
-            .map_err(|e| ChainError::ClickHouseError(format!("Failed to get ClickHouse connection: {}", e)))?;
+        let mut conn = self.pool.get_handle().await.map_err(|e| {
+            ChainError::ClickHouseError(format!("Failed to get ClickHouse connection: {}", e))
+        })?;
 
-        let block = conn.query(query)
-            .fetch_all()
-            .await
-            .map_err(|e| ChainError::ClickHouseError(format!("Failed to execute ClickHouse query: {}", e)))?;
+        let block = conn.query(query).fetch_all().await.map_err(|e| {
+            ChainError::ClickHouseError(format!("Failed to execute ClickHouse query: {}", e))
+        })?;
 
         let mut results = Vec::new();
 
         for row in block.rows() {
-            let symbol: String = row.get("symbol")
-                .map_err(|e| ChainError::ClickHouseError(format!("Failed to get 'symbol' from row: {}", e)))?;
-            
+            let symbol: String = row.get("symbol").map_err(|e| {
+                ChainError::ClickHouseError(format!("Failed to get 'symbol' from row: {}", e))
+            })?;
+
             let timestamp = row_to_datetime(&row, "timestamp")?;
-            
-            let open: f32 = row.get("open")
-                .map_err(|e| ChainError::ClickHouseError(format!("Failed to get 'open' from row: {}", e)))?;
 
-            let high: f32 = row.get("high")
-                .map_err(|e| ChainError::ClickHouseError(format!("Failed to get 'high' from row: {}", e)))?;
+            let open: f32 = row.get("open").map_err(|e| {
+                ChainError::ClickHouseError(format!("Failed to get 'open' from row: {}", e))
+            })?;
 
-            let low: f32 = row.get("low")
-                .map_err(|e| ChainError::ClickHouseError(format!("Failed to get 'low' from row: {}", e)))?;
+            let high: f32 = row.get("high").map_err(|e| {
+                ChainError::ClickHouseError(format!("Failed to get 'high' from row: {}", e))
+            })?;
 
-            let close: f32 = row.get("close")
-                .map_err(|e|ChainError::ClickHouseError( format!("Failed to get 'close' from row: {}", e)))?;
+            let low: f32 = row.get("low").map_err(|e| {
+                ChainError::ClickHouseError(format!("Failed to get 'low' from row: {}", e))
+            })?;
 
-            let volume: u32 = row.get("volume")
-                .map_err(|e| ChainError::ClickHouseError(format!("Failed to get 'volume' from row: {}", e)))?;
+            let close: f32 = row.get("close").map_err(|e| {
+                ChainError::ClickHouseError(format!("Failed to get 'close' from row: {}", e))
+            })?;
+
+            let volume: u64 = row.get("volume").map_err(|e| {
+                ChainError::ClickHouseError(format!("Failed to get 'volume' from row: {}", e))
+            })?;
 
             // Convert to Positive, which doesn't allow negative values
             let open_pos = pos!(open as f64);
@@ -289,18 +289,21 @@ impl ClickHouseClient {
             })
             .collect()
     }
+    
+    pub fn get_config(&mut self) -> &mut ClickHouseConfig {
+        &mut self.config
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use optionstratlib::{pos, Positive};
+    use optionstratlib::{Positive, pos};
     use rust_decimal::Decimal;
-    
+
     #[test]
     fn test_build_timeframe_query_minute() {
-
         let config = ClickHouseConfig {
             host: "test-host".to_string(),
             port: 9000,
@@ -309,7 +312,7 @@ mod tests {
             database: "test-db".to_string(),
             timeout: 30,
         };
-        
+
         fn build_timeframe_query(
             symbol: &str,
             timeframe: &TimeFrame,
@@ -336,7 +339,12 @@ mod tests {
                 TimeFrame::Day => "1 DAY",
                 TimeFrame::Week => "1 WEEK",
                 TimeFrame::Month => "1 MONTH",
-                _ => return Err(ChainError::ClickHouseError( format!("Unsupported timeframe: {:?}", timeframe))),
+                _ => {
+                    return Err(ChainError::ClickHouseError(format!(
+                        "Unsupported timeframe: {:?}",
+                        timeframe
+                    )));
+                }
             };
 
             Ok(format!(
@@ -370,7 +378,9 @@ mod tests {
         assert!(query.contains("SELECT symbol, timestamp, open, high, low, close, volume"));
         assert!(query.contains("FROM ohlcv"));
         assert!(query.contains("WHERE symbol = 'AAPL'"));
-        assert!(query.contains("AND timestamp BETWEEN '2023-01-01 00:00:00' AND '2023-01-02 00:00:00'"));
+        assert!(
+            query.contains("AND timestamp BETWEEN '2023-01-01 00:00:00' AND '2023-01-02 00:00:00'")
+        );
         assert!(query.contains("ORDER BY timestamp"));
     }
 
@@ -382,7 +392,6 @@ mod tests {
             start_date: &DateTime<Utc>,
             end_date: &DateTime<Utc>,
         ) -> Result<String, ChainError> {
-   
             let start_date_str = start_date.format("%Y-%m-%d %H:%M:%S").to_string();
             let end_date_str = end_date.format("%Y-%m-%d %H:%M:%S").to_string();
 
@@ -403,7 +412,12 @@ mod tests {
                 TimeFrame::Day => "1 DAY",
                 TimeFrame::Week => "1 WEEK",
                 TimeFrame::Month => "1 MONTH",
-                _ => return Err(ChainError::ClickHouseError( format!("Unsupported timeframe: {:?}", timeframe))),
+                _ => {
+                    return Err(ChainError::ClickHouseError(format!(
+                        "Unsupported timeframe: {:?}",
+                        timeframe
+                    )));
+                }
             };
 
             Ok(format!(
@@ -440,7 +454,6 @@ mod tests {
         assert!(query.contains("min(low) as low"));
         assert!(query.contains("sum(volume) as volume"));
     }
-    
 
     #[test]
     fn test_extract_prices() {

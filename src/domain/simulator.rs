@@ -1,26 +1,29 @@
+use crate::session::{Session, SessionState};
+use crate::utils::ChainError;
+use optionstratlib::utils::Len;
 use optionstratlib::{
-    chains::{chain::OptionChain, generator_optionchain, utils::OptionDataPriceParams, OptionChainBuildParams},
+    ExpirationDate, Positive,
+    chains::{
+        OptionChainBuildParams, chain::OptionChain, generator_optionchain,
+        utils::OptionDataPriceParams,
+    },
+    pos,
     simulation::{
+        WalkParams, WalkTypeAble,
         randomwalk::RandomWalk,
         steps::{Step, Xstep, Ystep},
-        WalkParams, WalkType, WalkTypeAble,
     },
-    utils::time::{convert_time_frame, get_x_days_formatted},
-    ExpirationDate, Positive, pos,
+    utils::time::get_x_days_formatted,
 };
 use rust_decimal::Decimal;
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
-use itertools::Itertools;
-use optionstratlib::utils::Len;
 use tracing::{debug, info, instrument};
-use crate::session::{Session, SimulationParameters, SimulationMethod, SessionState};
-use crate::utils::ChainError;
 
 /// Simulator handles the generation of option chains based on simulation parameters
 pub struct Simulator {
     // Store a cache of random walks for each session ID to avoid recalculating the entire path
-    simulation_cache: Arc<Mutex<std::collections::HashMap<uuid::Uuid, RandomWalk<Positive, OptionChain>>>>,
+    simulation_cache:
+        Arc<Mutex<std::collections::HashMap<uuid::Uuid, RandomWalk<Positive, OptionChain>>>>,
 }
 
 /// Walker struct for implementing WalkTypeAble
@@ -52,14 +55,18 @@ impl Simulator {
             "Simulating next step"
         );
 
-        let mut cache = self.simulation_cache.lock().map_err(|e| {
-            format!("Failed to acquire lock on simulation cache: {}", e)
-        })?;
+        let mut cache = self
+            .simulation_cache
+            .lock()
+            .map_err(|e| format!("Failed to acquire lock on simulation cache: {}", e))?;
 
         // Check if we need to create a new RandomWalk or use an existing one
-        if !cache.contains_key(&session.id) || session.current_step == 0 || session.state == SessionState::Reinitialized {
+        if !cache.contains_key(&session.id)
+            || session.current_step == 0
+            || session.state == SessionState::Reinitialized
+        {
             info!(
-                session_id = %session.id, 
+                session_id = %session.id,
                 "Creating new simulation for session"
             );
 
@@ -68,9 +75,9 @@ impl Simulator {
         }
 
         // Get the random walk for this session
-        let random_walk = cache.get(&session.id).ok_or_else(|| {
-            format!("Failed to get random walk for session {}", session.id)
-        })?;
+        let random_walk = cache
+            .get(&session.id)
+            .ok_or_else(|| format!("Failed to get random walk for session {}", session.id))?;
 
         // Get the chain for the current step
         let step = random_walk[session.current_step].clone();
@@ -90,7 +97,10 @@ impl Simulator {
 
     /// Creates a new RandomWalk for a session
     #[instrument(skip(self, session), level = "debug")]
-    fn create_random_walk(&self, session: &Session) -> Result<RandomWalk<Positive, OptionChain>, ChainError> {
+    fn create_random_walk(
+        &self,
+        session: &Session,
+    ) -> Result<RandomWalk<Positive, OptionChain>, ChainError> {
         let params = &session.parameters;
 
         // Extract parameters from session
@@ -136,12 +146,16 @@ impl Simulator {
 
         // Create walker for a random walk
         let walker = Box::new(Walker::new());
-        
+
         // Create step parameters for a random walk
         let walk_params = WalkParams {
             size: params.steps,
             init_step: Step {
-                x: Xstep::new(Positive::ONE, time_frame, ExpirationDate::Days(days_to_expiration)),
+                x: Xstep::new(
+                    Positive::ONE,
+                    time_frame,
+                    ExpirationDate::Days(days_to_expiration),
+                ),
                 y: Ystep::new(0, initial_chain),
             },
             walk_type: params.method.clone(),
@@ -167,9 +181,10 @@ impl Simulator {
     /// Cleans up the simulation cache by removing entries for sessions that are no longer active
     #[instrument(skip(self), level = "debug")]
     pub fn cleanup_cache(&self, active_session_ids: &[uuid::Uuid]) -> Result<usize, ChainError> {
-        let mut cache = self.simulation_cache.lock().map_err(|e| {
-            format!("Failed to acquire lock on simulation cache: {}", e)
-        })?;
+        let mut cache = self
+            .simulation_cache
+            .lock()
+            .map_err(|e| format!("Failed to acquire lock on simulation cache: {}", e))?;
 
         let initial_size = cache.len();
 
