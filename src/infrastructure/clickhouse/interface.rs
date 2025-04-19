@@ -1,6 +1,7 @@
 use chrono::Utc;
 use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
+use crate::utils::ChainError;
 
 /// A trait that defines the interface for interacting with a repository of historical financial data.
 /// Provides methods to fetch historical prices, get a list of available symbols, and determine the
@@ -41,7 +42,7 @@ pub trait HistoricalDataRepository: Send + Sync {
         timeframe: &TimeFrame,
         start_date: &chrono::DateTime<Utc>,
         end_date: &chrono::DateTime<Utc>,
-    ) -> Result<Vec<Positive>, String>;
+    ) -> Result<Vec<Positive>, ChainError>;
 
     /// Retrieves a list of all available symbols that can be accessed.
     ///
@@ -59,7 +60,7 @@ pub trait HistoricalDataRepository: Send + Sync {
     /// unavailable data, or internal errors), this method will return an 
     /// appropriate error message encapsulated in a `Result::Err`.
     ///
-    fn list_available_symbols(&self) -> Result<Vec<String>, String>;
+    fn list_available_symbols(&self) -> Result<Vec<String>, ChainError>;
 
     ///
     /// Retrieves the date range (start and end dates) associated with a given symbol.
@@ -81,7 +82,7 @@ pub trait HistoricalDataRepository: Send + Sync {
     /// * If the provided symbol is not found or is invalid.
     /// * If there is an issue retrieving the date range for the symbol.
     ///
-    fn get_date_range_for_symbol(&self, symbol: &str) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), String>;
+    fn get_date_range_for_symbol(&self, symbol: &str) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError>;
 }
 
 #[cfg(test)]
@@ -103,14 +104,14 @@ mod tests {
                 timeframe: &TimeFrame,
                 start_date: &chrono::DateTime<Utc>,
                 end_date: &chrono::DateTime<Utc>,
-            ) -> Result<Vec<Positive>, String>;
+            ) -> Result<Vec<Positive>, ChainError>;
 
-            fn list_available_symbols(&self) -> Result<Vec<String>, String>;
+            fn list_available_symbols(&self) -> Result<Vec<String>, ChainError>;
 
             fn get_date_range_for_symbol(
                 &self,
                 symbol: &str,
-            ) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), String>;
+            ) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError>;
         }
     }
 
@@ -129,7 +130,7 @@ mod tests {
             symbol: &str,
             start_date: &chrono::DateTime<Utc>,
             end_date: &chrono::DateTime<Utc>,
-        ) -> Result<Vec<Positive>, String> {
+        ) -> Result<Vec<Positive>, ChainError> {
             self.repository.get_historical_prices(
                 symbol,
                 &TimeFrame::Day,
@@ -139,13 +140,13 @@ mod tests {
         }
 
 
-        fn is_symbol_available(&self, symbol: &str) -> Result<bool, String> {
+        fn is_symbol_available(&self, symbol: &str) -> Result<bool, ChainError> {
             let symbols = self.repository.list_available_symbols()?;
             Ok(symbols.contains(&symbol.to_string()))
         }
 
 
-        fn get_data_age_days(&self, symbol: &str) -> Result<i64, String> {
+        fn get_data_age_days(&self, symbol: &str) -> Result<i64, ChainError> {
             let (start_date, end_date) = self.repository.get_date_range_for_symbol(symbol)?;
             let duration = end_date.signed_duration_since(start_date);
             Ok(duration.num_days())
@@ -257,7 +258,7 @@ mod tests {
         mock_repo
             .expect_list_available_symbols()
             .returning(move || {
-                Err(error_message.clone())
+                Err(ChainError::ClickHouseError( error_message.clone()))
             });
 
         let service = MarketDataService::new(Arc::new(mock_repo));
@@ -306,7 +307,7 @@ mod tests {
             .expect_get_date_range_for_symbol()
             .with(eq(symbol))
             .returning(move |_| {
-                Err(error_message.clone())
+                Err(ChainError::ClickHouseError(error_message.clone()))
             });
 
         let service = MarketDataService::new(Arc::new(mock_repo));

@@ -15,6 +15,7 @@ use itertools::Itertools;
 use optionstratlib::utils::Len;
 use tracing::{debug, info, instrument};
 use crate::session::{Session, SimulationParameters, SimulationMethod, SessionState};
+use crate::utils::ChainError;
 
 /// Simulator handles the generation of option chains based on simulation parameters
 pub struct Simulator {
@@ -44,7 +45,7 @@ impl Simulator {
 
     /// Simulates the next step based on the session parameters and returns an OptionChain
     #[instrument(skip(self, session), level = "debug")]
-    pub fn simulate_next_step(&self, session: &Session) -> Result<OptionChain, String> {
+    pub fn simulate_next_step(&self, session: &Session) -> Result<OptionChain, ChainError> {
         debug!(
             session_id = %session.id,
             current_step = session.current_step,
@@ -89,7 +90,7 @@ impl Simulator {
 
     /// Creates a new RandomWalk for a session
     #[instrument(skip(self, session), level = "debug")]
-    fn create_random_walk(&self, session: &Session) -> Result<RandomWalk<Positive, OptionChain>, String> {
+    fn create_random_walk(&self, session: &Session) -> Result<RandomWalk<Positive, OptionChain>, ChainError> {
         let params = &session.parameters;
 
         // Extract parameters from session
@@ -165,7 +166,7 @@ impl Simulator {
 
     /// Cleans up the simulation cache by removing entries for sessions that are no longer active
     #[instrument(skip(self), level = "debug")]
-    pub fn cleanup_cache(&self, active_session_ids: &[uuid::Uuid]) -> Result<usize, String> {
+    pub fn cleanup_cache(&self, active_session_ids: &[uuid::Uuid]) -> Result<usize, ChainError> {
         let mut cache = self.simulation_cache.lock().map_err(|e| {
             format!("Failed to acquire lock on simulation cache: {}", e)
         })?;

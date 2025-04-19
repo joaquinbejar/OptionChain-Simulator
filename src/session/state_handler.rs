@@ -31,10 +31,10 @@ impl StateProgressionHandler {
                 Ok(())
             },
             SessionState::Completed => {
-                Err(ChainError::InvalidState("Session has completed all steps"))
+                Err(ChainError::InvalidState("Session has completed all steps".to_string()))
             },
             SessionState::Error => {
-                Err(ChainError::InvalidState("Session is in error state"))
+                Err(ChainError::InvalidState("Session is in error state".to_string()))
             },
         }
     }

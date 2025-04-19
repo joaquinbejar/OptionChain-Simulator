@@ -5,6 +5,7 @@ use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
 use std::sync::Arc;
 use chrono::Utc;
+use crate::utils::ChainError;
 
 /// Represents a repository for accessing historical data stored in a ClickHouse database.
 ///
@@ -79,10 +80,10 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
         timeframe: &TimeFrame,
         start_date: &chrono::DateTime<Utc>,
         end_date: &chrono::DateTime<Utc>,
-    ) -> Result<Vec<Positive>, String> {
+    ) -> Result<Vec<Positive>, ChainError> {
         // Use tokio to block on the async operation
         let mut runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| format!("Failed to create Tokio runtime: {}", e))?;
+            .map_err(|e| ChainError::ClickHouseError(format!("Failed to create Tokio runtime: {}", e)))?;
 
         runtime.block_on(async {
             self.client
@@ -121,7 +122,7 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
     /// - Ensure that the `client.pool` has been properly configured to connect to a ClickHouse database.
     /// - The caller should handle the errors returned to identify or log the specific root cause.
     ///
-    fn list_available_symbols(&self) -> Result<Vec<String>, String> {
+    fn list_available_symbols(&self) -> Result<Vec<String>, ChainError> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| format!("Failed to create Tokio runtime: {}", e))?;
 
@@ -163,7 +164,7 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
     ///
     /// # Returns
     ///
-    /// * `Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), String>`:
+    /// * `Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError>`:
     ///    - On success, returns a tuple containing the minimum and maximum timestamps
     ///      (`chrono::DateTime` objects in UTC) for the given symbol.
     ///    - On failure, returns a descriptive `String` error message.
@@ -200,7 +201,7 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
     fn get_date_range_for_symbol(
         &self,
         symbol: &str,
-    ) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), String> {
+    ) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|e| format!("Failed to create Tokio runtime: {}", e))?;
 
@@ -210,7 +211,7 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
                 .pool
                 .get_handle()
                 .await
-                .map_err(|e| format!("Failed to get ClickHouse connection: {}", e))?;
+                .map_err(|e| ChainError::ClickHouseError( format!("Failed to get ClickHouse connection: {}", e)))?;
 
             let query = format!(
                 "SELECT 
@@ -225,7 +226,7 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
                 .query(query)
                 .fetch_all()
                 .await
-                .map_err(|e| format!("Failed to execute ClickHouse query: {}", e))?;
+                .map_err(|e| ChainError::ClickHouseError(format!("Failed to execute ClickHouse query: {}", e)))?;
 
             if let Some(row) = block.rows().next() {
                 let min_date = row_to_datetime(&row, "min_date")?;
@@ -233,7 +234,7 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
 
                 Ok((min_date, max_date))
             } else {
-                Err(format!("No date range found for symbol: {}", symbol))
+                Err(ChainError::ClickHouseError(format!("No date range found for symbol: {}", symbol)))
             }
         })
     }
@@ -281,24 +282,23 @@ mod tests {
             self.max_date = max_date;
             self
         }
-
-        // Método asíncrono simulado para fetch_historical_prices
+        
         async fn fetch_historical_prices(
             &self,
             _symbol: &str,
             _timeframe: &TimeFrame,
             _start_date: &chrono::DateTime<Utc>,
             _end_date: &chrono::DateTime<Utc>,
-        ) -> Result<Vec<Positive>, String> {
+        ) -> Result<Vec<Positive>, ChainError> {
             Ok(self.prices.borrow().clone())
         }
 
         // Métodos para simular comportamiento del pool y consultas
-        fn list_symbols(&self) -> Result<Vec<String>, String> {
+        fn list_symbols(&self) -> Result<Vec<String>, ChainError> {
             Ok(self.symbols.borrow().clone())
         }
 
-        fn get_date_range(&self) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), String> {
+        fn get_date_range(&self) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError> {
             Ok((self.min_date, self.max_date))
         }
     }
@@ -320,7 +320,7 @@ mod tests {
             timeframe: &TimeFrame,
             start_date: &chrono::DateTime<Utc>,
             end_date: &chrono::DateTime<Utc>,
-        ) -> Result<Vec<Positive>, String> {
+        ) -> Result<Vec<Positive>, ChainError> {
             // Crea un runtime de tokio para tests
             let runtime = tokio::runtime::Runtime::new()
                 .map_err(|e| format!("Failed to create Tokio runtime: {}", e))?;
@@ -331,11 +331,11 @@ mod tests {
             })
         }
 
-        fn list_available_symbols(&self) -> Result<Vec<String>, String> {
+        fn list_available_symbols(&self) -> Result<Vec<String>, ChainError> {
             self.client.list_symbols()
         }
 
-        fn get_date_range_for_symbol(&self, _symbol: &str) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), String> {
+        fn get_date_range_for_symbol(&self, _symbol: &str) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError> {
             self.client.get_date_range()
         }
     }

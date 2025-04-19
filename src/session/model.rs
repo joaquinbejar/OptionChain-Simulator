@@ -1,4 +1,4 @@
-use crate::utils::UuidGenerator;
+use crate::utils::{ChainError, UuidGenerator};
 use optionstratlib::Positive;
 pub use optionstratlib::simulation::WalkType as SimulationMethod;
 use optionstratlib::utils::TimeFrame;
@@ -117,9 +117,9 @@ impl Session {
         Self::new_with_generator(parameters, &generator)
     }
 
-    pub fn advance_step(&mut self) -> Result<(), String> {
+    pub fn advance_step(&mut self) -> Result<(), ChainError> {
         if self.current_step >= self.total_steps {
-            return Err("Session has completed all steps".to_string());
+            return Err(ChainError::SessionError( "Session has completed all steps".to_string()));
         }
 
         self.current_step += 1;

@@ -94,7 +94,7 @@ impl SessionStore for InMemorySessionStore {
         let sessions = self
             .sessions
             .lock()
-            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store"))?;
+            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store".to_string()))?;
 
         sessions
             .get(&id)
@@ -106,7 +106,7 @@ impl SessionStore for InMemorySessionStore {
         let mut sessions = self
             .sessions
             .lock()
-            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store"))?;
+            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store".to_string()))?;
 
         sessions.insert(session.id, session);
         Ok(())
@@ -116,7 +116,7 @@ impl SessionStore for InMemorySessionStore {
         let mut sessions = self
             .sessions
             .lock()
-            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store"))?;
+            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store".to_string()))?;
 
         Ok(sessions.remove(&id).is_some())
     }
@@ -125,7 +125,7 @@ impl SessionStore for InMemorySessionStore {
         let mut sessions = self
             .sessions
             .lock()
-            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store"))?;
+            .map_err(|_| ChainError::Internal("Failed to acquire lock on session store".to_string()))?;
 
         // Find expired sessions (older than 30 minutes)
         let now = std::time::SystemTime::now();

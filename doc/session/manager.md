@@ -43,7 +43,7 @@ classDiagram
         +state: SessionState
         +new(parameters, total_steps) Session
         +new_with_generator(parameters, total_steps, uuid_generator) Session
-        +advance_step() Result<(), String>
+        +advance_step() Result<(), ChainError>
         +modify_parameters(new_params) void
         +reinitialize(new_params, total_steps) void
         +is_active() bool
@@ -84,7 +84,7 @@ classDiagram
     
     class Simulator {
         +new() Simulator
-        +simulate_next_step(session: &Session) Result<OptionChain, String>
+        +simulate_next_step(session: &Session) Result<OptionChain, ChainError>
     }
     
     class ChainError {
