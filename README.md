@@ -43,6 +43,8 @@
 
 1. Clone the repository:
 ```bash
+# Prerequirement
+git clone https://github.com/joaquinbejar/OptionStratLib.git
 git clone https://github.com/joaquinbejar/OptionChain-Simulator.git
 cd OptionChain-Simulator
 ```
