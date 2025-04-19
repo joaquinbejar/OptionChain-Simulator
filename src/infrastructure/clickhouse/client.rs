@@ -161,11 +161,12 @@ impl ClickHouseClient {
         // Base query for minute data (smallest timeframe supported)
         if *timeframe == TimeFrame::Minute {
             return Ok(format!(
-                "SELECT symbol, toInt64(toUnixTimestamp(timestamp)) as timestamp, open, high, low, close, volume \
-        FROM ohlcv \
-        WHERE symbol = '{}' \
-        AND timestamp BETWEEN '{}' AND '{}' \
-        ORDER BY timestamp",
+                "SELECT symbol, toInt64(toUnixTimestamp(timestamp)) as timestamp, 
+                open, high, low, close, toUInt64(volume) as volume \
+                FROM ohlcv \
+                WHERE symbol = '{}' \
+                AND timestamp BETWEEN toDateTime('{}') AND toDateTime('{}') \
+                ORDER BY timestamp",
                 symbol, start_date_str, end_date_str
             ));
         }
@@ -189,24 +190,24 @@ impl ClickHouseClient {
         Ok(format!(
             "WITH intervals AS (
         SELECT 
+                symbol,
+                toStartOfInterval(timestamp, INTERVAL {}) as interval_start,
+                any(open) as open,
+                max(high) as high,
+                min(low) as low,
+                any(close) as close,
+                sum(volume) as volume
+            FROM ohlcv
+            WHERE symbol = '{}' 
+            AND timestamp BETWEEN '{}' AND '{}'
+            GROUP BY symbol, interval_start
+            ORDER BY interval_start
+        )
+        SELECT 
             symbol,
-            toStartOfInterval(timestamp, INTERVAL {}) as interval_start,
-            any(open) as open,
-            max(high) as high,
-            min(low) as low,
-            any(close) as close,
-            sum(volume) as volume
-        FROM ohlcv
-        WHERE symbol = '{}' 
-        AND timestamp BETWEEN '{}' AND '{}'
-        GROUP BY symbol, interval_start
-        ORDER BY interval_start
-    )
-    SELECT 
-        symbol,
-        toInt64(toUnixTimestamp(interval_start)) as timestamp,
-        open, high, low, close, volume
-    FROM intervals",
+            toInt64(toUnixTimestamp(interval_start)) as timestamp,
+            open, high, low, close, volume
+        FROM intervals",
             interval, symbol, start_date_str, end_date_str
         ))
     }
