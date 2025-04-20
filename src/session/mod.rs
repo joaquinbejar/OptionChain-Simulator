@@ -60,7 +60,8 @@ mod state_handler;
 /// - Querying and updating data.
 ///
 /// Users of this module should refer to its public items to utilize its functionality effectively.
-pub mod store;
+mod store;
+
 
 pub use manager::SessionManager;
 pub use model::{Session, SessionState, SimulationMethod, SimulationParameters};
