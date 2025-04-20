@@ -65,4 +65,4 @@ mod store;
 
 pub use manager::SessionManager;
 pub use model::{Session, SessionState, SimulationMethod, SimulationParameters};
-pub use store::{InMemorySessionStore, SessionStore};
+pub use store::{InMemorySessionStore, SessionStore, InRedisSessionStore};

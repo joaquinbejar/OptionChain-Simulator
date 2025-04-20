@@ -38,4 +38,5 @@ mod in_redis;
 mod interface;
 
 pub use in_memory::InMemorySessionStore;
+pub use in_redis::InRedisSessionStore;
 pub use interface::SessionStore;
