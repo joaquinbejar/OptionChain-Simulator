@@ -17,8 +17,6 @@
 
 ## OptionChain-Simulator API and Architecture
 
-Let me update the architecture details with proper Mermaid diagrams and include the REST API endpoints and JSON request/response formats.
-
 ### System Architecture
 
 ```mermaid
@@ -407,7 +405,6 @@ Additional commands for CI/CD and deployment:
 | `make publish` | Publishes the package to crates.io |
 | `make zip` | Creates a ZIP archive of the project |
 
-This comprehensive architecture provides a solid foundation for building the OptionChain-Simulator with clear separation of concerns, well-defined interfaces, and scalable infrastructure components.
 
 
 
