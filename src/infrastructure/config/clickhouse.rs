@@ -97,14 +97,14 @@ mod tests {
 
     static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
-    fn safe_set_var(name: &str, value: &str) {
+    fn set_var(name: &str, value: &str) {
         #[allow(unused_unsafe)]
         unsafe {
             env::set_var(name, value);
         }
     }
 
-    fn safe_remove_var(name: &str) {
+    fn remove_var(name: &str) {
         #[allow(unused_unsafe)]
         unsafe {
             env::remove_var(name);
@@ -122,11 +122,11 @@ mod tests {
         let current_password = env::var("CLICKHOUSE_PASSWORD").ok();
         let current_db = env::var("CLICKHOUSE_DB").ok();
 
-        safe_remove_var("CLICKHOUSE_HOST");
-        safe_remove_var("CLICKHOUSE_PORT");
-        safe_remove_var("CLICKHOUSE_USER");
-        safe_remove_var("CLICKHOUSE_PASSWORD");
-        safe_remove_var("CLICKHOUSE_DB");
+        remove_var("CLICKHOUSE_HOST");
+        remove_var("CLICKHOUSE_PORT");
+        remove_var("CLICKHOUSE_USER");
+        remove_var("CLICKHOUSE_PASSWORD");
+        remove_var("CLICKHOUSE_DB");
 
         // Create default config
         let config = ClickHouseConfig::default();
@@ -141,19 +141,19 @@ mod tests {
 
         // Restore environment variables
         if let Some(val) = current_host {
-            safe_set_var("CLICKHOUSE_HOST", &val);
+            set_var("CLICKHOUSE_HOST", &val);
         }
         if let Some(val) = current_port {
-            safe_set_var("CLICKHOUSE_PORT", &val);
+            set_var("CLICKHOUSE_PORT", &val);
         }
         if let Some(val) = current_user {
-            safe_set_var("CLICKHOUSE_USER", &val);
+            set_var("CLICKHOUSE_USER", &val);
         }
         if let Some(val) = current_password {
-            safe_set_var("CLICKHOUSE_PASSWORD", &val);
+            set_var("CLICKHOUSE_PASSWORD", &val);
         }
         if let Some(val) = current_db {
-            safe_set_var("CLICKHOUSE_DB", &val);
+            set_var("CLICKHOUSE_DB", &val);
         }
     }
 
@@ -161,11 +161,11 @@ mod tests {
     fn test_env_override() {
         let _guard = ENV_MUTEX.lock().expect("ENV_MUTEX poisoned");
         // Set environment variables for test
-        safe_set_var("CLICKHOUSE_HOST", "test-host");
-        safe_set_var("CLICKHOUSE_PORT", "8123");
-        safe_set_var("CLICKHOUSE_USER", "test-user");
-        safe_set_var("CLICKHOUSE_PASSWORD", "test-password");
-        safe_set_var("CLICKHOUSE_DB", "test-db");
+        set_var("CLICKHOUSE_HOST", "test-host");
+        set_var("CLICKHOUSE_PORT", "8123");
+        set_var("CLICKHOUSE_USER", "test-user");
+        set_var("CLICKHOUSE_PASSWORD", "test-password");
+        set_var("CLICKHOUSE_DB", "test-db");
 
         // Create config which should use these environment variables
         let config = ClickHouseConfig::default();
@@ -179,11 +179,11 @@ mod tests {
         assert_eq!(config.timeout, 30); // Not overridden
 
         // Clean up
-        safe_remove_var("CLICKHOUSE_HOST");
-        safe_remove_var("CLICKHOUSE_PORT");
-        safe_remove_var("CLICKHOUSE_USER");
-        safe_remove_var("CLICKHOUSE_PASSWORD");
-        safe_remove_var("CLICKHOUSE_DB");
+        remove_var("CLICKHOUSE_HOST");
+        remove_var("CLICKHOUSE_PORT");
+        remove_var("CLICKHOUSE_USER");
+        remove_var("CLICKHOUSE_PASSWORD");
+        remove_var("CLICKHOUSE_DB");
     }
 
     #[test]
@@ -191,7 +191,7 @@ mod tests {
         let _guard = ENV_MUTEX.lock().expect("ENV_MUTEX poisoned");
 
         // Set an invalid port
-        safe_set_var("CLICKHOUSE_PORT", "not_a_number");
+        set_var("CLICKHOUSE_PORT", "not_a_number");
 
         // Create config
         let config = ClickHouseConfig::default();
@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(config.port, 9000);
 
         // Clean up
-        safe_remove_var("CLICKHOUSE_PORT");
+        remove_var("CLICKHOUSE_PORT");
     }
 
     #[test]
