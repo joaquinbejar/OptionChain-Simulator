@@ -4,16 +4,19 @@ use utoipa::OpenApi;
 #[openapi(
     paths(
         crate::api::rest::handlers::create_session,
-        // crate::api::rest::handlers::get_next_step,
-        // crate::api::rest::handlers::replace_session,
-        // crate::api::rest::handlers::update_session,
-        // crate::api::rest::handlers::delete_session,
+        crate::api::rest::handlers::get_next_step,
+        crate::api::rest::handlers::replace_session,
+        crate::api::rest::handlers::update_session,
+        crate::api::rest::handlers::delete_session,
     ),
     components(
         schemas(
             crate::api::rest::responses::OptionContractResponse,
             crate::api::rest::responses::OptionPriceResponse,
             crate::api::rest::responses::SessionInfoResponse,
+            crate::api::rest::requests::CreateSessionRequest,
+            crate::api::rest::requests::UpdateSessionRequest,
+            crate::api::rest::models::SessionId,
         )
     ),
     tags(
