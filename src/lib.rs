@@ -1,16 +1,5 @@
 //! # OptionChain-Simulator
 //!
-//! <div style="text-align: center;">
-//! <img src="https://raw.githubusercontent.com/joaquinbejar/OptionChain-Simulator/main/doc/images/logo.png" alt="OptionChain-Simulator" style="width: 100%; height: 200px;">
-//! </div>
-//!
-//! [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
-//! [![Build](https://img.shields.io/github/actions/workflow/status/joaquinbejar/OptionChain-Simulator/ci.yml)](https://github.com/joaquinbejar/OptionChain-Simulator/actions)
-//! [![Crates.io](https://img.shields.io/crates/v/optionchain-simulator.svg)](https://crates.io/crates/optionchain-simulator)
-//! [![Downloads](https://img.shields.io/crates/d/optionchain-simulator.svg)](https://crates.io/crates/optionchain-simulator)
-//! [![Stars](https://img.shields.io/github/stars/joaquinbejar/OptionChain-Simulator.svg)](https://github.com/joaquinbejar/OptionChain-Simulator/stargazers)
-//! [![Issues](https://img.shields.io/github/issues/joaquinbejar/OptionChain-Simulator.svg)](https://github.com/joaquinbejar/OptionChain-Simulator/issues)
-//!
 //! ## OptionChain-Simulator: RESTful Option Chain Time Simulator
 //!
 //! ### Table of Contents
@@ -100,15 +89,6 @@
 //! cargo clippy
 //! ```
 //!
-//! ## Contribution and Contact
-//!
-//! Contributions are welcome! Please submit pull requests, issues, or suggestions.
-//!
-//! Maintainer: **Joaquín Béjar García**  
-//! 📧 jb@taunais.com  
-//! 🔗 [GitHub Profile](https://github.com/joaquinbejar)
-//!
-//! ---
 
 /// The `domain` module is intended to encapsulate and manage all the core business logic
 /// and domain-specific functionality of the application.
