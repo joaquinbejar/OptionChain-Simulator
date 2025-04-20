@@ -458,3 +458,9 @@ impl From<ApiWalkType> for WalkType {
         }
     }
 }
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct SessionId {
+    #[serde(rename = "sessionid")]
+    pub(crate) session_id: String,
+}
