@@ -1,4 +1,5 @@
-use crate::api::rest::requests::CreateSessionRequest;
+use crate::api::rest::models::SessionId;
+use crate::api::rest::requests::{CreateSessionRequest, UpdateSessionRequest};
 use crate::api::rest::responses::{ErrorResponse, SessionParametersResponse, SessionResponse};
 use crate::session::SessionManager;
 use crate::utils::ChainError;
@@ -68,39 +69,86 @@ pub(crate) async fn create_session(
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/v1/chain",
+    params(
+        ("sessionid" = String, Query, description = "ID of the session to get next step for")
+    ),
+    responses(
+        (status = 200, description = "Next step returned", body = String),
+        (status = 404, description = "Session not found")
+    )
+)]
 pub(crate) async fn get_next_step(
     _session_manager: web::Data<Arc<SessionManager>>,
-    _req: web::Path<String>,
+    query: web::Query<SessionId>,
 ) -> impl Responder {
-    // Implementation would get next simulation step
-    // Mock response for now
-    HttpResponse::Ok().body("Next step data would be returned here")
+    let session_id = &query.session_id;
+    let msg = format!("Next step for session ID: {} returned", session_id);
+    HttpResponse::Ok().body(msg)
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/v1/chain",
+    params(
+        ("sessionid" = String, Query, description = "ID of the session to replace")
+    ),
+    responses(
+        (status = 200, description = "Session replaced", body = String),
+        (status = 404, description = "Session not found")
+    )
+)]
 pub(crate) async fn replace_session(
     _session_manager: web::Data<Arc<SessionManager>>,
-    _session_id: web::Path<String>,
+    query: web::Query<SessionId>,
     _req: web::Json<CreateSessionRequest>,
 ) -> impl Responder {
-    // Implementation would replace all session parameters
-    HttpResponse::Ok().body("Session replaced")
+    let session_id = &query.session_id;
+    let msg = format!("Session replaced ID: {}", session_id);
+    HttpResponse::Ok().body(msg)
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/v1/chain",
+    params(
+        ("sessionid" = String, Query, description = "ID of the session to update")
+    ),
+    responses(
+        (status = 200, description = "Session updated", body = String),
+        (status = 404, description = "Session not found")
+    )
+)]
 pub(crate) async fn update_session(
     _session_manager: web::Data<Arc<SessionManager>>,
-    _session_id: web::Path<String>,
-    _req: web::Json<serde_json::Value>,
+    query: web::Query<SessionId>,
+    _req: web::Json<UpdateSessionRequest>,
 ) -> impl Responder {
-    // Implementation would patch specific session parameters
-    HttpResponse::Ok().body("Session updated")
+    let session_id = &query.session_id;
+    let msg = format!("Session updated ID: {}", session_id);
+    HttpResponse::Ok().body(msg)
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/v1/chain",
+    params(
+        ("sessionid" = String, Query, description = "ID of the session to delete")
+    ),
+    responses(
+        (status = 200, description = "Session deleted", body = String),
+        (status = 404, description = "Session not found")
+    )
+)]
 pub(crate) async fn delete_session(
     _session_manager: web::Data<Arc<SessionManager>>,
-    _session_id: web::Path<String>,
+    query: web::Query<SessionId>,
 ) -> impl Responder {
-    // Implementation would delete the session
-    HttpResponse::Ok().body("Session deleted")
+    let session_id = &query.session_id;
+    let msg = format!("Session deleted ID: {}", session_id);
+    HttpResponse::Ok().body(msg)
 }
 
 #[allow(dead_code)] // TODO: remove as soon as we have proper error handling
