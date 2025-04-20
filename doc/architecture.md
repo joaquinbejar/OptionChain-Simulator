@@ -199,9 +199,9 @@ classDiagram
     
     class SimulationMethod {
         <<enumeration>>
-        BlackScholes
-        MonteCarlo
-        HistoricalReplication
+        GeometricBrownian
+        Brownian
+        Historical
     }
     
     OptionChain "1" -- "many" OptionContract

@@ -209,7 +209,7 @@ Content-Type: application/json
   "riskFreeRate": 0.03,
   "strikes": [90, 95, 100, 105, 110],
   "expirations": ["2023-06-30", "2023-07-31"],
-  "method": "BlackScholes"
+  "method": "GeometricBrownian"
 }
 ```
 
@@ -228,7 +228,7 @@ Location: /chain/simulated/f47ac10b-58cc-4372-a567-0e02b2c3d479
     "riskFreeRate": 0.03,
     "strikes": [90, 95, 100, 105, 110],
     "expirations": ["2023-06-30", "2023-07-31"],
-    "method": "BlackScholes"
+    "method": "GeometricBrownian"
   },
   "currentStep": 0,
   "totalSteps": 20,
@@ -299,7 +299,7 @@ Content-Type: application/json
     "riskFreeRate": 0.03,
     "strikes": [90, 95, 100, 105, 110],
     "expirations": ["2023-06-30", "2023-07-31"],
-    "method": "BlackScholes"
+    "method": "GeometricBrownian"
   },
   "currentStep": 5,
   "totalSteps": 20,

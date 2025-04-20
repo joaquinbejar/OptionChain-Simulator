@@ -63,7 +63,7 @@ POST /chain/simulated
   "riskFreeRate": 0.03,
   "strikes": [90, 95, 100, 105, 110],
   "expirations": ["2023-06-30", "2023-09-30"],
-  "method": "BlackScholes"
+  "method": "GeometricBrownian"
 }
 ```
 
@@ -79,7 +79,7 @@ POST /chain/simulated
     "riskFreeRate": 0.03,
     "strikes": [90, 95, 100, 105, 110],
     "expirations": ["2023-06-30", "2023-09-30"],
-    "method": "BlackScholes"
+    "method": "GeometricBrownian"
   },
   "currentStep": 0,
   "totalSteps": 20,
@@ -160,7 +160,7 @@ PUT /chain/simulated/{session_id}
   "riskFreeRate": 0.035,
   "strikes": [95, 100, 105, 110, 115],
   "expirations": ["2023-06-30", "2023-09-30"],
-  "method": "BlackScholes"
+  "method": "GeometricBrownian"
 }
 ```
 
@@ -176,7 +176,7 @@ PUT /chain/simulated/{session_id}
     "riskFreeRate": 0.035,
     "strikes": [95, 100, 105, 110, 115],
     "expirations": ["2023-06-30", "2023-09-30"],
-    "method": "BlackScholes"
+    "method": "GeometricBrownian"
   },
   "currentStep": 0,
   "totalSteps": 20,
@@ -217,7 +217,7 @@ PATCH /chain/simulated/{session_id}
     "riskFreeRate": 0.03,
     "strikes": [90, 95, 100, 105, 110],
     "expirations": ["2023-06-30", "2023-09-30"],
-    "method": "BlackScholes"
+    "method": "GeometricBrownian"
   },
   "currentStep": 5,
   "totalSteps": 20,
@@ -318,7 +318,7 @@ GET /config/simulator
     "strikesCount": 5,
     "strikesSpread": 0.1,
     "expirations": ["30d", "90d"],
-    "method": "BlackScholes"
+    "method": "GeometricBrownian"
   },
   "limits": {
     "maxSessions": 10,
@@ -352,7 +352,7 @@ PUT /config/simulator
     "strikesCount": 7,
     "strikesSpread": 0.15,
     "expirations": ["30d", "60d", "90d"],
-    "method": "BlackScholes"
+    "method": "GeometricBrownian"
   },
   "limits": {
     "maxSessions": 20,
