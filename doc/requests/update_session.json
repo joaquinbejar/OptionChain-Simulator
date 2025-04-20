@@ -1,0 +1,17 @@
+{
+  "symbol": "AAPL",
+  "steps": 30,
+  "initial_price": 150.0,
+  "volatility": 0.2,
+  "risk_free_rate": 0.03,
+  "dividend_yield": 0.005,
+  "days_to_expiration": 30.0,
+  "method": {
+    "GeometricBrownian": {
+      "dt": 0.004,
+      "drift": 0.05,
+      "volatility": 0.25
+    }
+  },
+  "time_frame": "Day"
+}
