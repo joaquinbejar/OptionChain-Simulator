@@ -1,8 +1,8 @@
+use crate::session::{Session, SessionStore};
+use crate::utils::ChainError;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
-use crate::session::{Session, SessionStore};
-use crate::utils::ChainError;
 
 /// `InMemorySessionStore` is a structure that provides an in-memory implementation
 /// of a session storage system. It allows you to store session information in a

@@ -1,11 +1,11 @@
 use crate::domain::Simulator;
+use crate::session::SessionStore;
 use crate::session::model::{Session, SimulationParameters};
 use crate::session::state_handler::StateProgressionHandler;
 use crate::utils::error::ChainError;
 use optionstratlib::chains::OptionChain;
 use std::sync::Arc;
 use uuid::Uuid;
-use crate::session::SessionStore;
 
 /// Manages the lifecycle of simulation sessions
 pub struct SessionManager {

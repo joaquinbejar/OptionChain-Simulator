@@ -62,7 +62,6 @@ mod state_handler;
 /// Users of this module should refer to its public items to utilize its functionality effectively.
 mod store;
 
-
 pub use manager::SessionManager;
 pub use model::{Session, SessionState, SimulationMethod, SimulationParameters};
-pub use store::{InMemorySessionStore, SessionStore, InRedisSessionStore};
+pub use store::{InMemorySessionStore, InRedisSessionStore, SessionStore};

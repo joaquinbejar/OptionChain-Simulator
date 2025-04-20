@@ -1,12 +1,10 @@
+use crate::infrastructure::config::redis::RedisConfig;
 use redis::{Client, Commands, Connection, RedisError, RedisResult};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, instrument};
-use crate::infrastructure::config::redis::RedisConfig;
 
 /// A client for interacting with a Redis database
 pub struct RedisClient {
-    /// The underlying Redis client
-    client: Client,
     /// A connection pool (connection wrapped in Mutex for thread safety)
     connection_pool: Arc<Mutex<Connection>>,
     /// Redis configuration
@@ -18,7 +16,7 @@ impl RedisClient {
     #[instrument(skip(config), level = "debug")]
     pub fn new(config: RedisConfig) -> Result<Self, RedisError> {
         // Build Redis connection URL
-        let mut url = config.url();
+        let url = config.url();
         info!("Connecting to Redis at {}", url);
 
         // Create Redis client
@@ -32,7 +30,6 @@ impl RedisClient {
         info!("Successfully connected to Redis");
 
         Ok(Self {
-            client,
             connection_pool,
             config,
         })
@@ -67,14 +64,22 @@ impl RedisClient {
 
     /// Sets a value in Redis with an optional expiration time in seconds
     #[instrument(skip(self, value), level = "debug")]
-    pub fn set<T: redis::ToRedisArgs>(&self, key: &str, value: T, expiry_secs: Option<u64>) -> RedisResult<()> {
+    pub fn set<T: redis::ToRedisArgs>(
+        &self,
+        key: &str,
+        value: T,
+        expiry_secs: Option<u64>,
+    ) -> RedisResult<()> {
         let mut connection = self.get_connection()?;
 
         match expiry_secs {
             Some(secs) => {
-                debug!("Setting key '{}' in Redis with expiry of {} seconds", key, secs);
+                debug!(
+                    "Setting key '{}' in Redis with expiry of {} seconds",
+                    key, secs
+                );
                 connection.set_ex(key, value, secs)
-            },
+            }
             None => {
                 debug!("Setting key '{}' in Redis without expiry", key);
                 connection.set(key, value)
@@ -116,8 +121,8 @@ impl RedisClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
     use redis::{RedisError, RedisResult};
+    use std::sync::{Arc, Mutex};
 
     // Mock implementation for Redis connection
     // We need to create a custom struct that implements necessary methods
@@ -163,14 +168,20 @@ mod tests {
         fn exists(&mut self, key: &str) -> RedisResult<bool> {
             match self.exists_results.get(key) {
                 Some(result) => Ok(*result),
-                None => Err(RedisError::from((redis::ErrorKind::TypeError, "Key not configured in mock")))
+                None => Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "Key not configured in mock",
+                ))),
             }
         }
 
         fn get(&mut self, key: &str) -> RedisResult<String> {
             match self.get_results.get(key) {
                 Some(value) => Ok(value.clone()),
-                None => Err(RedisError::from((redis::ErrorKind::TypeError, "Key not configured in mock")))
+                None => Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "Key not configured in mock",
+                ))),
             }
         }
 
@@ -187,14 +198,20 @@ mod tests {
         fn del(&mut self, key: &str) -> RedisResult<i32> {
             match self.del_results.get(key) {
                 Some(result) => Ok(*result),
-                None => Err(RedisError::from((redis::ErrorKind::TypeError, "Key not configured in mock")))
+                None => Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "Key not configured in mock",
+                ))),
             }
         }
 
         fn keys(&mut self, pattern: &str) -> RedisResult<Vec<String>> {
             match self.keys_results.get(pattern) {
                 Some(result) => Ok(result.clone()),
-                None => Err(RedisError::from((redis::ErrorKind::TypeError, "Pattern not configured in mock")))
+                None => Err(RedisError::from((
+                    redis::ErrorKind::TypeError,
+                    "Pattern not configured in mock",
+                ))),
             }
         }
     }
@@ -202,14 +219,16 @@ mod tests {
     // We'll need to patch the RedisClient to use our mock
     // This avoids the trait/struct mismatch issue
     struct TestRedisClient {
-        client: redis::Client,
         connection: Arc<Mutex<MockConnection>>,
         config: RedisConfig,
     }
 
     impl TestRedisClient {
         // Implement the same methods as RedisClient but using our MockConnection
-        fn get<T: std::string::ToString + std::fmt::Display>(&self, key: T) -> RedisResult<Option<String>> {
+        fn get<T: std::string::ToString + std::fmt::Display>(
+            &self,
+            key: T,
+        ) -> RedisResult<Option<String>> {
             let key_str = key.to_string();
             let mut connection = self.connection.lock().map_err(|e| {
                 RedisError::from(std::io::Error::new(
@@ -232,7 +251,7 @@ mod tests {
             &self,
             key: T,
             value: V,
-            expiry_secs: Option<u64>
+            expiry_secs: Option<u64>,
         ) -> RedisResult<()> {
             let key_str = key.to_string();
             let value_str = value.to_string();
@@ -313,8 +332,7 @@ mod tests {
     #[test]
     fn test_get_non_existing_key() {
         // Create a mock connection with predefined behavior
-        let mock_conn = MockConnection::new()
-            .with_exists("non_existing_key", false);
+        let mock_conn = MockConnection::new().with_exists("non_existing_key", false);
 
         // Create the Redis client with the mock connection
         let client = create_test_client(mock_conn);
@@ -357,8 +375,7 @@ mod tests {
     #[test]
     fn test_delete_existing_key() {
         // Create a mock connection with predefined behavior
-        let mock_conn = MockConnection::new()
-            .with_del("test_key", 1);
+        let mock_conn = MockConnection::new().with_del("test_key", 1);
 
         // Create the Redis client with the mock connection
         let client = create_test_client(mock_conn);
@@ -367,14 +384,13 @@ mod tests {
         let result = client.delete("test_key");
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
     fn test_delete_non_existing_key() {
         // Create a mock connection with predefined behavior
-        let mock_conn = MockConnection::new()
-            .with_del("non_existing_key", 0);
+        let mock_conn = MockConnection::new().with_del("non_existing_key", 0);
 
         // Create the Redis client with the mock connection
         let client = create_test_client(mock_conn);
@@ -383,7 +399,7 @@ mod tests {
         let result = client.delete("non_existing_key");
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -399,14 +415,16 @@ mod tests {
         let result = client.keys("test*");
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), vec!["test1".to_string(), "test2".to_string()]);
+        assert_eq!(
+            result.unwrap(),
+            vec!["test1".to_string(), "test2".to_string()]
+        );
     }
 
     #[test]
     fn test_exists_true() {
         // Create a mock connection with predefined behavior
-        let mock_conn = MockConnection::new()
-            .with_exists("existing_key", true);
+        let mock_conn = MockConnection::new().with_exists("existing_key", true);
 
         // Create the Redis client with the mock connection
         let client = create_test_client(mock_conn);
@@ -415,14 +433,13 @@ mod tests {
         let result = client.exists("existing_key");
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
     fn test_exists_false() {
         // Create a mock connection with predefined behavior
-        let mock_conn = MockConnection::new()
-            .with_exists("non_existing_key", false);
+        let mock_conn = MockConnection::new().with_exists("non_existing_key", false);
 
         // Create the Redis client with the mock connection
         let client = create_test_client(mock_conn);
@@ -431,7 +448,7 @@ mod tests {
         let result = client.exists("non_existing_key");
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -449,8 +466,6 @@ mod tests {
         // Create Redis client
         let mock_conn = MockConnection::new();
         let client = TestRedisClient {
-            client: redis::Client::open(format!("redis://{}:{}", config.host, config.port))
-                .expect("Failed to create Redis client"),
             connection: Arc::new(Mutex::new(mock_conn)),
             config: config.clone(),
         };
@@ -471,11 +486,10 @@ mod tests {
         let config = RedisConfig::default();
 
         // Create a real client but inject our mock connection
-        let client = redis::Client::open(format!("redis://{}:{}", config.host, config.port))
+        let _client = Client::open(format!("redis://{}:{}", config.host, config.port))
             .expect("Failed to create Redis client");
 
         TestRedisClient {
-            client,
             connection: Arc::new(Mutex::new(mock_conn)),
             config,
         }
@@ -502,12 +516,7 @@ mod tests {
 
         // Create client with poisoned mutex
         let config = RedisConfig::default();
-        let client = TestRedisClient {
-            client: redis::Client::open(format!("redis://{}:{}", config.host, config.port))
-                .expect("Failed to create Redis client"),
-            connection: connection,
-            config,
-        };
+        let client = TestRedisClient { connection, config };
 
         // Test the get method - should fail due to poisoned mutex
         let result = client.get("test_key");

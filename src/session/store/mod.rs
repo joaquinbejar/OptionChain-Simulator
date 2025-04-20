@@ -1,4 +1,4 @@
-/// This module, `in_memory`, provides functionality for managing and storing 
+/// This module, `in_memory`, provides functionality for managing and storing
 /// data using an in-memory data structure. The specific implementation details
 /// and use cases depend on the contents of the module, which may include data such as
 /// caching, temporary storage, or other memory-based operations.

@@ -1,6 +1,5 @@
 use std::{env, fmt};
 
-
 /// Configuration for a Redis connection
 #[derive(Clone, Debug)]
 pub struct RedisConfig {
@@ -49,7 +48,7 @@ impl RedisConfig {
             url.push('/');
             url.push_str(&self.database.to_string());
         };
-        
+
         url
     }
 }
@@ -65,7 +64,7 @@ impl Default for RedisConfig {
             .ok()
             .and_then(|s| s.parse::<u8>().ok())
             .unwrap_or(0);
-        
+
         let username = env::var("REDIS_USER").ok();
         let password = env::var("REDIS_PASSWORD").ok();
 
@@ -84,35 +83,35 @@ impl fmt::Display for RedisConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // // Start building the URL
         // let mut url = String::from("redis://");
-        // 
+        //
         // // Add credentials if either username or password is present
         // if self.username.is_some() || self.password.is_some() {
         //     // Add username if present, otherwise an empty string
         //     if let Some(username) = &self.username {
         //         url.push_str(username);
         //     }
-        // 
+        //
         //     // Add password with colon prefix if present
         //     if let Some(password) = &self.password {
         //         url.push(':');
         //         url.push_str(password);
         //     }
-        // 
+        //
         //     // Add the @ separator after credentials
         //     url.push('@');
         // }
-        // 
+        //
         // // Add host and port
         // url.push_str(&self.host);
         // url.push(':');
         // url.push_str(&self.port.to_string());
-        // 
+        //
         // // Add database if not 0
         // if self.database > 0 {
         //     url.push('/');
         //     url.push_str(&self.database.to_string());
         // }
-        
+
         let url = self.url();
 
         // Write the complete URL and timeout
@@ -238,7 +237,10 @@ mod tests {
             timeout: 30,
         };
 
-        assert_eq!(format!("{}", config), "redis://localhost:6379 (timeout: 30s)");
+        assert_eq!(
+            format!("{}", config),
+            "redis://localhost:6379 (timeout: 30s)"
+        );
     }
 
     #[test]
@@ -252,7 +254,10 @@ mod tests {
             timeout: 30,
         };
 
-        assert_eq!(format!("{}", config), "redis://testuser@localhost:6379 (timeout: 30s)");
+        assert_eq!(
+            format!("{}", config),
+            "redis://testuser@localhost:6379 (timeout: 30s)"
+        );
     }
 
     #[test]
@@ -266,7 +271,10 @@ mod tests {
             timeout: 30,
         };
 
-        assert_eq!(format!("{}", config), "redis://:testpass@localhost:6379 (timeout: 30s)");
+        assert_eq!(
+            format!("{}", config),
+            "redis://:testpass@localhost:6379 (timeout: 30s)"
+        );
     }
 
     #[test]
@@ -280,7 +288,10 @@ mod tests {
             timeout: 30,
         };
 
-        assert_eq!(format!("{}", config), "redis://testuser:testpass@localhost:6379 (timeout: 30s)");
+        assert_eq!(
+            format!("{}", config),
+            "redis://testuser:testpass@localhost:6379 (timeout: 30s)"
+        );
     }
 
     #[test]
@@ -294,7 +305,10 @@ mod tests {
             timeout: 30,
         };
 
-        assert_eq!(format!("{}", config), "redis://localhost:6379/3 (timeout: 30s)");
+        assert_eq!(
+            format!("{}", config),
+            "redis://localhost:6379/3 (timeout: 30s)"
+        );
     }
 
     #[test]
@@ -308,7 +322,10 @@ mod tests {
             timeout: 45,
         };
 
-        assert_eq!(format!("{}", config), "redis://admin:s3cret@redis.example.com:6380/5 (timeout: 45s)");
+        assert_eq!(
+            format!("{}", config),
+            "redis://admin:s3cret@redis.example.com:6380/5 (timeout: 45s)"
+        );
     }
 
     #[test]

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use crate::session::model::Session;
@@ -119,4 +117,3 @@ pub trait SessionStore: Send + Sync {
     /// cleanup.
     fn cleanup(&self) -> Result<usize, ChainError>;
 }
-

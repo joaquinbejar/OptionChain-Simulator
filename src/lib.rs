@@ -144,6 +144,22 @@ mod domain;
 ///   of the codebase.
 pub mod infrastructure;
 
+/// The `api` module serves as a namespace for handling APIs within the project.
+///
+/// This module can include functionality for managing API requests, responses,
+/// routing, and any other API-related tasks. Consider this module as the
+/// central point to organize and define your application's API logic.
+///
+/// # Usage
+/// Include the `api` module in your project to handle all API-related processes.
+///
+/// # Structure
+/// You can further structure the `api` module by creating submodules
+/// or defining functions and types directly within it to suit the application's needs.
+///
+/// Modify and extend this module as necessary to fit your implementation.
+pub mod api;
+
 /// The `session` module provides functionality for managing and maintaining
 /// user sessions within the application. This module may include features such as:
 ///
@@ -159,6 +175,7 @@ pub mod infrastructure;
 /// to handle all operations related to session management efficiently and securely.
 ///
 pub mod session;
+
 /// This module `utils` serves as a container for utility functions, types,
 /// and other reusable components that can be shared across different parts
 /// of the application.
@@ -170,5 +187,3 @@ pub mod session;
 /// Note that the specific utility helpers and functionality provided will
 /// depend on the implementation within this module.
 pub mod utils;
-pub mod api;
-

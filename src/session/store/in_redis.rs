@@ -1,13 +1,11 @@
+use crate::infrastructure::RedisClient;
 use crate::session::{Session, SessionStore};
 use crate::utils::ChainError;
-use async_trait::async_trait;
-use redis::{Commands, RedisError};
+use redis::RedisError;
 use serde_json;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 use tracing::{debug, error, info, instrument};
 use uuid::Uuid;
-use crate::infrastructure::RedisClient;
 
 /// Session store implementation that uses Redis for persistence
 pub struct InRedisSessionStore {
@@ -168,13 +166,12 @@ impl SessionStore for InRedisSessionStore {
 mod tests {
     use super::*;
     use crate::session::{SessionState, SimulationMethod, SimulationParameters};
-    use optionstratlib::{Positive, pos};
     use optionstratlib::utils::TimeFrame;
+    use optionstratlib::{Positive, pos};
     use rust_decimal::Decimal;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
     use std::time::SystemTime;
     use uuid::Uuid;
-    use redis::RedisResult;
 
     // TestInRedisSessionStore - a version of InRedisSessionStore that we can test
     // This is a test double for our real implementation
@@ -187,10 +184,7 @@ mod tests {
 
     impl TestInRedisSessionStore {
         // Constructor that mimics InRedisSessionStore::new
-        fn new(
-            key_prefix: Option<String>,
-            session_ttl: Option<u64>,
-        ) -> Self {
+        fn new(key_prefix: Option<String>, session_ttl: Option<u64>) -> Self {
             let prefix = key_prefix.unwrap_or_else(|| "session:".to_string());
             let ttl = session_ttl.unwrap_or(1800); // Default 30 minutes
 
@@ -212,7 +206,7 @@ mod tests {
         }
     }
 
-    // Implement SessionStore for our test double 
+    // Implement SessionStore for our test double
     // using the same logic as the original but with in-memory storage
     impl SessionStore for TestInRedisSessionStore {
         fn get(&self, id: Uuid) -> Result<Session, ChainError> {
@@ -224,20 +218,16 @@ mod tests {
                     // Try to deserialize the session
                     match serde_json::from_str::<Session>(json_str) {
                         Ok(session) => Ok(session),
-                        Err(e) => {
-                            Err(ChainError::Internal(format!(
-                                "Failed to deserialize session: {}",
-                                e
-                            )))
-                        }
+                        Err(e) => Err(ChainError::Internal(format!(
+                            "Failed to deserialize session: {}",
+                            e
+                        ))),
                     }
                 }
-                None => {
-                    Err(ChainError::NotFound(format!(
-                        "Session with id {} not found",
-                        id
-                    )))
-                }
+                None => Err(ChainError::NotFound(format!(
+                    "Session with id {} not found",
+                    id
+                ))),
             }
         }
 
@@ -270,7 +260,7 @@ mod tests {
         }
 
         fn cleanup(&self) -> Result<usize, ChainError> {
-            // Redis handles expiration automatically, so our test double 
+            // Redis handles expiration automatically, so our test double
             // should also just return 0
             Ok(0)
         }
@@ -319,10 +309,7 @@ mod tests {
 
     #[test]
     fn test_new_with_custom_values() {
-        let store = TestInRedisSessionStore::new(
-            Some("custom_prefix:".to_string()),
-            Some(3600),
-        );
+        let store = TestInRedisSessionStore::new(Some("custom_prefix:".to_string()), Some(3600));
 
         assert_eq!(store.key_prefix, "custom_prefix:");
         assert_eq!(store.session_ttl, 3600);
@@ -393,7 +380,7 @@ mod tests {
         // Delete the session
         let delete_result = store.delete(session_id);
         assert!(delete_result.is_ok());
-        assert_eq!(delete_result.unwrap(), true);
+        assert!(delete_result.unwrap());
 
         // Verify it's removed
         assert_eq!(store.get_store_size(), 0);
@@ -411,7 +398,7 @@ mod tests {
         let result = store.delete(non_existent_id);
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]
@@ -458,25 +445,36 @@ mod tests {
 
     impl SessionStore for TestErrorInRedisSessionStore {
         fn get(&self, id: Uuid) -> Result<Session, ChainError> {
-            Err(ChainError::Internal(format!("Simulated error for session {}", id)))
+            Err(ChainError::Internal(format!(
+                "Simulated error for session {}",
+                id
+            )))
         }
 
         fn save(&self, session: Session) -> Result<(), ChainError> {
-            Err(ChainError::Internal(format!("Simulated error saving session {}", session.id)))
+            Err(ChainError::Internal(format!(
+                "Simulated error saving session {}",
+                session.id
+            )))
         }
 
         fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
-            Err(ChainError::Internal(format!("Simulated error deleting session {}", id)))
+            Err(ChainError::Internal(format!(
+                "Simulated error deleting session {}",
+                id
+            )))
         }
 
         fn cleanup(&self) -> Result<usize, ChainError> {
-            Err(ChainError::Internal("Simulated error during cleanup".to_string()))
+            Err(ChainError::Internal(
+                "Simulated error during cleanup".to_string(),
+            ))
         }
     }
 
     #[test]
     fn test_error_handling() {
-        let error_store = TestErrorInRedisSessionStore{};
+        let error_store = TestErrorInRedisSessionStore {};
 
         let session = create_test_session();
         let session_id = session.id;

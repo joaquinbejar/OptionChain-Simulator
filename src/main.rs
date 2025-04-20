@@ -1,12 +1,10 @@
 //! TBD
 
-
-use std::sync::Arc;
-use optionstratlib::utils::setup_logger;
-use tracing::info;
-use optionchain_simulator::api::start_server;
+use optionchain_simulator::api::{ListenOn, start_server};
 use optionchain_simulator::session::{InMemorySessionStore, SessionManager};
-
+use optionstratlib::utils::setup_logger;
+use std::sync::Arc;
+use tracing::info;
 
 /// The entry point of a Rust program.
 ///
@@ -19,14 +17,16 @@ use optionchain_simulator::session::{InMemorySessionStore, SessionManager};
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     setup_logger();
-    
+
     // Create session store
     let session_store = Arc::new(InMemorySessionStore::new());
 
     // Create session manager
     let session_manager = Arc::new(SessionManager::new(session_store));
 
+    let listen_on = ListenOn::All;
+    let port = 7070;
     // Start HTTP server
-    info!("Starting HTTP server at http://127.0.0.1:8080");
-    start_server(session_manager).await
+    info!("Starting HTTP server at http://{}:{}", listen_on, port);
+    start_server(session_manager, listen_on, port).await
 }

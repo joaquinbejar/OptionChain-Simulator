@@ -5,7 +5,7 @@ use optionstratlib::{ExpirationDate, Positive, pos, spos};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
-use tracing::{Level, info, error};
+use tracing::{Level, error, info};
 use uuid::Uuid;
 
 use optionchain_simulator::session::{InMemorySessionStore, SimulationMethod};
