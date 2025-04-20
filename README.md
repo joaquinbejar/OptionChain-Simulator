@@ -31,18 +31,6 @@ App --> Infra[Infrastructure Layer]
 Domain --> SimEngine[Simulation Engine]
 Infra --> ClickHouse[(ClickHouse DB)]
 Infra --> Redis[(Redis Store)]
-
-subgraph API Layer
-Controllers[REST Controllers]
-Middleware[Middleware]
-Models[Request/Response Models]
-end
-
-subgraph Session Management
-SessionMgr[Session Manager]
-StateHandler[State Handler]
-SessionStore[Session Store]
-end
 ```
 
 ### Session State Transitions
@@ -172,8 +160,7 @@ The OptionChain-Simulator exposes the following REST API endpoints:
 },
 "implied_volatility": 0.22,
 "gamma": 0.04
-},
-// Additional contracts...
+}
 ],
 "session_info": {
 "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
