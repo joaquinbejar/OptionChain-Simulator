@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Response containing session information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,7 +63,7 @@ pub struct ChainResponse {
 }
 
 /// Option contract data response that maps to the OptionStratLib's OptionData
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OptionContractResponse {
     /// The strike price of the option
     pub strike: f64,
@@ -79,7 +80,7 @@ pub struct OptionContractResponse {
 }
 
 /// Price data for a specific option type (call or put)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OptionPriceResponse {
     /// The bid price for the option
     pub bid: Option<f64>,
@@ -92,7 +93,7 @@ pub struct OptionPriceResponse {
 }
 
 /// Simplified session information for inclusion in chain responses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SessionInfoResponse {
     /// The unique identifier for the session
     pub id: String,
