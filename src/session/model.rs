@@ -1,11 +1,12 @@
 use crate::utils::{ChainError, UuidGenerator};
-use optionstratlib::Positive;
+use optionstratlib::{pos, Positive};
 pub use optionstratlib::simulation::WalkType as SimulationMethod;
 use optionstratlib::utils::TimeFrame;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use uuid::Uuid;
+use crate::api::CreateSessionRequest;
 
 /// Represents the various states a session can be in.
 ///
@@ -103,6 +104,26 @@ pub struct SimulationParameters {
     pub skew_factor: Option<Decimal>,
     /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     pub spread: Option<Positive>,
+}
+
+impl From<CreateSessionRequest> for SimulationParameters {
+    fn from(req: CreateSessionRequest) -> Self {
+        Self {
+            symbol: req.symbol,
+            steps: req.steps,
+            initial_price: pos!(req.initial_price),
+            days_to_expiration: pos!(req.days_to_expiration),
+            volatility: pos!(req.volatility),
+            risk_free_rate: Decimal::try_from(req.risk_free_rate).unwrap_or_default(),
+            dividend_yield: pos!(req.dividend_yield),
+            method: req.method.into(),
+            time_frame: req.time_frame.into(),
+            chain_size: req.chain_size,
+            strike_interval: req.strike_interval.map(|v| pos!(v)),
+            skew_factor: req.skew_factor.map(|v| Decimal::try_from(v).unwrap_or_default()),
+            spread: req.spread.map(|v| pos!(v)),
+        }
+    }
 }
 
 /// Represents a simulation session with its current state and parameters.
@@ -306,5 +327,342 @@ impl Session {
     ///
     pub fn is_active(&self) -> bool {
         self.state != SessionState::Completed && self.state != SessionState::Error
+    }
+}
+
+#[cfg(test)]
+mod tests_simulation_fparameters_serialization {
+    use optionstratlib::pos;
+    use rust_decimal_macros::dec;
+    use super::*;
+    use crate::session::SimulationParameters;
+    use serde_json::{from_str, to_string, Value};
+
+    #[test]
+    fn test_simulation_parameters_serialization() {
+        // Create a sample SimulationParameters with all fields populated
+        let params = SimulationParameters {
+            symbol: "AAPL".to_string(),
+            steps: 30,
+            initial_price: pos!(150.75),
+            days_to_expiration: pos!(45.0),
+            volatility: pos!(0.25),
+            risk_free_rate: dec!(0.04),
+            dividend_yield: pos!(0.015),
+            method: SimulationMethod::GeometricBrownian {
+                dt: pos!(0.0027),
+                drift: dec!(0.05),
+                volatility: pos!(0.25),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(15),
+            strike_interval: Some(pos!(5.0)),
+            skew_factor: Some(dec!(0.0005)),
+            spread: Some(pos!(0.02)),
+        };
+
+        // Serialize to JSON
+        let json = to_string(&params).unwrap();
+
+        // Verify JSON contains all expected fields
+        let value: Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["symbol"], "AAPL");
+        assert_eq!(value["steps"], 30);
+        assert_eq!(value["initial_price"], 150.75);
+        assert_eq!(value["days_to_expiration"], 45.0);
+        assert_eq!(value["volatility"], 0.25);
+        assert_eq!(value["risk_free_rate"], "0.04");
+        assert_eq!(value["dividend_yield"], 0.015);
+        assert_eq!(value["time_frame"], "Day");
+        assert_eq!(value["chain_size"], 15);
+        assert_eq!(value["strike_interval"], 5.0);
+        assert_eq!(value["skew_factor"], "0.0005");
+        assert_eq!(value["spread"], 0.02);
+
+        // Check the method field specifically
+        assert!(value["method"].is_object());
+        assert!(value["method"].as_object().unwrap().contains_key("GeometricBrownian"));
+        assert_eq!(value["method"]["GeometricBrownian"]["dt"], 0.0027);
+        assert_eq!(value["method"]["GeometricBrownian"]["drift"], "0.05");
+        assert_eq!(value["method"]["GeometricBrownian"]["volatility"], 0.25);
+
+        // Deserialize back to verify round-trip
+        let deserialized: SimulationParameters = from_str(&json).unwrap();
+
+        // Check a few key fields to verify successful deserialization
+        assert_eq!(deserialized.symbol, "AAPL");
+        assert_eq!(deserialized.initial_price, pos!(150.75));
+        assert_eq!(deserialized.chain_size, Some(15));
+
+        // For method, we need to match the enum variant
+        match deserialized.method {
+            SimulationMethod::GeometricBrownian { dt, drift, volatility } => {
+                assert_eq!(dt, pos!(0.0027));
+                assert_eq!(drift, dec!(0.05));
+                assert_eq!(volatility, pos!(0.25));
+            },
+            _ => panic!("Wrong simulation method variant deserialized"),
+        }
+    }
+
+    #[test]
+    fn test_simulation_parameters_with_optional_fields_none() {
+        // Create params with None for optional fields
+        let params = SimulationParameters {
+            symbol: "SPY".to_string(),
+            steps: 20,
+            initial_price: pos!(420.50),
+            days_to_expiration: pos!(30.0),
+            volatility: pos!(0.18),
+            risk_free_rate: dec!(0.035),
+            dividend_yield: pos!(0.01),
+            method: SimulationMethod::Brownian {
+                dt: pos!(0.0027),
+                drift: dec!(0.0),
+                volatility: pos!(0.18),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: None,
+            strike_interval: None,
+            skew_factor: None,
+            spread: None,
+        };
+
+        // Serialize to JSON
+        let json = to_string(&params).unwrap();
+
+        // Parse JSON to verify structure
+        let value: Value = serde_json::from_str(&json).unwrap();
+
+        // Check that optional fields are null or missing
+        assert!(value.get("chain_size").is_none() || value["chain_size"].is_null());
+        assert!(value.get("strike_interval").is_none() || value["strike_interval"].is_null());
+        assert!(value.get("skew_factor").is_none() || value["skew_factor"].is_null());
+        assert!(value.get("spread").is_none() || value["spread"].is_null());
+
+        // Deserialize back and verify
+        let deserialized: SimulationParameters = from_str(&json).unwrap();
+        assert_eq!(deserialized.chain_size, None);
+        assert_eq!(deserialized.strike_interval, None);
+        assert_eq!(deserialized.skew_factor, None);
+        assert_eq!(deserialized.spread, None);
+    }
+
+    #[test]
+    fn test_deserialization_from_json_string() {
+        // Create a JSON string directly
+        let json = r#"{
+            "symbol": "TSLA",
+            "steps": 50,
+            "initial_price": 240.35,
+            "days_to_expiration": 60,
+            "volatility": 0.35,
+            "risk_free_rate": "0.045",
+            "dividend_yield": 0,
+            "method": {
+                "Brownian": {
+                    "dt": 0.0027,
+                    "drift": "0.02",
+                    "volatility": 0.35
+                }
+            },
+            "time_frame": "Day",
+            "chain_size": 20,
+            "strike_interval": 10.0,
+            "skew_factor": "0.001",
+            "spread": 0.025
+        }"#;
+
+        // Deserialize
+        let params: SimulationParameters = from_str(json).unwrap();
+
+        // Verify fields
+        assert_eq!(params.symbol, "TSLA");
+        assert_eq!(params.steps, 50);
+        assert_eq!(params.initial_price, pos!(240.35));
+        assert_eq!(params.days_to_expiration, pos!(60.0));
+        assert_eq!(params.volatility, pos!(0.35));
+        assert_eq!(params.risk_free_rate, dec!(0.045));
+        assert_eq!(params.dividend_yield, pos!(0.0));
+        assert_eq!(params.time_frame, TimeFrame::Day);
+        assert_eq!(params.chain_size, Some(20));
+        assert_eq!(params.strike_interval, Some(pos!(10.0)));
+        assert_eq!(params.skew_factor, Some(dec!(0.001)));
+        assert_eq!(params.spread, Some(pos!(0.025)));
+
+        // Check method variant
+        match params.method {
+            SimulationMethod::Brownian { dt, drift, volatility } => {
+                assert_eq!(dt, pos!(0.0027));
+                assert_eq!(drift, dec!(0.02));
+                assert_eq!(volatility, pos!(0.35));
+            },
+            _ => panic!("Wrong simulation method variant deserialized"),
+        }
+    }
+
+    #[test]
+    fn test_different_simulation_methods() {
+        // Test serialization/deserialization with different simulation methods
+
+        // Test with MeanReverting method
+        let params_mr = SimulationParameters {
+            symbol: "GLD".to_string(),
+            steps: 40,
+            initial_price: pos!(1950.0),
+            days_to_expiration: pos!(90.0),
+            volatility: pos!(0.15),
+            risk_free_rate: dec!(0.04),
+            dividend_yield: pos!(0.0),
+            method: SimulationMethod::MeanReverting {
+                dt: pos!(0.0027),
+                volatility: pos!(0.15),
+                speed: pos!(0.5),
+                mean: pos!(2000.0),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(25),
+            strike_interval: Some(pos!(25.0)),
+            skew_factor: None,
+            spread: Some(pos!(0.01)),
+        };
+
+        let json_mr = to_string(&params_mr).unwrap();
+        let deserialized_mr: SimulationParameters = from_str(&json_mr).unwrap();
+
+        match deserialized_mr.method {
+            SimulationMethod::MeanReverting { dt, volatility, speed, mean } => {
+                assert_eq!(dt, pos!(0.0027));
+                assert_eq!(volatility, pos!(0.15));
+                assert_eq!(speed, pos!(0.5));
+                assert_eq!(mean, pos!(2000.0));
+            },
+            _ => panic!("Wrong simulation method variant deserialized"),
+        }
+
+        // Test with Historical method
+        let params_hist = SimulationParameters {
+            symbol: "OIL".to_string(),
+            steps: 30,
+            initial_price: pos!(75.0),
+            days_to_expiration: pos!(30.0),
+            volatility: pos!(0.25),
+            risk_free_rate: dec!(0.035),
+            dividend_yield: pos!(0.0),
+            method: SimulationMethod::Historical {
+                timeframe: TimeFrame::Day,
+                prices: vec![pos!(75.0), pos!(76.2), pos!(74.8), pos!(77.5), pos!(78.1)],
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(15),
+            strike_interval: Some(pos!(5.0)),
+            skew_factor: None,
+            spread: None,
+        };
+
+        let json_hist = to_string(&params_hist).unwrap();
+        let deserialized_hist: SimulationParameters = from_str(&json_hist).unwrap();
+
+        match deserialized_hist.method {
+            SimulationMethod::Historical { timeframe, prices } => {
+                assert_eq!(timeframe, TimeFrame::Day);
+                assert_eq!(prices.len(), 5);
+                assert_eq!(prices[0], pos!(75.0));
+                assert_eq!(prices[4], pos!(78.1));
+            },
+            _ => panic!("Wrong simulation method variant deserialized"),
+        }
+    }
+
+    #[test]
+    fn test_timeframe_serialization() {
+        // Test different TimeFrame values
+        let timeframes = vec![
+            (TimeFrame::Minute, "Minute"),
+            (TimeFrame::Hour, "Hour"),
+            (TimeFrame::Day, "Day"),
+            (TimeFrame::Week, "Week"),
+            (TimeFrame::Month, "Month"),
+        ];
+
+        for (tf, expected_str) in timeframes {
+            let params = SimulationParameters {
+                symbol: "TEST".to_string(),
+                steps: 10,
+                initial_price: pos!(100.0),
+                days_to_expiration: pos!(30.0),
+                volatility: pos!(0.2),
+                risk_free_rate: dec!(0.03),
+                dividend_yield: pos!(0.01),
+                method: SimulationMethod::GeometricBrownian {
+                    dt: pos!(0.0027),
+                    drift: dec!(0.0),
+                    volatility: pos!(0.2),
+                },
+                time_frame: tf,
+                chain_size: None,
+                strike_interval: None,
+                skew_factor: None,
+                spread: None,
+            };
+
+            let json = to_string(&params).unwrap();
+            let value: Value = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(value["time_frame"].as_str().unwrap(), expected_str);
+
+            let deserialized: SimulationParameters = from_str(&json).unwrap();
+            assert_eq!(deserialized.time_frame, tf);
+        }
+    }
+
+    #[test]
+    fn test_negative_values() {
+        // Test with some negative decimal values
+        let params = SimulationParameters {
+            symbol: "INDEX".to_string(),
+            steps: 25,
+            initial_price: pos!(1000.0),
+            days_to_expiration: pos!(30.0),
+            volatility: pos!(0.2),
+            risk_free_rate: dec!(-0.01), // Negative rate
+            dividend_yield: pos!(0.02),
+            method: SimulationMethod::JumpDiffusion {
+                dt: pos!(0.0027),
+                drift: dec!(-0.02), // Negative drift
+                volatility: pos!(0.2),
+                intensity: pos!(2.0),
+                jump_mean: dec!(-0.05), // Negative jump mean
+                jump_volatility: pos!(0.1),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(10),
+            strike_interval: Some(pos!(10.0)),
+            skew_factor: Some(dec!(-0.0005)), // Negative skew
+            spread: Some(pos!(0.015)),
+        };
+
+        let json = to_string(&params).unwrap();
+
+        // Check specific negative values
+        let value: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["risk_free_rate"], "-0.01");
+        assert_eq!(value["method"]["JumpDiffusion"]["drift"], "-0.02");
+        assert_eq!(value["method"]["JumpDiffusion"]["jump_mean"], "-0.05");
+        assert_eq!(value["skew_factor"], "-0.0005");
+
+        // Deserialize and verify
+        let deserialized: SimulationParameters = from_str(&json).unwrap();
+        assert_eq!(deserialized.risk_free_rate, dec!(-0.01));
+        assert_eq!(deserialized.skew_factor, Some(dec!(-0.0005)));
+
+        match deserialized.method {
+            SimulationMethod::JumpDiffusion { drift, jump_mean, .. } => {
+                assert_eq!(drift, dec!(-0.02));
+                assert_eq!(jump_mean, dec!(-0.05));
+            },
+            _ => panic!("Wrong simulation method variant deserialized"),
+        }
     }
 }
