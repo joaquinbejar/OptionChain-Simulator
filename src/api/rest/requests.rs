@@ -87,32 +87,43 @@ impl Default for CreateSessionRequest {
 /// This is a partial update, so all fields are optional.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UpdateSessionRequest {
-    /// The ticker symbol or identifier for the underlying asset
+    /// - `symbol` (`String`): The name or ticker symbol of the asset being simulated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbol: Option<String>,
-    /// The initial price of the underlying asset
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub initial_price: Option<f64>,
-    /// The volatility parameter for the simulation (annualized)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub volatility: Option<f64>,
-    /// The risk-free interest rate (decimal, e.g., 0.05 for 5%)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub risk_free_rate: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strikes: Option<Vec<f64>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expirations: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub method: Option<String>,
+    /// - `steps` (`usize`): The number of discrete time steps or intervals in the simulation process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub steps: Option<usize>,
+    /// - `initial_price` (`Positive`): The initial starting price of the asset. This must be a positive value.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub time_frame: Option<String>,
+    pub initial_price: Option<f64>,
+    /// - `days_to_expiration` (`Positive`): The number of days until the expiration of the asset or contract. This must be a positive value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub days_to_expiration: Option<f64>,
+    /// - `volatility` (`Positive`): The expected volatility (standard deviation) of the asset's returns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volatility: Option<f64>,
+    /// - `risk_free_rate` (`Decimal`): The risk-free rate of return, typically represented as an annualized percentage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub risk_free_rate: Option<f64>,
+    /// - `dividend_yield` (`Positive`): The annualized dividend yield of the asset, expressed as a positive value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dividend_yield: Option<f64>,
+    /// - `method` (`SimulationMethod`): The simulation method or algorithm to be used, defining the behavior of the simulation process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<ApiWalkType>,
+    /// - `time_frame` (`TimeFrame`): The time frame for the simulation intervals, such as daily, weekly, or hourly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_frame: Option<ApiTimeFrame>,
+    /// - `chain_size` (`Option<usize>`): The optional size of the option chain being simulated. If `None`, this is not specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_size: Option<usize>,
+    /// - `strike_interval` (`Option<Positive>`): The optional interval between strike prices for options. If `None`, this is not specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strike_interval: Option<f64>,
+    /// - `skew_factor` (`Option<Decimal>`): An optional factor that adjusts the skew of the distribution. For example, it can be used to bias option pricing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skew_factor: Option<f64>,
+    /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
 }
