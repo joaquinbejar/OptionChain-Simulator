@@ -6,6 +6,9 @@ use crate::session::SessionManager;
 use actix_web::{App, HttpServer, web};
 use std::sync::Arc;
 use tracing::info;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+use crate::api::rest::swagger::ApiDoc;
 
 /// Configures the routes for the web application under the "/api/v1/chain" endpoint.
 ///
@@ -53,6 +56,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig, session_manager: Arc<Sessi
             .route(web::patch().to(update_session))
             .route(web::delete().to(delete_session)),
     );
+        // .service(SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", ApiDoc::openapi()));
+    
 }
 
 /// Starts the HTTP server with the specified configuration
