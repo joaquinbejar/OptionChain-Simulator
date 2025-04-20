@@ -2,13 +2,13 @@ use crate::api::rest::handlers::{
     create_session, delete_session, get_next_step, replace_session, update_session,
 };
 use crate::api::rest::models::ListenOn;
+use crate::api::rest::swagger::ApiDoc;
 use crate::session::SessionManager;
 use actix_web::{App, HttpServer, web};
 use std::sync::Arc;
 use tracing::info;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
-use crate::api::rest::swagger::ApiDoc;
 
 /// Configures the routes for the web application under the "/api/v1/chain" endpoint.
 ///
@@ -48,16 +48,18 @@ use crate::api::rest::swagger::ApiDoc;
 /// sharing of session data.
 ///
 pub fn configure_routes(cfg: &mut web::ServiceConfig, session_manager: Arc<SessionManager>) {
-    cfg.app_data(web::Data::new(session_manager)).service(
-        web::resource("/api/v1/chain")
-            .route(web::post().to(create_session))
-            .route(web::get().to(get_next_step))
-            .route(web::put().to(replace_session))
-            .route(web::patch().to(update_session))
-            .route(web::delete().to(delete_session)),
-    );
-        // .service(SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", ApiDoc::openapi()));
-    
+    cfg.app_data(web::Data::new(session_manager))
+        .service(
+            web::resource("/api/v1/chain")
+                .route(web::post().to(create_session))
+                .route(web::get().to(get_next_step))
+                .route(web::put().to(replace_session))
+                .route(web::patch().to(update_session))
+                .route(web::delete().to(delete_session)),
+        )
+        .service(
+            SwaggerUi::new("/swagger-ui/{_:.*}").url("/api-docs/openapi.json", ApiDoc::openapi()),
+        );
 }
 
 /// Starts the HTTP server with the specified configuration

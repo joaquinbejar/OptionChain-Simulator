@@ -1,9 +1,8 @@
 pub(crate) mod controller;
-mod middleware;
-pub(crate) mod requests;
-mod responses;
-mod routes;
-
 pub(crate) mod handlers;
+mod middleware;
 pub(crate) mod models;
+pub(crate) mod requests;
+pub(crate) mod responses;
+mod routes;
 pub mod swagger;

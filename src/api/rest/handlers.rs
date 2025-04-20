@@ -1,11 +1,44 @@
 use crate::api::rest::requests::CreateSessionRequest;
-use crate::api::rest::responses::{SessionParametersResponse, SessionResponse};
+use crate::api::rest::responses::{ErrorResponse, SessionParametersResponse, SessionResponse};
 use crate::session::SessionManager;
 use crate::utils::ChainError;
 use actix_web::{HttpResponse, Responder, web};
 use std::sync::Arc;
 use uuid::Uuid;
 
+#[utoipa::path(
+    post,
+    path = "/api/v1/chain",
+    request_body(
+        example = r#"
+                    {
+                      "symbol": "AAPL",
+                      "steps": 30,
+                      "initial_price": 185.5,
+                      "days_to_expiration": 45.0,
+                      "volatility": 0.25,
+                      "risk_free_rate": 0.04,
+                      "dividend_yield": 0.005,
+                      "method": {
+                        "GeometricBrownian": {
+                          "dt": 0.004,
+                          "drift": 0.05,
+                          "volatility": 0.25
+                        }
+                      },
+                      "time_frame": "Day",
+                      "chain_size": 15,
+                      "strike_interval": 5.0,
+                      "skew_factor": 0.0005,
+                      "spread": 0.02
+                    }
+                    "#
+    ),
+    responses(
+        (status = 200, description = "Session created successfully", body = SessionResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse)
+    )
+)]
 pub(crate) async fn create_session(
     _session_manager: web::Data<Arc<SessionManager>>,
     _req: web::Json<CreateSessionRequest>,

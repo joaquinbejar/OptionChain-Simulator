@@ -1,9 +1,8 @@
-use optionstratlib::utils::TimeFrame;
+use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
+use crate::session::SimulationParameters;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
-use crate::session::SimulationParameters;
 
 /// Represents a request to create a new simulation session.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -71,7 +70,7 @@ impl Default for CreateSessionRequest {
             risk_free_rate: 0.0,
             dividend_yield: 0.0,
             method: ApiWalkType::Brownian {
-                dt: 1.0/252.0,
+                dt: 1.0 / 252.0,
                 drift: 0.0,
                 volatility: 0.2,
             },
@@ -83,8 +82,6 @@ impl Default for CreateSessionRequest {
         }
     }
 }
-
-
 
 /// Represents a request to update an existing simulation session.
 /// This is a partial update, so all fields are optional.
@@ -144,11 +141,15 @@ mod tests_create_session_request {
 
         // Check method field
         match default_req.method {
-            ApiWalkType::Brownian { dt, drift, volatility } => {
-                assert!((dt - 1.0/252.0).abs() < 1e-6);
+            ApiWalkType::Brownian {
+                dt,
+                drift,
+                volatility,
+            } => {
+                assert!((dt - 1.0 / 252.0).abs() < 1e-6);
                 assert_eq!(drift, 0.0);
                 assert_eq!(volatility, 0.2);
-            },
+            }
             _ => panic!("Expected default method to be Brownian"),
         }
     }
@@ -240,11 +241,15 @@ mod tests_create_session_request {
 
         // Check method field
         match req.method {
-            ApiWalkType::Brownian { dt, drift, volatility } => {
+            ApiWalkType::Brownian {
+                dt,
+                drift,
+                volatility,
+            } => {
                 assert_eq!(dt, 0.0027);
                 assert_eq!(drift, 0.02);
                 assert_eq!(volatility, 0.4);
-            },
+            }
             _ => panic!("Expected method to be Brownian"),
         }
     }
@@ -279,8 +284,7 @@ mod tests_create_session_request {
         assert_eq!(req.risk_free_rate, 0.03);
         assert_eq!(req.days_to_expiration, 30.0);
 
-
-        // Default fields 
+        // Default fields
         assert_eq!(req.steps, 30); // Default value
         assert_eq!(req.time_frame, ApiTimeFrame::Day); // Default value
         assert_eq!(req.dividend_yield, 0.005); // Default value
@@ -289,11 +293,15 @@ mod tests_create_session_request {
 
         // Method field should be default Brownian
         match req.method {
-            ApiWalkType::GeometricBrownian { dt, drift, volatility } => {
+            ApiWalkType::GeometricBrownian {
+                dt,
+                drift,
+                volatility,
+            } => {
                 assert!((dt - 0.004).abs() < 1e-6);
                 assert_eq!(drift, 0.05);
                 assert_eq!(volatility, 0.25);
-            },
+            }
             _ => panic!("Expected default method to be Brownian"),
         }
     }

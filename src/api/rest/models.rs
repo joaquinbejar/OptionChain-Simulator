@@ -1,10 +1,10 @@
-use std::fmt::Display;
-use optionstratlib::{pos, Positive};
+use optionstratlib::pos;
 use optionstratlib::simulation::WalkType;
 use optionstratlib::utils::TimeFrame;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use utoipa::ToSchema;
 
 /// Represents address binding options for the server
@@ -38,7 +38,6 @@ impl Display for ListenOn {
         write!(f, "{}", self.as_str())
     }
 }
-
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, PartialOrd, ToSchema)]
 pub enum ApiTimeFrame {
@@ -236,29 +235,54 @@ pub enum ApiWalkType {
 impl From<WalkType> for ApiWalkType {
     fn from(value: WalkType) -> Self {
         match value {
-            WalkType::Brownian { dt, drift, volatility } => ApiWalkType::Brownian {
+            WalkType::Brownian {
+                dt,
+                drift,
+                volatility,
+            } => ApiWalkType::Brownian {
                 dt: dt.to_f64(),
                 drift: drift.to_f64().unwrap_or(0.0),
                 volatility: volatility.to_f64(),
             },
-            WalkType::GeometricBrownian { dt, drift, volatility } => ApiWalkType::GeometricBrownian {
+            WalkType::GeometricBrownian {
+                dt,
+                drift,
+                volatility,
+            } => ApiWalkType::GeometricBrownian {
                 dt: dt.to_f64(),
                 drift: drift.to_f64().unwrap_or(0.0),
                 volatility: volatility.to_f64(),
             },
-            WalkType::LogReturns { dt, expected_return, volatility, autocorrelation } => ApiWalkType::LogReturns {
+            WalkType::LogReturns {
+                dt,
+                expected_return,
+                volatility,
+                autocorrelation,
+            } => ApiWalkType::LogReturns {
                 dt: dt.to_f64(),
                 expected_return: expected_return.to_f64().unwrap_or(0.0),
                 volatility: volatility.to_f64(),
                 autocorrelation: autocorrelation.map(|ac| ac.to_f64().unwrap_or(0.0)),
             },
-            WalkType::MeanReverting { dt, volatility, speed, mean } => ApiWalkType::MeanReverting {
+            WalkType::MeanReverting {
+                dt,
+                volatility,
+                speed,
+                mean,
+            } => ApiWalkType::MeanReverting {
                 dt: dt.to_f64(),
                 volatility: volatility.to_f64(),
                 speed: speed.to_f64(),
                 mean: mean.to_f64(),
             },
-            WalkType::JumpDiffusion { dt, drift, volatility, intensity, jump_mean, jump_volatility } => ApiWalkType::JumpDiffusion {
+            WalkType::JumpDiffusion {
+                dt,
+                drift,
+                volatility,
+                intensity,
+                jump_mean,
+                jump_volatility,
+            } => ApiWalkType::JumpDiffusion {
                 dt: dt.to_f64(),
                 drift: drift.to_f64().unwrap_or(0.0),
                 volatility: volatility.to_f64(),
@@ -266,7 +290,14 @@ impl From<WalkType> for ApiWalkType {
                 jump_mean: jump_mean.to_f64().unwrap_or(0.0),
                 jump_volatility: jump_volatility.to_f64(),
             },
-            WalkType::Garch { dt, drift, volatility, alpha, beta, omega } => ApiWalkType::Garch {
+            WalkType::Garch {
+                dt,
+                drift,
+                volatility,
+                alpha,
+                beta,
+                omega,
+            } => ApiWalkType::Garch {
                 dt: dt.to_f64(),
                 drift: drift.to_f64().unwrap_or(0.0),
                 volatility: volatility.to_f64(),
@@ -274,7 +305,15 @@ impl From<WalkType> for ApiWalkType {
                 beta: beta.to_f64(),
                 omega: omega.to_f64(),
             },
-            WalkType::Heston { dt, drift, volatility, kappa, theta, xi, rho } => ApiWalkType::Heston {
+            WalkType::Heston {
+                dt,
+                drift,
+                volatility,
+                kappa,
+                theta,
+                xi,
+                rho,
+            } => ApiWalkType::Heston {
                 dt: dt.to_f64(),
                 drift: drift.to_f64().unwrap_or(0.0),
                 volatility: volatility.to_f64(),
@@ -283,7 +322,14 @@ impl From<WalkType> for ApiWalkType {
                 xi: xi.to_f64(),
                 rho: rho.to_f64().unwrap_or(0.0),
             },
-            WalkType::Custom { dt, drift, volatility, vov, vol_speed, vol_mean } => ApiWalkType::Custom {
+            WalkType::Custom {
+                dt,
+                drift,
+                volatility,
+                vov,
+                vol_speed,
+                vol_mean,
+            } => ApiWalkType::Custom {
                 dt: dt.to_f64(),
                 drift: drift.to_f64().unwrap_or(0.0),
                 volatility: volatility.to_f64(),
@@ -302,29 +348,55 @@ impl From<WalkType> for ApiWalkType {
 impl From<ApiWalkType> for WalkType {
     fn from(value: ApiWalkType) -> Self {
         match value {
-            ApiWalkType::Brownian { dt, drift, volatility } => WalkType::Brownian {
+            ApiWalkType::Brownian {
+                dt,
+                drift,
+                volatility,
+            } => WalkType::Brownian {
                 dt: pos!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
                 volatility: pos!(volatility),
             },
-            ApiWalkType::GeometricBrownian { dt, drift, volatility } => WalkType::GeometricBrownian {
+            ApiWalkType::GeometricBrownian {
+                dt,
+                drift,
+                volatility,
+            } => WalkType::GeometricBrownian {
                 dt: pos!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
                 volatility: pos!(volatility),
             },
-            ApiWalkType::LogReturns { dt, expected_return, volatility, autocorrelation } => WalkType::LogReturns {
+            ApiWalkType::LogReturns {
+                dt,
+                expected_return,
+                volatility,
+                autocorrelation,
+            } => WalkType::LogReturns {
                 dt: pos!(dt),
                 expected_return: Decimal::try_from(expected_return).unwrap_or_default(),
                 volatility: pos!(volatility),
-                autocorrelation: autocorrelation.map(|ac| Decimal::try_from(ac).unwrap_or_default()),
+                autocorrelation: autocorrelation
+                    .map(|ac| Decimal::try_from(ac).unwrap_or_default()),
             },
-            ApiWalkType::MeanReverting { dt, volatility, speed, mean } => WalkType::MeanReverting {
+            ApiWalkType::MeanReverting {
+                dt,
+                volatility,
+                speed,
+                mean,
+            } => WalkType::MeanReverting {
                 dt: pos!(dt),
                 volatility: pos!(volatility),
                 speed: pos!(speed),
                 mean: pos!(mean),
             },
-            ApiWalkType::JumpDiffusion { dt, drift, volatility, intensity, jump_mean, jump_volatility } => WalkType::JumpDiffusion {
+            ApiWalkType::JumpDiffusion {
+                dt,
+                drift,
+                volatility,
+                intensity,
+                jump_mean,
+                jump_volatility,
+            } => WalkType::JumpDiffusion {
                 dt: pos!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
                 volatility: pos!(volatility),
@@ -332,7 +404,14 @@ impl From<ApiWalkType> for WalkType {
                 jump_mean: Decimal::try_from(jump_mean).unwrap_or_default(),
                 jump_volatility: pos!(jump_volatility),
             },
-            ApiWalkType::Garch { dt, drift, volatility, alpha, beta, omega } => WalkType::Garch {
+            ApiWalkType::Garch {
+                dt,
+                drift,
+                volatility,
+                alpha,
+                beta,
+                omega,
+            } => WalkType::Garch {
                 dt: pos!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
                 volatility: pos!(volatility),
@@ -340,7 +419,15 @@ impl From<ApiWalkType> for WalkType {
                 beta: pos!(beta),
                 omega: pos!(omega),
             },
-            ApiWalkType::Heston { dt, drift, volatility, kappa, theta, xi, rho } => WalkType::Heston {
+            ApiWalkType::Heston {
+                dt,
+                drift,
+                volatility,
+                kappa,
+                theta,
+                xi,
+                rho,
+            } => WalkType::Heston {
                 dt: pos!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
                 volatility: pos!(volatility),
@@ -349,7 +436,14 @@ impl From<ApiWalkType> for WalkType {
                 xi: pos!(xi),
                 rho: Decimal::try_from(rho).unwrap_or_default(),
             },
-            ApiWalkType::Custom { dt, drift, volatility, vov, vol_speed, vol_mean } => WalkType::Custom {
+            ApiWalkType::Custom {
+                dt,
+                drift,
+                volatility,
+                vov,
+                vol_speed,
+                vol_mean,
+            } => WalkType::Custom {
                 dt: pos!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
                 volatility: pos!(volatility),

@@ -1,12 +1,12 @@
+use crate::api::CreateSessionRequest;
 use crate::utils::{ChainError, UuidGenerator};
-use optionstratlib::{pos, Positive};
 pub use optionstratlib::simulation::WalkType as SimulationMethod;
 use optionstratlib::utils::TimeFrame;
+use optionstratlib::{Positive, pos};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use uuid::Uuid;
-use crate::api::CreateSessionRequest;
 
 /// Represents the various states a session can be in.
 ///
@@ -120,7 +120,9 @@ impl From<CreateSessionRequest> for SimulationParameters {
             time_frame: req.time_frame.into(),
             chain_size: req.chain_size,
             strike_interval: req.strike_interval.map(|v| pos!(v)),
-            skew_factor: req.skew_factor.map(|v| Decimal::try_from(v).unwrap_or_default()),
+            skew_factor: req
+                .skew_factor
+                .map(|v| Decimal::try_from(v).unwrap_or_default()),
             spread: req.spread.map(|v| pos!(v)),
         }
     }
@@ -332,11 +334,11 @@ impl Session {
 
 #[cfg(test)]
 mod tests_simulation_fparameters_serialization {
-    use optionstratlib::pos;
-    use rust_decimal_macros::dec;
     use super::*;
     use crate::session::SimulationParameters;
-    use serde_json::{from_str, to_string, Value};
+    use optionstratlib::pos;
+    use rust_decimal_macros::dec;
+    use serde_json::{Value, from_str, to_string};
 
     #[test]
     fn test_simulation_parameters_serialization() {
@@ -382,7 +384,12 @@ mod tests_simulation_fparameters_serialization {
 
         // Check the method field specifically
         assert!(value["method"].is_object());
-        assert!(value["method"].as_object().unwrap().contains_key("GeometricBrownian"));
+        assert!(
+            value["method"]
+                .as_object()
+                .unwrap()
+                .contains_key("GeometricBrownian")
+        );
         assert_eq!(value["method"]["GeometricBrownian"]["dt"], 0.0027);
         assert_eq!(value["method"]["GeometricBrownian"]["drift"], "0.05");
         assert_eq!(value["method"]["GeometricBrownian"]["volatility"], 0.25);
@@ -397,11 +404,15 @@ mod tests_simulation_fparameters_serialization {
 
         // For method, we need to match the enum variant
         match deserialized.method {
-            SimulationMethod::GeometricBrownian { dt, drift, volatility } => {
+            SimulationMethod::GeometricBrownian {
+                dt,
+                drift,
+                volatility,
+            } => {
                 assert_eq!(dt, pos!(0.0027));
                 assert_eq!(drift, dec!(0.05));
                 assert_eq!(volatility, pos!(0.25));
-            },
+            }
             _ => panic!("Wrong simulation method variant deserialized"),
         }
     }
@@ -493,11 +504,15 @@ mod tests_simulation_fparameters_serialization {
 
         // Check method variant
         match params.method {
-            SimulationMethod::Brownian { dt, drift, volatility } => {
+            SimulationMethod::Brownian {
+                dt,
+                drift,
+                volatility,
+            } => {
                 assert_eq!(dt, pos!(0.0027));
                 assert_eq!(drift, dec!(0.02));
                 assert_eq!(volatility, pos!(0.35));
-            },
+            }
             _ => panic!("Wrong simulation method variant deserialized"),
         }
     }
@@ -532,12 +547,17 @@ mod tests_simulation_fparameters_serialization {
         let deserialized_mr: SimulationParameters = from_str(&json_mr).unwrap();
 
         match deserialized_mr.method {
-            SimulationMethod::MeanReverting { dt, volatility, speed, mean } => {
+            SimulationMethod::MeanReverting {
+                dt,
+                volatility,
+                speed,
+                mean,
+            } => {
                 assert_eq!(dt, pos!(0.0027));
                 assert_eq!(volatility, pos!(0.15));
                 assert_eq!(speed, pos!(0.5));
                 assert_eq!(mean, pos!(2000.0));
-            },
+            }
             _ => panic!("Wrong simulation method variant deserialized"),
         }
 
@@ -570,7 +590,7 @@ mod tests_simulation_fparameters_serialization {
                 assert_eq!(prices.len(), 5);
                 assert_eq!(prices[0], pos!(75.0));
                 assert_eq!(prices[4], pos!(78.1));
-            },
+            }
             _ => panic!("Wrong simulation method variant deserialized"),
         }
     }
@@ -658,10 +678,12 @@ mod tests_simulation_fparameters_serialization {
         assert_eq!(deserialized.skew_factor, Some(dec!(-0.0005)));
 
         match deserialized.method {
-            SimulationMethod::JumpDiffusion { drift, jump_mean, .. } => {
+            SimulationMethod::JumpDiffusion {
+                drift, jump_mean, ..
+            } => {
                 assert_eq!(drift, dec!(-0.02));
                 assert_eq!(jump_mean, dec!(-0.05));
-            },
+            }
             _ => panic!("Wrong simulation method variant deserialized"),
         }
     }

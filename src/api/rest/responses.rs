@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 /// Response containing session information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SessionResponse {
     /// The unique identifier for the session
     pub id: String,
@@ -21,7 +21,7 @@ pub struct SessionResponse {
 }
 
 /// Nested response with simulation parameters.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SessionParametersResponse {
     /// The ticker symbol or identifier for the underlying asset
     pub symbol: String,
@@ -48,7 +48,7 @@ pub struct SessionParametersResponse {
 }
 
 /// Response containing option chain data directly using OptionChain from OptionStratLib
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChainResponse {
     /// The underlying asset's identifier
     pub underlying: String,
@@ -102,3 +102,6 @@ pub struct SessionInfoResponse {
     /// The total number of steps
     pub total_steps: usize,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorResponse {}
