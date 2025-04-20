@@ -1,27 +1,37 @@
-use optionstratlib::simulation::WalkType;
+use optionchain_simulator::infrastructure::{RedisClient, RedisConfig};
+use optionchain_simulator::session::{
+    InRedisSessionStore, SessionManager, SimulationMethod, SimulationParameters,
+};
+use optionchain_simulator::utils::ChainError;
 use optionstratlib::utils::time::convert_time_frame;
-use optionstratlib::utils::{TimeFrame, setup_logger};
-use optionstratlib::{ExpirationDate, Positive, pos, spos};
+use optionstratlib::utils::{Len, TimeFrame, setup_logger};
+use optionstratlib::{Positive, pos, spos};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
-use tracing::{Level, info, error};
+use tracing::{error, info};
 use uuid::Uuid;
 
-use optionchain_simulator::session::{InMemorySessionStore, SimulationMethod};
-use optionchain_simulator::session::{Session, SessionManager, SessionState, SimulationParameters};
-use optionchain_simulator::utils::error::ChainError;
-
-/// Example demonstrating the usage of SessionManager and Session for option chain simulation
+/// Example demonstrating the usage of SessionManager with Redis-backed session storage
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger();
 
-    info!("Starting OptionChain-Simulator example");
+    info!("Starting OptionChain-Simulator Redis example");
 
-    // Create an in-memory session store
-    let store = Arc::new(InMemorySessionStore::new());
+    // Create Redis client
+    let redis_config = RedisConfig::default();
 
-    // Initialize the session manager
+    info!("Connecting to Redis at {}", redis_config);
+    let redis_client = Arc::new(RedisClient::new(redis_config)?);
+
+    // Create a Redis-backed session store
+    let store = Arc::new(InRedisSessionStore::new(
+        redis_client,
+        Some("optionchain:session:".to_string()), // Custom key prefix
+        Some(3600),                               // 1 hour TTL
+    ));
+
+    // Initialize the session manager with Redis store
     let session_manager = SessionManager::new(store.clone());
 
     // Define simulation parameters
@@ -52,10 +62,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => error!("Expected error occurred: {}", e),
             }
 
-            // Cleanup expired sessions
+            // Cleanup expired sessions (Redis handles TTL automatically)
             match session_manager.cleanup_sessions() {
                 Ok(count) => info!("Cleaned up {} expired sessions", count),
                 Err(e) => error!("Error cleaning up sessions: {}", e),
+            }
+
+            // Optional: Check if the session still exists in Redis after deletion
+            match session_manager.get_next_step(session.id) {
+                Ok(_) => info!("Session still exists in Redis (unexpected)"),
+                Err(e) => error!("Confirmed session was deleted: {}", e),
             }
         }
         Err(e) => {
@@ -63,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    info!("OptionChain-Simulator example completed");
+    info!("OptionChain-Simulator Redis example completed");
     Ok(())
 }
 
@@ -106,6 +122,8 @@ fn run_session_lifecycle(
         session_id = %session_id,
         current_step = session.current_step,
         state = ?session.state,
+        underlying_price = %chain.underlying_price,
+        contracts_count = chain.len(),
         "Retrieved first option chain"
     );
 
@@ -113,11 +131,12 @@ fn run_session_lifecycle(
     for i in 0..3 {
         info!(session_id = %session_id, step = i+2, "Advancing to next step");
         match session_manager.get_next_step(session_id) {
-            Ok((session, _chain)) => {
+            Ok((session, chain)) => {
                 info!(
                     session_id = %session_id,
                     current_step = session.current_step,
                     state = ?session.state,
+                    underlying_price = %chain.underlying_price,
                     "Advanced simulation successfully"
                 );
             }
@@ -149,7 +168,8 @@ fn run_session_lifecycle(
             info!(
                 session_id = %session_id,
                 state = ?modified_session.state,
-                "Session parameters modified"
+                volatility = %volatility,
+                "Session parameters modified with increased volatility"
             );
         }
         Err(e) => {
@@ -162,13 +182,25 @@ fn run_session_lifecycle(
     for i in 0..2 {
         info!(session_id = %session_id, step = i+1, "Advancing with modified parameters");
         match session_manager.get_next_step(session_id) {
-            Ok((session, _chain)) => {
+            Ok((session, chain)) => {
                 info!(
                     session_id = %session_id,
                     current_step = session.current_step,
                     state = ?session.state,
+                    underlying_price = %chain.underlying_price,
                     "Advanced simulation with modified parameters"
                 );
+
+                // Get a sample option contract to show volatility effects
+                if let Some(contract) = chain.get_single_iter().next() {
+                    // Fix the access to strike and prices based on your actual OptionContract structure
+                    info!(
+                        strike = %contract.strike(),
+                        call_price = ?contract.call_middle,
+                        put_price = ?contract.put_middle,
+                        "Sample option contract with increased volatility"
+                    );
+                }
             }
             Err(e) => {
                 error!(session_id = %session_id, "Error advancing simulation: {}", e);
@@ -177,7 +209,7 @@ fn run_session_lifecycle(
         }
     }
 
-    // Step 7: Delete the session
+    // Step 5: Delete the session
     info!(session_id = %session_id, "Deleting session");
     match session_manager.delete_session(session_id) {
         Ok(deleted) => {
