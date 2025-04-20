@@ -26,6 +26,8 @@ clickhouse-rs = "1.1.0-alpha.1"
 tokio = { version = "1.44.2", features = ["full"] }
 async-trait = "0.1.88"
 actix-web = { version = "4.0.2", features = ["rustls"] }
+redis = "0.29.5"
+
 
 [dev-dependencies]
 mockall = "0.13.1" 
