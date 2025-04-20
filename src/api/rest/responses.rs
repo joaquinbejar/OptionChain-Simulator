@@ -31,10 +31,6 @@ pub struct SessionParametersResponse {
     pub volatility: f64,
     /// The risk-free interest rate (decimal, e.g., 0.05 for 5%)
     pub risk_free_rate: f64,
-    /// A list of strike prices to include in the option chain
-    pub strikes: Vec<f64>,
-    /// A list of expiration dates in ISO 8601 format (YYYY-MM-DD)
-    pub expirations: Vec<String>,
     /// The simulation method to use (e.g., "Brownian", "GeometricBrownian")
     pub method: String,
     /// The time frame for simulation steps

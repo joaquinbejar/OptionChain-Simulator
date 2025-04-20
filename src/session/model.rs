@@ -1,3 +1,4 @@
+use std::fmt::{Display, Formatter};
 use crate::api::CreateSessionRequest;
 use crate::utils::{ChainError, UuidGenerator};
 pub use optionstratlib::simulation::WalkType as SimulationMethod;
@@ -66,6 +67,20 @@ pub enum SessionState {
     /// error codes, or additional metadata to provide contextual information about
     /// the error.
     Error,
+}
+
+impl Display for SessionState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionState::Initialized => write!(f, "Initialized"),
+            SessionState::InProgress => write!(f, "In Progress"),
+            SessionState::Modified => write!(f, "Modified"),
+            SessionState::Reinitialized => write!(f, "Reinitialized"),
+            SessionState::Completed => write!(f, "Completed"),
+            SessionState::Error => write!(f, "Error"),
+        }
+    }
+
 }
 
 /// `SimulationParameters` is a struct that encapsulates the configuration parameters
