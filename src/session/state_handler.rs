@@ -1,5 +1,6 @@
 use crate::session::{Session, SessionState};
 use crate::utils::error::ChainError;
+use tracing::debug;
 
 /// Handles state transitions for simulation sessions
 pub struct StateProgressionHandler;
@@ -26,8 +27,7 @@ impl StateProgressionHandler {
                 Ok(())
             }
             SessionState::Reinitialized => {
-                session.state = SessionState::InProgress;
-                session.advance_step()?;
+                debug!("Reinitializing session");
                 Ok(())
             }
             SessionState::Completed => Err(ChainError::InvalidState(
