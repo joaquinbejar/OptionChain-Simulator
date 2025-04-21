@@ -1,3 +1,4 @@
+use crate::api::rest::error::map_error;
 use crate::api::rest::models::SessionId;
 use crate::api::rest::requests::{CreateSessionRequest, UpdateSessionRequest};
 use crate::api::rest::responses::{
@@ -6,13 +7,14 @@ use crate::api::rest::responses::{
 };
 use crate::session::{SessionManager, SimulationParameters};
 use crate::utils::ChainError;
-use actix_web::{HttpResponse, Responder, web};
+use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, Utc};
+use optionstratlib::pos;
+use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, info};
 use uuid::Uuid;
-use crate::api::rest::error::map_error;
 
 #[utoipa::path(
     post,
@@ -49,16 +51,14 @@ use crate::api::rest::error::map_error;
     )
 )]
 pub(crate) async fn create_session(
+    req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
-    req: web::Json<CreateSessionRequest>,
+    json_req: web::Json<CreateSessionRequest>,
 ) -> impl Responder {
+    info!("{} {}: body={}", req.method(), req.path(), json_req.0);
+
     // Convert request to domain SimulationParameters
-    let simulation_params = match SimulationParameters::try_from(req.0) {
-        Ok(params) => params,
-        Err(error) => {
-            return map_error(ChainError::InvalidState(error.to_string()));
-        }
-    };
+    let simulation_params: SimulationParameters = json_req.0.into();
 
     // Create session using session manager
     match session_manager.create_session(simulation_params) {
@@ -105,9 +105,17 @@ pub(crate) async fn create_session(
     )
 )]
 pub(crate) async fn get_next_step(
+    req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
 ) -> impl Responder {
+    info!(
+        "{} {}: session_id={}",
+        req.method(),
+        req.path(),
+        query.session_id
+    );
+
     // Parse the session ID
     let session_id = match Uuid::parse_str(&query.session_id) {
         Ok(id) => id,
@@ -187,27 +195,31 @@ pub(crate) async fn get_next_step(
     )
 )]
 pub(crate) async fn replace_session(
+    req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
-    req: web::Json<CreateSessionRequest>,
+    json_req: web::Json<CreateSessionRequest>,
 ) -> impl Responder {
+    info!(
+        "{} {}: body={} session_id={}",
+        req.method(),
+        req.path(),
+        json_req.0,
+        query.session_id
+    );
+
     // Parse the session ID
     let session_id = match Uuid::parse_str(&query.session_id) {
         Ok(id) => id,
         Err(_) => {
             return map_error(ChainError::InvalidState(
-                "Invalid session ID format".to_string()
+                "Invalid session ID format".to_string(),
             ));
         }
     };
 
     // Convert request to domain SimulationParameters
-    let simulation_params = match SimulationParameters::try_from(req.0) {
-        Ok(params) => params,
-        Err(error) => {
-            return map_error(ChainError::InvalidState(error.to_string()));
-        }
-    };
+    let simulation_params: SimulationParameters = json_req.0.into();
 
     // Replace session using session manager
     match session_manager.reinitialize_session(session_id, simulation_params) {
@@ -237,7 +249,7 @@ pub(crate) async fn replace_session(
 
             HttpResponse::Ok().json(response)
         }
-        Err(error) => map_error(error)
+        Err(error) => map_error(error),
     }
 }
 
@@ -248,18 +260,131 @@ pub(crate) async fn replace_session(
         ("sessionid" = String, Query, description = "ID of the session to update")
     ),
     responses(
-        (status = 200, description = "Session updated", body = String),
-        (status = 404, description = "Session not found")
+        (status = 200, description = "Session updated", body = SessionResponse),
+        (status = 404, description = "Session not found"),
+        (status = 400, description = "Invalid request parameters"),
+        (status = 500, description = "Internal server error")
     )
 )]
 pub(crate) async fn update_session(
-    _session_manager: web::Data<Arc<SessionManager>>,
+    req: HttpRequest,
+    session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
-    _req: web::Json<UpdateSessionRequest>,
+    json_req: web::Json<UpdateSessionRequest>,
 ) -> impl Responder {
-    let session_id = &query.session_id;
-    let msg = format!("Session updated ID: {}", session_id);
-    HttpResponse::Ok().body(msg)
+    info!(
+        "{} {}: body={} session_id={}",
+        req.method(),
+        req.path(),
+        json_req.0,
+        query.session_id
+    );
+
+    // Parse the session ID
+    let session_id = match Uuid::parse_str(&query.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return map_error(ChainError::InvalidState(
+                "Invalid session ID format".to_string(),
+            ));
+        }
+    };
+
+    // Get current session to update only the parameters that were provided
+    let current_session = match session_manager.get_session(session_id) {
+        Ok(session) => session,
+        Err(error) => return map_error(error),
+    };
+
+    // Create a new SimulationParameters object with updated values
+    let mut updated_params = current_session.parameters.clone();
+
+    // Update only the fields that are provided in the request
+    if let Some(symbol) = &json_req.symbol {
+        updated_params.symbol = symbol.clone();
+    }
+
+    if let Some(steps) = json_req.steps {
+        updated_params.steps = steps;
+    }
+
+    if let Some(initial_price) = json_req.initial_price {
+        updated_params.initial_price = pos!(initial_price);
+    }
+
+    if let Some(days_to_expiration) = json_req.days_to_expiration {
+        updated_params.days_to_expiration = pos!(days_to_expiration);
+    }
+
+    if let Some(volatility) = json_req.volatility {
+        updated_params.volatility = pos!(volatility);
+    }
+
+    if let Some(risk_free_rate) = json_req.risk_free_rate {
+        updated_params.risk_free_rate = Decimal::try_from(risk_free_rate).unwrap_or_default();
+    }
+
+    if let Some(dividend_yield) = json_req.dividend_yield {
+        updated_params.dividend_yield = pos!(dividend_yield);
+    }
+
+    if let Some(method) = &json_req.method {
+        updated_params.method = method.clone().into();
+    }
+
+    if let Some(time_frame) = json_req.time_frame {
+        updated_params.time_frame = time_frame.into();
+    }
+
+    if let Some(chain_size) = json_req.chain_size {
+        updated_params.chain_size = Some(chain_size);
+    }
+
+    if let Some(strike_interval) = json_req.strike_interval {
+        updated_params.strike_interval = Some(pos!(strike_interval));
+    }
+
+    if let Some(skew_factor) = json_req.skew_factor {
+        updated_params.skew_factor = Some(Decimal::try_from(skew_factor).unwrap_or_default());
+    }
+
+    if let Some(spread) = json_req.spread {
+        updated_params.spread = Some(pos!(spread));
+    }
+
+    // Update the session with new parameters
+    match session_manager.update_session(session_id, updated_params) {
+        Ok(session) => {
+            let created_at_utc = DateTime::<Utc>::from(session.created_at);
+            let updated_at_utc = DateTime::<Utc>::from(session.updated_at);
+
+            let response = SessionResponse {
+                id: session.id.to_string(),
+                created_at: created_at_utc.to_rfc3339(),
+                updated_at: updated_at_utc.to_rfc3339(),
+                parameters: SessionParametersResponse {
+                    symbol: session.parameters.symbol,
+                    initial_price: session.parameters.initial_price.into(),
+                    volatility: session.parameters.volatility.into(),
+                    risk_free_rate: session.parameters.risk_free_rate.to_f64().unwrap_or(0.0),
+                    method: format!("{:?}", session.parameters.method),
+                    time_frame: session.parameters.time_frame.to_string(),
+                    dividend_yield: session.parameters.dividend_yield.into(),
+                    skew_factor: session
+                        .parameters
+                        .skew_factor
+                        .map(|f| f.to_f64().unwrap_or(0.0)),
+                    spread: session.parameters.spread.map(|f| f.into()),
+                },
+                current_step: session.current_step,
+                total_steps: session.total_steps,
+                state: session.state.to_string(),
+            };
+
+            HttpResponse::Ok().json(response)
+        }
+        Err(error) => map_error(error),
+    }
 }
 
 #[utoipa::path(
@@ -275,9 +400,16 @@ pub(crate) async fn update_session(
     )
 )]
 pub(crate) async fn delete_session(
+    req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
 ) -> impl Responder {
+    info!(
+        "{} {}: session_id={}",
+        req.method(),
+        req.path(),
+        query.session_id
+    );
     let session_id = Uuid::parse_str(&query.session_id)
         .map_err(|_| ChainError::InvalidState("Invalid session ID format".to_string()));
 
@@ -304,5 +436,3 @@ pub(crate) async fn delete_session(
         }
     }
 }
-
-
