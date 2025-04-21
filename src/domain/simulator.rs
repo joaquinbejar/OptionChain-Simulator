@@ -15,8 +15,8 @@ use optionstratlib::{
     },
 };
 use rust_decimal::Decimal;
-use std::sync::{Arc, Mutex};
 use rust_decimal_macros::dec;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, instrument};
 
 const DEFAULT_CHAIN_SIZE: usize = 30;
@@ -63,6 +63,12 @@ impl Simulator {
             .lock()
             .map_err(|e| format!("Failed to acquire lock on simulation cache: {}", e))?;
 
+        // Remove the entry for the session if it is in the cache and the session is reinitialized
+        // force call create_random_walk to recalculate the random walk with the new parameters
+        if session.state == SessionState::Reinitialized && cache.contains_key(&session.id) {
+            cache.remove(&session.id);
+        }
+
         // Check if we need to create a new RandomWalk or use an existing one
         if !cache.contains_key(&session.id)
             || session.current_step == 0
@@ -72,7 +78,7 @@ impl Simulator {
                 session_id = %session.id,
                 "Creating new simulation for session"
             );
-
+            debug!("Reset Random Walk with Session: {}", session);
             let random_walk = self.create_random_walk(session)?;
             cache.insert(session.id, random_walk);
         }
@@ -85,7 +91,9 @@ impl Simulator {
         // Get the chain for the current step
         if session.current_step >= random_walk.len() {
             error!("Walker reached end of random walk");
-            return Err(ChainError::SimulatorError("Walker reached end of random walk".to_string()));
+            return Err(ChainError::SimulatorError(
+                "Walker reached end of random walk".to_string(),
+            ));
         }
         let step = random_walk[session.current_step].clone();
 
