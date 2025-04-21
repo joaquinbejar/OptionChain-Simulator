@@ -1,4 +1,3 @@
-use std::fmt::{Display, Formatter};
 use crate::api::CreateSessionRequest;
 use crate::utils::{ChainError, UuidGenerator};
 pub use optionstratlib::simulation::WalkType as SimulationMethod;
@@ -6,6 +5,7 @@ use optionstratlib::utils::TimeFrame;
 use optionstratlib::{Positive, pos};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::SystemTime;
 use uuid::Uuid;
 
@@ -69,8 +69,8 @@ pub enum SessionState {
     Error,
 }
 
-impl Display for SessionState {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SessionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SessionState::Initialized => write!(f, "Initialized"),
             SessionState::InProgress => write!(f, "In Progress"),
@@ -80,7 +80,6 @@ impl Display for SessionState {
             SessionState::Error => write!(f, "Error"),
         }
     }
-
 }
 
 /// `SimulationParameters` is a struct that encapsulates the configuration parameters
@@ -119,6 +118,15 @@ pub struct SimulationParameters {
     pub skew_factor: Option<Decimal>,
     /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     pub spread: Option<Positive>,
+}
+
+impl fmt::Display for SimulationParameters {
+    /// Serialize `SimulationParameters` to JSON string for Display.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Serialize to JSON, map any error to fmt::Error
+        let json = serde_json::to_string(self).map_err(|_| fmt::Error)?;
+        write!(f, "{}", json)
+    }
 }
 
 impl From<CreateSessionRequest> for SimulationParameters {
@@ -326,7 +334,7 @@ impl Session {
     ///   indicate that the simulation has been reset.
     ///
     pub fn reinitialize(&mut self, new_params: SimulationParameters) {
-        self.total_steps = new_params.steps.clone();
+        self.total_steps = new_params.steps;
         self.parameters = new_params;
         self.current_step = 0;
         self.updated_at = SystemTime::now();
@@ -344,6 +352,15 @@ impl Session {
     ///
     pub fn is_active(&self) -> bool {
         self.state != SessionState::Completed && self.state != SessionState::Error
+    }
+}
+
+impl fmt::Display for Session {
+    /// Serialize `Session` to JSON string for Display.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Same approach: convert to JSON string
+        let json = serde_json::to_string(self).map_err(|_| fmt::Error)?;
+        write!(f, "{}", json)
     }
 }
 
