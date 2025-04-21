@@ -13,11 +13,14 @@ use optionstratlib::{
         randomwalk::RandomWalk,
         steps::{Step, Xstep, Ystep},
     },
-    utils::time::get_x_days_formatted,
 };
 use rust_decimal::Decimal;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info, instrument};
+use rust_decimal_macros::dec;
+use tracing::{debug, error, info, instrument};
+
+const DEFAULT_CHAIN_SIZE: usize = 30;
+const DEFAULT_SKEW_FACTOR: Decimal = dec!(0.0005);
 
 /// Simulator handles the generation of option chains based on simulation parameters
 pub struct Simulator {
@@ -80,6 +83,10 @@ impl Simulator {
             .ok_or_else(|| format!("Failed to get random walk for session {}", session.id))?;
 
         // Get the chain for the current step
+        if session.current_step >= random_walk.len() {
+            error!("Walker reached end of random walk");
+            return Err(ChainError::SimulatorError("Walker reached end of random walk".to_string()));
+        }
         let step = random_walk[session.current_step].clone();
 
         let chain = step.y.value().clone();
@@ -113,9 +120,9 @@ impl Simulator {
         let time_frame = params.time_frame;
 
         // Set default values if not provided
-        let chain_size = params.chain_size.unwrap_or(10);
+        let chain_size = params.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE);
         let strike_interval = params.strike_interval.unwrap_or(Positive::ONE);
-        let skew_factor = params.skew_factor.unwrap_or(Decimal::new(5, 4)); // Default to 0.0005
+        let skew_factor = params.skew_factor.unwrap_or(DEFAULT_SKEW_FACTOR);
         let spread = params.spread.unwrap_or(pos!(0.01));
 
         // Create option data price parameters
@@ -141,8 +148,7 @@ impl Simulator {
         );
 
         // Build the initial chain
-        let mut initial_chain = OptionChain::build_chain(&build_params);
-        initial_chain.update_expiration_date(get_x_days_formatted(2));
+        let initial_chain = OptionChain::build_chain(&build_params);
 
         // Create walker for a random walk
         let walker = Box::new(Walker::new());

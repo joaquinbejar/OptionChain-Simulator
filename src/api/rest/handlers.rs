@@ -1,14 +1,18 @@
 use crate::api::rest::models::SessionId;
 use crate::api::rest::requests::{CreateSessionRequest, UpdateSessionRequest};
-use crate::api::rest::responses::{ErrorResponse, SessionParametersResponse, SessionResponse};
+use crate::api::rest::responses::{
+    ChainResponse, ErrorResponse, OptionContractResponse, OptionPriceResponse, SessionInfoResponse,
+    SessionParametersResponse, SessionResponse,
+};
 use crate::session::{SessionManager, SimulationParameters};
 use crate::utils::ChainError;
 use actix_web::{HttpResponse, Responder, web};
-use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
+use std::sync::Arc;
 use tracing::error;
 use uuid::Uuid;
+use crate::api::rest::error::map_error;
 
 #[utoipa::path(
     post,
@@ -83,7 +87,7 @@ pub(crate) async fn create_session(
 
             HttpResponse::Created().json(response)
         }
-        Err(error) => map_error(error)
+        Err(error) => map_error(error),
     }
 }
 
@@ -94,17 +98,75 @@ pub(crate) async fn create_session(
         ("sessionid" = String, Query, description = "ID of the session to get next step for")
     ),
     responses(
-        (status = 200, description = "Next step returned", body = String),
-        (status = 404, description = "Session not found")
+        (status = 200, description = "Next step returned", body = ChainResponse),
+        (status = 404, description = "Session not found"),
+        (status = 410, description = "Simulation completed. No more steps available"),
+        (status = 500, description = "Internal server error")
     )
 )]
 pub(crate) async fn get_next_step(
-    _session_manager: web::Data<Arc<SessionManager>>,
+    session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
 ) -> impl Responder {
-    let session_id = &query.session_id;
-    let msg = format!("Next step for session ID: {} returned", session_id);
-    HttpResponse::Ok().body(msg)
+    // Parse the session ID
+    let session_id = match Uuid::parse_str(&query.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return map_error(ChainError::InvalidState(
+                "Invalid session ID format".to_string(),
+            ));
+        }
+    };
+
+    // Get next step from session manager
+    match session_manager.get_next_step(session_id) {
+        Ok((session, option_chain)) => {
+            // Convert session and option chain to ChainResponse
+            let expiration = option_chain.get_expiration_date();
+            let response = ChainResponse {
+                underlying: option_chain.symbol.clone(),
+                timestamp: Utc::now().to_rfc3339(),
+                price: option_chain.underlying_price.into(),
+                contracts: option_chain
+                    .iter()
+                    .map(|contract| {
+                        let (call_delta, put_delta) = contract.current_deltas();
+                        let call_ask = contract.get_call_buy_price();
+                        let put_ask = contract.get_put_buy_price();
+                        let call_bid = contract.get_call_sell_price();
+                        let put_bid = contract.get_put_sell_price();
+                        let volatility = contract.volatility();
+                        OptionContractResponse {
+                            strike: contract.strike().into(),
+                            expiration: expiration.clone(),
+                            call: OptionPriceResponse {
+                                bid: call_bid.map(|b| b.into()),
+                                ask: call_ask.map(|a| a.into()),
+                                mid: contract.call_middle.map(|m| m.into()),
+                                delta: call_delta.map(|d| d.to_f64().unwrap()),
+                            },
+                            put: OptionPriceResponse {
+                                bid: put_bid.map(|b| b.into()),
+                                ask: put_ask.map(|a| a.into()),
+                                mid: contract.put_middle.map(|m| m.into()),
+                                delta: put_delta.map(|d| d.to_f64().unwrap()),
+                            },
+                            implied_volatility: volatility.map(|iv| iv.into()),
+                            gamma: contract.current_gamma().map(|g| g.to_f64().unwrap()),
+                        }
+                    })
+                    .collect(),
+                session_info: SessionInfoResponse {
+                    id: session.id.to_string(),
+                    current_step: session.current_step,
+                    total_steps: session.total_steps,
+                },
+            };
+
+            HttpResponse::Ok().json(response)
+        }
+        Err(error) => map_error(error),
+    }
 }
 
 #[utoipa::path(
@@ -113,19 +175,70 @@ pub(crate) async fn get_next_step(
     params(
         ("sessionid" = String, Query, description = "ID of the session to replace")
     ),
+    request_body(
+        content = CreateSessionRequest,
+        description = "New session parameters to replace the existing session"
+    ),
     responses(
-        (status = 200, description = "Session replaced", body = String),
-        (status = 404, description = "Session not found")
+        (status = 200, description = "Session replaced", body = SessionResponse),
+        (status = 400, description = "Invalid request parameters"),
+        (status = 404, description = "Session not found"),
+        (status = 500, description = "Internal server error")
     )
 )]
 pub(crate) async fn replace_session(
-    _session_manager: web::Data<Arc<SessionManager>>,
+    session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
-    _req: web::Json<CreateSessionRequest>,
+    req: web::Json<CreateSessionRequest>,
 ) -> impl Responder {
-    let session_id = &query.session_id;
-    let msg = format!("Session replaced ID: {}", session_id);
-    HttpResponse::Ok().body(msg)
+    // Parse the session ID
+    let session_id = match Uuid::parse_str(&query.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return map_error(ChainError::InvalidState(
+                "Invalid session ID format".to_string()
+            ));
+        }
+    };
+
+    // Convert request to domain SimulationParameters
+    let simulation_params = match SimulationParameters::try_from(req.0) {
+        Ok(params) => params,
+        Err(error) => {
+            return map_error(ChainError::InvalidState(error.to_string()));
+        }
+    };
+
+    // Replace session using session manager
+    match session_manager.reinitialize_session(session_id, simulation_params) {
+        Ok(session) => {
+            let created_at_utc = DateTime::<Utc>::from(session.created_at);
+            let updated_at_utc = DateTime::<Utc>::from(session.updated_at);
+
+            let response = SessionResponse {
+                id: session.id.to_string(),
+                created_at: created_at_utc.to_rfc3339(),
+                updated_at: updated_at_utc.to_rfc3339(),
+                parameters: SessionParametersResponse {
+                    symbol: session.parameters.symbol,
+                    initial_price: session.parameters.initial_price.into(),
+                    volatility: session.parameters.volatility.into(),
+                    risk_free_rate: session.parameters.risk_free_rate.to_f64().unwrap(),
+                    method: format!("{:?}", session.parameters.method),
+                    time_frame: session.parameters.time_frame.to_string(),
+                    dividend_yield: session.parameters.dividend_yield.into(),
+                    skew_factor: session.parameters.skew_factor.map(|f| f.to_f64().unwrap()),
+                    spread: session.parameters.spread.map(|f| f.into()),
+                },
+                current_step: session.current_step,
+                total_steps: session.total_steps,
+                state: session.state.to_string(),
+            };
+
+            HttpResponse::Ok().json(response)
+        }
+        Err(error) => map_error(error)
+    }
 }
 
 #[utoipa::path(
@@ -165,47 +278,31 @@ pub(crate) async fn delete_session(
     session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
 ) -> impl Responder {
-    let session_id = Uuid::parse_str(&query.session_id).map_err(|_| {
-        ChainError::InvalidState("Invalid session ID format".to_string())
-    });
+    let session_id = Uuid::parse_str(&query.session_id)
+        .map_err(|_| ChainError::InvalidState("Invalid session ID format".to_string()));
 
     match session_id {
-        Ok(id) => {
-            match session_manager.delete_session(id) {
-                Ok(true) => {
-                    let msg = format!("Session deleted successfully: {}", id);
-                    HttpResponse::Ok().json(serde_json::json!({
-                        "message": msg,
-                        "session_id": id.to_string()
-                    }))
-                }
-                Ok(false) => {
-                    HttpResponse::NotFound().json(serde_json::json!({
-                        "error": format!("Session not found: {}", id)
-                    }))
-                }
-                Err(chain_error) => {
-                    error!( "{} {}", id, chain_error );
-                    map_error(chain_error)
-                }
+        Ok(id) => match session_manager.delete_session(id) {
+            Ok(true) => {
+                let msg = format!("Session deleted successfully: {}", id);
+                HttpResponse::Ok().json(serde_json::json!({
+                    "message": msg,
+                    "session_id": id.to_string()
+                }))
             }
-        }
+            Ok(false) => HttpResponse::NotFound().json(serde_json::json!({
+                "error": format!("Session not found: {}", id)
+            })),
+            Err(chain_error) => {
+                error!("{} {}", id, chain_error);
+                map_error(chain_error)
+            }
+        },
         Err(error) => {
-            error!( "{}",  error );
+            error!("{}", error);
             map_error(error)
         }
     }
 }
 
-fn map_error(error: ChainError) -> HttpResponse {
-    match error {
-        ChainError::NotFound(_) => {
-            HttpResponse::NotFound().json(serde_json::json!({"error": error.to_string()}))
-        }
-        ChainError::InvalidState(_) => {
-            HttpResponse::BadRequest().json(serde_json::json!({"error": error.to_string()}))
-        }
-        _ => HttpResponse::InternalServerError()
-            .json(serde_json::json!({"error": "Internal server error".to_string()})),
-    }
-}
+

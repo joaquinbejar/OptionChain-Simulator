@@ -325,10 +325,10 @@ impl Session {
     /// - The `state` field is set to `SessionState::Reinitialized` to
     ///   indicate that the simulation has been reset.
     ///
-    pub fn reinitialize(&mut self, new_params: SimulationParameters, total_steps: usize) {
+    pub fn reinitialize(&mut self, new_params: SimulationParameters) {
+        self.total_steps = new_params.steps.clone();
         self.parameters = new_params;
         self.current_step = 0;
-        self.total_steps = total_steps;
         self.updated_at = SystemTime::now();
         self.state = SessionState::Reinitialized;
     }

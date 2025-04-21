@@ -102,7 +102,7 @@ impl SessionManager {
         let chain = self
             .simulator
             .simulate_next_step(&session)
-            .map_err(|e| ChainError::SimulatorError(format!("Simulation error: {}", e)))?;
+            .map_err(|e| ChainError::SimulatorError(e.to_string()))?;
 
         // Save updated session
         self.store.save(session.clone())?;
@@ -172,12 +172,11 @@ impl SessionManager {
         &self,
         id: Uuid,
         params: SimulationParameters,
-        total_steps: usize,
     ) -> Result<Session, ChainError> {
         let mut session = self.store.get(id)?;
 
         // Reinitialize session
-        session.reinitialize(params, total_steps);
+        session.reinitialize(params);
 
         // Reset progression
         self.state_handler.reset_progression(&mut session)?;
