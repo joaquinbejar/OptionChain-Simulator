@@ -3,6 +3,8 @@ mod config;
 mod redis;
 mod repositories;
 
+mod telemetry;
+
 pub use clickhouse::ClickHouseClient;
 pub use clickhouse::interface::HistoricalDataRepository;
 pub use clickhouse::model::{OHLCVData, PriceType};
