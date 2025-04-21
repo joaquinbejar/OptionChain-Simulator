@@ -2,6 +2,7 @@ use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
 use crate::session::SimulationParameters;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use utoipa::ToSchema;
 
 /// Represents a request to create a new simulation session.
@@ -83,6 +84,14 @@ impl Default for CreateSessionRequest {
     }
 }
 
+impl fmt::Display for CreateSessionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Serialize to JSON, map any error to fmt::Error
+        let json = serde_json::to_string(self).map_err(|_| fmt::Error)?;
+        write!(f, "{}", json)
+    }
+}
+
 /// Represents a request to update an existing simulation session.
 /// This is a partial update, so all fields are optional.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -126,6 +135,14 @@ pub struct UpdateSessionRequest {
     /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
+}
+
+impl fmt::Display for UpdateSessionRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Serialize to JSON, map any error to fmt::Error
+        let json = serde_json::to_string(self).map_err(|_| fmt::Error)?;
+        write!(f, "{}", json)
+    }
 }
 
 #[cfg(test)]
