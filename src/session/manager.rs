@@ -62,6 +62,26 @@ impl SessionManager {
         Ok(session)
     }
 
+    /// Retrieves a session corresponding to the provided UUID.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - A `Uuid` representing the unique identifier of the session to be retrieved.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(Session)` - If the session corresponding to the provided `UUID` is found.
+    /// * `Err(ChainError)` - If there is an error retrieving the session, such as the session not being found or an issue with the storage layer.
+    ///
+    /// # Errors
+    ///
+    /// This function will return a `ChainError` if:
+    /// - The session corresponding to the provided ID does not exist in the underlying store.
+    /// - There is an error in accessing or querying the storage mechanism.
+    pub fn get_session(&self, id: Uuid) -> Result<Session, ChainError> {
+        self.store.get(id)
+    }
+
     /// Retrieves the next step in the session workflow using the provided session ID.
     ///
     /// This function performs the following operations:
@@ -138,6 +158,9 @@ impl SessionManager {
 
         // Update parameters
         session.modify_parameters(params);
+
+        // Reset progression
+        self.state_handler.reset_progression(&mut session)?;
 
         // Save updated session
         self.store.save(session.clone())?;
