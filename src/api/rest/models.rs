@@ -4,7 +4,7 @@ use optionstratlib::utils::TimeFrame;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
+use std::fmt;
 use utoipa::ToSchema;
 
 /// Represents address binding options for the server
@@ -33,8 +33,8 @@ impl From<ListenOn> for String {
     }
 }
 
-impl Display for ListenOn {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ListenOn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
 }
@@ -459,8 +459,14 @@ impl From<ApiWalkType> for WalkType {
     }
 }
 
-#[derive(Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SessionId {
     #[serde(rename = "sessionid")]
     pub(crate) session_id: String,
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.session_id)
+    }
 }
