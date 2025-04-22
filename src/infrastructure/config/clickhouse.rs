@@ -30,8 +30,6 @@ pub struct ClickHouseConfig {
     pub password: String,
     /// Database name
     pub database: String,
-    /// Connection timeout in seconds
-    pub timeout: u64,
 }
 
 impl Default for ClickHouseConfig {
@@ -43,7 +41,7 @@ impl Default for ClickHouseConfig {
     /// - `CLICKHOUSE_HOST`: The hostname for connecting to the ClickHouse database.
     ///   Defaults to `"localhost"` if not set.
     /// - `CLICKHOUSE_PORT`: The port for connecting to the ClickHouse database.
-    ///   Defaults to `9000` if the variable is missing or contains an invalid value.
+    ///   Defaults to `8123` if the variable is missing or contains an invalid value.
     /// - `CLICKHOUSE_USER`: The username for authentication.
     ///   Defaults to `"admin"` if not set.
     /// - `CLICKHOUSE_PASSWORD`: The password for authentication.
@@ -60,7 +58,7 @@ impl Default for ClickHouseConfig {
         let port = env::var("CLICKHOUSE_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(9000);
+            .unwrap_or(8123);
 
         Self {
             host: env::var("CLICKHOUSE_HOST").unwrap_or_else(|_| "localhost".to_string()),
@@ -68,7 +66,6 @@ impl Default for ClickHouseConfig {
             username: env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "admin".to_string()),
             password: env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "password".to_string()),
             database: env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "default".to_string()),
-            timeout: 30,
         }
     }
 }
@@ -77,8 +74,8 @@ impl fmt::Display for ClickHouseConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ClickHouse[{}@{}:{}/{}] (timeout: {}s)",
-            self.username, self.host, self.port, self.database, self.timeout
+            "ClickHouse[{}@{}:{}/{}]",
+            self.username, self.host, self.port, self.database
         )
     }
 }
@@ -133,11 +130,11 @@ mod tests {
 
         // Assert default values
         assert_eq!(config.host, "localhost");
-        assert_eq!(config.port, 9000);
+        assert_eq!(config.port, 8123);
         assert_eq!(config.username, "admin");
         assert_eq!(config.password, "password");
         assert_eq!(config.database, "default");
-        assert_eq!(config.timeout, 30);
+
 
         // Restore environment variables
         if let Some(val) = current_host {
@@ -176,7 +173,6 @@ mod tests {
         assert_eq!(config.username, "test-user");
         assert_eq!(config.password, "test-password");
         assert_eq!(config.database, "test-db");
-        assert_eq!(config.timeout, 30); // Not overridden
 
         // Clean up
         remove_var("CLICKHOUSE_HOST");
@@ -197,7 +193,7 @@ mod tests {
         let config = ClickHouseConfig::default();
 
         // Should use default port
-        assert_eq!(config.port, 9000);
+        assert_eq!(config.port, 8123);
 
         // Clean up
         remove_var("CLICKHOUSE_PORT");
@@ -207,22 +203,20 @@ mod tests {
     fn test_serialization() {
         let config = ClickHouseConfig {
             host: "clickhouse.example.com".to_string(),
-            port: 9000,
+            port: 8123,
             username: "user".to_string(),
             password: "pass".to_string(),
             database: "analytics".to_string(),
-            timeout: 45,
         };
 
         let serialized = to_string(&config).expect("Failed to serialize config");
 
         // Ensure all fields are serialized
         assert!(serialized.contains("clickhouse.example.com"));
-        assert!(serialized.contains("9000"));
+        assert!(serialized.contains("8123"));
         assert!(serialized.contains("user"));
         assert!(serialized.contains("pass"));
         assert!(serialized.contains("analytics"));
-        assert!(serialized.contains("45"));
     }
 
     #[test]
@@ -231,7 +225,7 @@ mod tests {
 
         let json = r#"{
             "host": "clickhouse.example.com",
-            "port": 9000,
+            "port": 8123,
             "username": "user",
             "password": "pass",
             "database": "analytics",
@@ -241,11 +235,10 @@ mod tests {
         let config: ClickHouseConfig = from_str(json).expect("Failed to deserialize config");
 
         assert_eq!(config.host, "clickhouse.example.com");
-        assert_eq!(config.port, 9000);
+        assert_eq!(config.port, 8123);
         assert_eq!(config.username, "user");
         assert_eq!(config.password, "pass");
         assert_eq!(config.database, "analytics");
-        assert_eq!(config.timeout, 45);
     }
 
     #[test]
@@ -253,7 +246,7 @@ mod tests {
         // Missing some fields
         let json = r#"{
             "host": "clickhouse.example.com",
-            "port": 9000
+            "port": 8123
         }"#;
 
         // Should fail because all fields are required
@@ -265,15 +258,14 @@ mod tests {
     fn test_display_implementation() {
         let config = ClickHouseConfig {
             host: "clickhouse.example.com".to_string(),
-            port: 9000,
+            port: 8123,
             username: "user".to_string(),
             password: "pass".to_string(),
             database: "analytics".to_string(),
-            timeout: 45,
         };
 
         let display_string = format!("{}", config);
-        let expected = "ClickHouse[user@clickhouse.example.com:9000/analytics] (timeout: 45s)";
+        let expected = "ClickHouse[user@clickhouse.example.com:8123/analytics]";
 
         assert_eq!(display_string, expected);
     }
@@ -287,11 +279,10 @@ mod tests {
         // Create a config
         let config = ClickHouseConfig {
             host: "clickhouse.example.com".to_string(),
-            port: 9000,
+            port: 8123,
             username: "user".to_string(),
             password: "pass".to_string(),
             database: "analytics".to_string(),
-            timeout: 45,
         };
 
         // Serialize and write to file
@@ -309,18 +300,16 @@ mod tests {
         assert_eq!(config.username, loaded_config.username);
         assert_eq!(config.password, loaded_config.password);
         assert_eq!(config.database, loaded_config.database);
-        assert_eq!(config.timeout, loaded_config.timeout);
     }
 
     #[test]
     fn test_clone() {
         let config = ClickHouseConfig {
             host: "clickhouse.example.com".to_string(),
-            port: 9000,
+            port: 8123,
             username: "user".to_string(),
             password: "pass".to_string(),
             database: "analytics".to_string(),
-            timeout: 45,
         };
 
         let cloned_config = config.clone();
@@ -330,7 +319,6 @@ mod tests {
         assert_eq!(config.username, cloned_config.username);
         assert_eq!(config.password, cloned_config.password);
         assert_eq!(config.database, cloned_config.database);
-        assert_eq!(config.timeout, cloned_config.timeout);
     }
 
     fn write_to_file(path: &Path, content: &str) -> std::io::Result<()> {
@@ -361,20 +349,18 @@ mod tests_bis {
     fn test_direct_initialization() {
         let config = ClickHouseConfig {
             host: "localhost".to_string(),
-            port: 9000,
+            port: 8123,
             username: "admin".to_string(),
             password: "password".to_string(),
             database: "default".to_string(),
-            timeout: 30,
         };
 
         // Verificar valores predeterminados
         assert_eq!(config.host, "localhost");
-        assert_eq!(config.port, 9000);
+        assert_eq!(config.port, 8123);
         assert_eq!(config.username, "admin");
         assert_eq!(config.password, "password");
         assert_eq!(config.database, "default");
-        assert_eq!(config.timeout, 30);
     }
 
     // En vez de probar directamente variables de entorno, probamos el comportamiento
@@ -389,7 +375,7 @@ mod tests_bis {
             pass_var: Option<&str>,
             db_var: Option<&str>,
         ) -> ClickHouseConfig {
-            let port = port_var.and_then(|s| s.parse::<u16>().ok()).unwrap_or(9000);
+            let port = port_var.and_then(|s| s.parse::<u16>().ok()).unwrap_or(8123);
 
             ClickHouseConfig {
                 host: host_var.unwrap_or("localhost").to_string(),
@@ -397,7 +383,6 @@ mod tests_bis {
                 username: user_var.unwrap_or("admin").to_string(),
                 password: pass_var.unwrap_or("password").to_string(),
                 database: db_var.unwrap_or("default").to_string(),
-                timeout: 30,
             }
         }
 
@@ -406,7 +391,7 @@ mod tests_bis {
         // 1. Todos los valores predeterminados
         let config1 = create_config(None, None, None, None, None);
         assert_eq!(config1.host, "localhost");
-        assert_eq!(config1.port, 9000);
+        assert_eq!(config1.port, 8123);
 
         // 2. Sobrescribir algunos valores
         let config2 = create_config(Some("test-host"), Some("8123"), None, None, None);
@@ -415,50 +400,46 @@ mod tests_bis {
 
         // 3. Puerto inválido debe usar valor predeterminado
         let config3 = create_config(None, Some("not_a_number"), None, None, None);
-        assert_eq!(config3.port, 9000);
+        assert_eq!(config3.port, 8123);
     }
 
     #[test]
     fn test_serialization() {
         let config = ClickHouseConfig {
             host: "clickhouse.example.com".to_string(),
-            port: 9000,
+            port: 8123,
             username: "user".to_string(),
             password: "pass".to_string(),
             database: "analytics".to_string(),
-            timeout: 45,
         };
 
         let serialized = to_string(&config).expect("Failed to serialize config");
 
         // Ensure all fields are serialized
         assert!(serialized.contains("clickhouse.example.com"));
-        assert!(serialized.contains("9000"));
+        assert!(serialized.contains("8123"));
         assert!(serialized.contains("user"));
         assert!(serialized.contains("pass"));
         assert!(serialized.contains("analytics"));
-        assert!(serialized.contains("45"));
     }
 
     #[test]
     fn test_deserialization() {
         let json = r#"{
             "host": "clickhouse.example.com",
-            "port": 9000,
+            "port": 8123,
             "username": "user",
             "password": "pass",
-            "database": "analytics",
-            "timeout": 45
+            "database": "analytics"
         }"#;
 
         let config: ClickHouseConfig = from_str(json).expect("Failed to deserialize config");
 
         assert_eq!(config.host, "clickhouse.example.com");
-        assert_eq!(config.port, 9000);
+        assert_eq!(config.port, 8123);
         assert_eq!(config.username, "user");
         assert_eq!(config.password, "pass");
         assert_eq!(config.database, "analytics");
-        assert_eq!(config.timeout, 45);
     }
 
     #[test]
@@ -466,7 +447,7 @@ mod tests_bis {
         // Missing some fields
         let json = r#"{
             "host": "clickhouse.example.com",
-            "port": 9000
+            "port": 8123
         }"#;
 
         // Should fail because all fields are required
@@ -478,15 +459,14 @@ mod tests_bis {
     fn test_display_implementation() {
         let config = ClickHouseConfig {
             host: "clickhouse.example.com".to_string(),
-            port: 9000,
+            port: 8123,
             username: "user".to_string(),
             password: "pass".to_string(),
             database: "analytics".to_string(),
-            timeout: 45,
         };
 
         let display_string = format!("{}", config);
-        let expected = "ClickHouse[user@clickhouse.example.com:9000/analytics] (timeout: 45s)";
+        let expected = "ClickHouse[user@clickhouse.example.com:8123/analytics]";
 
         assert_eq!(display_string, expected);
     }
@@ -500,11 +480,10 @@ mod tests_bis {
         // Create a config
         let config = ClickHouseConfig {
             host: "clickhouse.example.com".to_string(),
-            port: 9000,
+            port: 8123,
             username: "user".to_string(),
             password: "pass".to_string(),
             database: "analytics".to_string(),
-            timeout: 45,
         };
 
         // Serialize and write to file
@@ -522,18 +501,16 @@ mod tests_bis {
         assert_eq!(config.username, loaded_config.username);
         assert_eq!(config.password, loaded_config.password);
         assert_eq!(config.database, loaded_config.database);
-        assert_eq!(config.timeout, loaded_config.timeout);
     }
 
     #[test]
     fn test_clone() {
         let config = ClickHouseConfig {
             host: "clickhouse.example.com".to_string(),
-            port: 9000,
+            port: 8123,
             username: "user".to_string(),
             password: "pass".to_string(),
             database: "analytics".to_string(),
-            timeout: 45,
         };
 
         let cloned_config = config.clone();
@@ -543,7 +520,6 @@ mod tests_bis {
         assert_eq!(config.username, cloned_config.username);
         assert_eq!(config.password, cloned_config.password);
         assert_eq!(config.database, cloned_config.database);
-        assert_eq!(config.timeout, cloned_config.timeout);
     }
 
     // Helper function to write to file

@@ -1,46 +1,59 @@
 use crate::utils::ChainError;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use optionstratlib::utils::TimeFrame;
+use rand::Rng;
 
-/// Converts a field in a `Row` object into a `DateTime<Utc>` value.
-///
-/// # Arguments
-///
-/// * `row` - A reference to a `clickhouse_rs::types::Row` object that contains the data.
-/// * `field_name` - A string slice holding the name of the field in the row whose value will be converted.
-///
-/// # Returns
-///
-/// * `Ok(DateTime<Utc>)` - The `DateTime<Utc>` representation of the field value on success.
-/// * `Err(String)` - An error message if the conversion fails, such as when the field is missing,
-///   has an invalid timestamp, or when accessing the field results in an error.
-///
-/// # Type Parameters
-///
-/// * `K` - Represents the column type in the `Row` object. It must implement the `clickhouse_rs::types::column::ColumnType` trait.
-///
-/// # Errors
-///
-/// Returns an error in the following cases:
-/// - If the field `field_name` does not exist or cannot be retrieved from the row.
-/// - If the value in the field is not a valid timestamp in seconds.
-///
-///
-/// Note: Ensure the `clickhouse_rs` and `chrono` crates are added to your `Cargo.toml`
-/// when using this function.
-pub fn row_to_datetime<K>(
-    row: &clickhouse_rs::types::Row<'_, K>,
-    field_name: &str,
-) -> Result<DateTime<Utc>, ChainError>
-where
-    K: clickhouse_rs::types::column::ColumnType,
-{
-    let timestamp_seconds: i64 = row.get(field_name).map_err(|e| {
-        ChainError::ClickHouseError(format!("Failed to get '{}' from row: {}", field_name, e))
-    })?;
 
-    DateTime::<Utc>::from_timestamp(timestamp_seconds, 0).ok_or_else(|| {
-        ChainError::ClickHouseError(format!("Invalid timestamp value: {}", timestamp_seconds))
-    })
+/// Calculates the required duration based on timeframe and steps
+pub fn calculate_required_duration(timeframe: &TimeFrame, steps: usize) -> Duration {
+    match timeframe {
+        TimeFrame::Microsecond => Duration::microseconds(steps as i64),
+        TimeFrame::Millisecond => Duration::milliseconds(steps as i64),
+        TimeFrame::Second => Duration::seconds(steps as i64),
+        TimeFrame::Minute => Duration::minutes(steps as i64),
+        TimeFrame::Hour => Duration::hours(steps as i64),
+        TimeFrame::Day => Duration::days(steps as i64),
+        TimeFrame::Week => Duration::weeks(steps as i64),
+        TimeFrame::Month => Duration::days(steps as i64 * 30), // Approximation
+        TimeFrame::Quarter => Duration::days(steps as i64 * 90), // Approximation
+        TimeFrame::Year => Duration::days(steps as i64 * 365), 
+        TimeFrame::Custom(p) => Duration::days(p.to_i64())
+    }
+}
+
+/// Selects a random date between min_date and max_date ensuring enough data for steps
+pub fn select_random_date<R: Rng>(
+    rng: &mut R,
+    min_date: DateTime<Utc>,
+    max_date: DateTime<Utc>,
+    timeframe: &TimeFrame,
+    steps: usize,
+) -> Result<DateTime<Utc>, ChainError> {
+    // Calculate the minimum duration required
+    let required_duration = calculate_required_duration(timeframe, steps);
+
+    // Check if the range is sufficient
+    let available_range = max_date - min_date;
+    if available_range < required_duration {
+        return Err(ChainError::NotEnoughData(format!(
+            "Date range too small. Required: {} days, Available: {} days",
+            required_duration.num_days(),
+            available_range.num_days()
+        )));
+    }
+
+    // Calculate the latest possible start date
+    let latest_possible_start = max_date - required_duration;
+
+    // Select a random date between min_date and latest_possible_start
+    if latest_possible_start <= min_date {
+        // If they're equal, we can only start at min_date
+        Ok(min_date)
+    } else {
+        let possible_range = latest_possible_start - min_date;
+        let random_days = rng.random_range(0..=possible_range.num_days());
+        Ok(min_date + Duration::days(random_days))
+    }
 }
 
 #[cfg(test)]

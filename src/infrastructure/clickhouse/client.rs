@@ -1,14 +1,11 @@
 use crate::infrastructure::ClickHouseConfig;
-use crate::infrastructure::clickhouse::model::{OHLCVData, PriceType};
-use crate::infrastructure::clickhouse::utils::row_to_datetime;
+use crate::infrastructure::clickhouse::model::{ClickHouseRow, OHLCVData, PriceType};
 use crate::utils::ChainError;
 use chrono::{DateTime, Utc};
-use clickhouse_rs::{Options, Pool};
+use clickhouse::Client;
+use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
-use optionstratlib::{Positive, pos};
 use rust_decimal::Decimal;
-use std::str::FromStr;
-use std::time::Duration;
 use tracing::{debug, info, instrument};
 
 /// Represents a client for interacting with a ClickHouse database.
@@ -42,7 +39,7 @@ pub struct ClickHouseClient {
     /// Note:
     /// Ensure that the `Pool` is properly configured and initialized before use
     /// to avoid runtime errors or resource exhaustion in multi-threaded applications.
-    pub(crate) pool: Pool,
+    pub(crate) client: Client,
 
     /// Represents the configuration settings for connecting to and interacting
     /// with a ClickHouse database.
@@ -77,23 +74,17 @@ impl ClickHouseClient {
     /// Creates a new ClickHouse client with the provided configuration
     #[instrument(name = "clickhouse_client_new", skip(config), level = "debug")]
     pub fn new(config: ClickHouseConfig) -> Result<Self, ChainError> {
-        let url = format!(
-            "tcp://{}:{}@{}:{}/{}",
-            config.username, config.password, config.host, config.port, config.database
-        );
+        let url = format!("http://{}:{}", config.host, config.port);
 
-        let opts = Options::from_str(&url)
-            .map_err(|e| {
-                ChainError::ClickHouseError(format!("Failed to parse ClickHouse URL: {}", e))
-            })?
-            .ping_timeout(Duration::from_secs(config.timeout))
-            .query_timeout(Duration::from_secs(5))
-            .connection_timeout(Duration::from_secs(1));
-
-        let pool = Pool::new(opts);
+        // Create the client with credentials
+        let client = Client::default()
+            .with_url(url)
+            .with_user(config.username.clone())
+            .with_password(config.password.clone())
+            .with_database(config.database.clone());
 
         info!("Created new ClickHouse client for host: {}", config.host);
-        Ok(Self { pool, config })
+        Ok(Self { client, config })
     }
 
     /// Fetches historical price data for a given symbol, time frame, and date range
@@ -229,25 +220,25 @@ impl ClickHouseClient {
         // Query with aggregation for larger timeframes
         Ok(format!(
             "WITH intervals AS (
-        SELECT 
+                SELECT 
+                    symbol,
+                    toStartOfInterval(timestamp, INTERVAL {}) as interval_start,
+                    any(open) as open,
+                    max(high) as high,
+                    min(low) as low,
+                    any(close) as close,
+                    sum(volume) as volume
+                FROM ohlcv
+                WHERE symbol = '{}' 
+                AND timestamp BETWEEN '{}' AND '{}'
+                GROUP BY symbol, interval_start
+                ORDER BY interval_start
+            )
+            SELECT 
                 symbol,
-                toStartOfInterval(timestamp, INTERVAL {}) as interval_start,
-                any(open) as open,
-                max(high) as high,
-                min(low) as low,
-                any(close) as close,
-                sum(volume) as volume
-            FROM ohlcv
-            WHERE symbol = '{}' 
-            AND timestamp BETWEEN '{}' AND '{}'
-            GROUP BY symbol, interval_start
-            ORDER BY interval_start
-        )
-        SELECT 
-            symbol,
-            toInt64(toUnixTimestamp(interval_start)) as timestamp,
-            open, high, low, close, volume
-        FROM intervals",
+                toInt64(toUnixTimestamp(interval_start)) as timestamp,
+                open, high, low, close, volume
+            FROM intervals",
             interval, symbol, start_date_str, end_date_str
         ))
     }
@@ -297,63 +288,16 @@ impl ClickHouseClient {
     async fn execute_query(&self, query: String) -> Result<Vec<OHLCVData>, ChainError> {
         debug!("Executing ClickHouse query: {}", query);
 
-        let mut conn = self.pool.get_handle().await.map_err(|e| {
-            ChainError::ClickHouseError(format!("Failed to get ClickHouse connection: {}", e))
-        })?;
-
-        let block = conn.query(query).fetch_all().await.map_err(|e| {
-            ChainError::ClickHouseError(format!("Failed to execute ClickHouse query: {}", e))
-        })?;
+        let rows: Vec<ClickHouseRow> = self.client.query(&query).fetch_all().await?;
 
         let mut results = Vec::new();
 
-        for row in block.rows() {
-            let symbol: String = row.get("symbol").map_err(|e| {
-                ChainError::ClickHouseError(format!("Failed to get 'symbol' from row: {}", e))
-            })?;
-
-            let timestamp = row_to_datetime(&row, "timestamp")?;
-
-            let open: f32 = row.get("open").map_err(|e| {
-                ChainError::ClickHouseError(format!("Failed to get 'open' from row: {}", e))
-            })?;
-
-            let high: f32 = row.get("high").map_err(|e| {
-                ChainError::ClickHouseError(format!("Failed to get 'high' from row: {}", e))
-            })?;
-
-            let low: f32 = row.get("low").map_err(|e| {
-                ChainError::ClickHouseError(format!("Failed to get 'low' from row: {}", e))
-            })?;
-
-            let close: f32 = row.get("close").map_err(|e| {
-                ChainError::ClickHouseError(format!("Failed to get 'close' from row: {}", e))
-            })?;
-
-            let volume: u64 = row.get("volume").map_err(|e| {
-                ChainError::ClickHouseError(format!("Failed to get 'volume' from row: {}", e))
-            })?;
-
-            // Convert to Positive, which doesn't allow negative values
-            let open_pos = pos!(open as f64);
-            let high_pos = pos!(high as f64);
-            let low_pos = pos!(low as f64);
-            let close_pos = pos!(close as f64);
-
-            results.push(OHLCVData {
-                symbol,
-                timestamp,
-                open: open_pos,
-                high: high_pos,
-                low: low_pos,
-                close: close_pos,
-                volume,
-            });
+        for row in rows {
+            results.push(row.into());
         }
 
         Ok(results)
     }
-
     /// Extracts a vector of prices of a specific type (`PriceType`) from a slice of OHLCV data.
     ///
     /// This function iterates through the input slice of `OHLCVData` and extracts the desired
@@ -384,7 +328,6 @@ impl ClickHouseClient {
                 PriceType::Typical => {
                     // Typical price is (high + low + close) / 3
                     let sum = ohlcv.high + ohlcv.low + ohlcv.close;
-
                     sum / Decimal::from(3)
                 }
             })
@@ -414,11 +357,10 @@ mod tests {
     fn test_build_timeframe_query_minute() {
         let _config = ClickHouseConfig {
             host: "test-host".to_string(),
-            port: 9000,
+            port: 8123,
             username: "test-user".to_string(),
             password: "test-pass".to_string(),
             database: "test-db".to_string(),
-            timeout: 30,
         };
 
         fn build_timeframe_query(

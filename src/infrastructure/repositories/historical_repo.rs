@@ -1,6 +1,5 @@
 //! A repository that interacts with ClickHouse to provide historical financial data.
 use crate::infrastructure::clickhouse::{ClickHouseClient, HistoricalDataRepository};
-use crate::infrastructure::row_to_datetime;
 use crate::utils::ChainError;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -119,28 +118,13 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
     /// - The caller should handle the errors returned to identify or log the specific root cause.
     ///
     async fn list_available_symbols(&self) -> Result<Vec<String>, ChainError> {
-        let mut conn = self
-            .client
-            .pool
-            .get_handle()
-            .await
-            .map_err(|e| format!("Failed to get ClickHouse connection: {}", e))?;
-
         let query = "SELECT DISTINCT symbol FROM ohlcv ORDER BY symbol";
 
-        let block = conn
+        let symbols: Vec<String> = self.client
+            .client
             .query(query)
-            .fetch_all()
-            .await
-            .map_err(|e| format!("Failed to execute ClickHouse query: {}", e))?;
-
-        let mut symbols = Vec::new();
-        for row in block.rows() {
-            let symbol: String = row
-                .get("symbol")
-                .map_err(|e| format!("Failed to get 'symbol' from row: {}", e))?;
-            symbols.push(symbol);
-        }
+            .fetch_all::<String>()
+            .await?;
 
         Ok(symbols)
     }
@@ -193,10 +177,6 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
         &self,
         symbol: &str,
     ) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError> {
-        let mut conn = self.client.pool.get_handle().await.map_err(|e| {
-            ChainError::ClickHouseError(format!("Failed to get ClickHouse connection: {}", e))
-        })?;
-
         let query = format!(
             "SELECT 
                 toInt64(toUnixTimestamp(min(timestamp))) as min_date, 
@@ -206,13 +186,28 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
             symbol
         );
 
-        let block = conn.query(query).fetch_all().await.map_err(|e| {
-            ChainError::ClickHouseError(format!("Failed to execute ClickHouse query: {}", e))
-        })?;
+        #[derive(Debug, clickhouse::Row, serde::Deserialize)]
+        struct DateRange {
+            min_date: i64,
+            max_date: i64,
+        }
 
-        if let Some(row) = block.rows().next() {
-            let min_date = row_to_datetime(&row, "min_date")?;
-            let max_date = row_to_datetime(&row, "max_date")?;
+        let rows: Vec<DateRange> = self.client
+            .client
+            .query(&query)
+            .fetch_all()
+            .await?;
+
+        if let Some(row) = rows.first() {
+            let min_date = chrono::DateTime::<Utc>::from_timestamp(row.min_date, 0)
+                .ok_or_else(|| ChainError::ClickHouseError(
+                    format!("Invalid min timestamp: {}", row.min_date)
+                ))?;
+
+            let max_date = chrono::DateTime::<Utc>::from_timestamp(row.max_date, 0)
+                .ok_or_else(|| ChainError::ClickHouseError(
+                    format!("Invalid max timestamp: {}", row.max_date)
+                ))?;
 
             Ok((min_date, max_date))
         } else {

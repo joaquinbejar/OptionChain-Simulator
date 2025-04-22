@@ -31,6 +31,9 @@ pub enum ChainError {
     /// - `ClickHouseError(String)`
     ///   Represents errors related to operations with the ClickHouse database. Contains a `String` with error details.
     ClickHouseError(String),
+    /// - `NotEnoughData(String)`
+    ///   Represents errors when there isn't enough data to fulfill the requested steps.
+    NotEnoughData(String),
 }
 
 impl<'a> From<&'a str> for ChainError {
@@ -57,6 +60,12 @@ impl From<Box<dyn Error>> for ChainError {
     }
 }
 
+impl From<clickhouse::error::Error> for ChainError {
+    fn from(err: clickhouse::error::Error) -> Self {
+        ChainError::ClickHouseError(err.to_string())
+    }
+}
+
 impl fmt::Display for ChainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -67,6 +76,7 @@ impl fmt::Display for ChainError {
             ChainError::NotFound(msg) => write!(f, "Not Found: {}", msg),
             ChainError::SimulatorError(msg) => write!(f, "Simulator Error: {}", msg),
             ChainError::ClickHouseError(msg) => write!(f, "ClickHouse Error: {}", msg),
+            ChainError::NotEnoughData(msg) => write!(f, "Not Enough Data: {}", msg),
         }
     }
 }

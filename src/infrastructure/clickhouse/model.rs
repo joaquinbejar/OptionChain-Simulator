@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
-use optionstratlib::Positive;
+use optionstratlib::{pos, Positive};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use clickhouse::Row;
+use crate::utils::ChainError;
 
 /// OHLCV data structure representing historical financial data
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -20,6 +22,34 @@ pub struct OHLCVData {
     pub close: Positive,
     /// Volume traded
     pub volume: u64,
+}
+
+impl From<ClickHouseRow> for OHLCVData {
+    
+    fn from(value: ClickHouseRow) -> Self {
+        let timestamp =  match DateTime::<Utc>::from_timestamp(value.timestamp, 0)
+            .ok_or_else(|| ChainError::ClickHouseError(
+                format!("Invalid timestamp value: {}", value.timestamp)
+            )) {
+            Ok(timestamp) => timestamp,
+            Err(err) => panic!("{}", err)
+        };
+
+        let open_pos = pos!(value.open as f64);
+        let high_pos = pos!(value.high as f64);
+        let low_pos = pos!(value.low as f64);
+        let close_pos = pos!(value.close as f64);
+
+        OHLCVData {
+            symbol: value.symbol,
+            timestamp,
+            open: open_pos,
+            high: high_pos,
+            low: low_pos,
+            close: close_pos,
+            volume: value.volume,
+        }
+    }
 }
 
 impl fmt::Display for OHLCVData {
@@ -64,6 +94,20 @@ impl fmt::Display for PriceType {
         }
     }
 }
+
+/// A row structure to match the expected query results
+#[derive(Debug, Clone, Row, Deserialize)]
+pub struct ClickHouseRow {
+    pub(crate) symbol: String,
+    pub(crate) timestamp: i64,
+    pub(crate) open: f32,
+    pub(crate) high: f32,
+    pub(crate) low: f32,
+    pub(crate) close: f32,
+    pub(crate) volume: u64,
+}
+
+
 
 #[cfg(test)]
 mod tests {
