@@ -222,30 +222,24 @@ impl Session {
         }
     }
 
-    /// Creates a new instance of the simulation using the specified parameters.
+
+    /// Creates a new instance of the struct using the provided `SimulationParameters` and a reference 
+    /// to a `UuidGenerator`.
     ///
-    /// This function initializes the simulation by creating a default UUID namespace,
-    /// which is required for compatibility purposes, and a UUID generator using this
-    /// namespace. It then delegates the creation process to the `new_with_generator`
-    /// function using the provided parameters and the generated UUID generator.
+    /// This function delegates to `Self::new_with_generator` to initialize the struct with the given 
+    /// parameters and UUID generator.
     ///
     /// # Arguments
-    /// * `parameters` - A `SimulationParameters` struct that contains the configuration
-    ///   settings necessary to start the simulation.
+    ///
+    /// * `parameters` - An instance of `SimulationParameters` that defines the configuration for the simulation.
+    /// * `uuid_generator` - A reference to a `UuidGenerator`, which is used for generating unique identifiers required by the instance.
     ///
     /// # Returns
-    /// * `Self` - A new instance of the simulation object.
     ///
-    /// # Panics
-    /// This method will panic if the hardcoded default UUID namespace cannot be parsed.
-    /// This is highly unlikely as the namespace string is valid and hardcoded.
+    /// A new instance of the struct.
     ///
-    pub fn new(parameters: SimulationParameters) -> Self {
-        // Create a default namespace for compatibility
-        let namespace = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-            .expect("Failed to parse default UUID namespace");
-        let generator = UuidGenerator::new(namespace);
-        Self::new_with_generator(parameters, &generator)
+    pub fn new(parameters: SimulationParameters, uuid_generator: &UuidGenerator) -> Self {
+        Self::new_with_generator(parameters, uuid_generator)
     }
 
     /// Advances the session to the next step while updating its state and timestamp.

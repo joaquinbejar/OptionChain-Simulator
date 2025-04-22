@@ -6,12 +6,14 @@ use crate::utils::error::ChainError;
 use optionstratlib::chains::OptionChain;
 use std::sync::Arc;
 use uuid::Uuid;
+use crate::utils::UuidGenerator;
 
 /// Manages the lifecycle of simulation sessions
 pub struct SessionManager {
     store: Arc<dyn SessionStore>,
     state_handler: StateProgressionHandler,
     simulator: Simulator,
+    uuid_generator: UuidGenerator
 }
 
 impl SessionManager {
@@ -32,10 +34,15 @@ impl SessionManager {
     ///   specific processes or operations as per the required functionality.
     ///
     pub fn new(store: Arc<dyn SessionStore>) -> Self {
+        // Create a default namespace for compatibility
+        let namespace = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+            .expect("Failed to parse default UUID namespace");
+        let uuid_generator = UuidGenerator::new(namespace);
         Self {
             store,
             state_handler: StateProgressionHandler::new(),
             simulator: Simulator::new(),
+            uuid_generator,
         }
     }
 
@@ -57,7 +64,7 @@ impl SessionManager {
     /// - When the session fails to be stored in the backend storage.
     ///
     pub fn create_session(&self, params: SimulationParameters) -> Result<Session, ChainError> {
-        let session = Session::new(params);
+        let session = Session::new(params, &self.uuid_generator);
         self.store.save(session.clone())?;
         Ok(session)
     }
