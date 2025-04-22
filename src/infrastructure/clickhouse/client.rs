@@ -8,22 +8,7 @@ use optionstratlib::utils::TimeFrame;
 use rust_decimal::Decimal;
 use tracing::{debug, info, instrument};
 
-/// Represents a client for interacting with a ClickHouse database.
-///
-/// The `ClickHouseClient` struct encapsulates the details required to connect
-/// and interact with a ClickHouse database instance. It provides the necessary
-/// components, such as a connection pool and configuration settings, to manage
-/// database access efficiently.
-///
-/// # Fields
-///
-/// * `pool` - A connection pool (`Pool`) used for establishing and managing
-///   database connections. This is a private field that facilitates efficient resource management
-///   and avoids the overhead of creating new connections for each operation.
-///
-/// * `config` - The configuration (`ClickHouseConfig`) that contains settings specific to this
-///   client, such as authentication credentials, database connection details, or other configuration parameters.
-///
+
 pub struct ClickHouseClient {
     /// Represents a connection pool that is used internally within the crate.
     ///
@@ -58,6 +43,7 @@ pub struct ClickHouseClient {
     ///
     /// Ensure you provide valid and reachable settings to avoid connection issues.
     config: ClickHouseConfig,
+
 }
 
 impl Default for ClickHouseClient {
@@ -84,8 +70,13 @@ impl ClickHouseClient {
             .with_database(config.database.clone());
 
         info!("Created new ClickHouse client for host: {}", config.host);
-        Ok(Self { client, config })
+        
+        Ok(Self { 
+            client, 
+            config,
+        })
     }
+    
 
     /// Fetches historical price data for a given symbol, time frame, and date range
     #[instrument(skip(self), level = "debug")]
@@ -289,7 +280,7 @@ impl ClickHouseClient {
         debug!("Executing ClickHouse query: {}", query);
 
         let rows: Vec<ClickHouseRow> = self.client.query(&query).fetch_all().await?;
-
+        
         let mut results = Vec::new();
 
         for row in rows {

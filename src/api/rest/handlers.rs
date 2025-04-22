@@ -127,7 +127,7 @@ pub(crate) async fn get_next_step(
     };
 
     // Get next step from session manager
-    match session_manager.get_next_step(session_id) {
+    match session_manager.get_next_step(session_id).await {
         Ok((session, option_chain)) => {
             // Convert session and option chain to ChainResponse
             let expiration = option_chain.get_expiration_date();

@@ -7,6 +7,7 @@ use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
 use std::sync::Arc;
 
+
 /// Represents a repository for accessing historical data stored in a ClickHouse database.
 ///
 /// The `ClickHouseHistoricalRepository` provides an abstraction over the ClickHouse client
@@ -49,6 +50,7 @@ impl ClickHouseHistoricalRepository {
 
 #[async_trait]
 impl HistoricalDataRepository for ClickHouseHistoricalRepository {
+    
     ///
     /// Retrieves historical price data for a given symbol, timeframe, and date range.
     ///

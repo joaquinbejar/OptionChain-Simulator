@@ -9,7 +9,10 @@ optionstratlib = { path = "../../../OptionStratLib" }
 #optionstratlib = "0.4.4"
 tracing = "0.1.41"
 uuid = { version = "1.16.0", features = ["v4", "serde"] }
-rust_decimal_macros = "1.37.1"
 rust_decimal = "1.37.1"
 chrono = { version = "0.4.40", features = ["serde"] }
 tokio = { version = "1.44.2", features = ["full"] }
+actix-web = { version = "4.0.2", features = ["rustls"] }
+clickhouse = "0.13.2"
+serde_json = "1.0.140"
+serde = "1.0.218"

@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex};
 use rand::Rng;
 use tracing::{debug, error, info, instrument};
 use crate::infrastructure::{calculate_required_duration, select_random_date, ClickHouseClient, ClickHouseConfig, ClickHouseHistoricalRepository, HistoricalDataRepository};
-use futures::executor::block_on;
 
 
 const DEFAULT_CHAIN_SIZE: usize = 30;
@@ -71,7 +70,7 @@ impl Simulator {
 
     /// Simulates the next step based on the session parameters and returns an OptionChain
     #[instrument(skip(self, session), level = "debug")]
-    pub fn simulate_next_step(&self, session: &Session) -> Result<OptionChain, ChainError> {
+    pub async fn simulate_next_step(&self, session: &Session) -> Result<OptionChain, ChainError> {
         debug!(
             session_id = %session.id,
             current_step = session.current_step,
@@ -100,7 +99,9 @@ impl Simulator {
             );
             debug!("Reset Random Walk with Session: {}", session);
             // let random_walk = self.create_random_walk(session);
-            let random_walk = block_on(self.create_random_walk(session))?;
+
+            
+            let random_walk = self.create_random_walk(session).await?;
             cache.insert(session.id, random_walk);
         }
 
@@ -140,9 +141,8 @@ impl Simulator {
         timeframe: &TimeFrame,
         steps: usize,
     ) -> Result<Vec<Positive>, ChainError> {
-        info!("1");
+        
         if let Some(repo) = &self.database_repo {
-            info!("2");
             let mut thread_rng = rand::rng();
 
             let actual_symbol = if let Some(sym) = symbol {
@@ -164,7 +164,7 @@ impl Simulator {
                 let random_index = thread_rng.random_range(0..available_symbols.len());
                 available_symbols[random_index].clone()
             };
-            info!("3 {}", actual_symbol);
+
             debug!("Selected symbol: {}", actual_symbol);
 
             // Get the available date range for the selected symbol
@@ -172,14 +172,15 @@ impl Simulator {
                 .get_date_range_for_symbol(&actual_symbol)
                 .await
                 .map_err(|e| ChainError::ClickHouseError(e.to_string()))?;
-            info!("4");
+            debug!("Available date range: {} - {}", min_date, max_date);
+
             // Select random start date ensuring enough data for all steps
             let start_date = select_random_date(&mut thread_rng, min_date, max_date, timeframe, steps)?;
 
             // Calculate end date based on required duration
             let duration = calculate_required_duration(timeframe, steps);
             let end_date = start_date + duration;
-            info!("5");
+
             debug!(
             "Fetching data from {} to {} for symbol {}",
             start_date, end_date, actual_symbol
@@ -215,7 +216,6 @@ impl Simulator {
         session: &Session,
     ) -> Result<RandomWalk<Positive, OptionChain>, ChainError> {
         let params = &session.parameters;
-        
         let method: SimulationMethod = match &params.method {
             SimulationMethod::Historical {timeframe, prices, symbol} => {
                 if prices.is_empty() || prices.len() < params.steps {

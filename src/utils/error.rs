@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use tokio::task::JoinError;
 
 /// `ChainError` is an enumeration that represents various kinds of errors that can occur within the context of the application.
 ///
@@ -62,6 +63,12 @@ impl From<Box<dyn Error>> for ChainError {
 
 impl From<clickhouse::error::Error> for ChainError {
     fn from(err: clickhouse::error::Error) -> Self {
+        ChainError::ClickHouseError(err.to_string())
+    }
+}
+
+impl From<JoinError> for ChainError {
+    fn from(err: JoinError) -> Self {
         ChainError::ClickHouseError(err.to_string())
     }
 }

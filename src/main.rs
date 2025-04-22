@@ -60,7 +60,7 @@
 use optionchain_simulator::api::{ListenOn, start_server};
 use optionchain_simulator::infrastructure::{RedisClient, RedisConfig};
 use optionchain_simulator::session::{InRedisSessionStore, SessionManager};
-use optionstratlib::utils::setup_logger;
+use optionstratlib::utils::{setup_logger, setup_logger_with_level};
 use std::sync::Arc;
 use tracing::info;
 
@@ -105,9 +105,10 @@ use tracing::info;
 /// [INFO] Connecting to Redis at default://127.0.0.1:6379
 /// [INFO] Starting HTTP server at http://0.0.0.0:7070
 /// ```
-#[actix_web::main]
+/// #[actix_web::main]
+#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setup_logger();
+    setup_logger_with_level("DEBUG");
 
     // Create session store
     let redis_config = RedisConfig::default();

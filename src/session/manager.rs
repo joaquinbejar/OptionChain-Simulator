@@ -20,6 +20,7 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    
     /// Constructs a new instance of the struct with the provided session store.
     ///
     /// # Arguments
@@ -128,7 +129,8 @@ impl SessionManager {
     ///   is returned, detailing the simulation failure.
     /// - If the updated session fails to be saved back to the store, an error from the store implementation is propagated.
     ///
-    pub fn get_next_step(&self, id: Uuid) -> Result<(Session, OptionChain), ChainError> {
+    pub async fn get_next_step(&self, id: Uuid) -> Result<(Session, OptionChain), ChainError> {
+
         let mut session = self.store.get(id)?;
 
         // Advance session state
@@ -138,6 +140,7 @@ impl SessionManager {
         let chain = self
             .simulator
             .simulate_next_step(&session)
+            .await
             .map_err(|e| ChainError::SimulatorError(e.to_string()))?;
 
         // Save updated session
