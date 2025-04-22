@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = Arc::new(ClickHouseClient::new(config)?);
 
     // Step 2: Create historical repository
-    let repo = ClickHouseHistoricalRepository::new(client.clone());
+    let repo = Arc::new(ClickHouseHistoricalRepository::new(client.clone()));
 
     // Step 3: Create session store and manager for option chain simulation
     let store = Arc::new(InMemorySessionStore::new());
@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
 
                             // Step 7: Run through a few simulation steps
-                            run_simulation_steps(&session_manager, session.id, 7)?;
+                            run_simulation_steps(&session_manager, session.id, 7).await?;
                         }
                         Err(e) => {
                             error!("Failed to create session: {}", e);
@@ -152,7 +152,7 @@ fn create_simulation_parameters(
 }
 
 /// Runs multiple simulation steps and displays results
-fn run_simulation_steps(
+async fn run_simulation_steps(
     session_manager: &SessionManager,
     session_id: Uuid,
     steps: usize,
@@ -160,7 +160,7 @@ fn run_simulation_steps(
     for i in 0..steps {
         info!(session_id = %session_id, step = i+1, "Advancing to simulation step");
 
-        let (session, chain) = session_manager.get_next_step(session_id)?;
+        let (session, chain) = session_manager.get_next_step(session_id).await?;
 
         info!(
             session_id = %session_id,

@@ -13,7 +13,8 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 /// Example demonstrating the usage of SessionManager with Redis-backed session storage
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger();
 
     info!("Starting OptionChain-Simulator Redis example");
@@ -50,14 +51,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             // Run the session through its lifecycle
-            if let Err(e) = run_session_lifecycle(&session_manager, session.id) {
+            if let Err(e) = run_session_lifecycle(&session_manager, session.id).await {
                 error!("Error during session lifecycle: {}", e);
             }
 
             // Demonstrate error handling with a non-existent session
             info!("Attempting to access a non-existent session");
             let random_uuid = Uuid::new_v4();
-            match session_manager.get_next_step(random_uuid) {
+            match session_manager.get_next_step(random_uuid).await {
                 Ok(_) => info!("Unexpectedly found a random session"),
                 Err(e) => error!("Expected error occurred: {}", e),
             }
@@ -69,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Optional: Check if the session still exists in Redis after deletion
-            match session_manager.get_next_step(session.id) {
+            match session_manager.get_next_step(session.id).await {
                 Ok(_) => info!("Session still exists in Redis (unexpected)"),
                 Err(e) => error!("Confirmed session was deleted: {}", e),
             }
@@ -110,13 +111,13 @@ fn create_simulation_parameters() -> SimulationParameters {
 }
 
 /// Runs a session through its complete lifecycle
-fn run_session_lifecycle(
+async fn run_session_lifecycle(
     session_manager: &SessionManager,
     session_id: Uuid,
 ) -> Result<(), ChainError> {
     // Step 1: Get initial option chain
     info!(session_id = %session_id, "Advancing session to first step");
-    let (session, chain) = session_manager.get_next_step(session_id)?;
+    let (session, chain) = session_manager.get_next_step(session_id).await?;
 
     info!(
         session_id = %session_id,
@@ -130,7 +131,7 @@ fn run_session_lifecycle(
     // Step 2: Advance a few more steps
     for i in 0..3 {
         info!(session_id = %session_id, step = i+2, "Advancing to next step");
-        match session_manager.get_next_step(session_id) {
+        match session_manager.get_next_step(session_id).await {
             Ok((session, chain)) => {
                 info!(
                     session_id = %session_id,
@@ -181,7 +182,7 @@ fn run_session_lifecycle(
     // Step 4: Advance with modified parameters
     for i in 0..2 {
         info!(session_id = %session_id, step = i+1, "Advancing with modified parameters");
-        match session_manager.get_next_step(session_id) {
+        match session_manager.get_next_step(session_id).await {
             Ok((session, chain)) => {
                 info!(
                     session_id = %session_id,
