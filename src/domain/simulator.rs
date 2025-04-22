@@ -1,6 +1,6 @@
-use crate::session::{Session, SessionState};
+use crate::session::{Session, SessionState, SimulationMethod};
 use crate::utils::ChainError;
-use optionstratlib::utils::Len;
+use optionstratlib::utils::{Len, TimeFrame};
 use optionstratlib::{
     ExpirationDate, Positive,
     chains::{
@@ -17,7 +17,11 @@ use optionstratlib::{
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::{Arc, Mutex};
+use rand::Rng;
 use tracing::{debug, error, info, instrument};
+use crate::infrastructure::{calculate_required_duration, select_random_date, ClickHouseClient, ClickHouseConfig, ClickHouseHistoricalRepository, HistoricalDataRepository};
+use futures::executor::block_on;
+
 
 const DEFAULT_CHAIN_SIZE: usize = 30;
 const DEFAULT_SKEW_FACTOR: Decimal = dec!(0.0005);
@@ -27,6 +31,7 @@ pub struct Simulator {
     // Store a cache of random walks for each session ID to avoid recalculating the entire path
     simulation_cache:
         Arc<Mutex<std::collections::HashMap<uuid::Uuid, RandomWalk<Positive, OptionChain>>>>,
+    database_repo: Option<Arc<dyn HistoricalDataRepository>>,
 }
 
 /// Walker struct for implementing WalkTypeAble
@@ -44,8 +49,23 @@ impl Simulator {
     /// Creates a new simulator instance
     pub fn new() -> Self {
         info!("Creating new simulator instance");
+        let database_config = ClickHouseConfig::default();
+        info!("Connecting to ClickHouse at {}", database_config.host);
+        let database_repo = match ClickHouseClient::new(database_config) {
+            Ok(client) => {
+                let client = Arc::new(client);
+                let repo: Arc<dyn HistoricalDataRepository> = Arc::new(ClickHouseHistoricalRepository::new(client));
+                Some(repo)
+            },
+            Err(e) => {
+                error!("Failed to connect to ClickHouse: {}", e);
+                None
+            }       
+        };
+
         Self {
             simulation_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            database_repo,       
         }
     }
 
@@ -79,7 +99,8 @@ impl Simulator {
                 "Creating new simulation for session"
             );
             debug!("Reset Random Walk with Session: {}", session);
-            let random_walk = self.create_random_walk(session)?;
+            // let random_walk = self.create_random_walk(session);
+            let random_walk = block_on(self.create_random_walk(session))?;
             cache.insert(session.id, random_walk);
         }
 
@@ -110,13 +131,109 @@ impl Simulator {
         Ok(chain)
     }
 
+    /// Fetches historical data for a given symbol and timeframe with random date range
+    /// If symbol is None, selects a random symbol from available symbols
+    #[instrument(skip(self), level = "debug")]
+    pub async fn get_historical_data(
+        &self,
+        symbol: &Option<String>,
+        timeframe: &TimeFrame,
+        steps: usize,
+    ) -> Result<Vec<Positive>, ChainError> {
+        info!("1");
+        if let Some(repo) = &self.database_repo {
+            info!("2");
+            let mut thread_rng = rand::rng();
+
+            let actual_symbol = if let Some(sym) = symbol {
+                // Use provided symbol
+                sym.clone()
+            } else {
+                // Get list of available symbols and choose one randomly
+                let available_symbols = repo
+                    .list_available_symbols()
+                    .await
+                    .map_err(|e| ChainError::ClickHouseError(e.to_string()))?;
+
+                if available_symbols.is_empty() {
+                    return Err(ChainError::NotFound(
+                        "No symbols available in the database".to_string(),
+                    ));
+                }
+
+                let random_index = thread_rng.random_range(0..available_symbols.len());
+                available_symbols[random_index].clone()
+            };
+            info!("3 {}", actual_symbol);
+            debug!("Selected symbol: {}", actual_symbol);
+
+            // Get the available date range for the selected symbol
+            let (min_date, max_date) = repo
+                .get_date_range_for_symbol(&actual_symbol)
+                .await
+                .map_err(|e| ChainError::ClickHouseError(e.to_string()))?;
+            info!("4");
+            // Select random start date ensuring enough data for all steps
+            let start_date = select_random_date(&mut thread_rng, min_date, max_date, timeframe, steps)?;
+
+            // Calculate end date based on required duration
+            let duration = calculate_required_duration(timeframe, steps);
+            let end_date = start_date + duration;
+            info!("5");
+            debug!(
+            "Fetching data from {} to {} for symbol {}",
+            start_date, end_date, actual_symbol
+        );
+            
+            // Fetch the historical prices
+            let prices = repo
+                .get_historical_prices(&actual_symbol, timeframe, &start_date, &end_date)
+                .await
+                .map_err(|e| ChainError::ClickHouseError(e.to_string()))?;
+
+            // Ensure we have enough data points
+            if prices.len() < steps {
+                return Err(ChainError::NotEnoughData(format!(
+                    "Retrieved {} data points but {} required for symbol {}",
+                    prices.len(), steps, actual_symbol
+                )));
+            }
+            
+            // Return exactly the number of steps requested
+            Ok(prices.into_iter().take(steps).collect())
+        } else {
+            Err(ChainError::SimulatorError(
+                "Database not available".to_string(),
+            ))
+        }
+    }
+
     /// Creates a new RandomWalk for a session
     #[instrument(skip(self, session), level = "debug")]
-    fn create_random_walk(
+    async fn create_random_walk(
         &self,
         session: &Session,
     ) -> Result<RandomWalk<Positive, OptionChain>, ChainError> {
         let params = &session.parameters;
+        
+        let method: SimulationMethod = match &params.method {
+            SimulationMethod::Historical {timeframe, prices, symbol} => {
+                if prices.is_empty() || prices.len() < params.steps {
+                    // load historical prices from database
+                    let prices = self.get_historical_data(symbol, timeframe, params.steps).await?;
+                    SimulationMethod::Historical {
+                        timeframe: timeframe.clone(),
+                        prices,
+                        symbol: symbol.clone()
+                    }
+                } else {
+                    params.method.clone()
+                }
+            },
+            _ => {
+                params.method.clone()
+            }
+        };
 
         // Extract parameters from session
         let initial_price = params.initial_price;
@@ -172,7 +289,7 @@ impl Simulator {
                 ),
                 y: Ystep::new(0, initial_chain),
             },
-            walk_type: params.method.clone(),
+            walk_type: method,
             walker,
         };
 

@@ -116,6 +116,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime};
     use uuid::Uuid;
+    use crate::utils::UuidGenerator;
 
     fn create_test_session(id_option: Option<Uuid>) -> Session {
         let params = SimulationParameters {
@@ -139,6 +140,10 @@ mod tests {
         };
 
         let now = SystemTime::now();
+        let namespace_uuid = Uuid::new_v4().to_string();
+        let namespace = Uuid::parse_str(&namespace_uuid)
+            .expect("Failed to parse default UUID namespace");
+        let uuid_generator = UuidGenerator::new(namespace);
 
         if let Some(id) = id_option {
             Session {
@@ -151,7 +156,7 @@ mod tests {
                 state: SessionState::Initialized,
             }
         } else {
-            Session::new(params)
+            Session::new(params, &uuid_generator)
         }
     }
 

@@ -599,6 +599,7 @@ mod tests_simulation_fparameters_serialization {
             method: SimulationMethod::Historical {
                 timeframe: TimeFrame::Day,
                 prices: vec![pos!(75.0), pos!(76.2), pos!(74.8), pos!(77.5), pos!(78.1)],
+                symbol: None
             },
             time_frame: TimeFrame::Day,
             chain_size: Some(15),
@@ -611,7 +612,7 @@ mod tests_simulation_fparameters_serialization {
         let deserialized_hist: SimulationParameters = from_str(&json_hist).unwrap();
 
         match deserialized_hist.method {
-            SimulationMethod::Historical { timeframe, prices } => {
+            SimulationMethod::Historical { timeframe, prices, .. } => {
                 assert_eq!(timeframe, TimeFrame::Day);
                 assert_eq!(prices.len(), 5);
                 assert_eq!(prices[0], pos!(75.0));
