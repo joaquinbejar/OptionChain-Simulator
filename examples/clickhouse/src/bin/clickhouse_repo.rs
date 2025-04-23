@@ -32,11 +32,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("=== Example 3: Get Historical Prices with Different Timeframes ===");
 
     // Use the last 30 days from the available date range
-    let query_end = end_date;
-    let query_start = query_end - Duration::days(30);
+    let query_start = end_date - Duration::days(30);
+    let query_limit = 30; // Request 30 data points
 
     // Get and display prices with different timeframes
-    get_prices_with_timeframes(&repo, symbol, &query_start, &query_end).await?;
+    get_prices_with_timeframes(&repo, symbol, &query_start, query_limit).await?;
 
     // Example 4: Benchmarking repository performance
     info!("=== Example 4: Performance Benchmarking ===");
@@ -118,7 +118,7 @@ async fn get_prices_with_timeframes(
     repo: &ClickHouseHistoricalRepository,
     symbol: &str,
     start_date: &DateTime<Utc>,
-    end_date: &DateTime<Utc>,
+    limit: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let timeframes = vec![
         (TimeFrame::Minute, "Minute"),
@@ -128,10 +128,10 @@ async fn get_prices_with_timeframes(
     ];
 
     info!(
-        "Fetching historical prices for '{}' from {} to {}",
+        "Fetching historical {} prices for '{}' from {}",
+        limit,
         symbol,
         start_date.format("%Y-%m-%d"),
-        end_date.format("%Y-%m-%d")
     );
 
     for (timeframe, name) in timeframes {
@@ -139,7 +139,7 @@ async fn get_prices_with_timeframes(
 
         let start_time = Instant::now();
         match repo
-            .get_historical_prices(symbol, &timeframe, start_date, end_date)
+            .get_historical_prices(symbol, &timeframe, start_date, limit)
             .await
         {
             Ok(prices) => {
@@ -211,6 +211,14 @@ async fn benchmark_repository_performance(
             full_start
         };
 
+        // Calculate appropriate limits for each window size
+        let daily_limit = window.num_days() as usize;
+        let hourly_limit = if window.num_days() <= 30 {
+            (window.num_days() * 24) as usize // 24 hours per day
+        } else {
+            0 // Skip hourly data for large windows
+        };
+
         info!(
             "Benchmarking {} day window ({} to {})",
             window.num_days(),
@@ -221,7 +229,7 @@ async fn benchmark_repository_performance(
         // Test daily timeframe
         let start_time = Instant::now();
         let daily_result = repo
-            .get_historical_prices(symbol, &TimeFrame::Day, &start_date, &full_end)
+            .get_historical_prices(symbol, &TimeFrame::Day, &start_date, daily_limit)
             .await;
         let daily_elapsed = start_time.elapsed();
 
@@ -240,10 +248,10 @@ async fn benchmark_repository_performance(
         }
 
         // Test hourly timeframe (if window is 30 days or less)
-        if window.num_days() <= 30 {
+        if hourly_limit > 0 {
             let start_time = Instant::now();
             let hourly_result = repo
-                .get_historical_prices(symbol, &TimeFrame::Hour, &start_date, &full_end)
+                .get_historical_prices(symbol, &TimeFrame::Hour, &start_date, hourly_limit)
                 .await;
             let hourly_elapsed = start_time.elapsed();
 
