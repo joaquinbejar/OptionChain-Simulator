@@ -1,13 +1,13 @@
-use std::string::ToString;
 use crate::domain::Simulator;
 use crate::session::SessionStore;
 use crate::session::model::{Session, SimulationParameters};
 use crate::session::state_handler::StateProgressionHandler;
+use crate::utils::UuidGenerator;
 use crate::utils::error::ChainError;
 use optionstratlib::chains::OptionChain;
+use std::string::ToString;
 use std::sync::Arc;
 use uuid::Uuid;
-use crate::utils::UuidGenerator;
 
 const DEFAULT_NAMESPACE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
@@ -16,11 +16,10 @@ pub struct SessionManager {
     store: Arc<dyn SessionStore>,
     state_handler: StateProgressionHandler,
     simulator: Simulator,
-    uuid_generator: UuidGenerator
+    uuid_generator: UuidGenerator,
 }
 
 impl SessionManager {
-    
     /// Constructs a new instance of the struct with the provided session store.
     ///
     /// # Arguments
@@ -38,15 +37,14 @@ impl SessionManager {
     ///   specific processes or operations as per the required functionality.
     ///
     pub fn new(store: Arc<dyn SessionStore>) -> Self {
-
         // Create a new namespace for each session manager instance
         // let namespace_uuid = Uuid::new_v4().to_string();
         // let namespace = Uuid::parse_str(&namespace_uuid)
         //     .expect("Failed to parse default UUID namespace");
-        
+
         // Create a default namespace for compatibility
-        let namespace = Uuid::parse_str(DEFAULT_NAMESPACE)
-            .expect("Failed to parse default UUID namespace");
+        let namespace =
+            Uuid::parse_str(DEFAULT_NAMESPACE).expect("Failed to parse default UUID namespace");
         let uuid_generator = UuidGenerator::new(namespace);
         Self {
             store,
@@ -130,7 +128,6 @@ impl SessionManager {
     /// - If the updated session fails to be saved back to the store, an error from the store implementation is propagated.
     ///
     pub async fn get_next_step(&self, id: Uuid) -> Result<(Session, OptionChain), ChainError> {
-
         let mut session = self.store.get(id)?;
 
         // Advance session state

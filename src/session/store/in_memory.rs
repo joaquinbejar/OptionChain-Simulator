@@ -110,13 +110,13 @@ mod tests {
     use crate::session::SimulationMethod;
     use crate::session::model::{Session, SessionState, SimulationParameters};
 
+    use crate::utils::UuidGenerator;
     use optionstratlib::utils::TimeFrame;
     use optionstratlib::{Positive, pos};
     use rust_decimal::Decimal;
     use std::thread;
     use std::time::{Duration, SystemTime};
     use uuid::Uuid;
-    use crate::utils::UuidGenerator;
 
     fn create_test_session(id_option: Option<Uuid>) -> Session {
         let params = SimulationParameters {
@@ -141,8 +141,8 @@ mod tests {
 
         let now = SystemTime::now();
         let namespace_uuid = Uuid::new_v4().to_string();
-        let namespace = Uuid::parse_str(&namespace_uuid)
-            .expect("Failed to parse default UUID namespace");
+        let namespace =
+            Uuid::parse_str(&namespace_uuid).expect("Failed to parse default UUID namespace");
         let uuid_generator = UuidGenerator::new(namespace);
 
         if let Some(id) = id_option {

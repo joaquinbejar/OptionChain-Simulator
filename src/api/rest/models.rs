@@ -234,7 +234,7 @@ pub enum ApiWalkType {
         /// This field can store the symbol related to an object, entity, or data structure.
         /// If no symbol is provided, the value will be `None`.
         ///
-        symbol: Option<String>
+        symbol: Option<String>,
     },
 }
 
@@ -343,10 +343,14 @@ impl From<WalkType> for ApiWalkType {
                 vol_speed: vol_speed.to_f64(),
                 vol_mean: vol_mean.to_f64(),
             },
-            WalkType::Historical { timeframe, prices, symbol } => ApiWalkType::Historical {
+            WalkType::Historical {
+                timeframe,
+                prices,
+                symbol,
+            } => ApiWalkType::Historical {
                 timeframe: timeframe.into(),
                 prices: prices.iter().map(|p| p.to_f64()).collect(),
-                symbol
+                symbol,
             },
         }
     }
@@ -458,10 +462,14 @@ impl From<ApiWalkType> for WalkType {
                 vol_speed: pos!(vol_speed),
                 vol_mean: pos!(vol_mean),
             },
-            ApiWalkType::Historical { timeframe, prices, symbol } => WalkType::Historical {
+            ApiWalkType::Historical {
+                timeframe,
+                prices,
+                symbol,
+            } => WalkType::Historical {
                 timeframe: timeframe.into(),
                 prices: prices.into_iter().map(|p| pos!(p)).collect(),
-                symbol
+                symbol,
             },
         }
     }

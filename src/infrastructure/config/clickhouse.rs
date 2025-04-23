@@ -135,7 +135,6 @@ mod tests {
         assert_eq!(config.password, "password");
         assert_eq!(config.database, "default");
 
-
         // Restore environment variables
         if let Some(val) = current_host {
             set_var("CLICKHOUSE_HOST", &val);

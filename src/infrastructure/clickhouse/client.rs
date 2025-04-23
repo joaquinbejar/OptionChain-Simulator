@@ -8,7 +8,50 @@ use optionstratlib::utils::TimeFrame;
 use rust_decimal::Decimal;
 use tracing::{debug, info, instrument};
 
-
+/// A client for interacting with a ClickHouse database.
+///
+/// The `ClickHouseClient` struct serves as a central component for managing
+/// connections to a ClickHouse database and executing queries. It encapsulates
+/// a connection pool for efficient resource management and holds configuration
+/// settings required to establish the connection.
+///
+/// # Fields
+///
+/// * `client`:
+///     * Type: `Client`
+///     * Visibility: `pub(crate)`
+///     * Description:
+///       Represents the internal connection pool used to manage database
+///       connections. It facilitates efficient resource reuse and thread-safe
+///       access to the ClickHouse database.
+///     * Notes:
+///         - This field is not directly accessible outside the crate to ensure
+///           proper encapsulation of the connection pooling mechanism.
+///         - The pool should be configured correctly to handle concurrent workloads
+///           and prevent resource exhaustion.
+///
+/// * `config`:
+///     * Type: `ClickHouseConfig`
+///     * Description:
+///       Contains the configuration parameters for connecting to the ClickHouse
+///       database. This includes details such as the server's host, port,
+///       authentication credentials, database name, and optional settings.
+///     * Notes:
+///         - Ensure the configuration is correctly set to establish a successful
+///           connection to the database.
+///         - Misconfigured settings such as an incorrect host, port, or credentials
+///           can lead to connection errors.
+///
+/// # Notes
+///
+/// - The `ClickHouseClient` is designed to encapsulate connection logic and
+///   manage resources in a way that minimizes overhead and improves performance
+///   in high-load scenarios.
+/// - Exceptions or errors during database interaction are typically surfaced
+///   to the caller for proper error handling.
+///
+/// This struct aims to provide a robust and flexible abstraction for ClickHouse
+/// interactions, enabling efficient and scalable database operations.
 pub struct ClickHouseClient {
     /// Represents a connection pool that is used internally within the crate.
     ///
@@ -43,7 +86,6 @@ pub struct ClickHouseClient {
     ///
     /// Ensure you provide valid and reachable settings to avoid connection issues.
     config: ClickHouseConfig,
-
 }
 
 impl Default for ClickHouseClient {
@@ -70,13 +112,9 @@ impl ClickHouseClient {
             .with_database(config.database.clone());
 
         info!("Created new ClickHouse client for host: {}", config.host);
-        
-        Ok(Self { 
-            client, 
-            config,
-        })
+
+        Ok(Self { client, config })
     }
-    
 
     /// Fetches historical price data for a given symbol, time frame, and date range
     #[instrument(skip(self), level = "debug")]
@@ -117,7 +155,7 @@ impl ClickHouseClient {
     ) -> Result<Vec<OHLCVData>, ChainError> {
         debug!(
             "Fetching {} OHLCV data for {} from {} with timeframe {:?}",
-            limit,  symbol, start_date, timeframe
+            limit, symbol, start_date, timeframe
         );
 
         // Build the SQL query based on the timeframe
@@ -190,7 +228,7 @@ impl ClickHouseClient {
             ORDER BY timestamp LIMIT {}",
                 symbol, start_timestamp, limit
             );
-            
+
             return Ok(query);
         }
 
@@ -233,7 +271,7 @@ impl ClickHouseClient {
         FROM intervals LIMIT {}",
             interval, symbol, start_timestamp, limit
         );
-        
+
         Ok(query)
     }
 
@@ -283,7 +321,7 @@ impl ClickHouseClient {
         debug!("Executing ClickHouse query: {}", query);
 
         let rows: Vec<ClickHouseRow> = self.client.query(&query).fetch_all().await?;
-        
+
         let mut results = Vec::new();
 
         for row in rows {

@@ -7,7 +7,6 @@ use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
 use std::sync::Arc;
 
-
 /// Represents a repository for accessing historical data stored in a ClickHouse database.
 ///
 /// The `ClickHouseHistoricalRepository` provides an abstraction over the ClickHouse client
@@ -50,7 +49,6 @@ impl ClickHouseHistoricalRepository {
 
 #[async_trait]
 impl HistoricalDataRepository for ClickHouseHistoricalRepository {
-    
     ///
     /// Retrieves historical price data for a given symbol, timeframe, and date range.
     ///
@@ -122,7 +120,8 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
     async fn list_available_symbols(&self) -> Result<Vec<String>, ChainError> {
         let query = "SELECT DISTINCT symbol FROM ohlcv ORDER BY symbol";
 
-        let symbols: Vec<String> = self.client
+        let symbols: Vec<String> = self
+            .client
             .client
             .query(query)
             .fetch_all::<String>()
@@ -194,22 +193,18 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
             max_date: i64,
         }
 
-        let rows: Vec<DateRange> = self.client
-            .client
-            .query(&query)
-            .fetch_all()
-            .await?;
+        let rows: Vec<DateRange> = self.client.client.query(&query).fetch_all().await?;
 
         if let Some(row) = rows.first() {
-            let min_date = chrono::DateTime::<Utc>::from_timestamp(row.min_date, 0)
-                .ok_or_else(|| ChainError::ClickHouseError(
-                    format!("Invalid min timestamp: {}", row.min_date)
-                ))?;
+            let min_date =
+                chrono::DateTime::<Utc>::from_timestamp(row.min_date, 0).ok_or_else(|| {
+                    ChainError::ClickHouseError(format!("Invalid min timestamp: {}", row.min_date))
+                })?;
 
-            let max_date = chrono::DateTime::<Utc>::from_timestamp(row.max_date, 0)
-                .ok_or_else(|| ChainError::ClickHouseError(
-                    format!("Invalid max timestamp: {}", row.max_date)
-                ))?;
+            let max_date =
+                chrono::DateTime::<Utc>::from_timestamp(row.max_date, 0).ok_or_else(|| {
+                    ChainError::ClickHouseError(format!("Invalid max timestamp: {}", row.max_date))
+                })?;
 
             Ok((min_date, max_date))
         } else {

@@ -3,7 +3,6 @@ use chrono::{DateTime, Duration, Utc};
 use optionstratlib::utils::TimeFrame;
 use rand::Rng;
 
-
 /// Calculates the required duration based on timeframe and steps
 pub fn calculate_required_duration(timeframe: &TimeFrame, steps: usize) -> Duration {
     match timeframe {
@@ -16,8 +15,8 @@ pub fn calculate_required_duration(timeframe: &TimeFrame, steps: usize) -> Durat
         TimeFrame::Week => Duration::weeks(steps as i64),
         TimeFrame::Month => Duration::days(steps as i64 * 30), // Approximation
         TimeFrame::Quarter => Duration::days(steps as i64 * 90), // Approximation
-        TimeFrame::Year => Duration::days(steps as i64 * 365), 
-        TimeFrame::Custom(p) => Duration::days(p.to_i64())
+        TimeFrame::Year => Duration::days(steps as i64 * 365),
+        TimeFrame::Custom(p) => Duration::days(p.to_i64()),
     }
 }
 
