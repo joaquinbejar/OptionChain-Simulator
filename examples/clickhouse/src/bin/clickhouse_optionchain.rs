@@ -50,11 +50,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             // Get a sample of historical prices to use as a basis for simulation
-            let end_date = max_date;
-            let start_date = end_date - Duration::days(60); // Last 60 days of data
+            let start_date = max_date - Duration::days(60); // Start from 60 days before max_date
+            let limit = 60; // Retrieve up to 60 data points (approximately 60 days of daily data)
 
             match repo
-                .get_historical_prices(symbol, &TimeFrame::Day, &start_date, &end_date)
+                .get_historical_prices(symbol, &TimeFrame::Day, &start_date, limit)
                 .await
             {
                 Ok(historical_prices) => {
@@ -144,7 +144,7 @@ fn create_simulation_parameters(
             volatility,
         },
         time_frame,
-        chain_size: Some(30),                  // 15 strikes
+        chain_size: Some(30),                  // 30 strikes
         strike_interval: Some(pos!(1.0)),      // $1 intervals
         skew_factor: Some(Decimal::new(5, 4)), // 0.0005
         spread: spos!(0.02),                   // 2% bid-ask spread
