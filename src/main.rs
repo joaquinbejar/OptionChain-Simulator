@@ -60,7 +60,7 @@
 use optionchain_simulator::api::{ListenOn, start_server};
 use optionchain_simulator::infrastructure::{RedisClient, RedisConfig};
 use optionchain_simulator::session::{InRedisSessionStore, SessionManager};
-use optionstratlib::utils::{setup_logger, setup_logger_with_level};
+use optionstratlib::utils::setup_logger_with_level;
 use std::sync::Arc;
 use tracing::info;
 
