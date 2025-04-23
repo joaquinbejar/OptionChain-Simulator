@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Define the symbol and date range
+    // Define the symbol
     let symbol = "CL"; // Crude oil
 
     // Get the date range for the symbol
@@ -49,14 +49,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 max_date.format("%Y-%m-%d %H:%M:%S")
             );
 
-            // Set our query date range to the last 30 days of available data
-            let end_date = max_date;
-            let start_date = end_date - Duration::days(30);
+            // Set our query start date to 30 days before max_date
+            let start_date = max_date - Duration::days(30);
 
-            // Example 1: Get daily prices
+            // Example 1: Get daily prices (up to 30 points)
             info!("Fetching daily prices for the last 30 days...");
             match repo
-                .get_historical_prices(symbol, &TimeFrame::Day, &start_date, &end_date)
+                .get_historical_prices(symbol, &TimeFrame::Day, &start_date, 30)
                 .await
             {
                 Ok(prices) => {
@@ -84,11 +83,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Example 2: Get hourly prices
+            // Example 2: Get hourly prices (up to 168 points - 7 days * 24 hours)
             info!("Fetching hourly prices for the last 7 days...");
-            let hourly_start = end_date - Duration::days(7);
+            let hourly_start = max_date - Duration::days(7);
+            let hourly_limit = 168; // 7 days * 24 hours
             match repo
-                .get_historical_prices(symbol, &TimeFrame::Hour, &hourly_start, &end_date)
+                .get_historical_prices(symbol, &TimeFrame::Hour, &hourly_start, hourly_limit)
                 .await
             {
                 Ok(prices) => {
@@ -108,9 +108,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Example 3: Get OHLCV data and extract different price types
             info!("Fetching OHLCV data for the last 14 days...");
-            let ohlcv_start = end_date - Duration::days(14);
+            let ohlcv_start = max_date - Duration::days(14);
+            let ohlcv_limit = 14; // 14 daily data points
             match client
-                .fetch_ohlcv_data(symbol, &TimeFrame::Day, &ohlcv_start, &end_date)
+                .fetch_ohlcv_data(symbol, &TimeFrame::Day, &ohlcv_start, ohlcv_limit)
                 .await
             {
                 Ok(ohlcv_data) => {
