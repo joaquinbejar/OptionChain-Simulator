@@ -85,15 +85,15 @@ impl ClickHouseClient {
         symbol: &str,
         timeframe: &TimeFrame,
         start_date: &DateTime<Utc>,
-        end_date: &DateTime<Utc>,
+        limit: usize,
     ) -> Result<Vec<Positive>, ChainError> {
         debug!(
-            "Fetching historical prices for {} from {} to {} with timeframe {:?}",
-            symbol, start_date, end_date, timeframe
+            "Fetching historical {} prices for {} from {} with timeframe {:?}",
+            limit, symbol, start_date, timeframe
         );
 
         // Build the SQL query based on the timeframe
-        let query = self.build_timeframe_query(symbol, timeframe, start_date, end_date)?;
+        let query = self.build_timeframe_query(symbol, timeframe, start_date, limit)?;
 
         // Execute the query
         let results = self.execute_query(query).await?;
@@ -113,15 +113,15 @@ impl ClickHouseClient {
         symbol: &str,
         timeframe: &TimeFrame,
         start_date: &DateTime<Utc>,
-        end_date: &DateTime<Utc>,
+        limit: usize,
     ) -> Result<Vec<OHLCVData>, ChainError> {
         debug!(
-            "Fetching OHLCV data for {} from {} to {} with timeframe {:?}",
-            symbol, start_date, end_date, timeframe
+            "Fetching {} OHLCV data for {} from {} with timeframe {:?}",
+            limit,  symbol, start_date, timeframe
         );
 
         // Build the SQL query based on the timeframe
-        let query = self.build_timeframe_query(symbol, timeframe, start_date, end_date)?;
+        let query = self.build_timeframe_query(symbol, timeframe, start_date, limit)?;
 
         // Execute the query directly
         let results = self.execute_query(query).await?;
@@ -174,23 +174,24 @@ impl ClickHouseClient {
         symbol: &str,
         timeframe: &TimeFrame,
         start_date: &DateTime<Utc>,
-        end_date: &DateTime<Utc>,
+        limit: usize,
     ) -> Result<String, ChainError> {
-        // Format dates for SQL
-        let start_date_str = start_date.format("%Y-%m-%d %H:%M:%S").to_string();
-        let end_date_str = end_date.format("%Y-%m-%d %H:%M:%S").to_string();
+        // Convert date to Unix timestamp for the query
+        let start_timestamp = start_date.timestamp();
 
         // Base query for minute data (smallest timeframe supported)
         if *timeframe == TimeFrame::Minute {
-            return Ok(format!(
+            let query = format!(
                 "SELECT symbol, toInt64(toUnixTimestamp(timestamp)) as timestamp, 
-                open, high, low, close, toUInt64(volume) as volume \
-                FROM ohlcv \
-                WHERE symbol = '{}' \
-                AND timestamp BETWEEN toDateTime('{}') AND toDateTime('{}') \
-                ORDER BY timestamp",
-                symbol, start_date_str, end_date_str
-            ));
+            open, high, low, close, toUInt64(volume) as volume \
+            FROM ohlcv \
+            WHERE symbol = '{}' \
+            AND timestamp >= FROM_UNIXTIME({}) \
+            ORDER BY timestamp LIMIT {}",
+                symbol, start_timestamp, limit
+            );
+            
+            return Ok(query);
         }
 
         // For larger timeframes, we need to aggregate the minute data
@@ -209,29 +210,31 @@ impl ClickHouseClient {
         };
 
         // Query with aggregation for larger timeframes
-        Ok(format!(
+        let query = format!(
             "WITH intervals AS (
-                SELECT 
-                    symbol,
-                    toStartOfInterval(timestamp, INTERVAL {}) as interval_start,
-                    any(open) as open,
-                    max(high) as high,
-                    min(low) as low,
-                    any(close) as close,
-                    sum(volume) as volume
-                FROM ohlcv
-                WHERE symbol = '{}' 
-                AND timestamp BETWEEN '{}' AND '{}'
-                GROUP BY symbol, interval_start
-                ORDER BY interval_start
-            )
             SELECT 
                 symbol,
-                toInt64(toUnixTimestamp(interval_start)) as timestamp,
-                open, high, low, close, volume
-            FROM intervals",
-            interval, symbol, start_date_str, end_date_str
-        ))
+                toStartOfInterval(timestamp, INTERVAL {}) as interval_start,
+                any(open) as open,
+                max(high) as high,
+                min(low) as low,
+                any(close) as close,
+                sum(volume) as volume
+            FROM ohlcv
+            WHERE symbol = '{}' \
+            AND timestamp >= FROM_UNIXTIME({}) \
+            GROUP BY symbol, interval_start
+            ORDER BY interval_start
+        )
+        SELECT 
+            symbol,
+            toInt64(toUnixTimestamp(interval_start)) as timestamp,
+            open, high, low, close, volume
+        FROM intervals LIMIT {}",
+            interval, symbol, start_timestamp, limit
+        );
+        
+        Ok(query)
     }
 
     /// Executes a ClickHouse query and retrieves data in the form of OHLCV (Open, High, Low, Close, Volume) records.

@@ -43,7 +43,7 @@ pub trait HistoricalDataRepository: Send + Sync {
         symbol: &str,
         timeframe: &TimeFrame,
         start_date: &DateTime<Utc>,
-        end_date: &DateTime<Utc>,
+        limit: usize,
     ) -> Result<Vec<Positive>, ChainError>;
 
     /// Retrieves a list of all available symbols that can be accessed.

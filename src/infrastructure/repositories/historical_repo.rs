@@ -82,10 +82,10 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
         symbol: &str,
         timeframe: &TimeFrame,
         start_date: &chrono::DateTime<Utc>,
-        end_date: &chrono::DateTime<Utc>,
+        limit: usize,
     ) -> Result<Vec<Positive>, ChainError> {
         self.client
-            .fetch_historical_prices(symbol, timeframe, start_date, end_date)
+            .fetch_historical_prices(symbol, timeframe, start_date, limit)
             .await
     }
 

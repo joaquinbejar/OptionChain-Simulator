@@ -18,7 +18,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::{Arc, Mutex};
 use rand::Rng;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use crate::infrastructure::{calculate_required_duration, select_random_date, ClickHouseClient, ClickHouseConfig, ClickHouseHistoricalRepository, HistoricalDataRepository};
 
 
@@ -112,9 +112,9 @@ impl Simulator {
 
         // Get the chain for the current step
         if session.current_step >= random_walk.len() {
-            error!("Walker reached end of random walk");
+            warn!("Walker reached end of data");
             return Err(ChainError::SimulatorError(
-                "Walker reached end of random walk".to_string(),
+                "Walker reached end of data".to_string(),
             ));
         }
         let step = random_walk[session.current_step].clone();
@@ -188,7 +188,7 @@ impl Simulator {
             
             // Fetch the historical prices
             let prices = repo
-                .get_historical_prices(&actual_symbol, timeframe, &start_date, &end_date)
+                .get_historical_prices(&actual_symbol, timeframe, &start_date, steps)
                 .await
                 .map_err(|e| ChainError::ClickHouseError(e.to_string()))?;
 

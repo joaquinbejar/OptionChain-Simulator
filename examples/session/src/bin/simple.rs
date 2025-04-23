@@ -1,11 +1,10 @@
-use optionstratlib::simulation::WalkType;
 use optionstratlib::utils::time::convert_time_frame;
 use optionstratlib::utils::{TimeFrame, setup_logger};
-use optionstratlib::{ExpirationDate, Positive, pos, spos};
+use optionstratlib::{ Positive, pos, spos};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
-use tracing::{Level, error, info};
+use tracing::{ error, info};
 use uuid::Uuid;
 
 use optionchain_simulator::session::{InMemorySessionStore, SimulationMethod};
