@@ -5,6 +5,7 @@ use crate::api::rest::responses::{
     ChainResponse, ErrorResponse, OptionContractResponse, OptionPriceResponse, SessionInfoResponse,
     SessionParametersResponse, SessionResponse,
 };
+use crate::infrastructure::MetricsCollector;
 use crate::session::{SessionManager, SimulationParameters};
 use crate::utils::ChainError;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
@@ -53,9 +54,11 @@ use uuid::Uuid;
 pub(crate) async fn create_session(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
+    metrics_collector: web::Data<Arc<MetricsCollector>>,
     json_req: web::Json<CreateSessionRequest>,
 ) -> impl Responder {
     info!("{} {}: body={}", req.method(), req.path(), json_req.0);
+    metrics_collector.increment_active_sessions();
 
     // Convert request to domain SimulationParameters
     let simulation_params: SimulationParameters = json_req.0.into();
@@ -107,6 +110,7 @@ pub(crate) async fn create_session(
 pub(crate) async fn get_next_step(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
+    metrics_collector: web::Data<Arc<MetricsCollector>>,
     query: web::Query<SessionId>,
 ) -> impl Responder {
     info!(
@@ -115,6 +119,7 @@ pub(crate) async fn get_next_step(
         req.path(),
         query.session_id
     );
+    let start_time = std::time::Instant::now();
 
     // Parse the session ID
     let session_id = match Uuid::parse_str(&query.session_id) {
@@ -170,7 +175,9 @@ pub(crate) async fn get_next_step(
                     total_steps: session.total_steps,
                 },
             };
-
+            let duration = start_time.elapsed();
+            metrics_collector.record_simulation_step(&session.parameters.method.to_string());
+            metrics_collector.record_simulation_duration(duration);
             HttpResponse::Ok().json(response)
         }
         Err(error) => map_error(error),
@@ -403,6 +410,7 @@ pub(crate) async fn delete_session(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
+    metrics_collector: web::Data<Arc<MetricsCollector>>,
 ) -> impl Responder {
     info!(
         "{} {}: session_id={}",
@@ -410,6 +418,7 @@ pub(crate) async fn delete_session(
         req.path(),
         query.session_id
     );
+    metrics_collector.decrement_active_sessions();
     let session_id = Uuid::parse_str(&query.session_id)
         .map_err(|_| ChainError::InvalidState("Invalid session ID format".to_string()));
 
