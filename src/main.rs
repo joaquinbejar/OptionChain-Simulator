@@ -58,7 +58,9 @@
 //! - Generated and maintained by the developers of `optionchain_simulator`.
 
 use optionchain_simulator::api::{ListenOn, start_server};
-use optionchain_simulator::infrastructure::{MetricsCollector, RedisClient, RedisConfig};
+use optionchain_simulator::infrastructure::{
+    MetricsCollector, RedisClient, RedisConfig, init_mongodb,
+};
 use optionchain_simulator::session::{InRedisSessionStore, SessionManager};
 use optionstratlib::utils::setup_logger_with_level;
 use std::sync::Arc;
@@ -110,7 +112,7 @@ use tracing::info;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_logger_with_level("DEBUG");
 
-    // Create session store
+    // Create a session store
     let redis_config = RedisConfig::default();
     info!("Connecting to Redis at {}", redis_config);
     let redis_client = Arc::new(RedisClient::new(redis_config)?);
@@ -120,16 +122,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(3600),                               // 1 hour TTL
     ));
 
-    // Create metrics collector
+    // Create a metrics collector
     let metrics_collector = Arc::new(MetricsCollector::new()?);
+    // Create a MongoDB repository
+    let mongodb_repository = init_mongodb().await?;
 
-    // Create session manager
+    // Create a session manager
     let session_manager = Arc::new(SessionManager::new(store.clone()));
     let listen_on = ListenOn::All;
     let port = 7070;
     // Start HTTP server
     info!("Starting HTTP server at http://{}:{}", listen_on, port);
-    match start_server(session_manager, metrics_collector, listen_on, port).await {
+    match start_server(
+        session_manager,
+        metrics_collector,
+        mongodb_repository,
+        listen_on,
+        port,
+    )
+    .await
+    {
         Ok(_) => Ok(()),
         Err(e) => Err(e.to_string().into()),
     }

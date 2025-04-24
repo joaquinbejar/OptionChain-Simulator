@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::api::rest::routes::configure_routes;
-use crate::infrastructure::{MetricsCollector, MetricsMiddleware};
+use crate::infrastructure::{MetricsCollector, MetricsMiddleware, MongoDBRepository};
 
 /// Starts an HTTP server with the given configuration.
 ///
@@ -42,6 +42,7 @@ use crate::infrastructure::{MetricsCollector, MetricsMiddleware};
 pub async fn start_server(
     session_manager: Arc<SessionManager>,
     metrics_collector: Arc<MetricsCollector>,
+    mongodb_repo: Arc<MongoDBRepository>,
     listen_on: ListenOn,
     port: u16,
 ) -> std::io::Result<()> {
@@ -53,7 +54,12 @@ pub async fn start_server(
         App::new()
             .wrap(MetricsMiddleware::new(metrics_collector.clone()))
             .configure(|cfg| {
-                configure_routes(cfg, session_manager.clone(), metrics_collector.clone())
+                configure_routes(
+                    cfg,
+                    session_manager.clone(),
+                    metrics_collector.clone(),
+                    mongodb_repo.clone(),
+                )
             })
     })
     .bind(bind_address)?

@@ -4,7 +4,7 @@ use crate::api::rest::handlers::{
 };
 use crate::api::rest::middleware::metrics_endpoint;
 use crate::api::rest::swagger::ApiDoc;
-use crate::infrastructure::MetricsCollector;
+use crate::infrastructure::{MetricsCollector, MongoDBRepository};
 use crate::session::SessionManager;
 use actix_web::web;
 use std::sync::Arc;
@@ -52,9 +52,11 @@ pub fn configure_routes(
     cfg: &mut web::ServiceConfig,
     session_manager: Arc<SessionManager>,
     metrics_collector: Arc<MetricsCollector>,
+    mongodb_repo: Arc<MongoDBRepository>,
 ) {
     cfg.app_data(web::Data::new(session_manager))
         .app_data(web::Data::new(metrics_collector.clone()))
+        .app_data(web::Data::new(mongodb_repo))
         .service(
             web::resource("/api/v1/chain")
                 .route(web::post().to(create_session))

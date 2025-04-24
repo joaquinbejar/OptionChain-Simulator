@@ -5,7 +5,7 @@ use crate::api::rest::responses::{
     ChainResponse, ErrorResponse, OptionContractResponse, OptionPriceResponse, SessionInfoResponse,
     SessionParametersResponse, SessionResponse,
 };
-use crate::infrastructure::MetricsCollector;
+use crate::infrastructure::{MetricsCollector, MongoDBRepository};
 use crate::session::{SessionManager, SimulationParameters};
 use crate::utils::ChainError;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
@@ -55,6 +55,7 @@ pub(crate) async fn create_session(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     metrics_collector: web::Data<Arc<MetricsCollector>>,
+    mongodb_repo: web::Data<Arc<MongoDBRepository>>,
     json_req: web::Json<CreateSessionRequest>,
 ) -> impl Responder {
     info!("{} {}: body={}", req.method(), req.path(), json_req.0);
@@ -68,6 +69,8 @@ pub(crate) async fn create_session(
         Ok(session) => {
             let created_at_utc = DateTime::<Utc>::from(session.created_at);
             let updated_at_utc = DateTime::<Utc>::from(session.updated_at);
+            let method_value =
+                serde_json::to_value(&session.parameters.method).unwrap_or(serde_json::Value::Null);
             let response = SessionResponse {
                 id: session.id.to_string(),
                 created_at: created_at_utc.to_rfc3339(),
@@ -77,7 +80,7 @@ pub(crate) async fn create_session(
                     initial_price: session.parameters.initial_price.into(),
                     volatility: session.parameters.volatility.into(),
                     risk_free_rate: session.parameters.risk_free_rate.to_f64().unwrap(),
-                    method: format!("{:?}", session.parameters.method),
+                    method: method_value,
                     time_frame: session.parameters.time_frame.to_string(),
                     dividend_yield: session.parameters.dividend_yield.into(),
                     skew_factor: session.parameters.skew_factor.map(|f| f.to_f64().unwrap()),
@@ -88,6 +91,14 @@ pub(crate) async fn create_session(
                 state: session.state.to_string(),
             };
 
+            // Save to MongoDB
+            if let Err(e) = mongodb_repo
+                .save_session_event(session.id, response.clone())
+                .await
+            {
+                error!(session_id = %session.id, "Failed to save session event to MongoDB: {}", e);
+                // Continue as this is not critical for the main flow
+            }
             HttpResponse::Created().json(response)
         }
         Err(error) => map_error(error),
@@ -111,6 +122,7 @@ pub(crate) async fn get_next_step(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     metrics_collector: web::Data<Arc<MetricsCollector>>,
+    mongodb_repo: web::Data<Arc<MongoDBRepository>>,
     query: web::Query<SessionId>,
 ) -> impl Responder {
     info!(
@@ -178,6 +190,15 @@ pub(crate) async fn get_next_step(
             let duration = start_time.elapsed();
             metrics_collector.record_simulation_step(&session.parameters.method.to_string());
             metrics_collector.record_simulation_duration(duration);
+
+            // Save to MongoDB
+            if let Err(e) = mongodb_repo
+                .save_chain_step(session_id, response.clone())
+                .await
+            {
+                error!(session_id = %session_id, "Failed to save chain step to MongoDB: {}", e);
+                // Continue as this is not critical for the main flow
+            }
             HttpResponse::Ok().json(response)
         }
         Err(error) => map_error(error),
@@ -205,6 +226,7 @@ pub(crate) async fn replace_session(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
+    mongodb_repo: web::Data<Arc<MongoDBRepository>>,
     json_req: web::Json<CreateSessionRequest>,
 ) -> impl Responder {
     info!(
@@ -233,7 +255,8 @@ pub(crate) async fn replace_session(
         Ok(session) => {
             let created_at_utc = DateTime::<Utc>::from(session.created_at);
             let updated_at_utc = DateTime::<Utc>::from(session.updated_at);
-
+            let method_value =
+                serde_json::to_value(&session.parameters.method).unwrap_or(serde_json::Value::Null);
             let response = SessionResponse {
                 id: session.id.to_string(),
                 created_at: created_at_utc.to_rfc3339(),
@@ -243,7 +266,7 @@ pub(crate) async fn replace_session(
                     initial_price: session.parameters.initial_price.into(),
                     volatility: session.parameters.volatility.into(),
                     risk_free_rate: session.parameters.risk_free_rate.to_f64().unwrap(),
-                    method: format!("{:?}", session.parameters.method),
+                    method: method_value,
                     time_frame: session.parameters.time_frame.to_string(),
                     dividend_yield: session.parameters.dividend_yield.into(),
                     skew_factor: session.parameters.skew_factor.map(|f| f.to_f64().unwrap()),
@@ -253,6 +276,15 @@ pub(crate) async fn replace_session(
                 total_steps: session.total_steps,
                 state: session.state.to_string(),
             };
+
+            // Save to MongoDB
+            if let Err(e) = mongodb_repo
+                .save_session_event(session_id, response.clone())
+                .await
+            {
+                error!(session_id = %session_id, "Failed to save reinitialized session event to MongoDB: {}", e);
+                // Continue as this is not critical for the main flow
+            }
 
             HttpResponse::Ok().json(response)
         }
@@ -277,6 +309,7 @@ pub(crate) async fn update_session(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
+    mongodb_repo: web::Data<Arc<MongoDBRepository>>,
     json_req: web::Json<UpdateSessionRequest>,
 ) -> impl Responder {
     info!(
@@ -364,6 +397,8 @@ pub(crate) async fn update_session(
         Ok(session) => {
             let created_at_utc = DateTime::<Utc>::from(session.created_at);
             let updated_at_utc = DateTime::<Utc>::from(session.updated_at);
+            let method_value =
+                serde_json::to_value(&session.parameters.method).unwrap_or(serde_json::Value::Null);
 
             let response = SessionResponse {
                 id: session.id.to_string(),
@@ -374,7 +409,7 @@ pub(crate) async fn update_session(
                     initial_price: session.parameters.initial_price.into(),
                     volatility: session.parameters.volatility.into(),
                     risk_free_rate: session.parameters.risk_free_rate.to_f64().unwrap_or(0.0),
-                    method: format!("{:?}", session.parameters.method),
+                    method: method_value,
                     time_frame: session.parameters.time_frame.to_string(),
                     dividend_yield: session.parameters.dividend_yield.into(),
                     skew_factor: session
@@ -387,6 +422,15 @@ pub(crate) async fn update_session(
                 total_steps: session.total_steps,
                 state: session.state.to_string(),
             };
+
+            // Save to MongoDB
+            if let Err(e) = mongodb_repo
+                .save_session_event(session_id, response.clone())
+                .await
+            {
+                error!(session_id = %session_id, "Failed to save updated session event to MongoDB: {}", e);
+                // Continue as this is not critical for the main flow
+            }
 
             HttpResponse::Ok().json(response)
         }
@@ -426,10 +470,11 @@ pub(crate) async fn delete_session(
         Ok(id) => match session_manager.delete_session(id) {
             Ok(true) => {
                 let msg = format!("Session deleted successfully: {}", id);
-                HttpResponse::Ok().json(serde_json::json!({
+                let msg = serde_json::json!({
                     "message": msg,
                     "session_id": id.to_string()
-                }))
+                });
+                HttpResponse::Ok().json(msg)
             }
             Ok(false) => HttpResponse::NotFound().json(serde_json::json!({
                 "error": format!("Session not found: {}", id)

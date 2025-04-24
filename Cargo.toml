@@ -23,17 +23,18 @@ itertools = "0.14.0"
 uuid = { version = "1.16.0", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4.40", features = ["serde"] }
 clickhouse = "0.13.2"
-#tokio = { version = "1.44.2", features = ["full"] }
-tokio = { version = "1.0.1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.44.2", features = ["full"] }
+#tokio = { version = "1.0.1", features = ["rt", "rt-multi-thread", "macros"] }
 async-trait = "0.1.88"
 actix-web = { version = "4.0.2", features = ["rustls"] }
-redis = "0.29.5"
+actix-files = "0.6.6"
+redis = "0.30.0"
 utoipa = { version = "5.3.1", features = ["actix_extras"] }
 utoipa-swagger-ui = { version = "9.0.1", features = ["actix-web"] }
 rand = "0.9.0"
 prometheus = "0.14.0"
 futures = "0.3.31"
-actix-files = "0.6.6"
+mongodb = "3.2.3"
 
 
 [dev-dependencies]
