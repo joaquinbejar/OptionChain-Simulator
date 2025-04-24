@@ -31,7 +31,9 @@ redis = "0.29.5"
 utoipa = { version = "5.3.1", features = ["actix_extras"] }
 utoipa-swagger-ui = { version = "9.0.1", features = ["actix-web"] }
 rand = "0.9.0"
+prometheus = "0.14.0"
 futures = "0.3.31"
+actix-files = "0.6.6"
 
 
 [dev-dependencies]
