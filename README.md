@@ -28,8 +28,8 @@ App --> Domain[Domain Layer]
 App --> Infra[Infrastructure Layer]
 Domain --> SimEngine[Simulation Engine]
 Infra --> ClickHouse[(ClickHouse DB)]
-Infra --> Redis[(Redis Store)]
-Infra --> MongoDB[(MongoDB Store)]
+Infra --> Redis[(Redis)]
+Infra --> MongoDB[(MongoDB)]
 ```
 
 ### Session State Transitions
