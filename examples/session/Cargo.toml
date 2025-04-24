@@ -5,11 +5,9 @@ edition = "2024"
 
 [dependencies]
 optionchain_simulator = { path = "../../" }
-optionstratlib = { path = "../../../OptionStratLib" }
-#optionstratlib = "0.4.4"
+optionstratlib = "0.4.5"
 tracing = "0.1.41"
 uuid = { version = "1.16.0", features = ["v4", "serde"] }
 rust_decimal_macros = "1.37.1"
 rust_decimal = "1.37.1"
-chrono = { version = "0.4.40", features = ["serde"] }
 tokio = { version = "1.44.2", features = ["full"] }

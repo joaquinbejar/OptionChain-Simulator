@@ -12,8 +12,7 @@ keywords = ["finance", "options", "trading"]
 categories = ["finance", "data-structures"]
 
 [dependencies]
-optionstratlib = { path = "../OptionStratLib" }
-#optionstratlib = "0.4.3"
+optionstratlib = "0.4.5"
 tracing = "0.1.41"
 rust_decimal = { version = "1.37.1", features = ["maths", "serde"] }
 rust_decimal_macros = "1.37.1"
@@ -24,7 +23,6 @@ uuid = { version = "1.16.0", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4.40", features = ["serde"] }
 clickhouse = "0.13.2"
 tokio = { version = "1.44.2", features = ["full"] }
-#tokio = { version = "1.0.1", features = ["rt", "rt-multi-thread", "macros"] }
 async-trait = "0.1.88"
 actix-web = { version = "4.0.2", features = ["rustls"] }
 actix-files = "0.6.6"
@@ -51,5 +49,5 @@ members = [
 ]
 
 [workspace.dependencies]
-optionstratlib = { path = "../OptionStratLib" }
+optionstratlib = "0.4.5"
 tracing = "0.1.41"
