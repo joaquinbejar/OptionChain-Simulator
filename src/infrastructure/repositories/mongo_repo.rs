@@ -1,8 +1,10 @@
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::api::rest::responses::{ChainResponse, SessionResponse};
+use crate::infrastructure::MetricsCollector;
 use crate::infrastructure::config::mongo::MongoDBConfig;
 use crate::infrastructure::mongodb::MongoDBClient;
 use crate::utils::ChainError;
@@ -20,25 +22,45 @@ impl MongoDBRepository {
     }
 
     /// Saves a chain response to the steps collection
-    #[instrument(skip(self, chain_data), level = "debug")]
+    #[instrument(skip(self, chain_data, metrics), level = "debug")]
     pub async fn save_chain_step(
         &self,
         session_id: Uuid,
         chain_data: ChainResponse,
+        metrics: Arc<MetricsCollector>,
     ) -> Result<(), ChainError> {
         info!(session_id = %session_id, "Saving chain step to MongoDB");
-        self.client.save_step(session_id, chain_data).await
+        // Start measuring execution time
+        let start_time = Instant::now();
+        // MongoDB operation
+        let result = self.client.save_step(session_id, chain_data).await;
+        // Record metrics
+        let duration = start_time.elapsed();
+        metrics.record_mongodb_insert("steps"); // Count the insert 
+        metrics.record_mongodb_insert_duration("steps", duration); // Record the latency
+
+        result
     }
 
     /// Saves a session response to the events collection
-    #[instrument(skip(self, session_data), level = "debug")]
+    #[instrument(skip(self, session_data, metrics), level = "debug")]
     pub async fn save_session_event(
         &self,
         session_id: Uuid,
         session_data: SessionResponse,
+        metrics: Arc<MetricsCollector>,
     ) -> Result<(), ChainError> {
         info!(session_id = %session_id, "Saving session event to MongoDB");
-        self.client.save_event(session_id, session_data).await
+        // Start measuring execution time
+        let start_time = Instant::now();
+        // MongoDB operation
+        let result = self.client.save_event(session_id, session_data).await;
+        // Record metrics
+        let duration = start_time.elapsed();
+        metrics.record_mongodb_insert("events"); // Count the insert 
+        metrics.record_mongodb_insert_duration("events", duration); // Record the latency
+
+        result
     }
 
     /// Saves a generic event to the events collection

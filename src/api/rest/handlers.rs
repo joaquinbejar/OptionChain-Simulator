@@ -93,7 +93,11 @@ pub(crate) async fn create_session(
 
             // Save to MongoDB
             if let Err(e) = mongodb_repo
-                .save_session_event(session.id, response.clone())
+                .save_session_event(
+                    session.id,
+                    response.clone(),
+                    metrics_collector.get_ref().clone(),
+                )
                 .await
             {
                 error!(session_id = %session.id, "Failed to save session event to MongoDB: {}", e);
@@ -193,7 +197,11 @@ pub(crate) async fn get_next_step(
 
             // Save to MongoDB
             if let Err(e) = mongodb_repo
-                .save_chain_step(session_id, response.clone())
+                .save_chain_step(
+                    session_id,
+                    response.clone(),
+                    metrics_collector.get_ref().clone(),
+                )
                 .await
             {
                 error!(session_id = %session_id, "Failed to save chain step to MongoDB: {}", e);
@@ -225,6 +233,7 @@ pub(crate) async fn get_next_step(
 pub(crate) async fn replace_session(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
+    metrics_collector: web::Data<Arc<MetricsCollector>>,
     query: web::Query<SessionId>,
     mongodb_repo: web::Data<Arc<MongoDBRepository>>,
     json_req: web::Json<CreateSessionRequest>,
@@ -279,7 +288,11 @@ pub(crate) async fn replace_session(
 
             // Save to MongoDB
             if let Err(e) = mongodb_repo
-                .save_session_event(session_id, response.clone())
+                .save_session_event(
+                    session_id,
+                    response.clone(),
+                    metrics_collector.get_ref().clone(),
+                )
                 .await
             {
                 error!(session_id = %session_id, "Failed to save reinitialized session event to MongoDB: {}", e);
@@ -309,6 +322,7 @@ pub(crate) async fn update_session(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     query: web::Query<SessionId>,
+    metrics_collector: web::Data<Arc<MetricsCollector>>,
     mongodb_repo: web::Data<Arc<MongoDBRepository>>,
     json_req: web::Json<UpdateSessionRequest>,
 ) -> impl Responder {
@@ -425,7 +439,11 @@ pub(crate) async fn update_session(
 
             // Save to MongoDB
             if let Err(e) = mongodb_repo
-                .save_session_event(session_id, response.clone())
+                .save_session_event(
+                    session_id,
+                    response.clone(),
+                    metrics_collector.get_ref().clone(),
+                )
                 .await
             {
                 error!(session_id = %session_id, "Failed to save updated session event to MongoDB: {}", e);

@@ -24,6 +24,10 @@ pub struct MetricsCollector {
 
     // Resource metrics
     memory_usage: Gauge,
+
+    // MongoDB metrics
+    mongodb_insert_counter: IntCounterVec, // Count inserts by collection
+    mongodb_insert_duration: HistogramVec, // Track latency of inserts by collection
 }
 
 impl MetricsCollector {
@@ -91,6 +95,24 @@ impl MetricsCollector {
         // Create resource metrics
         let memory_usage = Gauge::new("memory_usage_bytes", "Current memory usage in bytes")?;
 
+        // Create MongoDB metrics
+        let mongodb_insert_counter = IntCounterVec::new(
+            prometheus::opts!(
+                "mongodb_inserts_total",
+                "Total number of MongoDB insert operations"
+            ),
+            &["collection"],
+        )?;
+
+        let mongodb_insert_duration = HistogramVec::new(
+            prometheus::histogram_opts!(
+                "mongodb_insert_duration_seconds",
+                "MongoDB insert operation duration in seconds",
+                vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
+            ),
+            &["collection"],
+        )?;
+
         // Register all metrics with the registry
         registry.register(Box::new(request_counter.clone()))?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -103,6 +125,10 @@ impl MetricsCollector {
         registry.register(Box::new(cache_hit_counter.clone()))?;
         registry.register(Box::new(cache_miss_counter.clone()))?;
         registry.register(Box::new(memory_usage.clone()))?;
+
+        // Register MongoDB metrics
+        registry.register(Box::new(mongodb_insert_counter.clone()))?;
+        registry.register(Box::new(mongodb_insert_duration.clone()))?;
 
         Ok(Self {
             registry,
@@ -117,6 +143,8 @@ impl MetricsCollector {
             cache_hit_counter,
             cache_miss_counter,
             memory_usage,
+            mongodb_insert_counter,
+            mongodb_insert_duration,
         })
     }
 
@@ -178,6 +206,20 @@ impl MetricsCollector {
     /// Records the current memory usage
     pub fn record_memory_usage(&self, bytes: f64) {
         self.memory_usage.set(bytes);
+    }
+
+    /// Records a MongoDB insert operation
+    pub fn record_mongodb_insert(&self, collection: &str) {
+        self.mongodb_insert_counter
+            .with_label_values(&[collection])
+            .inc();
+    }
+
+    /// Records the duration of a MongoDB insert operation
+    pub fn record_mongodb_insert_duration(&self, collection: &str, duration: Duration) {
+        self.mongodb_insert_duration
+            .with_label_values(&[collection])
+            .observe(duration.as_secs_f64());
     }
 
     /// Returns the current metric registry
