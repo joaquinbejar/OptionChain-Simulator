@@ -81,37 +81,6 @@ impl Default for RedisConfig {
 
 impl fmt::Display for RedisConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // // Start building the URL
-        // let mut url = String::from("redis://");
-        //
-        // // Add credentials if either username or password is present
-        // if self.username.is_some() || self.password.is_some() {
-        //     // Add username if present, otherwise an empty string
-        //     if let Some(username) = &self.username {
-        //         url.push_str(username);
-        //     }
-        //
-        //     // Add password with colon prefix if present
-        //     if let Some(password) = &self.password {
-        //         url.push(':');
-        //         url.push_str(password);
-        //     }
-        //
-        //     // Add the @ separator after credentials
-        //     url.push('@');
-        // }
-        //
-        // // Add host and port
-        // url.push_str(&self.host);
-        // url.push(':');
-        // url.push_str(&self.port.to_string());
-        //
-        // // Add database if not 0
-        // if self.database > 0 {
-        //     url.push('/');
-        //     url.push_str(&self.database.to_string());
-        // }
-
         let url = self.url();
 
         // Write the complete URL and timeout

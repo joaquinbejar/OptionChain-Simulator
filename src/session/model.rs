@@ -1,4 +1,5 @@
 use crate::api::CreateSessionRequest;
+use crate::session::manager::DEFAULT_NAMESPACE;
 use crate::utils::{ChainError, UuidGenerator};
 pub use optionstratlib::simulation::WalkType as SimulationMethod;
 use optionstratlib::utils::TimeFrame;
@@ -348,6 +349,44 @@ impl Session {
     }
 }
 
+impl Default for Session {
+    fn default() -> Self {
+        let namespace =
+            Uuid::parse_str(DEFAULT_NAMESPACE).expect("Failed to parse default UUID namespace");
+        let uuid_generator = UuidGenerator::new(namespace);
+
+        // Parámetros de simulación predeterminados
+        let default_params = SimulationParameters {
+            symbol: "AAPL".to_string(),
+            steps: 20,
+            initial_price: pos!(100.0),
+            days_to_expiration: pos!(30.0),
+            volatility: pos!(0.2),
+            risk_free_rate: Decimal::new(3, 2),
+            dividend_yield: Positive::ZERO,
+            method: SimulationMethod::GeometricBrownian {
+                dt: pos!(1.0 / 252.0),
+                drift: Decimal::ZERO,
+                volatility: pos!(0.2),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(30),
+            strike_interval: Some(pos!(5.0)),
+            skew_factor: None,
+            spread: Some(pos!(0.02)),
+        };
+
+        Self {
+            id: uuid_generator.next(),
+            created_at: SystemTime::now(),
+            updated_at: SystemTime::now(),
+            parameters: default_params,
+            current_step: 0,
+            total_steps: 20,
+            state: SessionState::Initialized,
+        }
+    }
+}
 impl fmt::Display for Session {
     /// Serialize `Session` to JSON string for Display.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -358,7 +397,7 @@ impl fmt::Display for Session {
 }
 
 #[cfg(test)]
-mod tests_simulation_fparameters_serialization {
+mod tests_simulation_parameters_serialization {
     use super::*;
     use crate::session::SimulationParameters;
     use optionstratlib::pos;
@@ -714,5 +753,352 @@ mod tests_simulation_fparameters_serialization {
             }
             _ => panic!("Wrong simulation method variant deserialized"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_session_state {
+    use super::*;
+    use serde_json;
+
+    #[test]
+    fn test_session_state_display() {
+        assert_eq!(SessionState::Initialized.to_string(), "Initialized");
+        assert_eq!(SessionState::InProgress.to_string(), "In Progress");
+        assert_eq!(SessionState::Modified.to_string(), "Modified");
+        assert_eq!(SessionState::Reinitialized.to_string(), "Reinitialized");
+        assert_eq!(SessionState::Completed.to_string(), "Completed");
+        assert_eq!(SessionState::Error.to_string(), "Error");
+    }
+
+    #[test]
+    fn test_session_state_serialization() {
+        let state = SessionState::Initialized;
+        let serialized = serde_json::to_string(&state).unwrap();
+        assert_eq!(serialized, "\"Initialized\"");
+
+        let state = SessionState::InProgress;
+        let serialized = serde_json::to_string(&state).unwrap();
+        assert_eq!(serialized, "\"InProgress\"");
+
+        let state = SessionState::Modified;
+        let serialized = serde_json::to_string(&state).unwrap();
+        assert_eq!(serialized, "\"Modified\"");
+
+        let state = SessionState::Reinitialized;
+        let serialized = serde_json::to_string(&state).unwrap();
+        assert_eq!(serialized, "\"Reinitialized\"");
+
+        let state = SessionState::Completed;
+        let serialized = serde_json::to_string(&state).unwrap();
+        assert_eq!(serialized, "\"Completed\"");
+
+        let state = SessionState::Error;
+        let serialized = serde_json::to_string(&state).unwrap();
+        assert_eq!(serialized, "\"Error\"");
+    }
+
+    #[test]
+    fn test_session_state_deserialization() {
+        let deserialized: SessionState = serde_json::from_str("\"Initialized\"").unwrap();
+        assert_eq!(deserialized, SessionState::Initialized);
+
+        let deserialized: SessionState = serde_json::from_str("\"InProgress\"").unwrap();
+        assert_eq!(deserialized, SessionState::InProgress);
+
+        let deserialized: SessionState = serde_json::from_str("\"Modified\"").unwrap();
+        assert_eq!(deserialized, SessionState::Modified);
+
+        let deserialized: SessionState = serde_json::from_str("\"Reinitialized\"").unwrap();
+        assert_eq!(deserialized, SessionState::Reinitialized);
+
+        let deserialized: SessionState = serde_json::from_str("\"Completed\"").unwrap();
+        assert_eq!(deserialized, SessionState::Completed);
+
+        let deserialized: SessionState = serde_json::from_str("\"Error\"").unwrap();
+        assert_eq!(deserialized, SessionState::Error);
+    }
+
+    #[test]
+    fn test_session_state_equality() {
+        assert_eq!(SessionState::Initialized, SessionState::Initialized);
+        assert_ne!(SessionState::Initialized, SessionState::InProgress);
+        assert_ne!(SessionState::Error, SessionState::Completed);
+    }
+}
+
+#[cfg(test)]
+mod tests_session {
+    use super::*;
+    use optionstratlib::spos;
+    use rust_decimal_macros::dec;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    // Helper function to create a default SimulationParameters for tests
+    fn create_test_parameters() -> SimulationParameters {
+        SimulationParameters {
+            symbol: "TEST".to_string(),
+            steps: 10,
+            initial_price: pos!(100.0),
+            days_to_expiration: pos!(30.0),
+            volatility: pos!(0.25),
+            risk_free_rate: Decimal::new(5, 2), // 0.05
+            dividend_yield: pos!(0.02),         // 0.02
+            method: SimulationMethod::Brownian {
+                dt: pos!(0.0027),
+                drift: dec!(0.0),
+                volatility: pos!(0.25),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(10),
+            strike_interval: spos!(5.0),
+            skew_factor: Some(Decimal::new(1, 1)), // 0.1
+            spread: spos!(0.2),                    // 0.2
+        }
+    }
+
+    #[test]
+    fn test_new_with_generator() {
+        // Arrange
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        // Act
+        let session = Session::new_with_generator(params.clone(), &uuid_gen);
+
+        // Assert
+        assert_eq!(session.current_step, 0);
+        assert_eq!(session.total_steps, params.steps);
+        assert_eq!(session.parameters.symbol, params.symbol);
+        assert_eq!(session.state, SessionState::Initialized);
+
+        // The created_at and updated_at should be very close to each other
+        let time_diff = session
+            .updated_at
+            .duration_since(session.created_at)
+            .unwrap_or(Duration::from_secs(1));
+        assert!(time_diff.as_millis() < 100); // They should be within 100ms of each other
+    }
+
+    #[test]
+    fn test_new_delegates_to_new_with_generator() {
+        // Arrange
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+
+        // Act
+        let session = Session::new(params.clone(), &uuid_gen);
+
+        // Assert
+        assert_eq!(session.current_step, 0);
+        assert_eq!(session.total_steps, params.steps);
+        assert_eq!(session.state, SessionState::Initialized);
+    }
+
+    #[test]
+    fn test_advance_step_from_initialized() {
+        // Arrange
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(params, &uuid_gen);
+        let original_time = session.updated_at;
+
+        // Introduce a small delay to ensure timestamp changes
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Act
+        let result = session.advance_step();
+
+        // Assert
+        assert!(result.is_ok());
+        assert_eq!(session.current_step, 1);
+        assert_eq!(session.state, SessionState::InProgress);
+        assert!(session.updated_at > original_time);
+    }
+
+    #[test]
+    fn test_advance_step_from_modified() {
+        // Arrange
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(params.clone(), &uuid_gen);
+        session.state = SessionState::Modified;
+
+        // Act
+        let result = session.advance_step();
+
+        // Assert
+        assert!(result.is_ok());
+        assert_eq!(session.current_step, 1);
+        assert_eq!(session.state, SessionState::InProgress);
+    }
+
+    #[test]
+    fn test_advance_step_in_progress() {
+        // Arrange
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(params.clone(), &uuid_gen);
+        session.state = SessionState::InProgress;
+        session.current_step = 1;
+
+        // Act
+        let result = session.advance_step();
+
+        // Assert
+        assert!(result.is_ok());
+        assert_eq!(session.current_step, 2);
+        assert_eq!(session.state, SessionState::InProgress);
+    }
+
+    #[test]
+    fn test_advance_step_to_completion() {
+        // Arrange
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(params.clone(), &uuid_gen);
+        session.state = SessionState::InProgress;
+        session.current_step = session.total_steps - 1;
+
+        // Act
+        let result = session.advance_step();
+
+        // Assert
+        assert!(result.is_ok());
+        assert_eq!(session.current_step, session.total_steps);
+        assert_eq!(session.state, SessionState::Completed);
+    }
+
+    #[test]
+    fn test_advance_step_already_completed() {
+        // Arrange
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(params.clone(), &uuid_gen);
+        session.current_step = session.total_steps;
+        session.state = SessionState::Completed;
+
+        // Act
+        let result = session.advance_step();
+
+        // Assert
+        assert!(result.is_err());
+        match result {
+            Err(ChainError::SessionError(msg)) => {
+                assert_eq!(msg, "Session has completed all steps");
+            }
+            _ => panic!("Expected SessionError but got {:?}", result),
+        }
+    }
+
+    #[test]
+    fn test_modify_parameters() {
+        // Arrange
+        let original_params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(original_params, &uuid_gen);
+        let original_time = session.updated_at;
+
+        // Create new parameters with different values
+        let mut new_params = create_test_parameters();
+        new_params.symbol = "MODIFIED".to_string();
+        new_params.steps = 20;
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Act
+        session.modify_parameters(new_params.clone());
+
+        // Assert
+        assert_eq!(session.parameters.symbol, "MODIFIED");
+        assert_eq!(session.parameters.steps, 20);
+        assert_eq!(session.state, SessionState::Modified);
+        assert!(session.updated_at > original_time);
+    }
+
+    #[test]
+    fn test_reinitialize() {
+        // Arrange
+        let original_params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(original_params, &uuid_gen);
+
+        // Advance the session
+        session.current_step = 5;
+        session.state = SessionState::InProgress;
+
+        let original_time = session.updated_at;
+
+        // Create new parameters with different values
+        let mut new_params = create_test_parameters();
+        new_params.symbol = "REINITIALIZED".to_string();
+        new_params.steps = 15;
+
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Act
+        session.reinitialize(new_params.clone());
+
+        // Assert
+        assert_eq!(session.parameters.symbol, "REINITIALIZED");
+        assert_eq!(session.current_step, 0);
+        assert_eq!(session.total_steps, 15);
+        assert_eq!(session.state, SessionState::Reinitialized);
+        assert!(session.updated_at > original_time);
+    }
+
+    #[test]
+    fn test_is_active() {
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+
+        // Test different states
+        let mut session = Session::new_with_generator(params.clone(), &uuid_gen);
+
+        // Initialized state
+        session.state = SessionState::Initialized;
+        assert!(session.is_active());
+
+        // InProgress state
+        session.state = SessionState::InProgress;
+        assert!(session.is_active());
+
+        // Modified state
+        session.state = SessionState::Modified;
+        assert!(session.is_active());
+
+        // Reinitialized state
+        session.state = SessionState::Reinitialized;
+        assert!(session.is_active());
+
+        // Completed state
+        session.state = SessionState::Completed;
+        assert!(!session.is_active());
+
+        // Error state
+        session.state = SessionState::Error;
+        assert!(!session.is_active());
+    }
+
+    #[test]
+    fn test_display_implementation() {
+        // Arrange
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let session = Session::new_with_generator(params, &uuid_gen);
+
+        // Act
+        let display_string = format!("{}", session);
+
+        // Assert
+        // The display implementation should create a valid JSON string
+        let parsed_result = serde_json::from_str::<Session>(&display_string);
+        assert!(parsed_result.is_ok());
+
+        let parsed_session = parsed_result.unwrap();
+        assert_eq!(parsed_session.id, session.id);
+        assert_eq!(parsed_session.current_step, session.current_step);
+        assert_eq!(parsed_session.total_steps, session.total_steps);
+        assert_eq!(parsed_session.state, session.state);
     }
 }

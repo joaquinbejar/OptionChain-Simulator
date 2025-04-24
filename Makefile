@@ -2,7 +2,11 @@
 # Detect current branch
 CURRENT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 ZIP_NAME = OptionChain-Simulator.zip
+PROJECT_NAME := optionchain-simulator
 
+.PHONY: deploy
+deploy:
+	docker compose -p $(PROJECT_NAME) -f Docker/docker-compose.yml up --build  --force-recreate -d
 
 # Default target
 .PHONY: all

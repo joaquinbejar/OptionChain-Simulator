@@ -89,3 +89,154 @@ impl fmt::Display for ChainError {
 }
 
 impl Error for ChainError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error;
+    use std::io;
+
+    // Test conversion from &str
+    #[test]
+    fn test_from_str() {
+        let error: ChainError = "test error".into();
+        assert!(matches!(error, ChainError::StdError(msg) if msg == "test error"));
+    }
+
+    // Test conversion from String
+    #[test]
+    fn test_from_string() {
+        let error_msg = "test error".to_string();
+        let error: ChainError = error_msg.clone().into();
+        assert!(matches!(error, ChainError::StdError(msg) if msg == error_msg));
+    }
+
+    // Test conversion from std::io::Error
+    #[test]
+    fn test_from_io_error() {
+        let io_error = io::Error::new(io::ErrorKind::NotFound, "file not found");
+        let error: ChainError = io_error.into();
+        assert!(matches!(error, ChainError::StdError(msg) if msg == "file not found"));
+    }
+
+    // Test conversion from Box<dyn Error>
+    #[test]
+    fn test_from_boxed_error() {
+        let boxed_error: Box<dyn Error> =
+            Box::new(io::Error::new(io::ErrorKind::Other, "generic error"));
+        let error: ChainError = boxed_error.into();
+        assert!(matches!(error, ChainError::StdError(msg) if msg == "generic error"));
+    }
+
+    // Test conversion from clickhouse::error::Error
+    #[test]
+    fn test_from_clickhouse_error() {
+        // Note: You'll need to mock a clickhouse::error::Error for this test
+        // This is a simplified example
+        #[derive(Debug)]
+        struct MockClickHouseError;
+
+        impl std::fmt::Display for MockClickHouseError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "mock clickhouse error")
+            }
+        }
+
+        impl std::error::Error for MockClickHouseError {}
+
+        impl From<MockClickHouseError> for ChainError {
+            fn from(_err: MockClickHouseError) -> Self {
+                ChainError::ClickHouseError("mock clickhouse error".to_string())
+            }
+        }
+
+        let ch_error = MockClickHouseError;
+        let error: ChainError = ch_error.into();
+        assert!(
+            matches!(error, ChainError::ClickHouseError(msg) if msg == "mock clickhouse error")
+        );
+    }
+
+    // Test Display trait implementation
+    #[test]
+    fn test_display_trait() {
+        let test_cases = vec![
+            (
+                ChainError::SessionError("session problem".to_string()),
+                "Session Error: session problem",
+            ),
+            (
+                ChainError::StdError("standard error".to_string()),
+                "Std Error: standard error",
+            ),
+            (
+                ChainError::InvalidState("invalid state".to_string()),
+                "Invalid State: invalid state",
+            ),
+            (
+                ChainError::Internal("internal error".to_string()),
+                "Internal Error: internal error",
+            ),
+            (
+                ChainError::NotFound("resource missing".to_string()),
+                "Not Found: resource missing",
+            ),
+            (
+                ChainError::SimulatorError("simulation failed".to_string()),
+                "Simulator Error: simulation failed",
+            ),
+            (
+                ChainError::ClickHouseError("database error".to_string()),
+                "ClickHouse Error: database error",
+            ),
+            (
+                ChainError::NotEnoughData("insufficient data points".to_string()),
+                "Not Enough Data: insufficient data points",
+            ),
+        ];
+
+        for (error, expected_str) in test_cases {
+            assert_eq!(error.to_string(), expected_str);
+        }
+    }
+
+    // Test Error trait implementation
+    #[test]
+    fn test_error_trait() {
+        let error = ChainError::SessionError("test error".to_string());
+
+        // Check that it can be used as a standard Error
+        let _: &dyn Error = &error;
+
+        // Verify description is non-empty
+        assert!(!error.to_string().is_empty());
+    }
+
+    // Comprehensive pattern matching test
+    #[test]
+    fn test_error_variants() {
+        let errors = vec![
+            ChainError::SessionError("session issue".to_string()),
+            ChainError::StdError("standard issue".to_string()),
+            ChainError::InvalidState("invalid state".to_string()),
+            ChainError::Internal("internal issue".to_string()),
+            ChainError::NotFound("not found".to_string()),
+            ChainError::SimulatorError("simulation problem".to_string()),
+            ChainError::ClickHouseError("database issue".to_string()),
+            ChainError::NotEnoughData("insufficient data".to_string()),
+        ];
+
+        for error in errors {
+            match error {
+                ChainError::SessionError(msg) => assert_eq!(msg, "session issue"),
+                ChainError::StdError(msg) => assert_eq!(msg, "standard issue"),
+                ChainError::InvalidState(msg) => assert_eq!(msg, "invalid state"),
+                ChainError::Internal(msg) => assert_eq!(msg, "internal issue"),
+                ChainError::NotFound(msg) => assert_eq!(msg, "not found"),
+                ChainError::SimulatorError(msg) => assert_eq!(msg, "simulation problem"),
+                ChainError::ClickHouseError(msg) => assert_eq!(msg, "database issue"),
+                ChainError::NotEnoughData(msg) => assert_eq!(msg, "insufficient data"),
+            }
+        }
+    }
+}

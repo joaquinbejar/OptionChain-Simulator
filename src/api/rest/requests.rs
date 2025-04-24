@@ -334,3 +334,308 @@ mod tests_create_session_request {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use optionstratlib::{Positive, chains::OptionChain, pos, simulation::WalkType};
+    use rust_decimal::Decimal;
+    use uuid::Uuid;
+
+    // Session Management Tests
+    mod session_tests {
+        use super::*;
+        use crate::session::{
+            InMemorySessionStore, SessionManager, SessionState, SimulationParameters,
+        };
+        use optionstratlib::utils::TimeFrame;
+        use std::sync::Arc;
+
+        #[tokio::test]
+        async fn test_session_creation() {
+            let store = Arc::new(InMemorySessionStore::new());
+            let session_manager = SessionManager::new(store);
+
+            let params = SimulationParameters {
+                symbol: "AAPL".to_string(),
+                steps: 10,
+                initial_price: pos!(100.0),
+                days_to_expiration: pos!(30.0),
+                volatility: pos!(0.2),
+                risk_free_rate: Decimal::ZERO,
+                dividend_yield: Positive::ZERO,
+                method: WalkType::Brownian {
+                    dt: pos!(1.0 / 252.0),
+                    drift: Decimal::ZERO,
+                    volatility: pos!(0.2),
+                },
+                time_frame: TimeFrame::Day,
+                chain_size: Some(15),
+                strike_interval: Some(pos!(1.0)),
+                skew_factor: None,
+                spread: Some(pos!(0.02)),
+            };
+
+            let session = session_manager
+                .create_session(params.clone())
+                .expect("Session creation failed");
+
+            assert_eq!(session.parameters.symbol, "AAPL");
+            assert_eq!(session.state, SessionState::Initialized);
+            assert_eq!(session.current_step, 0);
+            assert_eq!(session.total_steps, params.steps);
+        }
+
+        #[tokio::test]
+        async fn test_session_advancement() {
+            let store = Arc::new(InMemorySessionStore::new());
+            let session_manager = SessionManager::new(store);
+
+            let params = SimulationParameters {
+                symbol: "AAPL".to_string(),
+                steps: 5,
+                initial_price: pos!(100.0),
+                days_to_expiration: pos!(30.0),
+                volatility: pos!(0.2),
+                risk_free_rate: Decimal::ZERO,
+                dividend_yield: Positive::ZERO,
+                method: WalkType::Brownian {
+                    dt: pos!(1.0 / 252.0),
+                    drift: Decimal::ZERO,
+                    volatility: pos!(0.2),
+                },
+                time_frame: TimeFrame::Day,
+                chain_size: Some(15),
+                strike_interval: Some(pos!(1.0)),
+                skew_factor: None,
+                spread: Some(pos!(0.02)),
+            };
+
+            let session = session_manager
+                .create_session(params)
+                .expect("Session creation failed");
+
+            // Advance through steps
+            for step in 0..4 {
+                let (advanced_session, _chain) = session_manager
+                    .get_next_step(session.id)
+                    .await
+                    .expect("Step advancement failed");
+
+                assert_eq!(advanced_session.current_step, step + 1);
+                assert_eq!(advanced_session.state, SessionState::InProgress);
+            }
+        }
+    }
+
+    // Simulation Method Tests
+    mod simulation_method_tests {
+        use super::*;
+        use crate::domain::Simulator;
+        use crate::session::Session;
+        use crate::utils::UuidGenerator;
+        use optionstratlib::utils::{Len, TimeFrame};
+
+        #[tokio::test]
+        async fn test_geometric_brownian_simulation() {
+            let simulator = Simulator::new();
+
+            let params = SimulationParameters {
+                symbol: "AAPL".to_string(),
+                steps: 10,
+                initial_price: pos!(100.0),
+                days_to_expiration: pos!(30.0),
+                volatility: pos!(0.2),
+                risk_free_rate: Decimal::new(3, 2), // 3%
+                dividend_yield: Positive::ZERO,
+                method: WalkType::GeometricBrownian {
+                    dt: pos!(1.0 / 252.0),
+                    drift: Decimal::new(5, 2), // 5%
+                    volatility: pos!(0.2),
+                },
+                time_frame: TimeFrame::Day,
+                chain_size: Some(15),
+                strike_interval: Some(pos!(1.0)),
+                skew_factor: None,
+                spread: Some(pos!(0.02)),
+            };
+
+            let session = Session::new(params, &UuidGenerator::new(Uuid::new_v4()));
+
+            let option_chain = simulator
+                .simulate_next_step(&session)
+                .await
+                .expect("Simulation step failed");
+
+            assert_eq!(option_chain.symbol, "AAPL");
+            assert!(option_chain.len() > 0);
+            assert!(option_chain.underlying_price > Positive::ZERO);
+        }
+    }
+
+    // Option Chain Generation Tests
+    mod option_chain_tests {
+        use super::*;
+        use optionstratlib::ExpirationDate;
+        use optionstratlib::chains::OptionChainBuildParams;
+        use optionstratlib::chains::utils::OptionDataPriceParams;
+
+        #[test]
+        fn test_option_chain_generation() {
+            let initial_price = pos!(100.0);
+            let expiration = ExpirationDate::Days(pos!(30.0));
+
+            let chain_params = OptionChainBuildParams::new(
+                "AAPL".to_string(),
+                Some(pos!(1000.0)), // Volume
+                15,                 // Chain size
+                pos!(1.0),          // Strike interval
+                Decimal::new(5, 4), // Skew factor
+                pos!(0.02),         // Spread
+                2,                  // Decimal places
+                OptionDataPriceParams::new(
+                    initial_price,
+                    expiration,
+                    Some(pos!(0.2)), // Volatility
+                    Decimal::ZERO,   // Risk-free rate
+                    Positive::ZERO,  // Dividend yield
+                    Some("AAPL".to_string()),
+                ),
+            );
+
+            let option_chain = OptionChain::build_chain(&chain_params);
+
+            assert_eq!(option_chain.symbol, "AAPL");
+            assert_eq!(option_chain.underlying_price, initial_price);
+        }
+    }
+
+    // Error Handling Tests
+    mod error_handling_tests {
+        use super::*;
+        use crate::session::{InMemorySessionStore, Session, SessionManager};
+        use crate::utils::{ChainError, UuidGenerator};
+        use optionstratlib::utils::TimeFrame;
+        use std::sync::Arc;
+
+        #[tokio::test]
+        async fn test_invalid_session_advancement() {
+            let store = Arc::new(InMemorySessionStore::new());
+            let session_manager = SessionManager::new(store);
+
+            // Use a non-existent UUID
+            let non_existent_id = Uuid::new_v4();
+
+            let result = session_manager.get_next_step(non_existent_id).await;
+
+            assert!(matches!(result, Err(ChainError::NotFound(_))));
+        }
+
+        #[test]
+        fn test_invalid_simulation_parameters() {
+            let invalid_params = SimulationParameters {
+                symbol: "".to_string(),   // Invalid: empty symbol
+                steps: 0,                 // Invalid: zero steps
+                initial_price: pos!(0.0), // Invalid: zero initial price
+
+                days_to_expiration: Default::default(),
+                volatility: Default::default(),
+                risk_free_rate: Default::default(),
+                dividend_yield: Default::default(),
+                method: WalkType::Brownian {
+                    dt: Default::default(),
+                    drift: Default::default(),
+                    volatility: Default::default(),
+                },
+                time_frame: TimeFrame::Microsecond,
+                chain_size: None,
+                strike_interval: None,
+                skew_factor: None,
+                spread: None,
+            };
+
+            let result = Session::new(invalid_params, &UuidGenerator::new(Uuid::new_v4()));
+
+            // Depending on your validation logic, this might panic or return an error
+            assert!(result.parameters.symbol.is_empty());
+            assert_eq!(result.parameters.steps, 0);
+        }
+    }
+
+    // Infrastructure Tests
+    mod infrastructure_tests {
+        use crate::infrastructure::{ClickHouseConfig, RedisConfig};
+
+        #[test]
+        fn test_redis_configuration() {
+            let config = RedisConfig::default();
+
+            assert!(!config.host.is_empty());
+            assert_ne!(config.port, 0);
+        }
+
+        #[test]
+        fn test_clickhouse_configuration() {
+            let config = ClickHouseConfig::default();
+
+            assert!(!config.host.is_empty());
+            assert_ne!(config.port, 0);
+            assert!(!config.username.is_empty());
+        }
+    }
+
+    // API Request Validation Tests
+    mod api_request_tests {
+
+        use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
+        use crate::api::rest::requests::{CreateSessionRequest, UpdateSessionRequest};
+
+        #[test]
+        fn test_create_session_request_validation() {
+            let req = CreateSessionRequest {
+                symbol: "AAPL".to_string(),
+                initial_price: 185.5,
+                volatility: 0.25,
+                risk_free_rate: 0.04,
+                days_to_expiration: 45.0,
+                method: ApiWalkType::GeometricBrownian {
+                    dt: 0.004,
+                    drift: 0.05,
+                    volatility: 0.25,
+                },
+                steps: 30,
+                time_frame: ApiTimeFrame::Day,
+                dividend_yield: 0.005,
+                ..Default::default()
+            };
+
+            // Validate required fields
+            assert_eq!(req.symbol, "AAPL");
+            assert_eq!(req.initial_price, 185.5);
+            assert_eq!(req.volatility, 0.25);
+        }
+
+        #[test]
+        fn test_update_session_request_partial_update() {
+            let update_req = UpdateSessionRequest {
+                symbol: Some("GOOGL".to_string()),
+                steps: None,
+                initial_price: None,
+                days_to_expiration: None,
+                volatility: Some(0.3),
+                risk_free_rate: None,
+                dividend_yield: None,
+                method: None,
+                time_frame: None,
+                chain_size: None,
+                strike_interval: None,
+                skew_factor: None,
+                spread: None,
+            };
+
+            assert_eq!(update_req.symbol, Some("GOOGL".to_string()));
+            assert_eq!(update_req.volatility, Some(0.3));
+            assert!(update_req.initial_price.is_none());
+        }
+    }
+}

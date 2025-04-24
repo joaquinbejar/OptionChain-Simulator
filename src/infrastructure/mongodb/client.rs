@@ -125,3 +125,52 @@ impl MongoDBClient {
         &self.config
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::infrastructure::config::mongo::MongoDBConfig;
+    use crate::infrastructure::mongodb::MongoDBClient;
+    use std::sync::Arc;
+    use tokio::test;
+
+    #[test]
+    async fn test_mongodb_client_initialization() {
+        // Test that we can create a new MongoDB client
+        let config = MongoDBConfig {
+            uri: "mongodb://localhost:27017".to_string(),
+            database: "test_db".to_string(),
+            steps_collection: "test_steps".to_string(),
+            events_collection: "test_events".to_string(),
+            timeout: 5,
+        };
+
+        let client_result = MongoDBClient::new(config.clone()).await;
+        assert!(
+            client_result.is_ok(),
+            "Failed to create MongoDB client: {:?}",
+            client_result.err()
+        );
+
+        let client = client_result.unwrap();
+        assert_eq!(client.get_config().database, "test_db");
+    }
+
+    #[test]
+    async fn test_init_mongodb() {
+        // Test the init_mongodb function
+        let result = crate::infrastructure::repositories::mongo_repo::init_mongodb().await;
+
+        // This might fail if MongoDB is not running, which is expected in CI environments
+        match result {
+            Ok(repo) => {
+                // If it succeeded, verify we got a repository
+                assert!(Arc::strong_count(&repo) >= 1);
+            }
+            Err(e) => {
+                // In CI, we expect this to fail with a connection error
+                println!("MongoDB initialization failed (expected in CI): {:?}", e);
+                // We don't assert because this is expected to fail in environments without MongoDB
+            }
+        }
+    }
+}

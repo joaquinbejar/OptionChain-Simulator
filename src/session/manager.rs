@@ -9,7 +9,7 @@ use std::string::ToString;
 use std::sync::Arc;
 use uuid::Uuid;
 
-const DEFAULT_NAMESPACE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+pub(crate) const DEFAULT_NAMESPACE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
 /// Manages the lifecycle of simulation sessions
 pub struct SessionManager {

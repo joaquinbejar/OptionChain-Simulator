@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use utoipa::ToSchema;
 
 /// Response containing session information.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct SessionResponse {
     /// The unique identifier for the session
     pub id: String,
@@ -76,7 +77,7 @@ pub struct OptionContractResponse {
 }
 
 /// Price data for a specific option type (call or put)
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct OptionPriceResponse {
     /// The bid price for the option
     pub bid: Option<f64>,
@@ -89,7 +90,7 @@ pub struct OptionPriceResponse {
 }
 
 /// Simplified session information for inclusion in chain responses.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct SessionInfoResponse {
     /// The unique identifier for the session
     pub id: String,
@@ -99,5 +100,121 @@ pub struct SessionInfoResponse {
     pub total_steps: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct ErrorResponse {}
+
+/// Default implementation for SessionParametersResponse
+impl Default for SessionParametersResponse {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            initial_price: 0.0,
+            volatility: 0.0,
+            risk_free_rate: 0.0,
+            method: Value::Null,
+            time_frame: String::new(),
+            dividend_yield: 0.0,
+            skew_factor: None,
+            spread: None,
+        }
+    }
+}
+
+impl Default for OptionContractResponse {
+    fn default() -> Self {
+        Self {
+            strike: 0.0,
+            expiration: String::new(),
+            call: OptionPriceResponse::default(),
+            put: OptionPriceResponse::default(),
+            implied_volatility: None,
+            gamma: None,
+        }
+    }
+}
+
+impl Default for ChainResponse {
+    fn default() -> Self {
+        Self {
+            underlying: String::new(),
+            timestamp: String::new(),
+            price: 0.0,
+            contracts: Vec::new(),
+            session_info: SessionInfoResponse::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn default_session_parameters() {
+        let sp = SessionParametersResponse::default();
+        assert_eq!(sp.symbol, "");
+        assert_eq!(sp.initial_price, 0.0);
+        assert_eq!(sp.volatility, 0.0);
+        assert_eq!(sp.risk_free_rate, 0.0);
+        assert_eq!(sp.method, Value::Null);
+        assert_eq!(sp.time_frame, "");
+        assert_eq!(sp.dividend_yield, 0.0);
+        assert!(sp.skew_factor.is_none());
+        assert!(sp.spread.is_none());
+    }
+
+    #[test]
+    fn default_session_info() {
+        let si = SessionInfoResponse::default();
+        assert_eq!(si.id, "");
+        assert_eq!(si.current_step, 0);
+        assert_eq!(si.total_steps, 0);
+    }
+
+    #[test]
+    fn default_option_price() {
+        let op = OptionPriceResponse::default();
+        assert!(op.bid.is_none());
+        assert!(op.ask.is_none());
+        assert!(op.mid.is_none());
+        assert!(op.delta.is_none());
+    }
+
+    #[test]
+    fn default_option_contract() {
+        let oc = OptionContractResponse::default();
+        assert_eq!(oc.strike, 0.0);
+        assert_eq!(oc.expiration, "");
+        assert!(oc.call.bid.is_none());
+        assert!(oc.put.ask.is_none());
+        assert!(oc.implied_volatility.is_none());
+        assert!(oc.gamma.is_none());
+    }
+
+    #[test]
+    fn default_chain_and_session_response() {
+        let cr = ChainResponse::default();
+        assert_eq!(cr.underlying, "");
+        assert_eq!(cr.timestamp, "");
+        assert_eq!(cr.price, 0.0);
+        assert!(cr.contracts.is_empty());
+        assert_eq!(cr.session_info.current_step, 0);
+
+        let sr = SessionResponse::default();
+        assert_eq!(sr.id, "");
+        assert_eq!(sr.created_at, "");
+        assert_eq!(sr.updated_at, "");
+        assert_eq!(sr.parameters.symbol, "");
+        assert_eq!(sr.current_step, 0);
+        assert_eq!(sr.total_steps, 0);
+        assert_eq!(sr.state, "");
+    }
+
+    #[test]
+    fn default_error_response() {
+        let er = ErrorResponse::default();
+        // just ensure it constructs
+        let _ = format!("{:?}", er);
+    }
+}

@@ -558,6 +558,21 @@
 //! HistoricalDataRepository <|.. ClickHouseHistoricalRepository: implements
 //! ```
 //!
+//! ### 🚀 Deploy the project
+//!
+//! To deploy the services defined in `Docker/docker-compose.yml`, run the following command:
+//!
+//! ```bash
+//! make deploy
+//! ```
+//!
+//! This will:
+//! - Build the Docker images (`--build`)
+//! - Force container recreation (`--force-recreate`)
+//! - Run everything in detached mode (`-d`)
+//! - Use `optionchain-simulator` as the project name to namespace containers and resources
+//!
+//! Make sure Docker and Docker Compose are installed and running on your system.
 //! ## Makefile Commands for Development
 //!
 //! The project includes a Makefile with useful commands for development:
@@ -575,6 +590,7 @@
 //! | `make doc` | Generates documentation |
 //! | `make coverage` | Generates code coverage report |
 //! | `make bench` | Runs benchmarks |
+//! | `make deploy` | deploy the services in local |
 //!
 //! Additional commands for CI/CD and deployment:
 //!

@@ -240,3 +240,216 @@ impl MetricsCollector {
         String::from_utf8(buffer).unwrap_or_else(|_| "Failed to export metrics".to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_new_metrics_collector() {
+        // Test that a new MetricsCollector can be created without errors
+        let collector = MetricsCollector::new();
+        assert!(collector.is_ok(), "Failed to create MetricsCollector");
+    }
+
+    #[test]
+    fn test_record_request() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Record a request
+        collector.record_request("/api/v1/chain", "GET", "200");
+
+        // Check that the counter was incremented
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains(
+            "api_requests_total{endpoint=\"/api/v1/chain\",method=\"GET\",status=\"200\"} 1"
+        ));
+    }
+
+    #[test]
+    fn test_record_multiple_requests() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Record multiple requests
+        collector.record_request("/api/v1/chain", "GET", "200");
+        collector.record_request("/api/v1/chain", "GET", "200");
+        collector.record_request("/api/v1/chain", "POST", "201");
+
+        // Check that the counters were incremented correctly
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains(
+            "api_requests_total{endpoint=\"/api/v1/chain\",method=\"GET\",status=\"200\"} 2"
+        ));
+        assert!(metrics.contains(
+            "api_requests_total{endpoint=\"/api/v1/chain\",method=\"POST\",status=\"201\"} 1"
+        ));
+    }
+
+    #[test]
+    fn test_record_request_duration() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Record request duration
+        collector.record_request_duration("/api/v1/chain", "GET", Duration::from_millis(100));
+
+        // Check that the histogram was updated
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("api_request_duration_seconds_bucket{endpoint=\"/api/v1/chain\",method=\"GET\",le=\"0.1\"} 1"));
+        assert!(metrics.contains(
+            "api_request_duration_seconds_count{endpoint=\"/api/v1/chain\",method=\"GET\"} 1"
+        ));
+    }
+
+    #[test]
+    fn test_record_error() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Record an error
+        collector.record_error("/api/v1/chain", "not_found");
+
+        // Check that the counter was incremented
+        let metrics = collector.export_metrics();
+        assert!(
+            metrics.contains(
+                "api_errors_total{endpoint=\"/api/v1/chain\",error_type=\"not_found\"} 1"
+            )
+        );
+    }
+
+    #[test]
+    fn test_active_sessions() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Increment and decrement active sessions
+        collector.increment_active_sessions();
+        collector.increment_active_sessions();
+        collector.decrement_active_sessions();
+
+        // Check that the gauge and counters were updated correctly
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("active_sessions 1"));
+        assert!(metrics.contains("session_creations_total 2"));
+        assert!(metrics.contains("session_deletions_total 1"));
+    }
+
+    #[test]
+    fn test_simulation_metrics() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Record simulation metrics
+        collector.record_simulation_step("GeometricBrownian");
+        collector.record_simulation_step("GeometricBrownian");
+        collector.record_simulation_duration(Duration::from_millis(50));
+
+        // Check that the counters and histogram were updated
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("simulation_steps_total{method=\"GeometricBrownian\"} 2"));
+        assert!(metrics.contains("simulation_step_duration_seconds_bucket{le=\"0.05\"} 1"));
+        assert!(metrics.contains("simulation_step_duration_seconds_count 1"));
+    }
+
+    #[test]
+    fn test_cache_metrics() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Record cache hits and misses
+        collector.record_cache_hit();
+        collector.record_cache_hit();
+        collector.record_cache_miss();
+
+        // Check that the counters were incremented correctly
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("cache_hits_total 2"));
+        assert!(metrics.contains("cache_misses_total 1"));
+    }
+
+    #[test]
+    fn test_memory_usage() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Record memory usage
+        collector.record_memory_usage(1024.0 * 1024.0); // 1MB
+
+        // Check that the gauge was updated
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("memory_usage_bytes 1048576"));
+    }
+
+    #[test]
+    fn test_mongodb_metrics() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Record MongoDB operations
+        collector.record_mongodb_insert("sessions");
+        collector.record_mongodb_insert("sessions");
+        collector.record_mongodb_insert("chains");
+        collector.record_mongodb_insert_duration("sessions", Duration::from_millis(30));
+
+        // Check that the counters and histogram were updated
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("mongodb_inserts_total{collection=\"sessions\"} 2"));
+        assert!(metrics.contains("mongodb_inserts_total{collection=\"chains\"} 1"));
+        assert!(metrics.contains(
+            "mongodb_insert_duration_seconds_bucket{collection=\"sessions\",le=\"0.05\"} 1"
+        ));
+        assert!(
+            metrics.contains("mongodb_insert_duration_seconds_count{collection=\"sessions\"} 1")
+        );
+    }
+
+    #[test]
+    fn test_registry() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Get the registry
+        let registry = collector.registry();
+
+        // Check that it's a valid Registry
+        assert!(
+            !registry.gather().is_empty(),
+            "Registry should contain metrics"
+        );
+    }
+
+    #[test]
+    fn test_export_metrics_format() {
+        // Create a new MetricsCollector
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        // Record various metrics
+        collector.record_request("/api/v1/chain", "GET", "200");
+        collector.increment_active_sessions();
+
+        // Export metrics
+        let metrics = collector.export_metrics();
+
+        // Check the format of the exported metrics
+        assert!(
+            metrics.contains("# HELP"),
+            "Metrics should contain HELP comments"
+        );
+        assert!(
+            metrics.contains("# TYPE"),
+            "Metrics should contain TYPE comments"
+        );
+        assert!(
+            metrics.contains("api_requests_total"),
+            "Metrics should contain request counter"
+        );
+        assert!(
+            metrics.contains("active_sessions"),
+            "Metrics should contain active sessions gauge"
+        );
+    }
+}

@@ -22,3 +22,31 @@ pub(crate) async fn get_favicon() -> Result<NamedFile, Box<dyn Error>> {
     let path: PathBuf = "static/favicon.ico".into();
     Ok(NamedFile::open(path)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Test that an error is returned when the favicon file is missing.
+    #[tokio::test]
+    async fn test_get_favicon_not_found() {
+        // Arrange: rename the file out of the way
+        let original = PathBuf::from("static/favicon.ico");
+        let temp = PathBuf::from("static/favicon_temp.ico");
+        fs::rename(&original, &temp).expect("Failed to rename favicon.ico for the test");
+
+        // Act
+        let result = get_favicon().await;
+
+        // Assert
+        assert!(
+            result.is_err(),
+            "get_favicon should return an Err when the file is missing"
+        );
+
+        // Cleanup: put the file back
+        fs::rename(&temp, &original).expect("Failed to restore favicon.ico after the test");
+    }
+}

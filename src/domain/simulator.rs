@@ -1,3 +1,4 @@
+use crate::domain::Walker;
 use crate::infrastructure::{
     ClickHouseClient, ClickHouseConfig, ClickHouseHistoricalRepository, HistoricalDataRepository,
     calculate_required_duration, select_random_date,
@@ -13,7 +14,7 @@ use optionstratlib::{
     },
     pos,
     simulation::{
-        WalkParams, WalkTypeAble,
+        WalkParams,
         randomwalk::RandomWalk,
         steps::{Step, Xstep, Ystep},
     },
@@ -36,16 +37,6 @@ pub struct Simulator {
     simulation_cache: Arc<Mutex<HashMap<Uuid, RandomWalk<Positive, OptionChain>>>>,
     database_repo: Option<Arc<dyn HistoricalDataRepository>>,
 }
-/// Walker struct for implementing WalkTypeAble
-struct Walker {}
-
-impl Walker {
-    fn new() -> Self {
-        Walker {}
-    }
-}
-
-impl WalkTypeAble<Positive, OptionChain> for Walker {}
 
 impl Simulator {
     /// Creates a new simulator instance
@@ -351,5 +342,404 @@ impl Simulator {
         debug!("Cleaned up {} entries from simulation cache", removed_count);
 
         Ok(removed_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{SimulationMethod, SimulationParameters};
+    use crate::utils::UuidGenerator;
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
+    use mockall::predicate::*;
+    use mockall::*;
+    use optionstratlib::utils::TimeFrame;
+    use optionstratlib::{Positive, pos};
+    use rust_decimal_macros::dec;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    // Mock for HistoricalDataRepository
+    mock! {
+        pub HistoricalRepository {}
+
+        #[async_trait]
+        impl HistoricalDataRepository for HistoricalRepository {
+            async fn get_historical_prices(
+                &self,
+                symbol: &str,
+                timeframe: &TimeFrame,
+                start_date: &DateTime<Utc>,
+                limit: usize,
+            ) -> Result<Vec<Positive>, ChainError>;
+
+            async fn list_available_symbols(&self) -> Result<Vec<String>, ChainError>;
+
+            async fn get_date_range_for_symbol(
+                &self,
+                symbol: &str,
+            ) -> Result<(DateTime<Utc>, DateTime<Utc>), ChainError>;
+        }
+    }
+
+    // Helper function to create a test session
+    fn create_test_session(id: Option<Uuid>) -> Session {
+        let params = SimulationParameters {
+            symbol: "TEST".to_string(),
+            steps: 10,
+            initial_price: pos!(100.0),
+            days_to_expiration: pos!(30.0),
+            volatility: pos!(0.2),
+            risk_free_rate: dec!(0.0),
+            dividend_yield: pos!(0.0),
+            method: SimulationMethod::GeometricBrownian {
+                dt: pos!(0.004),
+                drift: dec!(0.0),
+                volatility: pos!(0.2),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(10),
+            strike_interval: Some(pos!(5.0)),
+            skew_factor: Some(dec!(0.0005)),
+            spread: Some(pos!(0.01)),
+        };
+
+        let namespace = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap();
+        let uuid_generator = UuidGenerator::new(namespace);
+
+        let mut session = Session::new(params, &uuid_generator);
+        // Override the generated ID with the provided one if it exists
+        if let Some(id) = id {
+            session.id = id;
+        }
+        session
+    }
+
+    // Helper function to create test historical data
+    fn create_test_historical_data(count: usize) -> Vec<Positive> {
+        let mut data = Vec::with_capacity(count);
+        for i in 0..count {
+            data.push(pos!(100.0 + i as f64));
+        }
+        data
+    }
+
+    #[tokio::test]
+    async fn test_new_simulator_without_db() {
+        // Test that a simulator can be created without a database
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        assert!(simulator.database_repo.is_none());
+        assert_eq!(simulator.simulation_cache.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_new_simulator_with_mock_db() {
+        // Test simulator creation with a mock database
+        let mut mock_repo = MockHistoricalRepository::new();
+        mock_repo
+            .expect_list_available_symbols()
+            .returning(|| Ok(vec!["TEST".to_string()]));
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: Some(Arc::new(mock_repo)),
+        };
+
+        assert!(simulator.database_repo.is_some());
+        let symbols = simulator
+            .database_repo
+            .as_ref()
+            .unwrap()
+            .list_available_symbols()
+            .await
+            .unwrap();
+        assert_eq!(symbols, vec!["TEST".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_simulate_next_step_new_session() {
+        // Test simulating the next step for a brand new session
+        let session = create_test_session(None);
+        let session_id = session.id;
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        // The first call should create a new random walk
+        let result = simulator.simulate_next_step(&session).await;
+        assert!(result.is_ok());
+
+        // Check that the session was added to the cache
+        let cache = simulator.simulation_cache.lock().await;
+        assert!(cache.contains_key(&session_id));
+    }
+
+    #[tokio::test]
+    async fn test_simulate_next_step_existing_session() {
+        // Test simulating the next step for an existing session
+        let mut session = create_test_session(None);
+        let session_id = session.id;
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        // First call to initialize
+        let _ = simulator.simulate_next_step(&session).await.unwrap();
+
+        // Update session for next step
+        session.current_step = 1;
+        session.state = SessionState::InProgress;
+
+        // Second call should use the cached random walk
+        let result = simulator.simulate_next_step(&session).await;
+        assert!(result.is_ok());
+
+        // Check that there's still only one entry in the cache
+        let cache = simulator.simulation_cache.lock().await;
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&session_id));
+    }
+
+    #[tokio::test]
+    async fn test_simulate_next_step_reinitialized_session() {
+        // Test simulating with a reinitialized session
+        let mut session = create_test_session(None);
+        let session_id = session.id;
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        // First call to initialize
+        let _ = simulator.simulate_next_step(&session).await.unwrap();
+
+        // Update session to reinitialized state
+        session.state = SessionState::Reinitialized;
+
+        // Next call should create a new random walk
+        let result = simulator.simulate_next_step(&session).await;
+        assert!(result.is_ok());
+
+        // Check that there's still only one entry in the cache (the old one was replaced)
+        let cache = simulator.simulation_cache.lock().await;
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&session_id));
+    }
+
+    #[tokio::test]
+    async fn test_simulate_next_step_out_of_range() {
+        // Test simulating a step that's out of range
+        let mut session = create_test_session(None);
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        // First call to initialize
+        let _ = simulator.simulate_next_step(&session).await.unwrap();
+
+        // Update session to a step beyond the total
+        session.current_step = session.parameters.steps + 1;
+
+        // This should return an error
+        let result = simulator.simulate_next_step(&session).await;
+        assert!(result.is_err());
+
+        match result {
+            Err(ChainError::SimulatorError(msg)) => {
+                assert_eq!(msg, "Walker reached end of data");
+            }
+            _ => panic!("Expected SimulatorError"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_historical_data_with_symbol() {
+        // Test getting historical data with a specified symbol
+        let symbol = Some("TEST".to_string());
+        let timeframe = TimeFrame::Day;
+        let steps = 5;
+        let expected_data = create_test_historical_data(steps);
+
+        let mut mock_repo = MockHistoricalRepository::new();
+        mock_repo
+            .expect_get_date_range_for_symbol()
+            .with(eq("TEST"))
+            .returning(|_| Ok((Utc::now() - chrono::Duration::days(30), Utc::now())));
+
+        mock_repo
+            .expect_get_historical_prices()
+            .returning(move |_, _, _, _| Ok(expected_data.clone()));
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: Some(Arc::new(mock_repo)),
+        };
+
+        let result = simulator
+            .get_historical_data(&symbol, &timeframe, steps)
+            .await;
+        assert!(result.is_ok());
+
+        let data = result.unwrap();
+        assert_eq!(data.len(), steps);
+    }
+
+    #[tokio::test]
+    async fn test_get_historical_data_without_symbol() {
+        // Test getting historical data with no symbol specified (random selection)
+        let symbol = None;
+        let timeframe = TimeFrame::Day;
+        let steps = 5;
+        let expected_data = create_test_historical_data(steps);
+
+        let mut mock_repo = MockHistoricalRepository::new();
+        mock_repo
+            .expect_list_available_symbols()
+            .returning(|| Ok(vec!["RANDOM1".to_string(), "RANDOM2".to_string()]));
+
+        mock_repo
+            .expect_get_date_range_for_symbol()
+            .returning(|_| Ok((Utc::now() - chrono::Duration::days(30), Utc::now())));
+
+        mock_repo
+            .expect_get_historical_prices()
+            .returning(move |_, _, _, _| Ok(expected_data.clone()));
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: Some(Arc::new(mock_repo)),
+        };
+
+        let result = simulator
+            .get_historical_data(&symbol, &timeframe, steps)
+            .await;
+        assert!(result.is_ok());
+
+        let data = result.unwrap();
+        assert_eq!(data.len(), steps);
+    }
+
+    #[tokio::test]
+    async fn test_get_historical_data_no_db() {
+        // Test getting historical data when no database is available
+        let symbol = Some("TEST".to_string());
+        let timeframe = TimeFrame::Day;
+        let steps = 5;
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        let result = simulator
+            .get_historical_data(&symbol, &timeframe, steps)
+            .await;
+        assert!(result.is_err());
+
+        match result {
+            Err(ChainError::SimulatorError(msg)) => {
+                assert_eq!(msg, "Database not available");
+            }
+            _ => panic!("Expected SimulatorError"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_historical_data_not_enough_data() {
+        // Test getting historical data when not enough data is available
+        let symbol = Some("TEST".to_string());
+        let timeframe = TimeFrame::Day;
+        let steps = 10;
+        let expected_data = create_test_historical_data(5); // Not enough data
+
+        let mut mock_repo = MockHistoricalRepository::new();
+        mock_repo
+            .expect_get_date_range_for_symbol()
+            .returning(|_| Ok((Utc::now() - chrono::Duration::days(30), Utc::now())));
+
+        mock_repo
+            .expect_get_historical_prices()
+            .returning(move |_, _, _, _| Ok(expected_data.clone()));
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: Some(Arc::new(mock_repo)),
+        };
+
+        let result = simulator
+            .get_historical_data(&symbol, &timeframe, steps)
+            .await;
+        assert!(result.is_err());
+
+        match result {
+            Err(ChainError::NotEnoughData(_)) => {
+                // Expected error
+            }
+            _ => panic!("Expected NotEnoughData error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_random_walk() {
+        // Test creating a random walk for a session
+        let session = create_test_session(None);
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        let result = simulator.create_random_walk(&session).await;
+        assert!(result.is_ok());
+
+        let random_walk = result.unwrap();
+        assert_eq!(random_walk.len(), session.parameters.steps);
+    }
+
+    #[tokio::test]
+    async fn test_create_random_walk_historical() {
+        // Test creating a random walk with historical method
+        let mut session = create_test_session(None);
+        let steps = 5;
+        session.parameters.steps = steps;
+        session.parameters.method = SimulationMethod::Historical {
+            timeframe: TimeFrame::Day,
+            prices: vec![], // Empty prices to trigger database fetch
+            symbol: Some("TEST".to_string()),
+        };
+
+        let expected_data = create_test_historical_data(steps);
+
+        let mut mock_repo = MockHistoricalRepository::new();
+        mock_repo
+            .expect_get_date_range_for_symbol()
+            .returning(|_| Ok((Utc::now() - chrono::Duration::days(30), Utc::now())));
+
+        mock_repo
+            .expect_get_historical_prices()
+            .returning(move |_, _, _, _| Ok(expected_data.clone()));
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: Some(Arc::new(mock_repo)),
+        };
+
+        let result = simulator.create_random_walk(&session).await;
+        assert!(result.is_ok());
+
+        let random_walk = result.unwrap();
+        assert_eq!(random_walk.len(), steps);
     }
 }
