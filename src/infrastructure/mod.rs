@@ -13,3 +13,5 @@ pub use config::clickhouse::ClickHouseConfig;
 pub use config::redis::RedisConfig;
 pub use redis::RedisClient;
 pub use repositories::historical_repo::ClickHouseHistoricalRepository;
+pub use telemetry::collector::MetricsCollector;
+pub use telemetry::middleware::MetricsMiddleware;
