@@ -4,7 +4,7 @@ services:
   # Redis service configuration
   redis:
     image: redis:latest
-    container_name: optionchain-redis
+    container_name: redis
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-password}
     ports:
       - "6379:6379"
@@ -24,7 +24,7 @@ services:
   # MongoDB service configuration
   mongodb:
     image: mongo:latest
-    container_name: optionchain-mongodb
+    container_name: mongodb
     ports:
       - "27017:27017"
     volumes:
@@ -46,7 +46,7 @@ services:
   # MongoDB Express for web-based MongoDB management (optional)
   mongo-express:
     image: mongo-express:latest
-    container_name: optionchain-mongo-express
+    container_name: mongo-express
     restart: unless-stopped
     ports:
       - "8081:8081"
@@ -64,7 +64,7 @@ services:
   # Redis Commander for web-based Redis management (optional)
   redis-commander:
     image: rediscommander/redis-commander:latest
-    container_name: optionchain-redis-commander
+    container_name: redis-commander
     restart: unless-stopped
     ports:
       - "8082:8081"
@@ -86,7 +86,7 @@ services:
     environment:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
-      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-ohlcv_data}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
     volumes:
       - clickhouse_data:/var/lib/clickhouse
     ulimits:
@@ -97,6 +97,37 @@ services:
     networks:
       - optionchain-network
 
+  backend:
+    build:
+      context: ..
+      dockerfile: Docker/Dockerfile
+    container_name: backend
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT-8123}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST-clickhouse}
+      MONGODB_URI: ${MONGODB_URI-mongodb://admin:password@mongodb:27017}
+      MONGODB_DATABASE: ${MONGODB_DATABASE-optionchain_simulator}
+      MONGODB_STEPS_COLLECTION: ${MONGODB_STEPS_COLLECTION-steps}
+      MONGODB_EVENTS_COLLECTION: ${MONGODB_EVENTS_COLLECTION-events}
+      MONGODB_TIMEOUT: ${MONGODB_TIMEOUT-30}
+      REDIS_PORT: ${REDIS_PORT-6379}
+      REDIS_DB: ${REDIS_DB-0}
+      REDIS_USER: ${REDIS_USER}
+      REDIS_PASSWORD: ${REDIS_PASSWORD-password}
+      REDIS_HOST: ${REDIS_HOST-redis}
+    depends_on:
+      - redis
+      - mongodb
+      - clickhouse
+    ports:
+      - "7070:7070"
+    networks:
+      - optionchain-network
+      
 networks:
   optionchain-network:
     driver: bridge

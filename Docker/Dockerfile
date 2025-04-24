@@ -25,6 +25,6 @@ COPY --from=builder /usr/lib /usr/lib
 COPY --from=builder /lib /lib
 COPY --from=builder /app/target/release/optionchain_simulator /app/
 
-EXPOSE 8080
+EXPOSE 7070
 
 CMD ["/app/optionchain_simulator"]
