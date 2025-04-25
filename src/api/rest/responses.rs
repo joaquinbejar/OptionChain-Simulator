@@ -100,9 +100,25 @@ pub struct SessionInfoResponse {
     pub total_steps: usize,
 }
 
+/// Represents an error response structure used in the application.
+///
+/// This struct is typically used to standardize the format of error messages
+/// returned by APIs or other components in the system.
+///
+///
+/// # Traits
+/// - `Debug`: Enables formatting the struct using the `{:?}` formatter for debugging purposes.
+/// - `Clone`: Allows creating a copy of the struct.
+/// - `Serialize`: Enables the struct to be serialized, often used to convert it into JSON.
+/// - `Deserialize`: Allows the struct to be deserialized, commonly used when parsing input like JSON.
+/// - `ToSchema`: Used to integrate with OpenAPI documentation generators (for instance, `utoipa`).
+/// - `Default`: Provides a default implementation for the struct, which initializes `error` as an empty string.
+///
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct ErrorResponse {
-    pub error: String
+    /// - `error`: A `String` that contains a description or message for the error.
+    ///   This is intended to provide clarity about what went wrong.
+    pub error: String,
 }
 
 /// Default implementation for SessionParametersResponse
