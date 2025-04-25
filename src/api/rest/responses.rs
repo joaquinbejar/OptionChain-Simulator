@@ -33,7 +33,7 @@ pub struct SessionParametersResponse {
     /// The risk-free interest rate (decimal, e.g., 0.05 for 5%)
     pub risk_free_rate: f64,
     /// The simulation method to use (e.g., "Brownian", "GeometricBrownian")
-    pub method: serde_json::Value,
+    pub method: Value,
     /// The time frame for simulation steps
     pub time_frame: String,
     /// The dividend yield of the underlying asset
@@ -101,7 +101,9 @@ pub struct SessionInfoResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
-pub struct ErrorResponse {}
+pub struct ErrorResponse {
+    pub error: String
+}
 
 /// Default implementation for SessionParametersResponse
 impl Default for SessionParametersResponse {
