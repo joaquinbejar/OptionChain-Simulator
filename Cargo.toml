@@ -1,6 +1,6 @@
 [package]
 name = "optionchain_simulator"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "OptionChain-Simulator is a lightweight REST API service that simulates an evolving option chain with every request. It is designed for developers building or testing trading systems, backtesters, and visual tools that depend on option data streams but want to avoid relying on live data feeds."
