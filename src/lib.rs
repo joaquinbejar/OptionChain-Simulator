@@ -93,7 +93,7 @@
 //!   "time_frame": "Day",
 //!   "chain_size": 15,
 //!   "strike_interval": 5.0,
-//!   "skew_factor": 0.0005,
+//!   "smile_curve": 0.0005,
 //!   "spread": 0.02
 //! }
 //! ```
@@ -112,7 +112,7 @@
 //!         "method": "GeometricBrownian { dt: 0.004, drift: 0.05, volatility: 0.25 }",
 //!         "time_frame": "day",
 //!         "dividend_yield": 0.005,
-//!         "skew_factor": 0.0005,
+//!         "smile_curve": 0.0005,
 //!         "spread": 0.02
 //!     },
 //!     "current_step": 0,
@@ -367,7 +367,7 @@
 //!         "method": "GeometricBrownian { dt: 0.004, drift: 0.05, volatility: 0.25 }",
 //!         "time_frame": "day",
 //!         "dividend_yield": 0.005,
-//!         "skew_factor": 0.0005,
+//!         "smile_curve": 0.0005,
 //!         "spread": 0.02
 //!     },
 //!     "current_step": 0,
@@ -398,7 +398,7 @@
 //!   "time_frame": "Day",
 //!   "chain_size": 15,
 //!   "strike_interval": 5.0,
-//!   "skew_factor": 0.0005,
+//!   "smile_curve": 0.0005,
 //!   "spread": 0.02
 //! }
 //! ```
@@ -417,7 +417,7 @@
 //!         "method": "GeometricBrownian { dt: 0.004, drift: 0.05, volatility: 0.25 }",
 //!         "time_frame": "day",
 //!         "dividend_yield": 0.005,
-//!         "skew_factor": 0.0005,
+//!         "smile_curve": 0.0005,
 //!         "spread": 0.02
 //!     },
 //!     "current_step": 0,
