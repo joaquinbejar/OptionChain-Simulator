@@ -32,9 +32,12 @@ pub struct CreateSessionRequest {
     /// - `strike_interval` (`Option<Positive>`): The optional interval between strike prices for options. If `None`, this is not specified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strike_interval: Option<f64>,
-    /// - `skew_factor` (`Option<Decimal>`): An optional factor that adjusts the skew of the distribution. For example, it can be used to bias option pricing.
+    /// - `skew_slope` (`Option<Decimal>`): An optional factor that adjusts the slope of the volatility distribution.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub skew_factor: Option<f64>,
+    pub skew_slope: Option<f64>,
+    /// - `smile_curve` (`Option<Decimal>`): An optional factor that adjusts the skew of the volatility distribution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smile_curve: Option<f64>,
     /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
@@ -54,7 +57,8 @@ impl From<SimulationParameters> for CreateSessionRequest {
             time_frame: params.time_frame.into(),
             chain_size: params.chain_size,
             strike_interval: params.strike_interval.map(|p| p.to_f64()),
-            skew_factor: params.skew_factor.map(|d| d.to_f64().unwrap_or(0.0)),
+            skew_slope: params.skew_slope.map(|d| d.to_f64().unwrap_or(0.0)),
+            smile_curve: params.smile_curve.map(|d| d.to_f64().unwrap_or(0.0)),
             spread: params.spread.map(|p| p.to_f64()),
         }
     }
@@ -78,7 +82,8 @@ impl Default for CreateSessionRequest {
             time_frame: ApiTimeFrame::Day,
             chain_size: Some(30),
             strike_interval: Some(1.0),
-            skew_factor: None,
+            skew_slope: None,
+            smile_curve: None,
             spread: Some(0.01),
         }
     }
@@ -129,9 +134,9 @@ pub struct UpdateSessionRequest {
     /// - `strike_interval` (`Option<Positive>`): The optional interval between strike prices for options. If `None`, this is not specified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub strike_interval: Option<f64>,
-    /// - `skew_factor` (`Option<Decimal>`): An optional factor that adjusts the skew of the distribution. For example, it can be used to bias option pricing.
+    /// - `smile_curve` (`Option<Decimal>`): An optional factor that adjusts the skew of the distribution. For example, it can be used to bias option pricing.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub skew_factor: Option<f64>,
+    pub smile_curve: Option<f64>,
     /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
@@ -164,7 +169,7 @@ mod tests_create_session_request {
         assert_eq!(default_req.time_frame, ApiTimeFrame::Day);
         assert_eq!(default_req.chain_size, Some(30));
         assert_eq!(default_req.strike_interval, Some(1.0));
-        assert_eq!(default_req.skew_factor, None);
+        assert_eq!(default_req.smile_curve, None);
         assert_eq!(default_req.spread, Some(0.01));
 
         // Check method field
@@ -198,7 +203,8 @@ mod tests_create_session_request {
             steps: 30,
             time_frame: ApiTimeFrame::Day,
             dividend_yield: 0.005,
-            skew_factor: Some(0.0005),
+            skew_slope: Some(-0.2),
+            smile_curve: Some(0.5),
             spread: Some(0.02),
             chain_size: Some(15),
             strike_interval: Some(5.0),
@@ -214,7 +220,7 @@ mod tests_create_session_request {
         assert!(json.contains("\"days_to_expiration\":45.0"));
         assert!(json.contains("\"steps\":30"));
         assert!(json.contains("\"dividend_yield\":0.005"));
-        assert!(json.contains("\"skew_factor\":0.0005"));
+        assert!(json.contains("\"smile_curve\":0.5"));
         assert!(json.contains("\"spread\":0.02"));
         assert!(json.contains("\"chain_size\":15"));
         assert!(json.contains("\"strike_interval\":5.0"));
@@ -246,7 +252,7 @@ mod tests_create_session_request {
             "steps": 25,
             "time_frame": "Week",
             "dividend_yield": 0.0,
-            "skew_factor": 0.001,
+            "smile_curve": 0.001,
             "spread": 0.015,
             "chain_size": 20,
             "strike_interval": 10.0
@@ -262,7 +268,7 @@ mod tests_create_session_request {
         assert_eq!(req.steps, 25);
         assert_eq!(req.time_frame, ApiTimeFrame::Week);
         assert_eq!(req.dividend_yield, 0.0);
-        assert_eq!(req.skew_factor, Some(0.001));
+        assert_eq!(req.smile_curve, Some(0.001));
         assert_eq!(req.spread, Some(0.015));
         assert_eq!(req.chain_size, Some(20));
         assert_eq!(req.strike_interval, Some(10.0));
@@ -316,7 +322,7 @@ mod tests_create_session_request {
         assert_eq!(req.steps, 30); // Default value
         assert_eq!(req.time_frame, ApiTimeFrame::Day); // Default value
         assert_eq!(req.dividend_yield, 0.005); // Default value
-        assert_eq!(req.skew_factor, None); // Default value
+        assert_eq!(req.smile_curve, None); // Default value
         assert_eq!(req.spread, None); // Default value
 
         // Method field should be default Brownian
@@ -372,7 +378,8 @@ mod tests {
                 time_frame: TimeFrame::Day,
                 chain_size: Some(15),
                 strike_interval: Some(pos!(1.0)),
-                skew_factor: None,
+                skew_slope: None,
+                smile_curve: None,
                 spread: Some(pos!(0.02)),
             };
 
@@ -407,7 +414,8 @@ mod tests {
                 time_frame: TimeFrame::Day,
                 chain_size: Some(15),
                 strike_interval: Some(pos!(1.0)),
-                skew_factor: None,
+                skew_slope: None,
+                smile_curve: None,
                 spread: Some(pos!(0.02)),
             };
 
@@ -456,7 +464,8 @@ mod tests {
                 time_frame: TimeFrame::Day,
                 chain_size: Some(15),
                 strike_interval: Some(pos!(1.0)),
-                skew_factor: None,
+                skew_slope: None,
+                smile_curve: None,
                 spread: Some(pos!(0.02)),
             };
 
@@ -476,9 +485,10 @@ mod tests {
     // Option Chain Generation Tests
     mod option_chain_tests {
         use super::*;
-        use optionstratlib::ExpirationDate;
         use optionstratlib::chains::OptionChainBuildParams;
         use optionstratlib::chains::utils::OptionDataPriceParams;
+        use optionstratlib::{ExpirationDate, spos};
+        use rust_decimal_macros::dec;
 
         #[test]
         fn test_option_chain_generation() {
@@ -489,8 +499,9 @@ mod tests {
                 "AAPL".to_string(),
                 Some(pos!(1000.0)), // Volume
                 15,                 // Chain size
-                pos!(1.0),          // Strike interval
-                Decimal::new(5, 4), // Skew factor
+                spos!(1.0),         // Strike interval
+                dec!(-0.2),         // Skew slope
+                Decimal::new(5, 1), // Skew curve
                 pos!(0.02),         // Spread
                 2,                  // Decimal places
                 OptionDataPriceParams::new(
@@ -537,7 +548,6 @@ mod tests {
                 symbol: "".to_string(),   // Invalid: empty symbol
                 steps: 0,                 // Invalid: zero steps
                 initial_price: pos!(0.0), // Invalid: zero initial price
-
                 days_to_expiration: Default::default(),
                 volatility: Default::default(),
                 risk_free_rate: Default::default(),
@@ -550,7 +560,8 @@ mod tests {
                 time_frame: TimeFrame::Microsecond,
                 chain_size: None,
                 strike_interval: None,
-                skew_factor: None,
+                skew_slope: None,
+                smile_curve: None,
                 spread: None,
             };
 
@@ -629,7 +640,7 @@ mod tests {
                 time_frame: None,
                 chain_size: None,
                 strike_interval: None,
-                skew_factor: None,
+                smile_curve: None,
                 spread: None,
             };
 

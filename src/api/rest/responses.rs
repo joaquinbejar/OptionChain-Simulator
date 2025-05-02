@@ -39,7 +39,9 @@ pub struct SessionParametersResponse {
     /// The dividend yield of the underlying asset
     pub dividend_yield: f64,
     /// Factor for adjusting volatility skew
-    pub skew_factor: Option<f64>,
+    pub skew_slope: Option<f64>,
+    /// Factor for adjusting volatility skew
+    pub smile_curve: Option<f64>,
     /// Bid-ask spread factor
     pub spread: Option<f64>,
 }
@@ -132,7 +134,8 @@ impl Default for SessionParametersResponse {
             method: Value::Null,
             time_frame: String::new(),
             dividend_yield: 0.0,
-            skew_factor: None,
+            skew_slope: None,
+            smile_curve: None,
             spread: None,
         }
     }
@@ -178,7 +181,7 @@ mod tests {
         assert_eq!(sp.method, Value::Null);
         assert_eq!(sp.time_frame, "");
         assert_eq!(sp.dividend_yield, 0.0);
-        assert!(sp.skew_factor.is_none());
+        assert!(sp.smile_curve.is_none());
         assert!(sp.spread.is_none());
     }
 

@@ -5,6 +5,7 @@ pub use optionstratlib::simulation::WalkType as SimulationMethod;
 use optionstratlib::utils::TimeFrame;
 use optionstratlib::{Positive, pos};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
@@ -115,8 +116,16 @@ pub struct SimulationParameters {
     pub chain_size: Option<usize>,
     /// - `strike_interval` (`Option<Positive>`): The optional interval between strike prices for options. If `None`, this is not specified.
     pub strike_interval: Option<Positive>,
-    /// - `skew_factor` (`Option<Decimal>`): An optional factor that adjusts the skew of the distribution. For example, it can be used to bias option pricing.
-    pub skew_factor: Option<Decimal>,
+    /// A public field representing an optional skew slope value.
+    ///
+    /// # Description
+    /// The `skew_slope` field holds an optional `Decimal` value that indicates
+    /// the slope or angle associated with a skew operation or calculation.
+    /// If the value is `None`, it implies that the skew slope is not set or
+    /// applicable in the current context.
+    pub skew_slope: Option<Decimal>,
+    /// - `smile_curve` (`Option<Decimal>`): An optional factor that adjusts the skew of the distribution. For example, it can be used to bias option pricing.
+    pub smile_curve: Option<Decimal>,
     /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     pub spread: Option<Positive>,
 }
@@ -144,8 +153,11 @@ impl From<CreateSessionRequest> for SimulationParameters {
             time_frame: req.time_frame.into(),
             chain_size: req.chain_size,
             strike_interval: req.strike_interval.map(|v| pos!(v)),
-            skew_factor: req
-                .skew_factor
+            skew_slope: req
+                .skew_slope
+                .map(|v| Decimal::try_from(v).unwrap_or_default()),
+            smile_curve: req
+                .smile_curve
                 .map(|v| Decimal::try_from(v).unwrap_or_default()),
             spread: req.spread.map(|v| pos!(v)),
         }
@@ -372,7 +384,8 @@ impl Default for Session {
             time_frame: TimeFrame::Day,
             chain_size: Some(30),
             strike_interval: Some(pos!(5.0)),
-            skew_factor: None,
+            skew_slope: Some(dec!(-0.2)),
+            smile_curve: Some(dec!(0.4)),
             spread: Some(pos!(0.02)),
         };
 
@@ -423,7 +436,8 @@ mod tests_simulation_parameters_serialization {
             time_frame: TimeFrame::Day,
             chain_size: Some(15),
             strike_interval: Some(pos!(5.0)),
-            skew_factor: Some(dec!(0.0005)),
+            skew_slope: Some(dec!(-0.2)),
+            smile_curve: Some(dec!(0.5)),
             spread: Some(pos!(0.02)),
         };
 
@@ -443,7 +457,7 @@ mod tests_simulation_parameters_serialization {
         assert_eq!(value["time_frame"], "Day");
         assert_eq!(value["chain_size"], 15);
         assert_eq!(value["strike_interval"], 5.0);
-        assert_eq!(value["skew_factor"], "0.0005");
+        assert_eq!(value["smile_curve"], "0.5");
         assert_eq!(value["spread"], 0.02);
 
         // Check the method field specifically
@@ -500,7 +514,8 @@ mod tests_simulation_parameters_serialization {
             time_frame: TimeFrame::Day,
             chain_size: None,
             strike_interval: None,
-            skew_factor: None,
+            skew_slope: None,
+            smile_curve: None,
             spread: None,
         };
 
@@ -513,14 +528,14 @@ mod tests_simulation_parameters_serialization {
         // Check that optional fields are null or missing
         assert!(value.get("chain_size").is_none() || value["chain_size"].is_null());
         assert!(value.get("strike_interval").is_none() || value["strike_interval"].is_null());
-        assert!(value.get("skew_factor").is_none() || value["skew_factor"].is_null());
+        assert!(value.get("smile_curve").is_none() || value["smile_curve"].is_null());
         assert!(value.get("spread").is_none() || value["spread"].is_null());
 
         // Deserialize back and verify
         let deserialized: SimulationParameters = from_str(&json).unwrap();
         assert_eq!(deserialized.chain_size, None);
         assert_eq!(deserialized.strike_interval, None);
-        assert_eq!(deserialized.skew_factor, None);
+        assert_eq!(deserialized.smile_curve, None);
         assert_eq!(deserialized.spread, None);
     }
 
@@ -545,7 +560,7 @@ mod tests_simulation_parameters_serialization {
             "time_frame": "Day",
             "chain_size": 20,
             "strike_interval": 10.0,
-            "skew_factor": "0.001",
+            "smile_curve": "0.001",
             "spread": 0.025
         }"#;
 
@@ -563,7 +578,7 @@ mod tests_simulation_parameters_serialization {
         assert_eq!(params.time_frame, TimeFrame::Day);
         assert_eq!(params.chain_size, Some(20));
         assert_eq!(params.strike_interval, Some(pos!(10.0)));
-        assert_eq!(params.skew_factor, Some(dec!(0.001)));
+        assert_eq!(params.smile_curve, Some(dec!(0.001)));
         assert_eq!(params.spread, Some(pos!(0.025)));
 
         // Check method variant
@@ -603,7 +618,8 @@ mod tests_simulation_parameters_serialization {
             time_frame: TimeFrame::Day,
             chain_size: Some(25),
             strike_interval: Some(pos!(25.0)),
-            skew_factor: None,
+            skew_slope: None,
+            smile_curve: None,
             spread: Some(pos!(0.01)),
         };
 
@@ -642,7 +658,8 @@ mod tests_simulation_parameters_serialization {
             time_frame: TimeFrame::Day,
             chain_size: Some(15),
             strike_interval: Some(pos!(5.0)),
-            skew_factor: None,
+            skew_slope: None,
+            smile_curve: None,
             spread: None,
         };
 
@@ -690,7 +707,8 @@ mod tests_simulation_parameters_serialization {
                 time_frame: tf,
                 chain_size: None,
                 strike_interval: None,
-                skew_factor: None,
+                skew_slope: None,
+                smile_curve: None,
                 spread: None,
             };
 
@@ -726,7 +744,8 @@ mod tests_simulation_parameters_serialization {
             time_frame: TimeFrame::Day,
             chain_size: Some(10),
             strike_interval: Some(pos!(10.0)),
-            skew_factor: Some(dec!(-0.0005)), // Negative skew
+            skew_slope: Some(dec!(-0.2)),
+            smile_curve: Some(dec!(-0.5)), // Negative skew
             spread: Some(pos!(0.015)),
         };
 
@@ -737,12 +756,12 @@ mod tests_simulation_parameters_serialization {
         assert_eq!(value["risk_free_rate"], "-0.01");
         assert_eq!(value["method"]["JumpDiffusion"]["drift"], "-0.02");
         assert_eq!(value["method"]["JumpDiffusion"]["jump_mean"], "-0.05");
-        assert_eq!(value["skew_factor"], "-0.0005");
+        assert_eq!(value["smile_curve"], "-0.5");
 
         // Deserialize and verify
         let deserialized: SimulationParameters = from_str(&json).unwrap();
         assert_eq!(deserialized.risk_free_rate, dec!(-0.01));
-        assert_eq!(deserialized.skew_factor, Some(dec!(-0.0005)));
+        assert_eq!(deserialized.smile_curve, Some(dec!(-0.5)));
 
         match deserialized.method {
             SimulationMethod::JumpDiffusion {
@@ -853,7 +872,8 @@ mod tests_session {
             time_frame: TimeFrame::Day,
             chain_size: Some(10),
             strike_interval: spos!(5.0),
-            skew_factor: Some(Decimal::new(1, 1)), // 0.1
+            skew_slope: None,
+            smile_curve: Some(Decimal::new(1, 1)), // 0.1
             spread: spos!(0.2),                    // 0.2
         }
     }
