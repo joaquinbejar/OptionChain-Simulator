@@ -61,7 +61,7 @@ classDiagram
         +time_frame: TimeFrame
         +chain_size: Option~usize~
         +strike_interval: Option~Positive~
-        +skew_factor: Option~Decimal~
+        +smile_curve: Option~Decimal~
         +spread: Option~Positive~
     }
     
