@@ -135,7 +135,8 @@ mod tests {
             time_frame: TimeFrame::Day,
             chain_size: Some(5),
             strike_interval: Some(pos!(5.0)),
-            skew_factor: None,
+            skew_slope: None,
+            smile_curve: None,
             spread: None,
         };
 

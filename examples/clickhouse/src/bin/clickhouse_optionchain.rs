@@ -144,9 +144,10 @@ fn create_simulation_parameters(
             volatility,
         },
         time_frame,
-        chain_size: Some(30),                  // 30 strikes
-        strike_interval: Some(pos!(1.0)),      // $1 intervals
-        skew_factor: Some(Decimal::new(5, 4)), // 0.0005
+        chain_size: Some(30),             // 30 strikes
+        strike_interval: Some(pos!(1.0)), // $1 intervals
+        skew_slope: None,
+        smile_curve: Some(Decimal::new(5, 1)), // 0.5
         spread: spos!(0.02),                   // 2% bid-ask spread
     }
 }

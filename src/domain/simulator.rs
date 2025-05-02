@@ -29,7 +29,9 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 const DEFAULT_CHAIN_SIZE: usize = 30;
-const DEFAULT_SKEW_FACTOR: Decimal = dec!(0.0005);
+
+const DEFAULT_SKEW_SLOPE: Decimal = dec!(-0.2);
+const DEFAULT_SMILE_CURVE: Decimal = dec!(0.4);
 
 /// Simulator handles the generation of option chains based on simulation parameters
 pub struct Simulator {
@@ -262,8 +264,9 @@ impl Simulator {
 
         // Set default values if not provided
         let chain_size = params.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE);
-        let strike_interval = params.strike_interval.unwrap_or(Positive::ONE);
-        let skew_factor = params.skew_factor.unwrap_or(DEFAULT_SKEW_FACTOR);
+        let strike_interval = params.strike_interval;
+        let skew_slope = params.skew_slope.unwrap_or(DEFAULT_SKEW_SLOPE);
+        let smile_curve = params.smile_curve.unwrap_or(DEFAULT_SMILE_CURVE);
         let spread = params.spread.unwrap_or(pos!(0.01));
 
         // Create option data price parameters
@@ -282,7 +285,8 @@ impl Simulator {
             Some(Positive::ONE), // Default volume
             chain_size,
             strike_interval,
-            skew_factor,
+            skew_slope,
+            smile_curve,
             spread,
             2, // Decimal places
             price_params,
@@ -401,7 +405,8 @@ mod tests {
             time_frame: TimeFrame::Day,
             chain_size: Some(10),
             strike_interval: Some(pos!(5.0)),
-            skew_factor: Some(dec!(0.0005)),
+            skew_slope: Some(dec!(-0.2)),
+            smile_curve: Some(dec!(0.5)),
             spread: Some(pos!(0.01)),
         };
 

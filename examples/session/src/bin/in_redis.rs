@@ -105,7 +105,8 @@ fn create_simulation_parameters() -> SimulationParameters {
         time_frame,
         chain_size: Some(30),
         strike_interval: Some(Positive::ONE),
-        skew_factor: None,
+        skew_slope: None,
+        smile_curve: None,
         spread: spos!(0.02),
     }
 }

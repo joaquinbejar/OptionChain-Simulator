@@ -40,7 +40,8 @@ use uuid::Uuid;
                       "time_frame": "Day",
                       "chain_size": 15,
                       "strike_interval": 5.0,
-                      "skew_factor": 0.0005,
+                      "skew_slope": -0.2,
+                      "smile_curve": 0.5,
                       "spread": 0.02
                     }
                     "#
@@ -83,7 +84,8 @@ pub(crate) async fn create_session(
                     method: method_value,
                     time_frame: session.parameters.time_frame.to_string(),
                     dividend_yield: session.parameters.dividend_yield.into(),
-                    skew_factor: session.parameters.skew_factor.map(|f| f.to_f64().unwrap()),
+                    skew_slope: session.parameters.skew_slope.map(|f| f.to_f64().unwrap()),
+                    smile_curve: session.parameters.smile_curve.map(|f| f.to_f64().unwrap()),
                     spread: session.parameters.spread.map(|f| f.into()),
                 },
                 current_step: session.current_step,
@@ -278,7 +280,8 @@ pub(crate) async fn replace_session(
                     method: method_value,
                     time_frame: session.parameters.time_frame.to_string(),
                     dividend_yield: session.parameters.dividend_yield.into(),
-                    skew_factor: session.parameters.skew_factor.map(|f| f.to_f64().unwrap()),
+                    skew_slope: session.parameters.skew_slope.map(|f| f.to_f64().unwrap()),
+                    smile_curve: session.parameters.smile_curve.map(|f| f.to_f64().unwrap()),
                     spread: session.parameters.spread.map(|f| f.into()),
                 },
                 current_step: session.current_step,
@@ -398,8 +401,8 @@ pub(crate) async fn update_session(
         updated_params.strike_interval = Some(pos!(strike_interval));
     }
 
-    if let Some(skew_factor) = json_req.skew_factor {
-        updated_params.skew_factor = Some(Decimal::try_from(skew_factor).unwrap_or_default());
+    if let Some(smile_curve) = json_req.smile_curve {
+        updated_params.smile_curve = Some(Decimal::try_from(smile_curve).unwrap_or_default());
     }
 
     if let Some(spread) = json_req.spread {
@@ -426,9 +429,13 @@ pub(crate) async fn update_session(
                     method: method_value,
                     time_frame: session.parameters.time_frame.to_string(),
                     dividend_yield: session.parameters.dividend_yield.into(),
-                    skew_factor: session
+                    skew_slope: session
                         .parameters
-                        .skew_factor
+                        .skew_slope
+                        .map(|f| f.to_f64().unwrap_or(0.0)),
+                    smile_curve: session
+                        .parameters
+                        .smile_curve
                         .map(|f| f.to_f64().unwrap_or(0.0)),
                     spread: session.parameters.spread.map(|f| f.into()),
                 },
