@@ -1,6 +1,6 @@
 [package]
 name = "optionchain_simulator"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "OptionChain-Simulator is a lightweight REST API service that simulates an evolving option chain with every request. It is designed for developers building or testing trading systems, backtesters, and visual tools that depend on option data streams but want to avoid relying on live data feeds."
@@ -19,7 +19,7 @@ rust_decimal_macros = "1.37.1"
 serde_json = "1.0.140"
 serde = "1.0.219"
 uuid = { version = "1.16.0", features = ["v4", "v5", "serde"] }
-chrono = { version = "0.4.40", features = ["serde"] }
+chrono = { version = "0.4.41", features = ["serde"] }
 clickhouse = "0.13.2"
 tokio = { version = "1.44.2", features = ["full"] }
 async-trait = "0.1.88"
