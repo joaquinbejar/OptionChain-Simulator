@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::infrastructure::config::mongo::MongoDBConfig;
+use crate::infrastructure::config::{redact_uri, redact_userinfo};
 use crate::utils::ChainError;
 use mongodb::options::ClientOptions;
 use serde::Serialize;
@@ -23,24 +24,37 @@ impl MongoDBClient {
     /// Creates a new MongoDB client with the provided configuration
     #[instrument(skip(config), level = "debug")]
     pub async fn new(config: MongoDBConfig) -> Result<Self, ChainError> {
-        info!("Connecting to MongoDB at {}", config.uri);
+        // The URI may embed credentials; never log it raw.
+        info!("Connecting to MongoDB at {}", redact_uri(&config.uri));
 
-        let mut client_options = ClientOptions::parse(&config.uri)
-            .await
-            .map_err(|e| ChainError::Internal(format!("Failed to parse MongoDB URI: {}", e)))?;
+        // Driver errors can echo the connection URI back, so every error string
+        // is passed through `redact_userinfo` before it reaches a log or a
+        // `ChainError`.
+        let mut client_options = ClientOptions::parse(&config.uri).await.map_err(|e| {
+            ChainError::Internal(redact_userinfo(&format!(
+                "Failed to parse MongoDB URI: {}",
+                e
+            )))
+        })?;
 
         client_options.app_name = Some("OptionChain-Simulator".to_string());
         client_options.connect_timeout = Some(std::time::Duration::from_secs(config.timeout));
 
-        let client = mongodb::Client::with_options(client_options)
-            .map_err(|e| ChainError::Internal(format!("Failed to create MongoDB client: {}", e)))?;
+        let client = mongodb::Client::with_options(client_options).map_err(|e| {
+            ChainError::Internal(redact_userinfo(&format!(
+                "Failed to create MongoDB client: {}",
+                e
+            )))
+        })?;
 
         // Test connection
         client
             .database("admin")
             .run_command(doc! {"ping": 1})
             .await
-            .map_err(|e| ChainError::Internal(format!("Failed to ping MongoDB: {}", e)))?;
+            .map_err(|e| {
+                ChainError::Internal(redact_userinfo(&format!("Failed to ping MongoDB: {}", e)))
+            })?;
 
         info!("Successfully connected to MongoDB");
 
