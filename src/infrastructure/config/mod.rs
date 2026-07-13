@@ -12,7 +12,9 @@ pub mod redis;
 /// This is intentionally implemented with plain string scanning (no regex, no
 /// extra dependencies): for every `://`, the authority section runs up to the
 /// next `/`, whitespace, or end of string; if it contains an `@`, everything
-/// between `://` and that `@` is treated as credentials and redacted.
+/// between `://` and its LAST `@` is treated as credentials and redacted, so
+/// an unencoded `@` inside a password cannot leak a fragment. Credentials
+/// containing whitespace are not supported (invalid in a URL authority).
 pub(crate) fn redact_userinfo(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut i = 0;
@@ -32,9 +34,10 @@ pub(crate) fn redact_userinfo(s: &str) -> String {
                     .map(|p| sep + p)
                     .unwrap_or_else(|| s.len());
 
-                // If the authority contains an '@', everything before it is
-                // userinfo (credentials) and must be redacted.
-                match s[sep..authority_end].find('@') {
+                // If the authority contains an '@', everything before the
+                // LAST one is userinfo (credentials) and must be redacted —
+                // rfind so an unencoded '@' inside a password is covered too.
+                match s[sep..authority_end].rfind('@') {
                     Some(at_rel) => {
                         let at = sep + at_rel;
                         result.push_str("***@");
@@ -103,6 +106,16 @@ mod tests {
         // treated as userinfo.
         let input = "redis://localhost:6379/some@path";
         assert_eq!(redact_userinfo(input), input);
+    }
+
+    #[test]
+    fn test_redact_userinfo_unencoded_at_in_password() {
+        // An unencoded '@' inside the password must not leak a fragment: the
+        // LAST '@' in the authority bounds the userinfo.
+        assert_eq!(
+            redact_userinfo("redis://user:p@ss@localhost:6379"),
+            "redis://***@localhost:6379"
+        );
     }
 
     #[test]
