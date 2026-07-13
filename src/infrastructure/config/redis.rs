@@ -26,6 +26,29 @@ pub struct RedisConfig {
     /// attempt may block before the manager retries.
     pub connect_timeout: u64,
 }
+/// Parses a timeout environment variable in whole seconds.
+///
+/// The value must be a positive integer: zero would disable the bound entirely
+/// (a hung server could then hold a worker forever), so `0`, non-numeric, and
+/// unset values all fall back to `default` — invalid ones with a warning.
+fn parse_timeout_secs(var: &str, default: u64) -> u64 {
+    match env::var(var) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(v) if v >= 1 => v,
+            _ => {
+                tracing::warn!(
+                    "invalid {} value {:?}; must be an integer >= 1, using default {}s",
+                    var,
+                    raw,
+                    default
+                );
+                default
+            }
+        },
+        Err(_) => default,
+    }
+}
+
 impl RedisConfig {
     pub(crate) fn url(&self) -> String {
         // Start building the URL
@@ -78,15 +101,8 @@ impl Default for RedisConfig {
         let username = env::var("REDIS_USER").ok();
         let password = env::var("REDIS_PASSWORD").ok();
 
-        let timeout = env::var("REDIS_TIMEOUT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(30);
-
-        let connect_timeout = env::var("REDIS_CONNECT_TIMEOUT")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(5);
+        let timeout = parse_timeout_secs("REDIS_TIMEOUT", 30);
+        let connect_timeout = parse_timeout_secs("REDIS_CONNECT_TIMEOUT", 5);
 
         Self {
             host: env::var("REDIS_HOST").unwrap_or_else(|_| "localhost".to_string()),
@@ -215,6 +231,24 @@ mod tests {
         // Non-numeric timeouts must fall back to the documented defaults.
         set_var("REDIS_TIMEOUT", "not_a_number");
         set_var("REDIS_CONNECT_TIMEOUT", "also_bad");
+
+        let config = RedisConfig::default();
+
+        assert_eq!(config.timeout, 30);
+        assert_eq!(config.connect_timeout, 5);
+
+        remove_var("REDIS_TIMEOUT");
+        remove_var("REDIS_CONNECT_TIMEOUT");
+    }
+
+    #[test]
+    fn test_zero_timeouts_fall_back_to_defaults() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        // Zero would disable the bound entirely; it must be rejected like any
+        // other invalid value.
+        set_var("REDIS_TIMEOUT", "0");
+        set_var("REDIS_CONNECT_TIMEOUT", "0");
 
         let config = RedisConfig::default();
 
