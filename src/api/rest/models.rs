@@ -211,6 +211,24 @@ pub enum ApiWalkType {
         vol_mean: f64,
     },
 
+    /// Telegraph process (two-state regime switching model)
+    Telegraph {
+        /// Time step size (fraction of year: daily=1/365, weekly=1/52, etc.)
+        dt: f64,
+        /// Drift parameter (expected return)
+        drift: f64,
+        /// Base volatility parameter (annualized standard deviation)
+        volatility: f64,
+        /// Transition rate from state -1 to +1 (intensity of upward regime changes)
+        lambda_up: f64,
+        /// Transition rate from state +1 to -1 (intensity of downward regime changes)
+        lambda_down: f64,
+        /// Optional volatility multiplier for the +1 state (default: 1.0)
+        vol_multiplier_up: Option<f64>,
+        /// Optional volatility multiplier for the -1 state (default: 1.0)
+        vol_multiplier_down: Option<f64>,
+    },
+
     /// Represents historical price data for a given timeframe.
     ///
     /// This encapsulates the historical price data, including the timeframe
@@ -339,6 +357,23 @@ impl From<WalkType> for ApiWalkType {
                 vol_speed: vol_speed.to_f64(),
                 vol_mean: vol_mean.to_f64(),
             },
+            WalkType::Telegraph {
+                dt,
+                drift,
+                volatility,
+                lambda_up,
+                lambda_down,
+                vol_multiplier_up,
+                vol_multiplier_down,
+            } => ApiWalkType::Telegraph {
+                dt: dt.to_f64(),
+                drift: drift.to_f64().unwrap_or(0.0),
+                volatility: volatility.to_f64(),
+                lambda_up: lambda_up.to_f64(),
+                lambda_down: lambda_down.to_f64(),
+                vol_multiplier_up: vol_multiplier_up.map(|v| v.to_f64()),
+                vol_multiplier_down: vol_multiplier_down.map(|v| v.to_f64()),
+            },
             WalkType::Historical {
                 timeframe,
                 prices,
@@ -455,6 +490,23 @@ impl From<ApiWalkType> for WalkType {
                 vov: pos!(vov),
                 vol_speed: pos!(vol_speed),
                 vol_mean: pos!(vol_mean),
+            },
+            ApiWalkType::Telegraph {
+                dt,
+                drift,
+                volatility,
+                lambda_up,
+                lambda_down,
+                vol_multiplier_up,
+                vol_multiplier_down,
+            } => WalkType::Telegraph {
+                dt: pos!(dt),
+                drift: Decimal::try_from(drift).unwrap_or_default(),
+                volatility: pos!(volatility),
+                lambda_up: pos!(lambda_up),
+                lambda_down: pos!(lambda_down),
+                vol_multiplier_up: vol_multiplier_up.map(|v| pos!(v)),
+                vol_multiplier_down: vol_multiplier_down.map(|v| pos!(v)),
             },
             ApiWalkType::Historical {
                 timeframe,

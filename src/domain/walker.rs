@@ -4,7 +4,7 @@ use optionstratlib::simulation::{WalkParams, WalkType, WalkTypeAble};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, MathematicalOps};
 use std::error::Error;
 use std::sync::Mutex;
@@ -338,6 +338,76 @@ impl WalkTypeAble<Positive, OptionChain> for Walker {
                 Ok(values)
             }
             _ => Err("Invalid walk type for Heston model".into()),
+        }
+    }
+
+    fn telegraph(
+        &self,
+        params: &WalkParams<Positive, OptionChain>,
+    ) -> Result<Vec<Positive>, Box<dyn Error>> {
+        match params.walk_type {
+            WalkType::Telegraph {
+                dt,
+                drift,
+                volatility,
+                lambda_up,
+                lambda_down,
+                vol_multiplier_up,
+                vol_multiplier_down,
+            } => {
+                let mut values = Vec::with_capacity(params.size);
+                let mut price = params.ystep_as_positive().to_dec();
+                values.push(Positive::new_decimal(price).unwrap_or(Positive::ZERO));
+
+                // Initialize telegraph state randomly
+                let mut state: i8 = if self.normal_sample().to_f64().unwrap_or(0.0) < 0.0 {
+                    1
+                } else {
+                    -1
+                };
+
+                let sqrt_dt = dt.sqrt();
+                let vol_mult_up = vol_multiplier_up.unwrap_or(Positive::ONE);
+                let vol_mult_down = vol_multiplier_down.unwrap_or(Positive::ONE);
+
+                for _ in 1..params.size {
+                    // Calculate transition probabilities
+                    let lambda = if state == 1 {
+                        lambda_down.to_dec()
+                    } else {
+                        lambda_up.to_dec()
+                    };
+
+                    let transition_prob = Decimal::ONE - (-lambda * dt.to_dec()).exp();
+
+                    // Check for state transition using uniform random sample
+                    let uniform_sample = (self.normal_sample().abs() + Decimal::ONE) / Decimal::TWO; // Convert normal to uniform [0,1]
+                    if uniform_sample < transition_prob {
+                        state *= -1;
+                    }
+
+                    // Apply volatility multiplier based on current state
+                    let current_vol = if state == 1 {
+                        volatility * vol_mult_up
+                    } else {
+                        volatility * vol_mult_down
+                    };
+
+                    // Generate price change
+                    let z = self.normal_sample();
+                    let diffusion = current_vol.to_dec() * sqrt_dt.to_dec() * z;
+                    let drift_term = drift * dt.to_dec();
+
+                    // Update price using geometric Brownian motion with regime-dependent volatility
+                    let price_change = drift_term + diffusion;
+                    price *= price_change.exp();
+
+                    values.push(Positive::new_decimal(price).unwrap_or(Positive::ZERO));
+                }
+
+                Ok(values)
+            }
+            _ => Err("Invalid walk type for Telegraph process".into()),
         }
     }
 

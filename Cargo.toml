@@ -12,7 +12,9 @@ keywords = ["finance", "options", "trading"]
 categories = ["finance", "data-structures"]
 
 [dependencies]
-optionstratlib = "0.7"
+# Pinned exactly: 0.7.x patch releases have added WalkType variants, which
+# breaks the exhaustive matches in api::rest::models
+optionstratlib = "=0.7.3"
 tracing = "0.1.41"
 rust_decimal = { version = "1.37.1", features = ["maths", "serde"] }
 rust_decimal_macros = "1.37.1"
@@ -49,5 +51,5 @@ members = [
 ]
 
 [workspace.dependencies]
-optionstratlib = "0.7"
+optionstratlib = "=0.7.3"
 tracing = "0.1.41"
