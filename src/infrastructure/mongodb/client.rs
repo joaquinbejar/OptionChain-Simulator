@@ -154,7 +154,11 @@ mod tests {
     use std::sync::Arc;
     use tokio::test;
 
+    /// Live integration test: requires a running MongoDB. Opt in with
+    /// `cargo test -- --ignored` (CI runs it in the dedicated Integration job
+    /// with a mongo service container).
     #[test]
+    #[ignore = "requires live MongoDB on localhost:27017; run with -- --ignored"]
     async fn test_mongodb_client_initialization() {
         // Test that we can create a new MongoDB client
         let config = MongoDBConfig {
@@ -174,6 +178,24 @@ mod tests {
 
         let client = client_result.unwrap();
         assert_eq!(client.get_config().database, "test_db");
+    }
+
+    /// Hermetic replacement for the connection test: exercises config
+    /// construction and URI parsing without pinging a server.
+    #[test]
+    async fn test_client_options_parse_without_server() {
+        let config = MongoDBConfig {
+            uri: "mongodb://localhost:27017".to_string(),
+            database: "test_db".to_string(),
+            steps_collection: "test_steps".to_string(),
+            events_collection: "test_events".to_string(),
+            timeout: 5,
+        };
+
+        let options = mongodb::options::ClientOptions::parse(&config.uri).await;
+        assert!(options.is_ok(), "a well-formed URI must parse");
+        assert_eq!(config.database, "test_db");
+        assert_eq!(config.timeout, 5);
     }
 
     /// Regression for issue #17: with an unavailable server, `new` must fail
@@ -203,7 +225,12 @@ mod tests {
         );
     }
 
+    /// Live integration test: exercises `init_mongodb` against the default
+    /// (env-driven) configuration. Even though it tolerates a missing server,
+    /// the failure path burns the full configured server-selection timeout
+    /// (30s by default), so it is opt-in with the rest of the live tests.
     #[test]
+    #[ignore = "exercises a live MongoDB via env config; run with -- --ignored"]
     async fn test_init_mongodb() {
         // Test the init_mongodb function
         let result = crate::infrastructure::repositories::mongo_repo::init_mongodb().await;
