@@ -253,7 +253,7 @@ pub(crate) async fn create_session(
     metrics_collector.increment_active_sessions();
 
     // Create session using session manager
-    match session_manager.create_session(simulation_params) {
+    match session_manager.create_session(simulation_params).await {
         Ok(session) => {
             let created_at_utc = DateTime::<Utc>::from(session.created_at);
             let updated_at_utc = DateTime::<Utc>::from(session.updated_at);
@@ -365,7 +365,7 @@ pub(crate) async fn advance_step(
     // Expected-cursor precondition: a transport-level check (412) so an
     // ambiguous retry can be resolved without consuming another step.
     if let Some(expected) = query.expected_step {
-        match session_manager.get_session(session_id) {
+        match session_manager.get_session(session_id).await {
             Ok(session) => {
                 if session.current_step != expected {
                     return HttpResponse::PreconditionFailed().json(serde_json::json!({
@@ -506,7 +506,10 @@ pub(crate) async fn replace_session(
     };
 
     // Replace session using session manager
-    match session_manager.reinitialize_session(session_id, simulation_params) {
+    match session_manager
+        .reinitialize_session(session_id, simulation_params)
+        .await
+    {
         Ok(session) => {
             let created_at_utc = DateTime::<Utc>::from(session.created_at);
             let updated_at_utc = DateTime::<Utc>::from(session.updated_at);
@@ -608,7 +611,7 @@ pub(crate) async fn update_session(
     };
 
     // Get current session to update only the parameters that were provided
-    let current_session = match session_manager.get_session(session_id) {
+    let current_session = match session_manager.get_session(session_id).await {
         Ok(session) => session,
         Err(error) => return map_error(error),
     };
@@ -623,7 +626,10 @@ pub(crate) async fn update_session(
     }
 
     // Update the session with new parameters
-    match session_manager.update_session(session_id, updated_params) {
+    match session_manager
+        .update_session(session_id, updated_params)
+        .await
+    {
         Ok(session) => {
             let created_at_utc = DateTime::<Utc>::from(session.created_at);
             let updated_at_utc = DateTime::<Utc>::from(session.updated_at);
@@ -706,7 +712,7 @@ pub(crate) async fn delete_session(
         .map_err(|_| ChainError::InvalidState("Invalid session ID format".to_string()));
 
     match session_id {
-        Ok(id) => match session_manager.delete_session(id) {
+        Ok(id) => match session_manager.delete_session(id).await {
             Ok(true) => {
                 let msg = format!("Session deleted successfully: {}", id);
                 let msg = serde_json::json!({

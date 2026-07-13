@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Creating simulation session based on {} historical data",
                         symbol
                     );
-                    let session_result = session_manager.create_session(params);
+                    let session_result = session_manager.create_session(params).await;
 
                     match session_result {
                         Ok(session) => {

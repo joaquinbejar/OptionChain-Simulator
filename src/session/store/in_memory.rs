@@ -1,5 +1,6 @@
 use crate::session::{Session, SessionStore};
 use crate::utils::ChainError;
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -48,8 +49,9 @@ impl InMemorySessionStore {
     }
 }
 
+#[async_trait]
 impl SessionStore for InMemorySessionStore {
-    fn get(&self, id: Uuid) -> Result<Session, ChainError> {
+    async fn get(&self, id: Uuid) -> Result<Session, ChainError> {
         let sessions = self.sessions.lock().map_err(|_| {
             ChainError::Internal("Failed to acquire lock on session store".to_string())
         })?;
@@ -60,7 +62,7 @@ impl SessionStore for InMemorySessionStore {
             .ok_or_else(|| ChainError::NotFound(format!("Session with id {} not found", id)))
     }
 
-    fn create(&self, session: Session) -> Result<(), ChainError> {
+    async fn create(&self, session: Session) -> Result<(), ChainError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ChainError::Internal("Failed to acquire lock on session store".to_string())
         })?;
@@ -76,7 +78,7 @@ impl SessionStore for InMemorySessionStore {
         Ok(())
     }
 
-    fn save(&self, session: Session) -> Result<(), ChainError> {
+    async fn save(&self, session: Session) -> Result<(), ChainError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ChainError::Internal("Failed to acquire lock on session store".to_string())
         })?;
@@ -85,7 +87,7 @@ impl SessionStore for InMemorySessionStore {
         Ok(())
     }
 
-    fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
+    async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ChainError::Internal("Failed to acquire lock on session store".to_string())
         })?;
@@ -93,7 +95,7 @@ impl SessionStore for InMemorySessionStore {
         Ok(sessions.remove(&id).is_some())
     }
 
-    fn cleanup(&self) -> Result<usize, ChainError> {
+    async fn cleanup(&self) -> Result<usize, ChainError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ChainError::Internal("Failed to acquire lock on session store".to_string())
         })?;
@@ -130,7 +132,6 @@ mod tests {
     use optionstratlib::utils::TimeFrame;
     use positive::{Positive, pos_or_panic};
     use rust_decimal::Decimal;
-    use std::thread;
     use std::time::{Duration, SystemTime};
     use uuid::Uuid;
 
@@ -187,12 +188,12 @@ mod tests {
         assert_eq!(sessions.len(), 0);
     }
 
-    #[test]
-    fn test_get_nonexistent_session() {
+    #[tokio::test]
+    async fn test_get_nonexistent_session() {
         let store = InMemorySessionStore::new();
         let id = Uuid::new_v4();
 
-        let result = store.get(id);
+        let result = store.get(id).await;
 
         assert!(result.is_err());
         match result {
@@ -203,16 +204,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_save_and_get_session() {
+    #[tokio::test]
+    async fn test_save_and_get_session() {
         let store = InMemorySessionStore::new();
         let session = create_test_session(None);
         let id = session.id;
 
-        let save_result = store.save(session.clone());
+        let save_result = store.save(session.clone()).await;
         assert!(save_result.is_ok());
 
-        let get_result = store.get(id);
+        let get_result = store.get(id).await;
         assert!(get_result.is_ok());
 
         let retrieved_session = get_result.unwrap();
@@ -221,29 +222,29 @@ mod tests {
         assert_eq!(retrieved_session.state, SessionState::Initialized);
     }
 
-    #[test]
-    fn test_create_new_session() {
+    #[tokio::test]
+    async fn test_create_new_session() {
         let store = InMemorySessionStore::new();
         let session = create_test_session(None);
         let id = session.id;
 
         // create succeeds on a new id
-        assert!(store.create(session).is_ok());
+        assert!(store.create(session).await.is_ok());
 
         // and the session is retrievable
-        assert!(store.get(id).is_ok());
+        assert!(store.get(id).await.is_ok());
     }
 
-    #[test]
-    fn test_create_duplicate_returns_already_exists() {
+    #[tokio::test]
+    async fn test_create_duplicate_returns_already_exists() {
         let store = InMemorySessionStore::new();
         let session = create_test_session(None);
 
         // first create wins
-        assert!(store.create(session.clone()).is_ok());
+        assert!(store.create(session.clone()).await.is_ok());
 
         // second create with the same id is rejected instead of overwriting
-        match store.create(session) {
+        match store.create(session).await {
             Err(ChainError::AlreadyExists(msg)) => {
                 assert!(msg.contains("already exists"));
             }
@@ -251,25 +252,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_save_still_updates_after_create() {
+    #[tokio::test]
+    async fn test_save_still_updates_after_create() {
         let store = InMemorySessionStore::new();
         let mut session = create_test_session(None);
         let id = session.id;
 
         // create the session, then save (upsert) an updated copy
-        assert!(store.create(session.clone()).is_ok());
+        assert!(store.create(session.clone()).await.is_ok());
         session.current_step = 7;
         session.state = SessionState::InProgress;
-        assert!(store.save(session).is_ok());
+        assert!(store.save(session).await.is_ok());
 
-        let retrieved = store.get(id).unwrap();
+        let retrieved = store.get(id).await.unwrap();
         assert_eq!(retrieved.current_step, 7);
         assert_eq!(retrieved.state, SessionState::InProgress);
     }
 
-    #[test]
-    fn test_save_multiple_sessions() {
+    #[tokio::test]
+    async fn test_save_multiple_sessions() {
         let store = InMemorySessionStore::new();
 
         let id1 = Uuid::new_v4();
@@ -278,11 +279,11 @@ mod tests {
         let session1 = create_test_session(Some(id1));
         let session2 = create_test_session(Some(id2));
 
-        assert!(store.save(session1).is_ok());
-        assert!(store.save(session2).is_ok());
+        assert!(store.save(session1).await.is_ok());
+        assert!(store.save(session2).await.is_ok());
 
-        let retrieved1 = store.get(id1).unwrap();
-        let retrieved2 = store.get(id2).unwrap();
+        let retrieved1 = store.get(id1).await.unwrap();
+        let retrieved2 = store.get(id2).await.unwrap();
 
         assert_eq!(retrieved1.id, id1);
         assert_eq!(retrieved2.id, id2);
@@ -291,56 +292,56 @@ mod tests {
         assert_eq!(sessions.len(), 2);
     }
 
-    #[test]
-    fn test_update_existing_session() {
+    #[tokio::test]
+    async fn test_update_existing_session() {
         let store = InMemorySessionStore::new();
         let mut session = create_test_session(None);
         let id = session.id;
 
         // Guardar la sesión inicial
-        assert!(store.save(session.clone()).is_ok());
+        assert!(store.save(session.clone()).await.is_ok());
 
         // Modificar la sesión y guardarla nuevamente
         session.state = SessionState::InProgress;
         session.current_step = 1;
-        assert!(store.save(session).is_ok());
+        assert!(store.save(session).await.is_ok());
 
         // Verificar que los cambios se aplicaron
-        let retrieved = store.get(id).unwrap();
+        let retrieved = store.get(id).await.unwrap();
         assert_eq!(retrieved.state, SessionState::InProgress);
         assert_eq!(retrieved.current_step, 1);
     }
 
-    #[test]
-    fn test_delete_session() {
+    #[tokio::test]
+    async fn test_delete_session() {
         let store = InMemorySessionStore::new();
         let session = create_test_session(None);
         let id = session.id;
 
         // Guardar y luego borrar la sesión
-        assert!(store.save(session).is_ok());
-        let delete_result = store.delete(id);
+        assert!(store.save(session).await.is_ok());
+        let delete_result = store.delete(id).await;
 
         assert!(delete_result.is_ok());
         assert!(delete_result.unwrap());
 
         // Verificar que la sesión ya no existe
-        assert!(store.get(id).is_err());
+        assert!(store.get(id).await.is_err());
     }
 
-    #[test]
-    fn test_delete_nonexistent_session() {
+    #[tokio::test]
+    async fn test_delete_nonexistent_session() {
         let store = InMemorySessionStore::new();
         let id = Uuid::new_v4();
 
-        let delete_result = store.delete(id);
+        let delete_result = store.delete(id).await;
 
         assert!(delete_result.is_ok());
         assert!(!delete_result.unwrap()); // Debe retornar false
     }
 
-    #[test]
-    fn test_cleanup_expired_sessions() {
+    #[tokio::test]
+    async fn test_cleanup_expired_sessions() {
         let store = InMemorySessionStore::new();
 
         // Crear una sesión con tiempo actual
@@ -363,57 +364,86 @@ mod tests {
         };
 
         // Guardar ambas sesiones
-        assert!(store.save(current_session).is_ok());
-        assert!(store.save(expired_session).is_ok());
+        assert!(store.save(current_session).await.is_ok());
+        assert!(store.save(expired_session).await.is_ok());
 
         // Ejecutar la limpieza
-        let cleanup_result = store.cleanup();
+        let cleanup_result = store.cleanup().await;
         assert!(cleanup_result.is_ok());
         assert_eq!(cleanup_result.unwrap(), 1); // Una sesión debe ser eliminada
 
         // Verificar que solo la sesión actual sigue existiendo
-        assert!(store.get(current_id).is_ok());
-        assert!(store.get(expired_id).is_err());
+        assert!(store.get(current_id).await.is_ok());
+        assert!(store.get(expired_id).await.is_err());
     }
 
-    #[test]
-    fn test_concurrent_access() {
+    #[tokio::test]
+    async fn test_concurrent_access() {
         let store = Arc::new(InMemorySessionStore::new());
         let session = create_test_session(None);
         let id = session.id;
 
         // Guardar la sesión inicial
-        assert!(store.save(session).is_ok());
+        assert!(store.save(session).await.is_ok());
 
         let store_clone = Arc::clone(&store);
-        let handle = thread::spawn(move || {
-            // Intentar obtener la sesión desde otro hilo
-            let result = store_clone.get(id);
+        let handle = tokio::spawn(async move {
+            // Intentar obtener la sesión desde otra tarea
+            let result = store_clone.get(id).await;
             assert!(result.is_ok());
 
             let mut session = result.unwrap();
             session.state = SessionState::InProgress;
 
             // Guardar los cambios
-            assert!(store_clone.save(session).is_ok());
+            assert!(store_clone.save(session).await.is_ok());
         });
 
-        // Esperar a que el hilo termine
-        handle.join().unwrap();
+        // Esperar a que la tarea termine
+        handle.await.unwrap();
 
-        // Verificar que los cambios del otro hilo se aplicaron
-        let retrieved = store.get(id).unwrap();
+        // Verificar que los cambios de la otra tarea se aplicaron
+        let retrieved = store.get(id).await.unwrap();
         assert_eq!(retrieved.state, SessionState::InProgress);
     }
 
-    #[test]
-    fn test_lock_poisoning_recovery() {
+    /// Issue #19: two store operations on DIFFERENT sessions run concurrently
+    /// over a single shared `Arc<InMemorySessionStore>` via `tokio::join!` and
+    /// both complete — the async trait never serializes independent callers on
+    /// an `.await`-held lock (the `std::Mutex` is only held for synchronous map
+    /// access, never across an await).
+    #[tokio::test]
+    async fn test_concurrent_ops_on_different_sessions_do_not_serialize() {
+        let store = Arc::new(InMemorySessionStore::new());
+
+        let session_a = create_test_session(None);
+        let session_b = create_test_session(None);
+        let (id_a, id_b) = (session_a.id, session_b.id);
+
+        // Two creates on different ids issued concurrently through one Arc.
+        let store_a = Arc::clone(&store);
+        let store_b = Arc::clone(&store);
+        let (res_a, res_b) =
+            tokio::join!(async move { store_a.create(session_a).await }, async move {
+                store_b.create(session_b).await
+            },);
+
+        assert!(res_a.is_ok());
+        assert!(res_b.is_ok());
+
+        // Both sessions landed independently.
+        assert!(store.get(id_a).await.is_ok());
+        assert!(store.get(id_b).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_lock_poisoning_recovery() {
         let store = InMemorySessionStore::new();
         let session = create_test_session(None);
         let id = session.id;
 
         // Guardar la sesión
-        assert!(store.save(session).is_ok());
+        assert!(store.save(session).await.is_ok());
 
         // Simular un envenenamiento del mutex
         {
@@ -427,8 +457,8 @@ mod tests {
 
         // Operaciones posteriores deberían manejar correctamente un mutex envenenado
         // aunque en este caso no lo está realmente
-        let _ = store.get(id);
-        let _ = store.delete(id);
-        let _ = store.cleanup();
+        let _ = store.get(id).await;
+        let _ = store.delete(id).await;
+        let _ = store.cleanup().await;
     }
 }
