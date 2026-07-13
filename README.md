@@ -37,18 +37,21 @@ Infra --> MongoDB[(MongoDB)]
 ```mermaid
 stateDiagram-v2
 [*] --> Initialized: POST /api/v1/chain
-Initialized --> InProgress: GET
-InProgress --> InProgress: GET
+Initialized --> InProgress: POST /api/v1/chain/step
+InProgress --> InProgress: POST /api/v1/chain/step
 InProgress --> Modified: PATCH
-Modified --> InProgress: GET
+Modified --> InProgress: POST /api/v1/chain/step
 InProgress --> Reinitialized: PUT
 Modified --> Reinitialized: PUT
-Reinitialized --> InProgress: GET
+Reinitialized --> InProgress: POST /api/v1/chain/step
 Initialized --> [*]: DELETE
 InProgress --> [*]: DELETE
 Modified --> [*]: DELETE
 Reinitialized --> [*]: DELETE
 ```
+
+`GET /api/v1/chain` is a safe, repeatable peek and does not appear here because it
+never changes the session state — only `POST /api/v1/chain/step` advances the cursor.
 
 ### API Request Flow
 
@@ -66,25 +69,40 @@ SS-->>SM: Initial state
 SM-->>API: Session created (id: abc123)
 API-->>Client: 201 Created (session details)
 
-Client->>API: GET /api/v1/chain
-API->>SM: Get next step
+Client->>API: POST /api/v1/chain/step
+API->>SM: Advance one step
 SM->>SS: Advance simulation
 SS-->>SM: Step data
 SM-->>API: Chain data
 API-->>Client: 200 OK (Chain data)
+
+Client->>API: GET /api/v1/chain
+API->>SM: Peek current step
+SM->>SS: Read current snapshot
+SS-->>SM: Step data (no advance)
+SM-->>API: Chain data
+API-->>Client: 200 OK (same snapshot, repeatable)
 ```
 
 ### REST API Endpoints
 
 The OptionChain-Simulator exposes the following REST API endpoints:
 
-| Method | Endpoint       | Action           | Description                                      |
-|--------|---------------|------------------|--------------------------------------------------|
-| POST   | /api/v1/chain | Create Session   | Creates a new simulation session                 |
-| GET    | /api/v1/chain | Read Next Step   | Gets the next step in the simulation            |
-| PUT    | /api/v1/chain | Replace Session  | Completely replaces session parameters          |
-| PATCH  | /api/v1/chain | Update Parameters| Updates specific session parameters             |
-| DELETE | /api/v1/chain | Delete Session   | Terminates and removes a session                 |
+| Method | Endpoint           | Action              | Description                                                      |
+|--------|--------------------|---------------------|------------------------------------------------------------------|
+| POST   | /api/v1/chain      | Create Session      | Creates a new simulation session                                 |
+| GET    | /api/v1/chain      | Read Current Step   | Returns the current snapshot WITHOUT advancing (safe, repeatable)|
+| POST   | /api/v1/chain/step | Advance Step        | Advances one step, serves the snapshot, and persists the advance |
+| PUT    | /api/v1/chain      | Replace Session     | Completely replaces session parameters                           |
+| PATCH  | /api/v1/chain      | Update Parameters   | Updates specific session parameters                              |
+| DELETE | /api/v1/chain      | Delete Session      | Terminates and removes a session                                 |
+
+> **Migration (breaking, issue #21):** `GET /api/v1/chain` used to advance the
+> session and consume a step. It is now a read-only, repeatable **peek** that returns
+> the current snapshot without mutating state. To advance the cursor, clients must now
+> call **`POST /api/v1/chain/step`** (same response shape, same 200/404/410/500 status
+> codes as the old GET). Downstream consumers such as IronCondor must switch their
+> step-advancing call from `GET /api/v1/chain` to `POST /api/v1/chain/step`.
 
 ### Request/Response Models
 
@@ -138,7 +156,12 @@ The OptionChain-Simulator exposes the following REST API endpoints:
 }
 ```
 
-#### 2. Get Next Step (GET /api/v1/chain?sessionid=6af613b6-569c-5c22-9c37-2ed93f31d3af)
+#### 2. Peek Current Step (GET /api/v1/chain?sessionid=6af613b6-569c-5c22-9c37-2ed93f31d3af)
+
+Safe and repeatable: returns the session's current snapshot without advancing the
+cursor or persisting anything. To advance the session and consume a step, use
+`POST /api/v1/chain/step?sessionid=...` (issue #21) — it takes the same query
+parameter and returns the same body shown below.
 
 **Response (200 OK):**
 ```json

@@ -8,14 +8,61 @@ use crate::api::rest::responses::{
 };
 use crate::api::rest::validation::{self, decimal_field, positive_field, strictly_positive_field};
 use crate::infrastructure::{MetricsCollector, MongoDBRepository};
-use crate::session::{SessionManager, SimulationParameters};
+use crate::session::{Session, SessionManager, SimulationParameters};
 use crate::utils::ChainError;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, Utc};
+use optionstratlib::chains::OptionChain;
 use rust_decimal::prelude::ToPrimitive;
 use std::sync::Arc;
 use tracing::{error, info};
 use uuid::Uuid;
+
+/// Builds the `ChainResponse` DTO shared by the advance (`POST /api/v1/chain/step`) and
+/// peek (`GET /api/v1/chain`) endpoints from a session and its current option-chain
+/// snapshot. Kept as a single place so both surfaces emit an identical response shape.
+fn build_chain_response(session: &Session, option_chain: &OptionChain) -> ChainResponse {
+    let expiration = option_chain.get_expiration_date();
+    ChainResponse {
+        underlying: option_chain.symbol.clone(),
+        timestamp: Utc::now().to_rfc3339(),
+        price: option_chain.underlying_price.into(),
+        contracts: option_chain
+            .iter()
+            .map(|contract| {
+                let (call_delta, put_delta) = contract.current_deltas();
+                let call_ask = contract.get_call_buy_price();
+                let put_ask = contract.get_put_buy_price();
+                let call_bid = contract.get_call_sell_price();
+                let put_bid = contract.get_put_sell_price();
+                let volatility = contract.get_volatility();
+                OptionContractResponse {
+                    strike: contract.strike().into(),
+                    expiration: expiration.clone(),
+                    call: OptionPriceResponse {
+                        bid: call_bid.map(|b| b.into()),
+                        ask: call_ask.map(|a| a.into()),
+                        mid: contract.call_middle.map(|m| m.into()),
+                        delta: call_delta.map(|d| d.to_f64().unwrap_or(0.0)),
+                    },
+                    put: OptionPriceResponse {
+                        bid: put_bid.map(|b| b.into()),
+                        ask: put_ask.map(|a| a.into()),
+                        mid: contract.put_middle.map(|m| m.into()),
+                        delta: put_delta.map(|d| d.to_f64().unwrap_or(0.0)),
+                    },
+                    implied_volatility: Some(volatility.into()),
+                    gamma: contract.current_gamma().map(|g| g.to_f64().unwrap_or(0.0)),
+                }
+            })
+            .collect(),
+        session_info: SessionInfoResponse {
+            id: session.id.to_string(),
+            current_step: session.current_step,
+            total_steps: session.total_steps,
+        },
+    }
+}
 
 #[utoipa::path(
     post,
@@ -121,19 +168,22 @@ pub(crate) async fn create_session(
 }
 
 #[utoipa::path(
-    get,
-    path = "/api/v1/chain",
+    post,
+    path = "/api/v1/chain/step",
+    description = "Advance the session one step and return the served snapshot. This is an \
+        explicit, state-mutating command (the former GET behavior): it serves the next \
+        step and persists the advance. Use GET /api/v1/chain for a safe, repeatable peek.",
     params(
-        ("sessionid" = String, Query, description = "ID of the session to get next step for")
+        ("sessionid" = String, Query, description = "ID of the session to advance one step")
     ),
     responses(
-        (status = 200, description = "Next step returned", body = ChainResponse),
+        (status = 200, description = "Advanced one step; served snapshot returned", body = ChainResponse),
         (status = 404, description = "Session not found"),
         (status = 410, description = "Simulation completed. No more steps available"),
         (status = 500, description = "Internal server error")
     )
 )]
-pub(crate) async fn get_next_step(
+pub(crate) async fn advance_step(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     metrics_collector: web::Data<Arc<MetricsCollector>>,
@@ -158,50 +208,10 @@ pub(crate) async fn get_next_step(
         }
     };
 
-    // Get next step from session manager
+    // Advance the session one step (mutates state and persists it).
     match session_manager.get_next_step(session_id).await {
         Ok((session, option_chain)) => {
-            // Convert session and option chain to ChainResponse
-            let expiration = option_chain.get_expiration_date();
-            let response = ChainResponse {
-                underlying: option_chain.symbol.clone(),
-                timestamp: Utc::now().to_rfc3339(),
-                price: option_chain.underlying_price.into(),
-                contracts: option_chain
-                    .iter()
-                    .map(|contract| {
-                        let (call_delta, put_delta) = contract.current_deltas();
-                        let call_ask = contract.get_call_buy_price();
-                        let put_ask = contract.get_put_buy_price();
-                        let call_bid = contract.get_call_sell_price();
-                        let put_bid = contract.get_put_sell_price();
-                        let volatility = contract.get_volatility();
-                        OptionContractResponse {
-                            strike: contract.strike().into(),
-                            expiration: expiration.clone(),
-                            call: OptionPriceResponse {
-                                bid: call_bid.map(|b| b.into()),
-                                ask: call_ask.map(|a| a.into()),
-                                mid: contract.call_middle.map(|m| m.into()),
-                                delta: call_delta.map(|d| d.to_f64().unwrap()),
-                            },
-                            put: OptionPriceResponse {
-                                bid: put_bid.map(|b| b.into()),
-                                ask: put_ask.map(|a| a.into()),
-                                mid: contract.put_middle.map(|m| m.into()),
-                                delta: put_delta.map(|d| d.to_f64().unwrap()),
-                            },
-                            implied_volatility: Some(volatility.into()),
-                            gamma: contract.current_gamma().map(|g| g.to_f64().unwrap()),
-                        }
-                    })
-                    .collect(),
-                session_info: SessionInfoResponse {
-                    id: session.id.to_string(),
-                    current_step: session.current_step,
-                    total_steps: session.total_steps,
-                },
-            };
+            let response = build_chain_response(&session, &option_chain);
             let duration = start_time.elapsed();
             metrics_collector.record_simulation_step(&session.parameters.method.to_string());
             metrics_collector.record_simulation_duration(duration);
@@ -218,6 +228,57 @@ pub(crate) async fn get_next_step(
                 error!(session_id = %session_id, "Failed to save chain step to MongoDB: {}", e);
                 // Continue as this is not critical for the main flow
             }
+            HttpResponse::Ok().json(response)
+        }
+        Err(error) => map_error(error),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/chain",
+    description = "Returns the current snapshot without advancing the session; safe and \
+        repeatable (a peek). The same snapshot is returned until an explicit advance via \
+        POST /api/v1/chain/step moves the cursor. This endpoint does not mutate session \
+        state or record a simulation step.",
+    params(
+        ("sessionid" = String, Query, description = "ID of the session to read the current snapshot for")
+    ),
+    responses(
+        (status = 200, description = "Current snapshot returned (read-only; repeatable)", body = ChainResponse),
+        (status = 404, description = "Session not found"),
+        (status = 410, description = "Session completed; no current step available"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub(crate) async fn get_current_step(
+    req: HttpRequest,
+    session_manager: web::Data<Arc<SessionManager>>,
+    query: web::Query<SessionId>,
+) -> impl Responder {
+    info!(
+        "{} {}: session_id={}",
+        req.method(),
+        req.path(),
+        query.session_id
+    );
+
+    // Parse the session ID
+    let session_id = match Uuid::parse_str(&query.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return map_error(ChainError::InvalidState(
+                "Invalid session ID format".to_string(),
+            ));
+        }
+    };
+
+    // Peek the current snapshot: read-only, repeatable, no state change and no persistence.
+    // No simulation-step metric is recorded and no chain-step event is written, because the
+    // same step is served repeatedly.
+    match session_manager.peek_current_step(session_id).await {
+        Ok((session, option_chain)) => {
+            let response = build_chain_response(&session, &option_chain);
             HttpResponse::Ok().json(response)
         }
         Err(error) => map_error(error),

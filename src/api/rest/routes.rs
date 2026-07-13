@@ -1,6 +1,6 @@
 use crate::api::rest::get_favicon;
 use crate::api::rest::handlers::{
-    create_session, delete_session, get_next_step, replace_session, update_session,
+    advance_step, create_session, delete_session, get_current_step, replace_session, update_session,
 };
 use crate::api::rest::middleware::metrics_endpoint;
 use crate::api::rest::swagger::ApiDoc;
@@ -30,10 +30,15 @@ use utoipa_swagger_ui::SwaggerUi;
 /// - **POST** `/api/v1/chain`  
 ///   Handled by the `create_session` function. This is used to create a new session.
 ///
-/// - **GET** `/api/v1/chain`  
-///   Handled by the `get_next_step` function. This is used to fetch the next step of the session.
+/// - **GET** `/api/v1/chain`
+///   Handled by the `get_current_step` function. This is a safe, repeatable peek that
+///   returns the session's current snapshot WITHOUT advancing or persisting it.
 ///
-/// - **PUT** `/api/v1/chain`  
+/// - **POST** `/api/v1/chain/step`
+///   Handled by the `advance_step` function. This advances the session one step, serves
+///   the resulting snapshot, and persists the advance (the former GET behavior).
+///
+/// - **PUT** `/api/v1/chain`
 ///   Handled by the `replace_session` function. This is used to replace an existing session with new data.
 ///
 /// - **PATCH** `/api/v1/chain`  
@@ -60,11 +65,12 @@ pub fn configure_routes(
         .service(
             web::resource("/api/v1/chain")
                 .route(web::post().to(create_session))
-                .route(web::get().to(get_next_step))
+                .route(web::get().to(get_current_step))
                 .route(web::put().to(replace_session))
                 .route(web::patch().to(update_session))
                 .route(web::delete().to(delete_session)),
         )
+        .service(web::resource("/api/v1/chain/step").route(web::post().to(advance_step)))
         .route("/metrics", web::get().to(metrics_endpoint))
         .route("/favicon.ico", web::get().to(get_favicon))
         .service(
