@@ -154,7 +154,11 @@ mod tests {
     use std::sync::Arc;
     use tokio::test;
 
+    /// Live integration test: requires a running MongoDB. Opt in with
+    /// `cargo test -- --ignored` (CI runs it in the dedicated Integration job
+    /// with a mongo service container).
     #[test]
+    #[ignore = "requires live MongoDB on localhost:27017; run with -- --ignored"]
     async fn test_mongodb_client_initialization() {
         // Test that we can create a new MongoDB client
         let config = MongoDBConfig {
@@ -174,6 +178,24 @@ mod tests {
 
         let client = client_result.unwrap();
         assert_eq!(client.get_config().database, "test_db");
+    }
+
+    /// Hermetic replacement for the connection test: exercises config
+    /// construction and URI parsing without pinging a server.
+    #[test]
+    async fn test_client_options_parse_without_server() {
+        let config = MongoDBConfig {
+            uri: "mongodb://localhost:27017".to_string(),
+            database: "test_db".to_string(),
+            steps_collection: "test_steps".to_string(),
+            events_collection: "test_events".to_string(),
+            timeout: 5,
+        };
+
+        let options = mongodb::options::ClientOptions::parse(&config.uri).await;
+        assert!(options.is_ok(), "a well-formed URI must parse");
+        assert_eq!(config.database, "test_db");
+        assert_eq!(config.timeout, 5);
     }
 
     /// Regression for issue #17: with an unavailable server, `new` must fail
@@ -203,22 +225,18 @@ mod tests {
         );
     }
 
+    /// Live integration test: exercises `init_mongodb` against the default
+    /// (env-driven) configuration and ASSERTS success. The environment must
+    /// provide a reachable MongoDB whose credentials match `MONGODB_URI` (the
+    /// CI integration job provisions admin/password on its service container);
+    /// tolerating `Err` here would let the job stay green without validating
+    /// initialization at all.
     #[test]
+    #[ignore = "requires a live MongoDB matching MONGODB_URI; run with -- --ignored"]
     async fn test_init_mongodb() {
-        // Test the init_mongodb function
-        let result = crate::infrastructure::repositories::mongo_repo::init_mongodb().await;
-
-        // This might fail if MongoDB is not running, which is expected in CI environments
-        match result {
-            Ok(repo) => {
-                // If it succeeded, verify we got a repository
-                assert!(Arc::strong_count(&repo) >= 1);
-            }
-            Err(e) => {
-                // In CI, we expect this to fail with a connection error
-                println!("MongoDB initialization failed (expected in CI): {:?}", e);
-                // We don't assert because this is expected to fail in environments without MongoDB
-            }
-        }
+        let repo = crate::infrastructure::repositories::mongo_repo::init_mongodb()
+            .await
+            .expect("init_mongodb must succeed against the provisioned live MongoDB");
+        assert!(Arc::strong_count(&repo) >= 1);
     }
 }
