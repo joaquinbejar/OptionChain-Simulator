@@ -91,11 +91,18 @@ The OptionChain-Simulator exposes the following REST API endpoints:
 | Method | Endpoint           | Action              | Description                                                      |
 |--------|--------------------|---------------------|------------------------------------------------------------------|
 | POST   | /api/v1/chain      | Create Session      | Creates a new simulation session                                 |
-| GET    | /api/v1/chain      | Read Current Step   | Returns the current snapshot WITHOUT advancing (safe, repeatable)|
-| POST   | /api/v1/chain/step | Advance Step        | Advances one step, serves the snapshot, and persists the advance |
+| GET    | /api/v1/chain      | Read Current Step   | Returns the snapshot the next advance will serve (safe, repeatable)|
+| POST   | /api/v1/chain/step | Advance Step        | Serves the snapshot at the cursor (index 0 first), then advances  |
 | PUT    | /api/v1/chain      | Replace Session     | Completely replaces session parameters                           |
 | PATCH  | /api/v1/chain      | Update Parameters   | Updates specific session parameters                              |
 | DELETE | /api/v1/chain      | Delete Session      | Terminates and removes a session                                 |
+
+**Step cursor semantics (serve-then-advance):** `current_step` is the 0-based index
+of the NEXT snapshot to serve. `POST /api/v1/chain/step` serves the snapshot at the
+cursor and then advances it, so a session with `steps = N` serves EXACTLY indices
+`0..N-1` over `N` advances. The advance that serves the last snapshot persists the
+`Completed` state, and any further advance returns `410 Gone`. `GET /api/v1/chain`
+peeks the snapshot the next advance would serve without moving the cursor.
 
 > **Migration (breaking, issue #21):** `GET /api/v1/chain` used to advance the
 > session and consume a step. It is now a read-only, repeatable **peek** that returns

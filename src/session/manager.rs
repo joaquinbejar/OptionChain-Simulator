@@ -91,14 +91,26 @@ impl SessionManager {
         self.store.get(id)
     }
 
-    /// Retrieves the next step in the session workflow using the provided session ID.
+    /// Advances the session by one step, serving the snapshot at the current cursor.
     ///
-    /// This function performs the following operations:
-    /// 1. Fetches the session corresponding to the given `id` from the session store.
-    /// 2. Advances the session's state using the `state_handler`.
-    /// 3. Generates an option chain based on the session's updated state using the `simulator`.
-    /// 4. Saves the updated session back to the session store.
-    /// 5. Returns the updated `Session` and the generated `OptionChain`.
+    /// The step cursor (`session.current_step`) is the 0-based index of the NEXT
+    /// snapshot to serve. This method follows *serve-then-advance* semantics so a
+    /// session with `steps = N` serves EXACTLY indices `0..N-1` over `N` advances:
+    ///
+    /// 1. Fetch the session for `id` from the store.
+    /// 2. Guard: if the session is already `Completed` (or the cursor has reached
+    ///    `total_steps`), return the terminal [`ChainError::SimulatorError`] (HTTP 410)
+    ///    WITHOUT touching the store — there is no further snapshot to serve.
+    /// 3. Serve the snapshot at `session.current_step` via the simulator. The
+    ///    simulator sees the PRE-advance session state, so a `Reinitialized` session
+    ///    rebuilds its walk correctly before serving.
+    /// 4. Advance the cursor via the `state_handler`; the advance that serves the last
+    ///    snapshot transitions the session to `Completed`.
+    /// 5. Persist the advanced session. The save ALWAYS happens after a successfully
+    ///    served snapshot, INCLUDING the advance that transitions to `Completed`.
+    ///
+    /// The returned `Session` reflects the post-advance state; the returned
+    /// `OptionChain` is the snapshot at the pre-advance cursor.
     ///
     /// # Arguments
     ///
@@ -108,33 +120,45 @@ impl SessionManager {
     ///
     /// Returns a `Result` containing:
     /// - A tuple `(Session, OptionChain)` if the operation succeeds:
-    ///     - `Session`: The updated session after advancing its state.
-    ///     - `OptionChain`: The generated options for the current step of the session.
+    ///     - `Session`: The session after advancing its cursor.
+    ///     - `OptionChain`: The snapshot served at the pre-advance cursor.
     /// - A `ChainError` if there is an error during any step of the process.
     ///
     /// # Errors
     ///
     /// This function may return the following errors encapsulated in `ChainError`:
-    /// - If the session cannot be retrieved from the store, an error from the store implementation is propagated.
-    /// - If an issue occurs while advancing the session's state, the error is propagated.
-    /// - If the simulator fails during the generation of the option chain, a `ChainError::SimulatorError`
-    ///   is returned, detailing the simulation failure.
-    /// - If the updated session fails to be saved back to the store, an error from the store implementation is propagated.
+    /// - [`ChainError::NotFound`] if the session cannot be retrieved from the store.
+    /// - [`ChainError::SimulatorError`] (mapped to HTTP 410) when the session has
+    ///   already served all of its snapshots; the store is left untouched.
+    /// - Any error surfaced by the simulator while building the served snapshot.
+    /// - Any error surfaced while advancing the state or saving the session back to
+    ///   the store.
     ///
     pub async fn get_next_step(&self, id: Uuid) -> Result<(Session, OptionChain), ChainError> {
         let mut session = self.store.get(id)?;
 
-        // Advance session state
-        self.state_handler.advance_state(&mut session)?;
+        // Completed guard: a session that has served all of its snapshots has nothing
+        // left to serve. Mirror the exhausted-advance path (410 Gone) and leave the
+        // store untouched so a repeated call keeps returning the terminal error.
+        if session.state == SessionState::Completed || session.current_step >= session.total_steps {
+            return Err(ChainError::SimulatorError(
+                "session completed; no further steps".to_string(),
+            ));
+        }
 
-        // Generate option chain for current step
+        // Serve the snapshot at the current cursor. The simulator sees the pre-advance
+        // state, so a `Reinitialized` session rebuilds its walk before serving.
         let chain = self
             .simulator
             .simulate_next_step(&session)
             .await
             .map_err(|e| ChainError::SimulatorError(e.to_string()))?;
 
-        // Save updated session
+        // Advance the cursor; the advance that serves the last snapshot marks Completed.
+        self.state_handler.advance_state(&mut session)?;
+
+        // Always persist after a successfully served snapshot, including the advance
+        // that transitions the session to Completed.
         self.store.save(session.clone())?;
 
         Ok((session, chain))
@@ -356,6 +380,184 @@ mod tests {
             spread: Some(pos_or_panic!(0.02)),
             seed: None,
         }
+    }
+
+    /// Deterministic parameters for tape/cursor tests: a fixed seed makes the served
+    /// snapshots reproducible so index-alignment assertions are stable.
+    fn seeded_parameters(steps: usize, seed: u64) -> SimulationParameters {
+        SimulationParameters {
+            steps,
+            seed: Some(seed),
+            ..test_parameters()
+        }
+    }
+
+    /// Issue #5: a session with `steps = N` serves EXACTLY indices `0..N-1` over `N`
+    /// advances; the N-th advance persists `Completed`; the (N+1)-th is terminal and
+    /// leaves the store untouched.
+    #[tokio::test]
+    async fn test_n_step_session_serves_exactly_n_snapshots() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let session = manager
+            .create_session(seeded_parameters(3, 20260713))
+            .expect("failed to create session");
+        let id = session.id;
+
+        let mut prices = Vec::new();
+        for _ in 0..3 {
+            let (_s, chain) = manager.get_next_step(id).await.expect("advance failed");
+            prices.push(chain.underlying_price);
+        }
+        // Exactly three served snapshots (indices 0, 1, 2).
+        assert_eq!(prices.len(), 3);
+
+        // The 4th advance is terminal.
+        match manager.get_next_step(id).await {
+            Err(ChainError::SimulatorError(_)) => {}
+            other => panic!("expected terminal SimulatorError, got {other:?}"),
+        }
+
+        // Completion is persisted: the cursor reached total_steps and the state is Completed.
+        let stored = store.get(id).expect("session missing from store");
+        assert_eq!(stored.state, SessionState::Completed);
+        assert_eq!(stored.current_step, 3);
+    }
+
+    /// Issue #5: the FIRST advance serves index 0 (previously index 0 was skipped).
+    /// Peek shows the snapshot the next advance will serve, and after the advance the
+    /// cursor moves on to the next index.
+    #[tokio::test]
+    async fn test_first_advance_serves_index_zero() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let session = manager
+            .create_session(seeded_parameters(4, 777))
+            .expect("failed to create session");
+        let id = session.id;
+
+        // Peek shows P0 (the snapshot the next advance will serve).
+        let (_p, peek_chain) = manager.peek_current_step(id).await.expect("peek failed");
+        let p0 = peek_chain.underlying_price;
+
+        // The first advance serves exactly P0 (index 0), not index 1.
+        let (_a, advance_chain) = manager.get_next_step(id).await.expect("advance failed");
+        assert_eq!(advance_chain.underlying_price, p0);
+
+        // Peek now reflects the moved cursor (index 1)...
+        let (peek_after, peek_next) = manager
+            .peek_current_step(id)
+            .await
+            .expect("peek after advance failed");
+        assert_eq!(peek_after.current_step, 1);
+
+        // ...and that P1 is exactly what the next advance serves, and it is a new index.
+        let (_a2, advance2) = manager
+            .get_next_step(id)
+            .await
+            .expect("second advance failed");
+        assert_eq!(advance2.underlying_price, peek_next.underlying_price);
+        assert_ne!(advance2.underlying_price, p0);
+    }
+
+    /// Issue #5: the advance that serves the last snapshot persists `Completed` exactly
+    /// once; a further advance is terminal and must not mutate the stored session.
+    #[tokio::test]
+    async fn test_completion_is_persisted_once() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let n = 3;
+        let session = manager
+            .create_session(seeded_parameters(n, 55))
+            .expect("failed to create session");
+        let id = session.id;
+
+        for _ in 0..n {
+            manager.get_next_step(id).await.expect("advance failed");
+        }
+
+        let after_completion = store.get(id).expect("session missing from store");
+        assert_eq!(after_completion.state, SessionState::Completed);
+        assert_eq!(after_completion.current_step, n);
+        let updated_at = after_completion.updated_at;
+
+        // A further advance is terminal and leaves the stored session unchanged.
+        match manager.get_next_step(id).await {
+            Err(ChainError::SimulatorError(_)) => {}
+            other => panic!("expected terminal SimulatorError, got {other:?}"),
+        }
+        let unchanged = store.get(id).expect("session missing from store");
+        assert_eq!(unchanged.state, SessionState::Completed);
+        assert_eq!(unchanged.current_step, n);
+        assert_eq!(unchanged.updated_at, updated_at);
+    }
+
+    /// Issue #5: peek and the next advance serve the SAME index across the whole tape,
+    /// and both become terminal at the same point.
+    #[tokio::test]
+    async fn test_advance_and_peek_serve_same_index() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let n = 4;
+        let session = manager
+            .create_session(seeded_parameters(n, 999))
+            .expect("failed to create session");
+        let id = session.id;
+
+        for _ in 0..n {
+            // Peek shows the snapshot the next advance will serve...
+            let (_p, peeked) = manager.peek_current_step(id).await.expect("peek failed");
+            // ...and the advance serves exactly that snapshot.
+            let (_a, advanced) = manager.get_next_step(id).await.expect("advance failed");
+            assert_eq!(advanced.underlying_price, peeked.underlying_price);
+        }
+
+        // Both peek and advance are exhausted at the same point.
+        assert!(matches!(
+            manager.peek_current_step(id).await,
+            Err(ChainError::SimulatorError(_))
+        ));
+        assert!(matches!(
+            manager.get_next_step(id).await,
+            Err(ChainError::SimulatorError(_))
+        ));
+    }
+
+    /// Reproducibility at the manager level: two sessions with identical parameters and
+    /// the same seed, advanced through every step via `get_next_step`, yield identical
+    /// price sequences.
+    #[tokio::test]
+    async fn test_manager_same_seed_produces_identical_tape() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store);
+        let n = 5;
+        let seed = 20260713;
+
+        let session_a = manager
+            .create_session(seeded_parameters(n, seed))
+            .expect("failed to create session a");
+        let session_b = manager
+            .create_session(seeded_parameters(n, seed))
+            .expect("failed to create session b");
+
+        let mut tape_a = Vec::with_capacity(n);
+        let mut tape_b = Vec::with_capacity(n);
+        for _ in 0..n {
+            let (_s, chain) = manager
+                .get_next_step(session_a.id)
+                .await
+                .expect("advance a failed");
+            tape_a.push(chain.underlying_price);
+        }
+        for _ in 0..n {
+            let (_s, chain) = manager
+                .get_next_step(session_b.id)
+                .await
+                .expect("advance b failed");
+            tape_b.push(chain.underlying_price);
+        }
+
+        assert_eq!(tape_a, tape_b);
     }
 
     /// Regression for issue #7: two freshly built managers (each with its own store,

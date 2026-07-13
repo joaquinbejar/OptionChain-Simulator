@@ -187,12 +187,14 @@ pub(crate) struct AdvanceStepQuery {
 #[utoipa::path(
     post,
     path = "/api/v1/chain/step",
-    description = "Advance the session one step and return the served snapshot. This is an \
-        explicit, state-mutating command (the former GET behavior): it serves the next \
-        step and persists the advance. Use GET /api/v1/chain for a safe, repeatable peek. \
-        Pass `expected_step` (the cursor you believe the session is at) to make retries \
-        safe: if a previous attempt already consumed the step, the call returns 412 with \
-        the actual cursor instead of consuming another one.",
+    description = "Advance the session one step and return the served snapshot. Serves the \
+        snapshot at the current cursor (index 0 first), then advances the cursor; the \
+        advance that serves the last snapshot persists Completed, and any further call \
+        returns 410 Gone. This is an explicit, state-mutating command. Use \
+        GET /api/v1/chain for a safe, repeatable peek. Pass `expected_step` (the cursor \
+        you believe the session is at) to make retries safe: if a previous attempt \
+        already consumed the step, the call returns 412 with the actual cursor instead \
+        of consuming another one.",
     params(
         ("sessionid" = String, Query, description = "ID of the session to advance one step"),
         ("expected_step" = Option<usize>, Query, description = "Expected current cursor; mismatch returns 412 without advancing")
@@ -275,10 +277,10 @@ pub(crate) async fn advance_step(
 #[utoipa::path(
     get,
     path = "/api/v1/chain",
-    description = "Returns the current snapshot without advancing the session; safe and \
-        repeatable (a peek). The same snapshot is returned until an explicit advance via \
-        POST /api/v1/chain/step moves the cursor. This endpoint does not mutate session \
-        state or record a simulation step.",
+    description = "Returns the snapshot the next advance will serve, without advancing the \
+        session; safe and repeatable (a peek). The same snapshot is returned until an \
+        explicit advance via POST /api/v1/chain/step moves the cursor. This endpoint does \
+        not mutate session state or record a simulation step.",
     params(
         ("sessionid" = String, Query, description = "ID of the session to read the current snapshot for")
     ),
