@@ -1,4 +1,5 @@
 use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
+use crate::api::rest::patch::Patch;
 use crate::session::SimulationParameters;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -136,22 +137,39 @@ pub struct UpdateSessionRequest {
     /// - `time_frame` (`TimeFrame`): The time frame for the simulation intervals, such as daily, weekly, or hourly.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_frame: Option<ApiTimeFrame>,
-    /// - `chain_size` (`Option<usize>`): The optional size of the option chain being simulated. If `None`, this is not specified.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chain_size: Option<usize>,
-    /// - `strike_interval` (`Option<Positive>`): The optional interval between strike prices for options. If `None`, this is not specified.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strike_interval: Option<f64>,
-    /// - `smile_curve` (`Option<Decimal>`): An optional factor that adjusts the skew of the distribution. For example, it can be used to bias option pricing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub smile_curve: Option<f64>,
-    /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub spread: Option<f64>,
-    /// - `seed` (`Option<u64>`): An optional RNG seed for the session's stochastic walk.
-    ///   Providing a value makes regenerated steps reproducible.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub seed: Option<u64>,
+    /// - `chain_size` (`Option<usize>`): The size of the option chain being simulated.
+    ///   Tri-state: **absent** keeps the current value, **null** clears it, a **value** replaces it.
+    #[serde(default, skip_serializing_if = "Patch::is_absent")]
+    #[schema(value_type = Option<usize>)]
+    pub chain_size: Patch<usize>,
+    /// - `strike_interval` (`Option<Positive>`): The interval between strike prices for options.
+    ///   Tri-state: **absent** keeps the current value, **null** clears it, a **value** replaces it.
+    #[serde(default, skip_serializing_if = "Patch::is_absent")]
+    #[schema(value_type = Option<f64>)]
+    pub strike_interval: Patch<f64>,
+    /// - `skew_slope` (`Option<Decimal>`): A factor that adjusts the slope of the volatility distribution.
+    ///   Tri-state: **absent** keeps the current value, **null** clears it, a **value** replaces it.
+    #[serde(default, skip_serializing_if = "Patch::is_absent")]
+    #[schema(value_type = Option<f64>)]
+    pub skew_slope: Patch<f64>,
+    /// - `smile_curve` (`Option<Decimal>`): A factor that adjusts the skew of the volatility distribution.
+    ///   Tri-state: **absent** keeps the current value, **null** clears it, a **value** replaces it.
+    #[serde(default, skip_serializing_if = "Patch::is_absent")]
+    #[schema(value_type = Option<f64>)]
+    pub smile_curve: Patch<f64>,
+    /// - `spread` (`Option<Positive>`): The bid-ask spread factor.
+    ///   Tri-state: **absent** keeps the current value, **null** clears it, a **value** replaces it.
+    #[serde(default, skip_serializing_if = "Patch::is_absent")]
+    #[schema(value_type = Option<f64>)]
+    pub spread: Patch<f64>,
+    /// - `seed` (`Option<u64>`): The RNG seed driving the session's stochastic walk.
+    ///   Tri-state: **absent** keeps the current seed, a **value** replaces it, and **null**
+    ///   re-seeds the session with a fresh random seed. The effective seed is never cleared —
+    ///   `SimulationParameters.seed` stays `Some` so the session remains reproducible and the
+    ///   seed is always reported back in the session response.
+    #[serde(default, skip_serializing_if = "Patch::is_absent")]
+    #[schema(value_type = Option<u64>)]
+    pub seed: Patch<u64>,
 }
 
 impl fmt::Display for UpdateSessionRequest {
@@ -648,6 +666,8 @@ mod tests {
 
         #[test]
         fn test_update_session_request_partial_update() {
+            use crate::api::rest::patch::Patch;
+
             let update_req = UpdateSessionRequest {
                 symbol: Some("GOOGL".to_string()),
                 steps: None,
@@ -658,16 +678,133 @@ mod tests {
                 dividend_yield: None,
                 method: None,
                 time_frame: None,
-                chain_size: None,
-                strike_interval: None,
-                smile_curve: None,
-                spread: None,
-                seed: None,
+                chain_size: Patch::Absent,
+                strike_interval: Patch::Absent,
+                skew_slope: Patch::Absent,
+                smile_curve: Patch::Absent,
+                spread: Patch::Absent,
+                seed: Patch::Absent,
             };
 
             assert_eq!(update_req.symbol, Some("GOOGL".to_string()));
             assert_eq!(update_req.volatility, Some(0.3));
             assert!(update_req.initial_price.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_update_session_request_tristate {
+    use super::*;
+    use crate::api::rest::patch::Patch;
+    use serde_json::{from_str, json, to_value};
+
+    #[test]
+    fn test_deserialize_absent_optional_fields_are_absent() {
+        // A body that touches only a required field leaves every optional
+        // (tri-state) field Absent — meaning "keep the current value".
+        let json = r#"{ "volatility": 0.3 }"#;
+        let req: UpdateSessionRequest = from_str(json).expect("partial body deserializes");
+
+        assert_eq!(req.volatility, Some(0.3));
+        assert_eq!(req.chain_size, Patch::Absent);
+        assert_eq!(req.strike_interval, Patch::Absent);
+        assert_eq!(req.skew_slope, Patch::Absent);
+        assert_eq!(req.smile_curve, Patch::Absent);
+        assert_eq!(req.spread, Patch::Absent);
+        assert_eq!(req.seed, Patch::Absent);
+    }
+
+    #[test]
+    fn test_deserialize_explicit_null_optional_fields_are_null() {
+        // Explicit JSON null on each optional field is the "clear" signal.
+        let json = r#"{
+            "chain_size": null,
+            "strike_interval": null,
+            "skew_slope": null,
+            "smile_curve": null,
+            "spread": null,
+            "seed": null
+        }"#;
+        let req: UpdateSessionRequest = from_str(json).expect("null body deserializes");
+
+        assert_eq!(req.chain_size, Patch::Null);
+        assert_eq!(req.strike_interval, Patch::Null);
+        assert_eq!(req.skew_slope, Patch::Null);
+        assert_eq!(req.smile_curve, Patch::Null);
+        assert_eq!(req.spread, Patch::Null);
+        assert_eq!(req.seed, Patch::Null);
+    }
+
+    #[test]
+    fn test_deserialize_valued_optional_fields_are_value() {
+        // A present value is the "replace" signal, including the new skew_slope.
+        let json = r#"{
+            "chain_size": 25,
+            "strike_interval": 5.0,
+            "skew_slope": -0.15,
+            "smile_curve": 0.4,
+            "spread": 0.02,
+            "seed": 99
+        }"#;
+        let req: UpdateSessionRequest = from_str(json).expect("valued body deserializes");
+
+        assert_eq!(req.chain_size, Patch::Value(25));
+        assert_eq!(req.strike_interval, Patch::Value(5.0));
+        assert_eq!(req.skew_slope, Patch::Value(-0.15));
+        assert_eq!(req.smile_curve, Patch::Value(0.4));
+        assert_eq!(req.spread, Patch::Value(0.02));
+        assert_eq!(req.seed, Patch::Value(99));
+    }
+
+    #[test]
+    fn test_serialize_absent_fields_are_omitted() {
+        let req = UpdateSessionRequest {
+            symbol: None,
+            steps: None,
+            initial_price: None,
+            days_to_expiration: None,
+            volatility: None,
+            risk_free_rate: None,
+            dividend_yield: None,
+            method: None,
+            time_frame: None,
+            chain_size: Patch::Absent,
+            strike_interval: Patch::Absent,
+            skew_slope: Patch::Absent,
+            smile_curve: Patch::Absent,
+            spread: Patch::Absent,
+            seed: Patch::Absent,
+        };
+
+        let value = to_value(&req).expect("serializes");
+        assert_eq!(value, json!({}));
+    }
+
+    #[test]
+    fn test_serialize_null_and_value_fields() {
+        let req = UpdateSessionRequest {
+            symbol: None,
+            steps: None,
+            initial_price: None,
+            days_to_expiration: None,
+            volatility: None,
+            risk_free_rate: None,
+            dividend_yield: None,
+            method: None,
+            time_frame: None,
+            chain_size: Patch::Value(25),
+            strike_interval: Patch::Absent,
+            skew_slope: Patch::Null,
+            smile_curve: Patch::Absent,
+            spread: Patch::Absent,
+            seed: Patch::Null,
+        };
+
+        let value = to_value(&req).expect("serializes");
+        assert_eq!(
+            value,
+            json!({ "chain_size": 25, "skew_slope": null, "seed": null })
+        );
     }
 }

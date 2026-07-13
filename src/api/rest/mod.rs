@@ -5,6 +5,7 @@ pub(crate) mod handlers;
 pub(crate) mod limits;
 mod middleware;
 pub(crate) mod models;
+pub(crate) mod patch;
 pub(crate) mod requests;
 pub(crate) mod responses;
 mod routes;
