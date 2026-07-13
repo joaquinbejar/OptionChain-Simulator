@@ -66,29 +66,56 @@ static MAX_CACHED_WALKS: LazyLock<usize> =
 ///
 /// `last_access` drives least-recently-accessed eviction: every cache hit refreshes
 /// it so active sessions survive the [`MAX_CACHED_WALKS`] bound while idle ones age out.
+///
+/// `evictable` gates whether the entry may be chosen as an LRU victim. It is set at
+/// insert time: `false` for a `SimulationMethod::Historical` walk, `true` otherwise.
+/// A historical walk is pinned because, at this point in the stack, its symbol/date
+/// selection still draws from an unseeded `rand::rng()` — evicting it mid-session
+/// would rebuild a DIFFERENT tape. This is a temporary conservatism: the stacked
+/// seeded-historical PR makes historical selection reproducible and lifts the pin so
+/// every walk becomes evictable again.
 struct CacheEntry {
     walk: RandomWalk<Positive, OptionChain>,
     last_access: Instant,
+    evictable: bool,
 }
 
-/// Evicts least-recently-accessed entries until `cache` holds at most `max` entries.
+/// Evicts least-recently-accessed **evictable** entries until `cache` holds at most
+/// `max` entries.
 ///
 /// Pure over the cache map (no I/O, no locking) so it can be unit-tested directly.
 /// The insert path calls it with `max = MAX_CACHED_WALKS - 1` BEFORE inserting the
-/// new entry, so the id being inserted is absent and can never be the victim, and
-/// the cache never exceeds `MAX_CACHED_WALKS` after the insert. An `O(n)` scan per
-/// eviction is acceptable at these cache sizes.
+/// new entry, so the id being inserted is absent and can never be the victim, and a
+/// cache of only evictable entries never exceeds `MAX_CACHED_WALKS` after the insert.
+/// An `O(n)` scan per eviction is acceptable at these cache sizes.
+///
+/// Only entries with `evictable == true` are considered as victims. If the cache is
+/// over `max` but every remaining entry is non-evictable (active historical walks,
+/// see [`CacheEntry`]), eviction is skipped and the cache is allowed to exceed the
+/// bound — never evict a historical walk mid-session, because at this stack level its
+/// rebuild would draw a different tape. A `tracing::warn!` names the over-capacity
+/// count. This conservatism is temporary: the stacked seeded-historical PR makes all
+/// walks evictable and this filter becomes a no-op.
 fn enforce_capacity(cache: &mut HashMap<Uuid, CacheEntry>, max: usize) {
     while cache.len() > max {
         let victim = cache
             .iter()
+            .filter(|(_, entry)| entry.evictable)
             .min_by_key(|(_, entry)| entry.last_access)
             .map(|(id, _)| *id);
         match victim {
             Some(id) => {
                 cache.remove(&id);
             }
-            None => break,
+            None => {
+                warn!(
+                    cache_len = cache.len(),
+                    max,
+                    "cache over capacity but all entries are non-evictable \
+                     (active historical walks); skipping eviction"
+                );
+                break;
+            }
         }
     }
 }
@@ -152,62 +179,79 @@ impl Simulator {
         // it once. Dropping the `== 0` trigger keeps peek(cursor 0) and the next advance
         // serving the SAME cached walk (they would otherwise rebuild — and, for an
         // unseeded walker, diverge — on every step-0 access).
+        //
+        // The lock here is held only for these cheap map ops, never across the walk
+        // build below. A Reinitialized session's stale walk is evicted so the next
+        // build rebuilds it from the (possibly new) seed; `remove` on an absent id is
+        // a no-op.
         let need_new_walk;
         {
-            let cache = self.simulation_cache.lock().await;
+            let mut cache = self.simulation_cache.lock().await;
             need_new_walk =
                 !cache.contains_key(&session.id) || session.state == SessionState::Reinitialized;
 
-            // If the session is reinitialized, remove it from cache
-            if session.state == SessionState::Reinitialized && cache.contains_key(&session.id) {
-                // We need to drop and re-acquire as a mutable reference
-                drop(cache);
-                let mut cache = self.simulation_cache.lock().await;
+            if session.state == SessionState::Reinitialized {
                 cache.remove(&session.id);
             }
         }
 
-        // Create a new random walk if needed
-        if need_new_walk {
+        // Build the walk OUTSIDE any lock (this awaits ClickHouse). We keep it in an
+        // Option so the single critical section below can insert it. Reproducibility is
+        // preserved: a seeded rebuild reproduces the identical tape.
+        let random_walk_opt = if need_new_walk {
             info!(
                 session_id = %session.id,
                 "Creating new simulation for session"
             );
             debug!("Reset Random Walk with Session: {}", session);
+            Some(self.create_random_walk(session).await?)
+        } else {
+            None
+        };
 
-            // Create the random walk (asynchronous operation). The cache lock is NOT
-            // held across this build/await into infrastructure.
-            let random_walk = self.create_random_walk(session).await?;
-
-            // Insert the new random walk into the cache, enforcing the LRU bound
-            // first. Evicting down to `max - 1` before inserting keeps the cache at
-            // or below `MAX_CACHED_WALKS` afterwards; the id being inserted is absent
-            // here (a Reinitialized session was removed above), so it is never evicted.
-            let mut cache = self.simulation_cache.lock().await;
-            let max = *MAX_CACHED_WALKS;
-            enforce_capacity(&mut cache, max.saturating_sub(1));
-            cache.insert(
-                session.id,
-                CacheEntry {
-                    walk: random_walk,
-                    last_access: Instant::now(),
-                },
-            );
-        }
-
-        // Get the current step data
+        // ONE critical section for the cache: on a fresh build, enforce capacity,
+        // insert, then range-check and clone the step; on a hit, refresh recency,
+        // range-check and clone — all under a single lock. Collapsing insert and step
+        // lookup into one lock closes the window in which a concurrent cold insertion
+        // could evict this entry between the two, which would otherwise surface as a
+        // spurious `Internal` error.
         let step = {
             let mut cache = self.simulation_cache.lock().await;
 
-            let entry = cache.get_mut(&session.id).ok_or_else(|| {
-                ChainError::Internal(format!(
-                    "Failed to get random walk for session {}",
-                    session.id
-                ))
-            })?;
+            let entry = if let Some(random_walk) = random_walk_opt {
+                // Non-historical walks may be LRU-evicted; a Historical walk must not
+                // at this stack level, because its symbol/date selection still uses an
+                // unseeded RNG (see `CacheEntry`) — evicting mid-session would rebuild a
+                // DIFFERENT tape. The stacked seeded-historical PR lifts this pin.
+                let evictable = !matches!(
+                    session.parameters.method,
+                    SimulationMethod::Historical { .. }
+                );
 
-            // Refresh recency on every hit so an actively served session survives the
-            // LRU bound while idle sessions age out.
+                // Evicting down to `max - 1` before inserting keeps a cache of evictable
+                // entries at or below `MAX_CACHED_WALKS` afterwards. `MAX_CACHED_WALKS`
+                // is validated `>= 1` at parse time (see its definition), so `max - 1`
+                // cannot underflow — no saturating arithmetic (rules forbid it).
+                let max = *MAX_CACHED_WALKS;
+                debug_assert!(max >= 1, "MAX_CACHED_WALKS is validated >= 1 at parse time");
+                enforce_capacity(&mut cache, max - 1);
+
+                cache.entry(session.id).or_insert(CacheEntry {
+                    walk: random_walk,
+                    last_access: Instant::now(),
+                    evictable,
+                })
+            } else {
+                cache.get_mut(&session.id).ok_or_else(|| {
+                    ChainError::Internal(format!(
+                        "Failed to get random walk for session {}",
+                        session.id
+                    ))
+                })?
+            };
+
+            // Refresh recency so an actively served session survives the LRU bound
+            // while idle sessions age out.
             entry.last_access = Instant::now();
 
             // Check if the current step is within range
@@ -666,6 +710,7 @@ mod tests {
             CacheEntry {
                 walk: simulator.create_random_walk(&small).await.unwrap(),
                 last_access: now - Duration::from_secs(3),
+                evictable: true,
             },
         );
         cache.insert(
@@ -673,6 +718,7 @@ mod tests {
             CacheEntry {
                 walk: simulator.create_random_walk(&small).await.unwrap(),
                 last_access: now - Duration::from_secs(2),
+                evictable: true,
             },
         );
         cache.insert(
@@ -680,6 +726,7 @@ mod tests {
             CacheEntry {
                 walk: simulator.create_random_walk(&small).await.unwrap(),
                 last_access: now - Duration::from_secs(1),
+                evictable: true,
             },
         );
 
@@ -715,6 +762,7 @@ mod tests {
             CacheEntry {
                 walk: simulator.create_random_walk(&small).await.unwrap(),
                 last_access: now - Duration::from_secs(2),
+                evictable: true,
             },
         );
         cache.insert(
@@ -722,11 +770,106 @@ mod tests {
             CacheEntry {
                 walk: simulator.create_random_walk(&small).await.unwrap(),
                 last_access: now - Duration::from_secs(1),
+                evictable: true,
             },
         );
 
         enforce_capacity(&mut cache, 5);
         assert_eq!(cache.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_enforce_capacity_skips_non_evictable_and_evicts_oldest_non_historical() {
+        // Fix 1: a non-evictable (historical) entry is never chosen as the victim,
+        // even when it is the least-recently-accessed. With three staggered entries
+        // and max 2, the oldest is historical (pinned) so the victim is the oldest
+        // NON-historical entry instead. The `evictable` flag alone drives this, so the
+        // entries are built from a non-historical walk and their flags set directly.
+        use std::time::Duration;
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+        let mut small = create_test_session(None);
+        small.parameters.steps = 2;
+
+        let id_hist_old = Uuid::new_v4();
+        let id_nonhist_mid = Uuid::new_v4();
+        let id_nonhist_new = Uuid::new_v4();
+
+        let now = Instant::now();
+        let mut cache: HashMap<Uuid, CacheEntry> = HashMap::new();
+        cache.insert(
+            id_hist_old,
+            CacheEntry {
+                walk: simulator.create_random_walk(&small).await.unwrap(),
+                last_access: now - Duration::from_secs(3),
+                evictable: false,
+            },
+        );
+        cache.insert(
+            id_nonhist_mid,
+            CacheEntry {
+                walk: simulator.create_random_walk(&small).await.unwrap(),
+                last_access: now - Duration::from_secs(2),
+                evictable: true,
+            },
+        );
+        cache.insert(
+            id_nonhist_new,
+            CacheEntry {
+                walk: simulator.create_random_walk(&small).await.unwrap(),
+                last_access: now - Duration::from_secs(1),
+                evictable: true,
+            },
+        );
+
+        enforce_capacity(&mut cache, 2);
+
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache.contains_key(&id_hist_old),
+            "non-evictable historical entry must survive even as least-recently-accessed"
+        );
+        assert!(
+            !cache.contains_key(&id_nonhist_mid),
+            "oldest non-historical entry must be evicted"
+        );
+        assert!(cache.contains_key(&id_nonhist_new));
+    }
+
+    #[tokio::test]
+    async fn test_enforce_capacity_skips_eviction_when_all_non_evictable() {
+        // Fix 1: when every entry is non-evictable (all active historical walks),
+        // eviction is skipped and the cache is left OVER the bound (with a warn),
+        // rather than evicting a historical walk mid-session.
+        use std::time::Duration;
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+        let mut small = create_test_session(None);
+        small.parameters.steps = 2;
+
+        let now = Instant::now();
+        let mut cache: HashMap<Uuid, CacheEntry> = HashMap::new();
+        for secs in 1..=3 {
+            cache.insert(
+                Uuid::new_v4(),
+                CacheEntry {
+                    walk: simulator.create_random_walk(&small).await.unwrap(),
+                    last_access: now - Duration::from_secs(secs),
+                    evictable: false,
+                },
+            );
+        }
+
+        enforce_capacity(&mut cache, 2);
+
+        // Nothing evictable: the cache stays at 3, exceeding the bound of 2.
+        assert_eq!(cache.len(), 3);
     }
 
     // Helper function to create test historical data
