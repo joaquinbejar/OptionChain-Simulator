@@ -175,14 +175,31 @@ impl MetricsCollector {
             .inc();
     }
 
-    /// Increments the active sessions counter
-    pub fn increment_active_sessions(&self) {
+    /// Records that a session was created: bumps the `active_sessions` gauge and
+    /// the `session_creations_total` counter.
+    ///
+    /// Call this ONLY after the create operation has succeeded — a rejected or
+    /// failed create must not inflate either metric. The gauge is a
+    /// process-local approximation of live sessions: Redis TTL expiry and
+    /// process restarts are not reflected here (documented known drift; a
+    /// store-derived gauge is future work).
+    pub fn record_session_created(&self) {
         self.active_sessions.inc();
         self.session_creation_counter.inc();
     }
 
-    /// Decrements the active sessions counter
-    pub fn decrement_active_sessions(&self) {
+    /// Records that a session was deleted: decrements the `active_sessions`
+    /// gauge and bumps the `session_deletions_total` counter.
+    ///
+    /// Call this ONLY after a session was actually deleted (the delete returned
+    /// `Ok(true)`). Invalid ids, not-found (`Ok(false)`), and errors must record
+    /// nothing. Prometheus allows a gauge to go negative, so repeated calls
+    /// without a matching create CAN drive `active_sessions` below zero at this
+    /// level — the protection against that is the call-site gating in the delete
+    /// handler, not this method. Like the creation counterpart, the gauge is a
+    /// process-local approximation (Redis TTL expiry and restarts are not
+    /// reflected — documented known drift; a store-derived gauge is future work).
+    pub fn record_session_deleted(&self) {
         self.active_sessions.dec();
         self.session_deletion_counter.inc();
     }
@@ -341,15 +358,78 @@ mod tests {
         // Create a new MetricsCollector
         let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
 
-        // Increment and decrement active sessions
-        collector.increment_active_sessions();
-        collector.increment_active_sessions();
-        collector.decrement_active_sessions();
+        // Record two creations and one deletion
+        collector.record_session_created();
+        collector.record_session_created();
+        collector.record_session_deleted();
 
         // Check that the gauge and counters were updated correctly
         let metrics = collector.export_metrics();
         assert!(metrics.contains("active_sessions 1"));
         assert!(metrics.contains("session_creations_total 2"));
+        assert!(metrics.contains("session_deletions_total 1"));
+    }
+
+    #[test]
+    fn test_record_session_created_bumps_gauge_and_creation_counter() {
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        collector.record_session_created();
+
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("active_sessions 1"));
+        assert!(metrics.contains("session_creations_total 1"));
+        // A creation must not touch the deletion counter.
+        assert!(metrics.contains("session_deletions_total 0"));
+    }
+
+    #[test]
+    fn test_record_session_deleted_decrements_gauge_and_bumps_deletion_counter() {
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        collector.record_session_created();
+        collector.record_session_deleted();
+
+        let metrics = collector.export_metrics();
+        // created then deleted returns the gauge to zero.
+        assert!(metrics.contains("active_sessions 0"));
+        assert!(metrics.contains("session_creations_total 1"));
+        assert!(metrics.contains("session_deletions_total 1"));
+    }
+
+    #[test]
+    fn test_created_then_deleted_returns_gauge_to_zero() {
+        // The collector-level pairing invariant: one create balanced by one delete
+        // leaves the gauge at zero. The handler is responsible for only pairing a
+        // delete with an actual deletion.
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        for _ in 0..5 {
+            collector.record_session_created();
+        }
+        for _ in 0..5 {
+            collector.record_session_deleted();
+        }
+
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("active_sessions 0"));
+        assert!(metrics.contains("session_creations_total 5"));
+        assert!(metrics.contains("session_deletions_total 5"));
+    }
+
+    #[test]
+    fn test_record_session_deleted_can_go_negative_at_collector_level() {
+        // Prometheus permits an IntGauge to go negative. Deleting without a
+        // matching create drives active_sessions below zero at this level; the
+        // protection is the delete handler only calling this on Ok(true), never
+        // this method. This test documents that behavior so the call-site gating
+        // is understood as the real guard.
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        collector.record_session_deleted();
+
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("active_sessions -1"));
         assert!(metrics.contains("session_deletions_total 1"));
     }
 
@@ -458,7 +538,7 @@ mod tests {
 
         // Record various metrics
         collector.record_request("/api/v1/chain", "GET", "200");
-        collector.increment_active_sessions();
+        collector.record_session_created();
 
         // Export metrics
         let metrics = collector.export_metrics();

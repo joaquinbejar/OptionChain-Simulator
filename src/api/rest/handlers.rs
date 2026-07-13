@@ -243,18 +243,20 @@ pub(crate) async fn create_session(
 
     // Validate and convert the request into domain SimulationParameters. Invalid input
     // (negative/non-finite numerics, out-of-range steps/chain_size, ...) yields a 400
-    // instead of panicking during conversion. Validate before touching the active-session
-    // metric so a rejected request does not inflate the counter.
+    // instead of panicking during conversion.
     let simulation_params: SimulationParameters = match json_req.0.try_into() {
         Ok(params) => params,
         Err(error) => return map_error(error),
     };
 
-    metrics_collector.increment_active_sessions();
-
     // Create session using session manager
     match session_manager.create_session(simulation_params).await {
         Ok(session) => {
+            // Only record the active-session metric after the create actually
+            // succeeded, so a failed create (store error, 409 AlreadyExists, ...)
+            // does not inflate the gauge or the creation counter.
+            metrics_collector.record_session_created();
+
             let created_at_utc = DateTime::<Utc>::from(session.created_at);
             let updated_at_utc = DateTime::<Utc>::from(session.updated_at);
             let method_value =
@@ -714,7 +716,6 @@ pub(crate) async fn delete_session(
         req.path(),
         query.session_id
     );
-    metrics_collector.decrement_active_sessions();
     let session_id = Uuid::parse_str(&query.session_id)
         .map_err(|_| ChainError::InvalidState("Invalid session ID format".to_string()));
 
@@ -727,6 +728,12 @@ pub(crate) async fn delete_session(
                 .set_simulation_cache_size(session_manager.simulation_cache_len().await as i64);
             match delete_result {
                 Ok(true) => {
+                    // Record the active-session metric ONLY when a session was
+                    // actually deleted. Invalid ids, not-found (Ok(false)), and
+                    // errors record nothing, so repeated DELETEs cannot drive the
+                    // active_sessions gauge negative.
+                    metrics_collector.record_session_deleted();
+
                     let msg = format!("Session deleted successfully: {}", id);
                     let msg = serde_json::json!({
                         "message": msg,
