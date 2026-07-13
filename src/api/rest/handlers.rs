@@ -1,6 +1,7 @@
 use crate::api::rest::error::map_error;
 use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS};
 use crate::api::rest::models::SessionId;
+use crate::api::rest::patch::Patch;
 use crate::api::rest::requests::{CreateSessionRequest, UpdateSessionRequest};
 use crate::api::rest::responses::{
     ChainResponse, ErrorResponse, OptionContractResponse, OptionPriceResponse, SessionInfoResponse,
@@ -13,6 +14,7 @@ use crate::utils::ChainError;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, Utc};
 use optionstratlib::chains::OptionChain;
+use rand::RngExt;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -64,6 +66,134 @@ fn build_chain_response(session: &Session, option_chain: &OptionChain) -> ChainR
             total_steps: session.total_steps,
         },
     }
+}
+
+/// Merges a partial [`UpdateSessionRequest`] into existing [`SimulationParameters`]
+/// in place, applying the tri-state PATCH semantics and validating every
+/// user-supplied numeric with the same helpers as the create/replace conversions
+/// (so a bad float yields a `ChainError::Validation` instead of panicking).
+///
+/// Per-field behavior:
+/// - domain-required fields (`symbol`, `steps`, `initial_price`,
+///   `days_to_expiration`, `volatility`, `risk_free_rate`, `dividend_yield`,
+///   `method`, `time_frame`) are `Option`: absent keeps the current value, a
+///   value replaces it after validation;
+/// - domain-optional fields (`chain_size`, `strike_interval`, `skew_slope`,
+///   `smile_curve`, `spread`) are [`Patch`]: [`Patch::Absent`] keeps,
+///   [`Patch::Null`] clears to `None`, [`Patch::Value`] replaces after validation;
+/// - `seed` is [`Patch`] but its invariant forbids `None`: [`Patch::Value`] sets
+///   the given seed, [`Patch::Null`] re-seeds with a fresh random seed, and
+///   [`Patch::Absent`] keeps the current seed — `params.seed` stays `Some` so the
+///   session remains reproducible and its effective seed is always reportable.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Validation`] naming the first field that fails
+/// validation.
+pub(crate) fn apply_update(
+    params: &mut SimulationParameters,
+    req: &UpdateSessionRequest,
+) -> Result<(), ChainError> {
+    // Domain-required fields: absent = keep, value = validate + replace.
+    if let Some(symbol) = &req.symbol {
+        params.symbol = symbol.clone();
+    }
+
+    if let Some(steps) = req.steps {
+        if steps < 1 {
+            return Err(ChainError::Validation {
+                field: "steps".to_string(),
+                reason: "must be at least 1".to_string(),
+            });
+        }
+        if steps > *MAX_STEPS {
+            return Err(ChainError::Validation {
+                field: "steps".to_string(),
+                reason: format!("must not exceed {}, got {}", *MAX_STEPS, steps),
+            });
+        }
+        params.steps = steps;
+    }
+
+    if let Some(initial_price) = req.initial_price {
+        params.initial_price = positive_field("initial_price", initial_price)?;
+    }
+
+    if let Some(days_to_expiration) = req.days_to_expiration {
+        params.days_to_expiration = positive_field("days_to_expiration", days_to_expiration)?;
+    }
+
+    if let Some(volatility) = req.volatility {
+        params.volatility = positive_field("volatility", volatility)?;
+    }
+
+    if let Some(risk_free_rate) = req.risk_free_rate {
+        params.risk_free_rate = decimal_field("risk_free_rate", risk_free_rate)?;
+    }
+
+    if let Some(dividend_yield) = req.dividend_yield {
+        params.dividend_yield = positive_field("dividend_yield", dividend_yield)?;
+    }
+
+    if let Some(method) = &req.method {
+        params.method = method.clone().try_into()?;
+    }
+
+    if let Some(time_frame) = req.time_frame {
+        params.time_frame = validation::time_frame_field("time_frame", time_frame)?;
+    }
+
+    // Domain-optional fields: absent = keep, null = clear, value = validate + replace.
+    match &req.chain_size {
+        Patch::Absent => {}
+        Patch::Null => params.chain_size = None,
+        Patch::Value(chain_size) => {
+            let chain_size = *chain_size;
+            if chain_size > *MAX_CHAIN_SIZE {
+                return Err(ChainError::Validation {
+                    field: "chain_size".to_string(),
+                    reason: format!("must not exceed {}, got {}", *MAX_CHAIN_SIZE, chain_size),
+                });
+            }
+            params.chain_size = Some(chain_size);
+        }
+    }
+
+    match &req.strike_interval {
+        Patch::Absent => {}
+        Patch::Null => params.strike_interval = None,
+        Patch::Value(value) => {
+            params.strike_interval = Some(strictly_positive_field("strike_interval", *value)?);
+        }
+    }
+
+    match &req.skew_slope {
+        Patch::Absent => {}
+        Patch::Null => params.skew_slope = None,
+        Patch::Value(value) => params.skew_slope = Some(decimal_field("skew_slope", *value)?),
+    }
+
+    match &req.smile_curve {
+        Patch::Absent => {}
+        Patch::Null => params.smile_curve = None,
+        Patch::Value(value) => params.smile_curve = Some(decimal_field("smile_curve", *value)?),
+    }
+
+    match &req.spread {
+        Patch::Absent => {}
+        Patch::Null => params.spread = None,
+        Patch::Value(value) => params.spread = Some(positive_field("spread", *value)?),
+    }
+
+    // Seed keeps the effective-seed invariant: it is never cleared to None. A
+    // null seed means "give me a fresh random seed" rather than "clear it".
+    match &req.seed {
+        Patch::Absent => {}
+        Patch::Null => params.seed = Some(rand::rng().random()),
+        Patch::Value(seed) => params.seed = Some(*seed),
+    }
+
+    Ok(())
 }
 
 #[utoipa::path(
@@ -429,6 +559,21 @@ pub(crate) async fn replace_session(
     params(
         ("sessionid" = String, Query, description = "ID of the session to update")
     ),
+    request_body(
+        content = UpdateSessionRequest,
+        description = "Partial update. Optional fields are tri-state: omit a key to keep the \
+            current value, send `null` to clear it, or send a value to replace it. \
+            `seed: null` re-seeds the session with a fresh random seed (the seed is never \
+            cleared, preserving reproducibility).",
+        example = r#"
+                    {
+                      "volatility": 0.3,
+                      "skew_slope": -0.15,
+                      "smile_curve": null,
+                      "seed": null
+                    }
+                    "#
+    ),
     responses(
         (status = 200, description = "Session updated", body = SessionResponse),
         (status = 404, description = "Session not found"),
@@ -468,116 +613,13 @@ pub(crate) async fn update_session(
         Err(error) => return map_error(error),
     };
 
-    // Create a new SimulationParameters object with updated values
+    // Create a new SimulationParameters object with updated values. The merge applies the
+    // tri-state PATCH semantics (absent = keep, null = clear, value = replace) and validates
+    // every user-supplied numeric with the same helpers as the create/replace conversions, so
+    // a bad float yields a 400 instead of panicking during the PATCH merge.
     let mut updated_params = current_session.parameters.clone();
-
-    // Update only the fields that are provided in the request. Every user-supplied
-    // numeric is validated with the same helpers as the create/replace conversions, so a
-    // bad float yields a 400 instead of panicking during the PATCH merge.
-    if let Some(symbol) = &json_req.symbol {
-        updated_params.symbol = symbol.clone();
-    }
-
-    if let Some(steps) = json_req.steps {
-        if steps < 1 {
-            return map_error(ChainError::Validation {
-                field: "steps".to_string(),
-                reason: "must be at least 1".to_string(),
-            });
-        }
-        if steps > *MAX_STEPS {
-            return map_error(ChainError::Validation {
-                field: "steps".to_string(),
-                reason: format!("must not exceed {}, got {}", *MAX_STEPS, steps),
-            });
-        }
-        updated_params.steps = steps;
-    }
-
-    if let Some(initial_price) = json_req.initial_price {
-        updated_params.initial_price = match positive_field("initial_price", initial_price) {
-            Ok(value) => value,
-            Err(error) => return map_error(error),
-        };
-    }
-
-    if let Some(days_to_expiration) = json_req.days_to_expiration {
-        updated_params.days_to_expiration =
-            match positive_field("days_to_expiration", days_to_expiration) {
-                Ok(value) => value,
-                Err(error) => return map_error(error),
-            };
-    }
-
-    if let Some(volatility) = json_req.volatility {
-        updated_params.volatility = match positive_field("volatility", volatility) {
-            Ok(value) => value,
-            Err(error) => return map_error(error),
-        };
-    }
-
-    if let Some(risk_free_rate) = json_req.risk_free_rate {
-        updated_params.risk_free_rate = match decimal_field("risk_free_rate", risk_free_rate) {
-            Ok(value) => value,
-            Err(error) => return map_error(error),
-        };
-    }
-
-    if let Some(dividend_yield) = json_req.dividend_yield {
-        updated_params.dividend_yield = match positive_field("dividend_yield", dividend_yield) {
-            Ok(value) => value,
-            Err(error) => return map_error(error),
-        };
-    }
-
-    if let Some(method) = &json_req.method {
-        updated_params.method = match method.clone().try_into() {
-            Ok(value) => value,
-            Err(error) => return map_error(error),
-        };
-    }
-
-    if let Some(time_frame) = json_req.time_frame {
-        updated_params.time_frame = match validation::time_frame_field("time_frame", time_frame) {
-            Ok(value) => value,
-            Err(error) => return map_error(error),
-        };
-    }
-
-    if let Some(chain_size) = json_req.chain_size {
-        if chain_size > *MAX_CHAIN_SIZE {
-            return map_error(ChainError::Validation {
-                field: "chain_size".to_string(),
-                reason: format!("must not exceed {}, got {}", *MAX_CHAIN_SIZE, chain_size),
-            });
-        }
-        updated_params.chain_size = Some(chain_size);
-    }
-
-    if let Some(strike_interval) = json_req.strike_interval {
-        updated_params.strike_interval =
-            match strictly_positive_field("strike_interval", strike_interval) {
-                Ok(value) => Some(value),
-                Err(error) => return map_error(error),
-            };
-    }
-
-    if let Some(smile_curve) = json_req.smile_curve {
-        updated_params.smile_curve = match decimal_field("smile_curve", smile_curve) {
-            Ok(value) => Some(value),
-            Err(error) => return map_error(error),
-        };
-    }
-
-    if let Some(spread) = json_req.spread {
-        updated_params.spread = match positive_field("spread", spread) {
-            Ok(value) => Some(value),
-            Err(error) => return map_error(error),
-        };
-    }
-
-    if let Some(seed) = json_req.seed {
-        updated_params.seed = Some(seed);
+    if let Err(error) = apply_update(&mut updated_params, &json_req.0) {
+        return map_error(error);
     }
 
     // Update the session with new parameters
@@ -705,5 +747,216 @@ mod tests_advance_step_query {
         let q: AdvanceStepQuery = serde_json::from_str(r#"{"sessionid":"abc","expected_step":3}"#)
             .expect("query must parse");
         assert_eq!(q.expected_step, Some(3));
+    }
+}
+
+#[cfg(test)]
+mod tests_apply_update {
+    use super::*;
+    use optionstratlib::simulation::WalkType;
+    use optionstratlib::utils::TimeFrame;
+    use positive::{Positive, pos_or_panic};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+
+    /// Base parameters with every optional field populated, so a `Null` patch has
+    /// something to clear and an `Absent` patch has something to preserve.
+    fn base_params() -> SimulationParameters {
+        SimulationParameters {
+            symbol: "AAPL".to_string(),
+            steps: 20,
+            initial_price: pos_or_panic!(100.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.2),
+            risk_free_rate: dec!(0.03),
+            dividend_yield: Positive::ZERO,
+            method: WalkType::Brownian {
+                dt: pos_or_panic!(1.0 / 252.0),
+                drift: Decimal::ZERO,
+                volatility: pos_or_panic!(0.2),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(30),
+            strike_interval: Some(pos_or_panic!(5.0)),
+            skew_slope: Some(dec!(-0.2)),
+            smile_curve: Some(dec!(0.4)),
+            spread: Some(pos_or_panic!(0.02)),
+            seed: Some(42),
+        }
+    }
+
+    /// An update request that touches nothing (all required fields `None`, all
+    /// optional fields `Patch::Absent`).
+    fn empty_update() -> UpdateSessionRequest {
+        UpdateSessionRequest {
+            symbol: None,
+            steps: None,
+            initial_price: None,
+            days_to_expiration: None,
+            volatility: None,
+            risk_free_rate: None,
+            dividend_yield: None,
+            method: None,
+            time_frame: None,
+            chain_size: Patch::Absent,
+            strike_interval: Patch::Absent,
+            skew_slope: Patch::Absent,
+            smile_curve: Patch::Absent,
+            spread: Patch::Absent,
+            seed: Patch::Absent,
+        }
+    }
+
+    #[test]
+    fn test_apply_update_absent_preserves_all_fields() {
+        let mut params = base_params();
+        let before = params.clone();
+
+        apply_update(&mut params, &empty_update()).expect("empty update succeeds");
+
+        assert_eq!(params.symbol, before.symbol);
+        assert_eq!(params.steps, before.steps);
+        assert_eq!(params.chain_size, before.chain_size);
+        assert_eq!(params.strike_interval, before.strike_interval);
+        assert_eq!(params.skew_slope, before.skew_slope);
+        assert_eq!(params.smile_curve, before.smile_curve);
+        assert_eq!(params.spread, before.spread);
+        assert_eq!(params.seed, before.seed);
+    }
+
+    #[test]
+    fn test_apply_update_null_clears_each_optional_field() {
+        let mut params = base_params();
+        let req = UpdateSessionRequest {
+            chain_size: Patch::Null,
+            strike_interval: Patch::Null,
+            skew_slope: Patch::Null,
+            smile_curve: Patch::Null,
+            spread: Patch::Null,
+            ..empty_update()
+        };
+
+        apply_update(&mut params, &req).expect("null update succeeds");
+
+        assert_eq!(params.chain_size, None);
+        assert_eq!(params.strike_interval, None);
+        assert_eq!(params.skew_slope, None);
+        assert_eq!(params.smile_curve, None);
+        assert_eq!(params.spread, None);
+        // Seed was left absent, so it is preserved (never cleared).
+        assert_eq!(params.seed, Some(42));
+    }
+
+    #[test]
+    fn test_apply_update_value_replaces_optional_fields() {
+        let mut params = base_params();
+        let req = UpdateSessionRequest {
+            chain_size: Patch::Value(25),
+            strike_interval: Patch::Value(2.5),
+            skew_slope: Patch::Value(-0.15),
+            smile_curve: Patch::Value(0.6),
+            spread: Patch::Value(0.03),
+            ..empty_update()
+        };
+
+        apply_update(&mut params, &req).expect("value update succeeds");
+
+        assert_eq!(params.chain_size, Some(25));
+        assert_eq!(params.strike_interval, Some(pos_or_panic!(2.5)));
+        assert_eq!(params.skew_slope, Some(dec!(-0.15)));
+        assert_eq!(params.smile_curve, Some(dec!(0.6)));
+        assert_eq!(params.spread, Some(pos_or_panic!(0.03)));
+    }
+
+    #[test]
+    fn test_apply_update_skew_slope_is_now_patchable() {
+        // Regression for #20: skew_slope was previously unreachable via PATCH.
+        let mut params = base_params();
+        params.skew_slope = None;
+
+        let req = UpdateSessionRequest {
+            skew_slope: Patch::Value(-0.3),
+            ..empty_update()
+        };
+        apply_update(&mut params, &req).expect("skew_slope patch succeeds");
+        assert_eq!(params.skew_slope, Some(dec!(-0.3)));
+
+        // And it can be cleared again.
+        let clear = UpdateSessionRequest {
+            skew_slope: Patch::Null,
+            ..empty_update()
+        };
+        apply_update(&mut params, &clear).expect("skew_slope clear succeeds");
+        assert_eq!(params.skew_slope, None);
+    }
+
+    #[test]
+    fn test_apply_update_invalid_value_is_validation_error() {
+        let mut params = base_params();
+        let req = UpdateSessionRequest {
+            spread: Patch::Value(-1.0),
+            ..empty_update()
+        };
+
+        match apply_update(&mut params, &req) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "spread"),
+            other => panic!("expected Validation error for spread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_update_invalid_skew_slope_is_validation_error() {
+        let mut params = base_params();
+        let req = UpdateSessionRequest {
+            skew_slope: Patch::Value(f64::NAN),
+            ..empty_update()
+        };
+
+        match apply_update(&mut params, &req) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "skew_slope"),
+            other => panic!("expected Validation error for skew_slope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_update_seed_value_sets_seed() {
+        let mut params = base_params();
+        let req = UpdateSessionRequest {
+            seed: Patch::Value(777),
+            ..empty_update()
+        };
+
+        apply_update(&mut params, &req).expect("seed value update succeeds");
+        assert_eq!(params.seed, Some(777));
+    }
+
+    #[test]
+    fn test_apply_update_seed_null_regenerates_fresh_seed() {
+        // A null seed must NOT clear the seed (the effective-seed invariant keeps it
+        // Some); it re-seeds with a fresh random value. Retry a few times so a random
+        // collision with the previous seed does not flake the test.
+        let old_seed = 42u64;
+        let mut changed = false;
+        for _ in 0..3 {
+            let mut params = base_params();
+            let req = UpdateSessionRequest {
+                seed: Patch::Null,
+                ..empty_update()
+            };
+            apply_update(&mut params, &req).expect("seed null update succeeds");
+
+            assert!(
+                params.seed.is_some(),
+                "seed must stay Some to preserve reproducibility"
+            );
+            if params.seed != Some(old_seed) {
+                changed = true;
+                break;
+            }
+        }
+        assert!(
+            changed,
+            "seed null should produce a fresh seed different from the previous one"
+        );
     }
 }
