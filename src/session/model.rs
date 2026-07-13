@@ -396,17 +396,17 @@ impl Session {
     ///
     /// # Behavior
     /// - The `parameters` field of the session is updated with the provided `new_params`.
+    /// - `total_steps` is synced to `new_params.steps` so the progression limit,
+    ///   the regenerated walk length, and the advertised parameters always agree —
+    ///   diverging metadata lets a session terminate early or index past the tape.
     /// - The `updated_at` field is set to the current system time, marking the time of modification.
     /// - The session's `state` is updated to `SessionState::Modified` to reflect the change.
     ///
     /// # Notes
     /// This method assumes that the caller has mutable access to the session object and is responsible for ensuring
     /// that the modified parameters are valid within the context of the simulation.
-    ///
-    /// # Panics
-    /// This function does not explicitly handle errors; however, any issues such as obtaining the current system time
-    /// (if `SystemTime::now()` fails) may panic depending on the environment.
     pub fn modify_parameters(&mut self, new_params: SimulationParameters) {
+        self.total_steps = new_params.steps;
         self.parameters = new_params;
         self.updated_at = SystemTime::now();
         self.state = SessionState::Modified;
@@ -1307,8 +1307,29 @@ mod tests_session {
         // Assert
         assert_eq!(session.parameters.symbol, "MODIFIED");
         assert_eq!(session.parameters.steps, 20);
+        assert_eq!(session.total_steps, 20);
         assert_eq!(session.state, SessionState::Modified);
         assert!(session.updated_at > original_time);
+    }
+
+    #[test]
+    fn test_modify_parameters_syncs_total_steps_up_and_down() {
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(create_test_parameters(), &uuid_gen);
+
+        // Upward: 10 -> 25
+        let mut up = create_test_parameters();
+        up.steps = 25;
+        session.modify_parameters(up);
+        assert_eq!(session.parameters.steps, session.total_steps);
+        assert_eq!(session.total_steps, 25);
+
+        // Downward: 25 -> 4
+        let mut down = create_test_parameters();
+        down.steps = 4;
+        session.modify_parameters(down);
+        assert_eq!(session.parameters.steps, session.total_steps);
+        assert_eq!(session.total_steps, 4);
     }
 
     #[test]

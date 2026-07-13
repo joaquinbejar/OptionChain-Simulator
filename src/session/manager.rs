@@ -900,4 +900,48 @@ mod tests {
         assert_eq!(post_reset, ref_tape_new);
         assert_ne!(post_reset, ref_tape_old);
     }
+
+    /// Regression for issue #6: PATCHing `steps` must keep `parameters.steps`
+    /// and `total_steps` equal, and the session must serve exactly the NEW
+    /// number of snapshots — both when growing and when shrinking the tape.
+    #[tokio::test]
+    async fn test_patch_steps_syncs_total_steps_up_and_down() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+
+        // Start with 2 steps, PATCH up to 5.
+        let session = manager
+            .create_session(seeded_parameters(2, 7))
+            .expect("failed to create session");
+        let id = session.id;
+
+        let patched = manager
+            .update_session(id, seeded_parameters(5, 7))
+            .expect("update failed");
+        assert_eq!(patched.parameters.steps, patched.total_steps);
+        assert_eq!(patched.total_steps, 5);
+
+        // The regenerated walk and the progression limit agree: exactly 5 advances.
+        for expected_cursor in 1..=5 {
+            let (s, _chain) = manager.get_next_step(id).await.expect("advance failed");
+            assert_eq!(s.current_step, expected_cursor);
+        }
+        assert!(manager.get_next_step(id).await.is_err());
+        let stored = store.get(id).expect("session missing from store");
+        assert_eq!(stored.state, SessionState::Completed);
+        assert_eq!(stored.total_steps, 5);
+
+        // PATCH down to 3: metadata stays consistent and only 3 advances succeed.
+        let patched_down = manager
+            .update_session(id, seeded_parameters(3, 7))
+            .expect("downward update failed");
+        assert_eq!(patched_down.parameters.steps, patched_down.total_steps);
+        assert_eq!(patched_down.total_steps, 3);
+
+        for expected_cursor in 1..=3 {
+            let (s, _chain) = manager.get_next_step(id).await.expect("advance failed");
+            assert_eq!(s.current_step, expected_cursor);
+        }
+        assert!(manager.get_next_step(id).await.is_err());
+    }
 }
