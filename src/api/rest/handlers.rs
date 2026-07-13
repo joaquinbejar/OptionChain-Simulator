@@ -386,6 +386,10 @@ pub(crate) async fn advance_step(
             let duration = start_time.elapsed();
             metrics_collector.record_simulation_step(&session.parameters.method.to_string());
             metrics_collector.record_simulation_duration(duration);
+            // Publish the current simulation-cache occupancy: an advance may have
+            // populated a fresh walk or evicted a completed one (issue #9).
+            metrics_collector
+                .set_simulation_cache_size(session_manager.simulation_cache_len().await as i64);
 
             // Save to MongoDB
             if let Err(e) = mongodb_repo
@@ -715,23 +719,30 @@ pub(crate) async fn delete_session(
         .map_err(|_| ChainError::InvalidState("Invalid session ID format".to_string()));
 
     match session_id {
-        Ok(id) => match session_manager.delete_session(id).await {
-            Ok(true) => {
-                let msg = format!("Session deleted successfully: {}", id);
-                let msg = serde_json::json!({
-                    "message": msg,
-                    "session_id": id.to_string()
-                });
-                HttpResponse::Ok().json(msg)
+        Ok(id) => {
+            let delete_result = session_manager.delete_session(id).await;
+            // The delete evicted the cached walk (issue #9); publish the post-eviction
+            // cache occupancy so the gauge tracks actual state.
+            metrics_collector
+                .set_simulation_cache_size(session_manager.simulation_cache_len().await as i64);
+            match delete_result {
+                Ok(true) => {
+                    let msg = format!("Session deleted successfully: {}", id);
+                    let msg = serde_json::json!({
+                        "message": msg,
+                        "session_id": id.to_string()
+                    });
+                    HttpResponse::Ok().json(msg)
+                }
+                Ok(false) => HttpResponse::NotFound().json(serde_json::json!({
+                    "error": format!("Session not found: {}", id)
+                })),
+                Err(chain_error) => {
+                    error!("{} {}", id, chain_error);
+                    map_error(chain_error)
+                }
             }
-            Ok(false) => HttpResponse::NotFound().json(serde_json::json!({
-                "error": format!("Session not found: {}", id)
-            })),
-            Err(chain_error) => {
-                error!("{} {}", id, chain_error);
-                map_error(chain_error)
-            }
-        },
+        }
         Err(error) => {
             error!("{}", error);
             map_error(error)

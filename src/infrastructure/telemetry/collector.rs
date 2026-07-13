@@ -21,6 +21,7 @@ pub struct MetricsCollector {
     // Cache metrics
     cache_hit_counter: IntCounter,
     cache_miss_counter: IntCounter,
+    simulation_cache_size: IntGauge,
 
     // Resource metrics
     memory_usage: Gauge,
@@ -92,6 +93,9 @@ impl MetricsCollector {
         let cache_miss_counter =
             IntCounter::new("cache_misses_total", "Total number of cache misses")?;
 
+        let simulation_cache_size =
+            IntGauge::new("simulation_cache_size", "Number of cached random walks")?;
+
         // Create resource metrics
         let memory_usage = Gauge::new("memory_usage_bytes", "Current memory usage in bytes")?;
 
@@ -124,6 +128,7 @@ impl MetricsCollector {
         registry.register(Box::new(simulation_duration.clone()))?;
         registry.register(Box::new(cache_hit_counter.clone()))?;
         registry.register(Box::new(cache_miss_counter.clone()))?;
+        registry.register(Box::new(simulation_cache_size.clone()))?;
         registry.register(Box::new(memory_usage.clone()))?;
 
         // Register MongoDB metrics
@@ -142,6 +147,7 @@ impl MetricsCollector {
             simulation_duration,
             cache_hit_counter,
             cache_miss_counter,
+            simulation_cache_size,
             memory_usage,
             mongodb_insert_counter,
             mongodb_insert_duration,
@@ -201,6 +207,15 @@ impl MetricsCollector {
     /// Records a cache miss
     pub fn record_cache_miss(&self) {
         self.cache_miss_counter.inc();
+    }
+
+    /// Sets the current number of cached random walks held by the domain simulator.
+    ///
+    /// Published by the API layer after operations that grow or shrink the
+    /// simulation cache (advance and delete), so the `simulation_cache_size` gauge
+    /// tracks actual cache occupancy rather than a stale estimate.
+    pub fn set_simulation_cache_size(&self, size: i64) {
+        self.simulation_cache_size.set(size);
     }
 
     /// Records the current memory usage
@@ -369,6 +384,20 @@ mod tests {
         let metrics = collector.export_metrics();
         assert!(metrics.contains("cache_hits_total 2"));
         assert!(metrics.contains("cache_misses_total 1"));
+    }
+
+    #[test]
+    fn test_simulation_cache_size_gauge() {
+        // The gauge reflects the last value written and can move both up and down.
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        collector.set_simulation_cache_size(3);
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("simulation_cache_size 3"));
+
+        collector.set_simulation_cache_size(0);
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("simulation_cache_size 0"));
     }
 
     #[test]

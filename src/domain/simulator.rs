@@ -23,7 +23,8 @@ use rand::RngExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
@@ -33,10 +34,80 @@ const DEFAULT_CHAIN_SIZE: usize = 30;
 const DEFAULT_SKEW_SLOPE: Decimal = dec!(-0.2);
 const DEFAULT_SMILE_CURVE: Decimal = dec!(0.4);
 
-/// Simulator handles the generation of option chains based on simulation parameters
+/// Default upper bound on the number of random walks held in the simulation cache.
+const DEFAULT_MAX_CACHED_WALKS: usize = 1000;
+
+/// Hard bound on the number of random walks the simulation cache may hold
+/// (`OCS_MAX_CACHED_WALKS`).
+///
+/// Read once via [`LazyLock`]; an unset or invalid value (not an integer `>= 1`)
+/// falls back to [`DEFAULT_MAX_CACHED_WALKS`] and emits a `tracing::warn!`, so a
+/// misconfiguration never aborts startup. The bound is enforced with
+/// least-recently-accessed eviction (see [`enforce_capacity`]). This mirrors the
+/// parse-once pattern in `api::rest::limits` but lives in the domain layer to keep
+/// the dependency flow api -> session -> domain intact.
+static MAX_CACHED_WALKS: LazyLock<usize> =
+    LazyLock::new(|| match std::env::var("OCS_MAX_CACHED_WALKS").ok() {
+        None => DEFAULT_MAX_CACHED_WALKS,
+        Some(value) => match value.trim().parse::<usize>() {
+            Ok(parsed) if parsed >= 1 => parsed,
+            _ => {
+                warn!(
+                    raw = %value,
+                    default = DEFAULT_MAX_CACHED_WALKS,
+                    "invalid OCS_MAX_CACHED_WALKS; falling back to default"
+                );
+                DEFAULT_MAX_CACHED_WALKS
+            }
+        },
+    });
+
+/// One cached random walk together with the last time it was accessed.
+///
+/// `last_access` drives least-recently-accessed eviction: every cache hit refreshes
+/// it so active sessions survive the [`MAX_CACHED_WALKS`] bound while idle ones age out.
+struct CacheEntry {
+    walk: RandomWalk<Positive, OptionChain>,
+    last_access: Instant,
+}
+
+/// Evicts least-recently-accessed entries until `cache` holds at most `max` entries.
+///
+/// Pure over the cache map (no I/O, no locking) so it can be unit-tested directly.
+/// The insert path calls it with `max = MAX_CACHED_WALKS - 1` BEFORE inserting the
+/// new entry, so the id being inserted is absent and can never be the victim, and
+/// the cache never exceeds `MAX_CACHED_WALKS` after the insert. An `O(n)` scan per
+/// eviction is acceptable at these cache sizes.
+fn enforce_capacity(cache: &mut HashMap<Uuid, CacheEntry>, max: usize) {
+    while cache.len() > max {
+        let victim = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_access)
+            .map(|(id, _)| *id);
+        match victim {
+            Some(id) => {
+                cache.remove(&id);
+            }
+            None => break,
+        }
+    }
+}
+
+/// Simulator handles the generation of option chains based on simulation parameters.
+///
+/// It owns a bounded, per-session cache of [`RandomWalk`]s keyed by session id. The
+/// cache is evicted on three lifecycle triggers so it never outlives the sessions
+/// it serves (issue #9):
+/// - DELETE / completion, via [`Simulator::remove_session`] driven by the session
+///   manager;
+/// - a `Reinitialized` session, which drops and rebuilds its walk in
+///   [`Simulator::simulate_next_step`];
+/// - the [`MAX_CACHED_WALKS`] LRU bound, enforced by [`enforce_capacity`] on insert.
+///
+/// Eviction never affects reproducibility: a re-simulate after eviction rebuilds the
+/// walk from the same seed, yielding the identical tape.
 pub struct Simulator {
-    // Cambia el tipo de Mutex
-    simulation_cache: Arc<Mutex<HashMap<Uuid, RandomWalk<Positive, OptionChain>>>>,
+    simulation_cache: Arc<Mutex<HashMap<Uuid, CacheEntry>>>,
     database_repo: Option<Arc<dyn HistoricalDataRepository>>,
 }
 
@@ -104,27 +175,43 @@ impl Simulator {
             );
             debug!("Reset Random Walk with Session: {}", session);
 
-            // Create the random walk (asynchronous operation)
+            // Create the random walk (asynchronous operation). The cache lock is NOT
+            // held across this build/await into infrastructure.
             let random_walk = self.create_random_walk(session).await?;
 
-            // Insert the new random walk into the cache
+            // Insert the new random walk into the cache, enforcing the LRU bound
+            // first. Evicting down to `max - 1` before inserting keeps the cache at
+            // or below `MAX_CACHED_WALKS` afterwards; the id being inserted is absent
+            // here (a Reinitialized session was removed above), so it is never evicted.
             let mut cache = self.simulation_cache.lock().await;
-            cache.insert(session.id, random_walk);
+            let max = *MAX_CACHED_WALKS;
+            enforce_capacity(&mut cache, max.saturating_sub(1));
+            cache.insert(
+                session.id,
+                CacheEntry {
+                    walk: random_walk,
+                    last_access: Instant::now(),
+                },
+            );
         }
 
         // Get the current step data
         let step = {
-            let cache = self.simulation_cache.lock().await;
+            let mut cache = self.simulation_cache.lock().await;
 
-            let random_walk = cache.get(&session.id).ok_or_else(|| {
+            let entry = cache.get_mut(&session.id).ok_or_else(|| {
                 ChainError::Internal(format!(
                     "Failed to get random walk for session {}",
                     session.id
                 ))
             })?;
 
+            // Refresh recency on every hit so an actively served session survives the
+            // LRU bound while idle sessions age out.
+            entry.last_access = Instant::now();
+
             // Check if the current step is within range
-            if session.current_step >= random_walk.len() {
+            if session.current_step >= entry.walk.len() {
                 warn!("Walker reached end of data.");
                 return Err(ChainError::SimulatorError(
                     "Walker reached end of data".to_string(),
@@ -132,7 +219,7 @@ impl Simulator {
             }
 
             // Clone the step data so we can release the lock
-            random_walk[session.current_step].clone()
+            entry.walk[session.current_step].clone()
         };
 
         // Process the chain data outside the lock
@@ -340,24 +427,31 @@ impl Simulator {
         Ok(random_walk)
     }
 
-    /// Cleans up the simulation cache by removing entries for sessions that are no longer active
-    #[allow(dead_code)] // maintenance API: not wired to a caller yet
+    /// Removes a session's cached random walk, returning whether one was present.
+    ///
+    /// Driven by the session lifecycle: the manager calls this on DELETE and when an
+    /// advance transitions the session to `Completed`, so a deleted or finished
+    /// session does not retain its walk (issue #9). Removing an id that is not cached
+    /// is a cheap no-op returning `false`.
+    ///
+    /// Eviction never affects reproducibility: a later re-simulate of a seeded session
+    /// rebuilds the identical walk from the same seed.
     #[instrument(skip(self), level = "debug")]
-    pub async fn cleanup_cache(&self, active_session_ids: &[Uuid]) -> Result<usize, ChainError> {
+    pub async fn remove_session(&self, id: &Uuid) -> bool {
         let mut cache = self.simulation_cache.lock().await;
+        let removed = cache.remove(id).is_some();
+        if removed {
+            debug!(session_id = %id, "Evicted cached random walk");
+        }
+        removed
+    }
 
-        let initial_size = cache.len();
-
-        // Create a set of active session IDs for faster lookups
-        let active_set: std::collections::HashSet<_> = active_session_ids.iter().collect();
-
-        // Remove entries for sessions that are no longer active
-        cache.retain(|id, _| active_set.contains(id));
-
-        let removed_count = initial_size - cache.len();
-        debug!("Cleaned up {} entries from simulation cache", removed_count);
-
-        Ok(removed_count)
+    /// Returns the number of random walks currently held in the simulation cache.
+    ///
+    /// Read-only; used by the API layer (via the session manager) to publish the
+    /// `simulation_cache_size` gauge after operations that grow or shrink the cache.
+    pub async fn cache_len(&self) -> usize {
+        self.simulation_cache.lock().await.len()
     }
 }
 
@@ -492,6 +586,147 @@ mod tests {
         let tape_b = collect_tape(&simulator, &mut session_b).await;
 
         assert_ne!(tape_a, tape_b);
+    }
+
+    #[tokio::test]
+    async fn test_remove_session_evicts_cached_walk() {
+        // Issue #9: remove_session drops the cached walk and reports presence.
+        let session = create_test_session(Some(Uuid::new_v4()));
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        // Populate the cache via a simulate, then evict.
+        simulator
+            .simulate_next_step(&session)
+            .await
+            .expect("initial simulate failed");
+        assert_eq!(simulator.cache_len().await, 1);
+
+        assert!(simulator.remove_session(&session.id).await);
+        assert_eq!(simulator.cache_len().await, 0);
+
+        // Removing again is a no-op reporting absence.
+        assert!(!simulator.remove_session(&session.id).await);
+    }
+
+    #[tokio::test]
+    async fn test_eviction_preserves_seeded_tape() {
+        // Issue #9 reproducibility guard: evicting a seeded session's walk and
+        // rebuilding it from the same seed yields the identical snapshot.
+        let mut session = create_test_session(Some(Uuid::new_v4()));
+        session.parameters.seed = Some(20260713);
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        let before = simulator
+            .simulate_next_step(&session)
+            .await
+            .expect("first simulate failed");
+        assert_eq!(simulator.cache_len().await, 1);
+
+        // Evict, then rebuild from the same seed on the next simulate.
+        assert!(simulator.remove_session(&session.id).await);
+        assert_eq!(simulator.cache_len().await, 0);
+
+        let after = simulator
+            .simulate_next_step(&session)
+            .await
+            .expect("rebuild simulate failed");
+        assert_eq!(simulator.cache_len().await, 1);
+
+        // The rebuilt walk reproduces the pre-eviction snapshot exactly.
+        assert_eq!(before.underlying_price, after.underlying_price);
+    }
+
+    #[tokio::test]
+    async fn test_enforce_capacity_evicts_least_recently_accessed() {
+        // Bound logic in isolation: with three staggered entries and max 2, the
+        // least-recently-accessed entry is the one evicted.
+        use std::time::Duration;
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+        let mut small = create_test_session(None);
+        small.parameters.steps = 2;
+
+        let id_old = Uuid::new_v4();
+        let id_mid = Uuid::new_v4();
+        let id_new = Uuid::new_v4();
+
+        let now = Instant::now();
+        let mut cache: HashMap<Uuid, CacheEntry> = HashMap::new();
+        cache.insert(
+            id_old,
+            CacheEntry {
+                walk: simulator.create_random_walk(&small).await.unwrap(),
+                last_access: now - Duration::from_secs(3),
+            },
+        );
+        cache.insert(
+            id_mid,
+            CacheEntry {
+                walk: simulator.create_random_walk(&small).await.unwrap(),
+                last_access: now - Duration::from_secs(2),
+            },
+        );
+        cache.insert(
+            id_new,
+            CacheEntry {
+                walk: simulator.create_random_walk(&small).await.unwrap(),
+                last_access: now - Duration::from_secs(1),
+            },
+        );
+
+        enforce_capacity(&mut cache, 2);
+
+        assert_eq!(cache.len(), 2);
+        assert!(
+            !cache.contains_key(&id_old),
+            "least-recently-accessed entry must be evicted"
+        );
+        assert!(cache.contains_key(&id_mid));
+        assert!(cache.contains_key(&id_new));
+    }
+
+    #[tokio::test]
+    async fn test_enforce_capacity_noop_when_within_bound() {
+        // Below/at the bound, enforce_capacity evicts nothing.
+        use std::time::Duration;
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+        let mut small = create_test_session(None);
+        small.parameters.steps = 2;
+
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let now = Instant::now();
+        let mut cache: HashMap<Uuid, CacheEntry> = HashMap::new();
+        cache.insert(
+            id_a,
+            CacheEntry {
+                walk: simulator.create_random_walk(&small).await.unwrap(),
+                last_access: now - Duration::from_secs(2),
+            },
+        );
+        cache.insert(
+            id_b,
+            CacheEntry {
+                walk: simulator.create_random_walk(&small).await.unwrap(),
+                last_access: now - Duration::from_secs(1),
+            },
+        );
+
+        enforce_capacity(&mut cache, 5);
+        assert_eq!(cache.len(), 2);
     }
 
     // Helper function to create test historical data

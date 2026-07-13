@@ -182,6 +182,14 @@ impl SessionManager {
             .save_cas(session.clone(), expected_version)
             .await?;
 
+        // The advance that serves the last snapshot marks the session `Completed`. Its
+        // walk is finished — the completed guard above blocks any further simulate — so
+        // evict it from the domain cache to reclaim memory (issue #9). Eviction is safe
+        // for reproducibility: a re-simulate would rebuild the identical seeded walk.
+        if session.state == SessionState::Completed {
+            self.simulator.remove_session(&id).await;
+        }
+
         Ok((session, chain))
     }
 
@@ -358,7 +366,24 @@ impl SessionManager {
     /// This function will return a `ChainError` if there is an issue interacting with the store.
     ///
     pub async fn delete_session(&self, id: Uuid) -> Result<bool, ChainError> {
-        self.store.delete(id).await
+        let deleted = self.store.delete(id).await?;
+
+        // Evict the cached walk regardless of whether the store held the session:
+        // removing a non-cached id is a cheap no-op, and this keeps the domain cache
+        // from outliving the session it served (issue #9).
+        self.simulator.remove_session(&id).await;
+
+        Ok(deleted)
+    }
+
+    /// Returns the number of random walks currently cached by the domain simulator.
+    ///
+    /// Read-only helper the API layer uses to publish the `simulation_cache_size`
+    /// gauge after operations that grow or shrink the cache (advance, delete). It
+    /// delegates to [`crate::domain`]'s simulator without touching session state or
+    /// the store.
+    pub async fn simulation_cache_len(&self) -> usize {
+        self.simulator.cache_len().await
     }
 
     /// Cleans up outdated or inactive sessions in the underlying storage.
@@ -602,6 +627,56 @@ mod tests {
         }
 
         assert_eq!(tape_a, tape_b);
+    }
+
+    /// Issue #9 (DELETE path): deleting a session evicts its cached walk from the
+    /// domain simulator, not just the session store.
+    #[tokio::test]
+    async fn test_delete_session_evicts_cached_walk() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store);
+        let session = manager
+            .create_session(seeded_parameters(5, 20260713))
+            .await
+            .expect("failed to create session");
+        let id = session.id;
+
+        // One advance populates the domain cache for this session.
+        manager.get_next_step(id).await.expect("advance failed");
+        assert_eq!(manager.simulation_cache_len().await, 1);
+
+        // DELETE evicts the walk.
+        assert!(manager.delete_session(id).await.expect("delete failed"));
+        assert_eq!(manager.simulation_cache_len().await, 0);
+    }
+
+    /// Issue #9 (completion path): the advance that transitions a session to
+    /// `Completed` evicts its cached walk (the walk is finished and can never be
+    /// simulated again).
+    #[tokio::test]
+    async fn test_completion_evicts_cached_walk() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store);
+        let session = manager
+            .create_session(seeded_parameters(2, 4242))
+            .await
+            .expect("failed to create session");
+        let id = session.id;
+
+        // First advance populates the cache but does not complete the 2-step tape.
+        manager
+            .get_next_step(id)
+            .await
+            .expect("first advance failed");
+        assert_eq!(manager.simulation_cache_len().await, 1);
+
+        // Second advance serves the last snapshot, marks Completed, and evicts.
+        let (completed, _chain) = manager
+            .get_next_step(id)
+            .await
+            .expect("second advance failed");
+        assert_eq!(completed.state, SessionState::Completed);
+        assert_eq!(manager.simulation_cache_len().await, 0);
     }
 
     /// Regression for issue #7: two freshly built managers (each with its own store,
