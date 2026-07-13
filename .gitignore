@@ -27,3 +27,8 @@ src/.DS_Store
 /cobertura.xml
 /tarpaulin-report.html
 .secrets
+# Claude local working assets (see rules/CLAUDE_SETUP.md)
+.claude/
+rules/
+CLAUDE.md
+AGENTS.md
