@@ -141,16 +141,19 @@ fn timeframe_query_template(timeframe: &TimeFrame) -> Result<String, ChainError>
         }
     };
 
-    // Query with aggregation for larger timeframes
+    // Query with aggregation for larger timeframes. Open/close use the
+    // timestamp-aware argMin/argMax aggregates: ClickHouse's any() picks an
+    // arbitrary row per group, so opens/closes would be nondeterministic and
+    // depend on insertion/part order.
     Ok(format!(
         "WITH intervals AS (
             SELECT
                 symbol,
                 toStartOfInterval(timestamp, INTERVAL {}) as interval_start,
-                any(open) as open,
+                argMin(open, timestamp) as open,
                 max(high) as high,
                 min(low) as low,
-                any(close) as close,
+                argMax(close, timestamp) as close,
                 sum(volume) as volume
             FROM ohlcv
             WHERE symbol = ? \
@@ -461,6 +464,33 @@ mod tests {
         assert!(sql.contains("LIMIT ?"));
         assert!(!sql.contains("EVIL'--"));
         assert!(!sql.contains('\''));
+    }
+
+    /// Regression for issue #14: open/close must come from timestamp-aware
+    /// aggregates. ClickHouse's `any()` returns an arbitrary row per group, so
+    /// aggregated candles would be nondeterministic across insertion/part order.
+    #[test]
+    fn test_timeframe_query_template_aggregates_are_deterministic() {
+        for tf in [
+            TimeFrame::Hour,
+            TimeFrame::Day,
+            TimeFrame::Week,
+            TimeFrame::Month,
+        ] {
+            let sql = timeframe_query_template(&tf).unwrap();
+            assert!(
+                sql.contains("argMin(open, timestamp) as open"),
+                "{tf:?}: open must be the earliest row in the interval"
+            );
+            assert!(
+                sql.contains("argMax(close, timestamp) as close"),
+                "{tf:?}: close must be the latest row in the interval"
+            );
+            assert!(
+                !sql.contains("any("),
+                "{tf:?}: nondeterministic any() must not appear"
+            );
+        }
     }
 
     #[test]
