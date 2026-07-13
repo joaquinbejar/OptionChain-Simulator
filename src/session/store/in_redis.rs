@@ -167,7 +167,7 @@ mod tests {
     use super::*;
     use crate::session::{SessionState, SimulationMethod, SimulationParameters};
     use optionstratlib::utils::TimeFrame;
-    use optionstratlib::{Positive, pos};
+    use positive::{Positive, pos_or_panic};
     use rust_decimal::Decimal;
     use std::sync::Mutex;
     use std::time::SystemTime;
@@ -271,19 +271,19 @@ mod tests {
         let params = SimulationParameters {
             symbol: "TEST".to_string(),
             steps: 10,
-            initial_price: pos!(100.0),
-            days_to_expiration: pos!(30.0),
-            volatility: pos!(0.2),
+            initial_price: pos_or_panic!(100.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.2),
             risk_free_rate: Decimal::new(0, 0),
             dividend_yield: Positive::ZERO,
             method: SimulationMethod::GeometricBrownian {
-                dt: pos!(1.0),
+                dt: pos_or_panic!(1.0),
                 drift: Decimal::new(0, 0),
-                volatility: pos!(0.2),
+                volatility: pos_or_panic!(0.2),
             },
             time_frame: TimeFrame::Day,
             chain_size: Some(5),
-            strike_interval: Some(pos!(5.0)),
+            strike_interval: Some(pos_or_panic!(5.0)),
             skew_slope: None,
             smile_curve: None,
             spread: None,

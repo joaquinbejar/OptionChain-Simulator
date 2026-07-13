@@ -64,7 +64,7 @@ impl RedisClient {
 
     /// Sets a value in Redis with an optional expiration time in seconds
     #[instrument(skip(self, value), level = "debug")]
-    pub fn set<T: redis::ToRedisArgs>(
+    pub fn set<T: redis::ToSingleRedisArg>(
         &self,
         key: &str,
         value: T,
@@ -169,7 +169,7 @@ mod tests {
             match self.exists_results.get(key) {
                 Some(result) => Ok(*result),
                 None => Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Key not configured in mock",
                 ))),
             }
@@ -179,7 +179,7 @@ mod tests {
             match self.get_results.get(key) {
                 Some(value) => Ok(value.clone()),
                 None => Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Key not configured in mock",
                 ))),
             }
@@ -199,7 +199,7 @@ mod tests {
             match self.del_results.get(key) {
                 Some(result) => Ok(*result),
                 None => Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Key not configured in mock",
                 ))),
             }
@@ -209,7 +209,7 @@ mod tests {
             match self.keys_results.get(pattern) {
                 Some(result) => Ok(result.clone()),
                 None => Err(RedisError::from((
-                    redis::ErrorKind::TypeError,
+                    redis::ErrorKind::UnexpectedReturnType,
                     "Pattern not configured in mock",
                 ))),
             }

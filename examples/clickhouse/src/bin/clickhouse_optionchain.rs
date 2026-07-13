@@ -10,7 +10,7 @@ use optionstratlib::utils::others::calculate_log_returns;
 use optionstratlib::utils::time::convert_time_frame;
 use optionstratlib::utils::{Len, TimeFrame, setup_logger};
 use optionstratlib::volatility::{annualized_volatility, constant_volatility};
-use optionstratlib::{Positive, pos, spos};
+use positive::{Positive, pos_or_panic, spos};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -134,7 +134,7 @@ fn create_simulation_parameters(
         symbol,
         steps: 30, // Simulate 30 days into the future
         initial_price,
-        days_to_expiration: pos!(30.0), // 30-day options
+        days_to_expiration: pos_or_panic!(30.0), // 30-day options
         volatility,
         risk_free_rate: Decimal::new(3, 2), // 0.03 = 3%
         dividend_yield: Positive::ZERO,
@@ -144,8 +144,8 @@ fn create_simulation_parameters(
             volatility,
         },
         time_frame,
-        chain_size: Some(30),             // 30 strikes
-        strike_interval: Some(pos!(1.0)), // $1 intervals
+        chain_size: Some(30),                      // 30 strikes
+        strike_interval: Some(pos_or_panic!(1.0)), // $1 intervals
         skew_slope: None,
         smile_curve: Some(Decimal::new(5, 1)), // 0.5
         spread: spos!(0.02),                   // 2% bid-ask spread

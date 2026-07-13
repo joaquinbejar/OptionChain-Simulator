@@ -1,7 +1,7 @@
 use crate::utils::ChainError;
 use chrono::{DateTime, Utc};
 use clickhouse::Row;
-use optionstratlib::{Positive, pos};
+use positive::{Positive, pos_or_panic};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -33,10 +33,10 @@ impl From<ClickHouseRow> for OHLCVData {
             Err(err) => panic!("{}", err),
         };
 
-        let open_pos = pos!(value.open as f64);
-        let high_pos = pos!(value.high as f64);
-        let low_pos = pos!(value.low as f64);
-        let close_pos = pos!(value.close as f64);
+        let open_pos = pos_or_panic!(value.open as f64);
+        let high_pos = pos_or_panic!(value.high as f64);
+        let low_pos = pos_or_panic!(value.low as f64);
+        let close_pos = pos_or_panic!(value.close as f64);
 
         OHLCVData {
             symbol: value.symbol,
@@ -109,7 +109,7 @@ pub struct ClickHouseRow {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use optionstratlib::pos;
+    use positive::pos_or_panic;
     use serde_json::{from_str, to_string};
 
     #[test]
@@ -117,10 +117,10 @@ mod tests {
         let sample_data = OHLCVData {
             symbol: "AAPL".to_string(),
             timestamp: Utc.with_ymd_and_hms(2023, 5, 15, 14, 30, 0).unwrap(),
-            open: pos!(150.25),
-            high: pos!(152.75),
-            low: pos!(149.50),
-            close: pos!(151.80),
+            open: pos_or_panic!(150.25),
+            high: pos_or_panic!(152.75),
+            low: pos_or_panic!(149.50),
+            close: pos_or_panic!(151.80),
             volume: 1_000_000,
         };
 
@@ -173,10 +173,10 @@ mod tests {
         let sample_data = OHLCVData {
             symbol: "AAPL".to_string(),
             timestamp: Utc.with_ymd_and_hms(2023, 5, 15, 14, 30, 0).unwrap(),
-            open: pos!(150.25),
-            high: pos!(152.75),
-            low: pos!(149.50),
-            close: pos!(151.80),
+            open: pos_or_panic!(150.25),
+            high: pos_or_panic!(152.75),
+            low: pos_or_panic!(149.50),
+            close: pos_or_panic!(151.80),
             volume: 1_000_000,
         };
 

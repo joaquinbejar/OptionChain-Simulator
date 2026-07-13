@@ -1,8 +1,8 @@
 use crate::utils::ChainError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
+use positive::Positive;
 
 /// A trait that defines the interface for interacting with a repository of historical financial data.
 /// Provides methods to fetch historical prices, get a list of available symbols, and determine the
@@ -96,9 +96,9 @@ mod tests {
     use crate::utils::ChainError;
     use async_trait::async_trait;
     use chrono::{DateTime, TimeZone, Utc};
-    use optionstratlib::Positive;
-    use optionstratlib::pos;
     use optionstratlib::utils::TimeFrame;
+    use positive::Positive;
+    use positive::pos_or_panic;
     use std::collections::HashMap;
     use std::sync::RwLock;
 
@@ -214,11 +214,11 @@ mod tests {
 
         // Add AAPL data
         let aapl_prices = vec![
-            pos!(150.0),
-            pos!(151.2),
-            pos!(149.8),
-            pos!(152.5),
-            pos!(153.1),
+            pos_or_panic!(150.0),
+            pos_or_panic!(151.2),
+            pos_or_panic!(149.8),
+            pos_or_panic!(152.5),
+            pos_or_panic!(153.1),
         ];
         let aapl_start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
         let aapl_end = Utc.with_ymd_and_hms(2023, 1, 5, 0, 0, 0).unwrap();
@@ -226,11 +226,11 @@ mod tests {
 
         // Add MSFT data
         let msft_prices = vec![
-            pos!(250.0),
-            pos!(252.3),
-            pos!(251.8),
-            pos!(253.5),
-            pos!(254.2),
+            pos_or_panic!(250.0),
+            pos_or_panic!(252.3),
+            pos_or_panic!(251.8),
+            pos_or_panic!(253.5),
+            pos_or_panic!(254.2),
         ];
         let msft_start = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
         let msft_end = Utc.with_ymd_and_hms(2023, 1, 5, 0, 0, 0).unwrap();
@@ -254,9 +254,9 @@ mod tests {
         assert!(result.is_ok(), "Expected successful result");
         let prices = result.unwrap();
         assert_eq!(prices.len(), 3, "Expected 3 price points");
-        assert_eq!(prices[0], pos!(150.0));
-        assert_eq!(prices[1], pos!(151.2));
-        assert_eq!(prices[2], pos!(149.8));
+        assert_eq!(prices[0], pos_or_panic!(150.0));
+        assert_eq!(prices[1], pos_or_panic!(151.2));
+        assert_eq!(prices[2], pos_or_panic!(149.8));
     }
 
     #[tokio::test]

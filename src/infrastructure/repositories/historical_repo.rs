@@ -3,8 +3,8 @@ use crate::infrastructure::clickhouse::{ClickHouseClient, HistoricalDataReposito
 use crate::utils::ChainError;
 use async_trait::async_trait;
 use chrono::Utc;
-use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
+use positive::Positive;
 use std::sync::Arc;
 
 /// Represents a repository for accessing historical data stored in a ClickHouse database.
@@ -221,7 +221,7 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
     use optionstratlib::utils::TimeFrame;
-    use optionstratlib::{Positive, pos};
+    use positive::{Positive, pos_or_panic};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -335,7 +335,11 @@ mod tests {
         let symbol = "AAPL";
         let timeframe = TimeFrame::Day;
 
-        let expected_prices = vec![pos!(150.25), pos!(152.50), pos!(151.75)];
+        let expected_prices = vec![
+            pos_or_panic!(150.25),
+            pos_or_panic!(152.50),
+            pos_or_panic!(151.75),
+        ];
 
         let test_client = TestClickHouseClient::new().with_prices(expected_prices.clone());
 
@@ -349,7 +353,7 @@ mod tests {
         let prices = result.unwrap();
         assert_eq!(prices, expected_prices);
         assert_eq!(prices.len(), 3);
-        assert_eq!(prices[0], pos!(150.25));
+        assert_eq!(prices[0], pos_or_panic!(150.25));
     }
 
     #[test]

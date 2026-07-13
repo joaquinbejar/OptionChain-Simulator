@@ -1,6 +1,6 @@
-use optionstratlib::pos;
 use optionstratlib::simulation::WalkType;
 use optionstratlib::utils::TimeFrame;
+use positive::pos_or_panic;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -96,7 +96,7 @@ impl From<ApiTimeFrame> for TimeFrame {
             ApiTimeFrame::Month => TimeFrame::Month,
             ApiTimeFrame::Quarter => TimeFrame::Quarter,
             ApiTimeFrame::Year => TimeFrame::Year,
-            ApiTimeFrame::Custom(value) => TimeFrame::Custom(pos!(value)),
+            ApiTimeFrame::Custom(value) => TimeFrame::Custom(pos_or_panic!(value)),
         }
     }
 }
@@ -395,18 +395,18 @@ impl From<ApiWalkType> for WalkType {
                 drift,
                 volatility,
             } => WalkType::Brownian {
-                dt: pos!(dt),
+                dt: pos_or_panic!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos!(volatility),
+                volatility: pos_or_panic!(volatility),
             },
             ApiWalkType::GeometricBrownian {
                 dt,
                 drift,
                 volatility,
             } => WalkType::GeometricBrownian {
-                dt: pos!(dt),
+                dt: pos_or_panic!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos!(volatility),
+                volatility: pos_or_panic!(volatility),
             },
             ApiWalkType::LogReturns {
                 dt,
@@ -414,9 +414,9 @@ impl From<ApiWalkType> for WalkType {
                 volatility,
                 autocorrelation,
             } => WalkType::LogReturns {
-                dt: pos!(dt),
+                dt: pos_or_panic!(dt),
                 expected_return: Decimal::try_from(expected_return).unwrap_or_default(),
-                volatility: pos!(volatility),
+                volatility: pos_or_panic!(volatility),
                 autocorrelation: autocorrelation
                     .map(|ac| Decimal::try_from(ac).unwrap_or_default()),
             },
@@ -426,10 +426,10 @@ impl From<ApiWalkType> for WalkType {
                 speed,
                 mean,
             } => WalkType::MeanReverting {
-                dt: pos!(dt),
-                volatility: pos!(volatility),
-                speed: pos!(speed),
-                mean: pos!(mean),
+                dt: pos_or_panic!(dt),
+                volatility: pos_or_panic!(volatility),
+                speed: pos_or_panic!(speed),
+                mean: pos_or_panic!(mean),
             },
             ApiWalkType::JumpDiffusion {
                 dt,
@@ -439,12 +439,12 @@ impl From<ApiWalkType> for WalkType {
                 jump_mean,
                 jump_volatility,
             } => WalkType::JumpDiffusion {
-                dt: pos!(dt),
+                dt: pos_or_panic!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos!(volatility),
-                intensity: pos!(intensity),
+                volatility: pos_or_panic!(volatility),
+                intensity: pos_or_panic!(intensity),
                 jump_mean: Decimal::try_from(jump_mean).unwrap_or_default(),
-                jump_volatility: pos!(jump_volatility),
+                jump_volatility: pos_or_panic!(jump_volatility),
             },
             ApiWalkType::Garch {
                 dt,
@@ -453,11 +453,11 @@ impl From<ApiWalkType> for WalkType {
                 alpha,
                 beta,
             } => WalkType::Garch {
-                dt: pos!(dt),
+                dt: pos_or_panic!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos!(volatility),
-                alpha: pos!(alpha),
-                beta: pos!(beta),
+                volatility: pos_or_panic!(volatility),
+                alpha: pos_or_panic!(alpha),
+                beta: pos_or_panic!(beta),
             },
             ApiWalkType::Heston {
                 dt,
@@ -468,12 +468,12 @@ impl From<ApiWalkType> for WalkType {
                 xi,
                 rho,
             } => WalkType::Heston {
-                dt: pos!(dt),
+                dt: pos_or_panic!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos!(volatility),
-                kappa: pos!(kappa),
-                theta: pos!(theta),
-                xi: pos!(xi),
+                volatility: pos_or_panic!(volatility),
+                kappa: pos_or_panic!(kappa),
+                theta: pos_or_panic!(theta),
+                xi: pos_or_panic!(xi),
                 rho: Decimal::try_from(rho).unwrap_or_default(),
             },
             ApiWalkType::Custom {
@@ -484,12 +484,12 @@ impl From<ApiWalkType> for WalkType {
                 vol_speed,
                 vol_mean,
             } => WalkType::Custom {
-                dt: pos!(dt),
+                dt: pos_or_panic!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos!(volatility),
-                vov: pos!(vov),
-                vol_speed: pos!(vol_speed),
-                vol_mean: pos!(vol_mean),
+                volatility: pos_or_panic!(volatility),
+                vov: pos_or_panic!(vov),
+                vol_speed: pos_or_panic!(vol_speed),
+                vol_mean: pos_or_panic!(vol_mean),
             },
             ApiWalkType::Telegraph {
                 dt,
@@ -500,13 +500,13 @@ impl From<ApiWalkType> for WalkType {
                 vol_multiplier_up,
                 vol_multiplier_down,
             } => WalkType::Telegraph {
-                dt: pos!(dt),
+                dt: pos_or_panic!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos!(volatility),
-                lambda_up: pos!(lambda_up),
-                lambda_down: pos!(lambda_down),
-                vol_multiplier_up: vol_multiplier_up.map(|v| pos!(v)),
-                vol_multiplier_down: vol_multiplier_down.map(|v| pos!(v)),
+                volatility: pos_or_panic!(volatility),
+                lambda_up: pos_or_panic!(lambda_up),
+                lambda_down: pos_or_panic!(lambda_down),
+                vol_multiplier_up: vol_multiplier_up.map(|v| pos_or_panic!(v)),
+                vol_multiplier_down: vol_multiplier_down.map(|v| pos_or_panic!(v)),
             },
             ApiWalkType::Historical {
                 timeframe,
@@ -514,7 +514,7 @@ impl From<ApiWalkType> for WalkType {
                 symbol,
             } => WalkType::Historical {
                 timeframe: timeframe.into(),
-                prices: prices.into_iter().map(|p| pos!(p)).collect(),
+                prices: prices.into_iter().map(|p| pos_or_panic!(p)).collect(),
                 symbol,
             },
         }
@@ -562,7 +562,10 @@ mod api_timeframe_tests {
             (TimeFrame::Month, ApiTimeFrame::Month),
             (TimeFrame::Quarter, ApiTimeFrame::Quarter),
             (TimeFrame::Year, ApiTimeFrame::Year),
-            (TimeFrame::Custom(pos!(2.0)), ApiTimeFrame::Custom(2.0)),
+            (
+                TimeFrame::Custom(pos_or_panic!(2.0)),
+                ApiTimeFrame::Custom(2.0),
+            ),
         ];
 
         for (input, expected) in test_cases {
@@ -585,7 +588,10 @@ mod api_timeframe_tests {
             (ApiTimeFrame::Month, TimeFrame::Month),
             (ApiTimeFrame::Quarter, TimeFrame::Quarter),
             (ApiTimeFrame::Year, TimeFrame::Year),
-            (ApiTimeFrame::Custom(2.0), TimeFrame::Custom(pos!(2.0))),
+            (
+                ApiTimeFrame::Custom(2.0),
+                TimeFrame::Custom(pos_or_panic!(2.0)),
+            ),
         ];
 
         for (input, expected) in test_cases {
@@ -622,38 +628,42 @@ mod api_walktype_tests {
     fn create_test_walk_types() -> Vec<WalkType> {
         vec![
             WalkType::Brownian {
-                dt: pos!(0.004),
+                dt: pos_or_panic!(0.004),
                 drift: dec!(0.05),
-                volatility: pos!(0.25),
+                volatility: pos_or_panic!(0.25),
             },
             WalkType::GeometricBrownian {
-                dt: pos!(0.004),
+                dt: pos_or_panic!(0.004),
                 drift: dec!(0.05),
-                volatility: pos!(0.25),
+                volatility: pos_or_panic!(0.25),
             },
             WalkType::LogReturns {
-                dt: pos!(0.004),
+                dt: pos_or_panic!(0.004),
                 expected_return: dec!(0.02),
-                volatility: pos!(0.25),
+                volatility: pos_or_panic!(0.25),
                 autocorrelation: Some(dec!(0.1)),
             },
             WalkType::MeanReverting {
-                dt: pos!(0.004),
-                volatility: pos!(0.25),
-                speed: pos!(0.5),
-                mean: pos!(100.0),
+                dt: pos_or_panic!(0.004),
+                volatility: pos_or_panic!(0.25),
+                speed: pos_or_panic!(0.5),
+                mean: pos_or_panic!(100.0),
             },
             WalkType::JumpDiffusion {
-                dt: pos!(0.004),
+                dt: pos_or_panic!(0.004),
                 drift: dec!(0.05),
-                volatility: pos!(0.25),
-                intensity: pos!(0.1),
+                volatility: pos_or_panic!(0.25),
+                intensity: pos_or_panic!(0.1),
                 jump_mean: dec!(0.02),
-                jump_volatility: pos!(0.15),
+                jump_volatility: pos_or_panic!(0.15),
             },
             WalkType::Historical {
                 timeframe: TimeFrame::Day,
-                prices: vec![pos!(100.0), pos!(101.0), pos!(102.0)],
+                prices: vec![
+                    pos_or_panic!(100.0),
+                    pos_or_panic!(101.0),
+                    pos_or_panic!(102.0),
+                ],
                 symbol: Some("AAPL".to_string()),
             },
         ]
@@ -703,14 +713,14 @@ mod api_walktype_tests {
         // Test conversion of walk types with extreme/default values
         let edge_cases = vec![
             WalkType::Brownian {
-                dt: pos!(0.001),
+                dt: pos_or_panic!(0.001),
                 drift: dec!(0.0),
-                volatility: pos!(0.0),
+                volatility: pos_or_panic!(0.0),
             },
             WalkType::LogReturns {
-                dt: pos!(1.0 / 252.0), // Trading day fraction
+                dt: pos_or_panic!(1.0 / 252.0), // Trading day fraction
                 expected_return: dec!(0.0),
-                volatility: pos!(0.5),
+                volatility: pos_or_panic!(0.5),
                 autocorrelation: None,
             },
         ];

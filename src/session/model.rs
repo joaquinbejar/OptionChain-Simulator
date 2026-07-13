@@ -3,8 +3,8 @@ use crate::session::manager::DEFAULT_NAMESPACE;
 use crate::utils::{ChainError, UuidGenerator};
 pub use optionstratlib::simulation::WalkType as SimulationMethod;
 use optionstratlib::utils::TimeFrame;
-use optionstratlib::{Positive, pos};
-use rand::Rng;
+use positive::{Positive, pos_or_panic};
+use rand::RngExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -150,22 +150,22 @@ impl From<CreateSessionRequest> for SimulationParameters {
         Self {
             symbol: req.symbol,
             steps: req.steps,
-            initial_price: pos!(req.initial_price),
-            days_to_expiration: pos!(req.days_to_expiration),
-            volatility: pos!(req.volatility),
+            initial_price: pos_or_panic!(req.initial_price),
+            days_to_expiration: pos_or_panic!(req.days_to_expiration),
+            volatility: pos_or_panic!(req.volatility),
             risk_free_rate: Decimal::try_from(req.risk_free_rate).unwrap_or_default(),
-            dividend_yield: pos!(req.dividend_yield),
+            dividend_yield: pos_or_panic!(req.dividend_yield),
             method: req.method.into(),
             time_frame: req.time_frame.into(),
             chain_size: req.chain_size,
-            strike_interval: req.strike_interval.map(|v| pos!(v)),
+            strike_interval: req.strike_interval.map(|v| pos_or_panic!(v)),
             skew_slope: req
                 .skew_slope
                 .map(|v| Decimal::try_from(v).unwrap_or_default()),
             smile_curve: req
                 .smile_curve
                 .map(|v| Decimal::try_from(v).unwrap_or_default()),
-            spread: req.spread.map(|v| pos!(v)),
+            spread: req.spread.map(|v| pos_or_panic!(v)),
             // When the client does not provide a seed, generate one so the
             // session is still reproducible and the effective seed can be
             // reported back in the session response.
@@ -381,22 +381,22 @@ impl Default for Session {
         let default_params = SimulationParameters {
             symbol: "AAPL".to_string(),
             steps: 20,
-            initial_price: pos!(100.0),
-            days_to_expiration: pos!(30.0),
-            volatility: pos!(0.2),
+            initial_price: pos_or_panic!(100.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.2),
             risk_free_rate: Decimal::new(3, 2),
             dividend_yield: Positive::ZERO,
             method: SimulationMethod::GeometricBrownian {
-                dt: pos!(1.0 / 252.0),
+                dt: pos_or_panic!(1.0 / 252.0),
                 drift: Decimal::ZERO,
-                volatility: pos!(0.2),
+                volatility: pos_or_panic!(0.2),
             },
             time_frame: TimeFrame::Day,
             chain_size: Some(30),
-            strike_interval: Some(pos!(5.0)),
+            strike_interval: Some(pos_or_panic!(5.0)),
             skew_slope: Some(dec!(-0.2)),
             smile_curve: Some(dec!(0.4)),
-            spread: Some(pos!(0.02)),
+            spread: Some(pos_or_panic!(0.02)),
             seed: None,
         };
 
@@ -494,7 +494,7 @@ mod tests_seed_conversion {
 mod tests_simulation_parameters_serialization {
     use super::*;
     use crate::session::SimulationParameters;
-    use optionstratlib::pos;
+    use positive::pos_or_panic;
     use rust_decimal_macros::dec;
     use serde_json::{Value, from_str, to_string};
 
@@ -504,22 +504,22 @@ mod tests_simulation_parameters_serialization {
         let params = SimulationParameters {
             symbol: "AAPL".to_string(),
             steps: 30,
-            initial_price: pos!(150.75),
-            days_to_expiration: pos!(45.0),
-            volatility: pos!(0.25),
+            initial_price: pos_or_panic!(150.75),
+            days_to_expiration: pos_or_panic!(45.0),
+            volatility: pos_or_panic!(0.25),
             risk_free_rate: dec!(0.04),
-            dividend_yield: pos!(0.015),
+            dividend_yield: pos_or_panic!(0.015),
             method: SimulationMethod::GeometricBrownian {
-                dt: pos!(0.0027),
+                dt: pos_or_panic!(0.0027),
                 drift: dec!(0.05),
-                volatility: pos!(0.25),
+                volatility: pos_or_panic!(0.25),
             },
             time_frame: TimeFrame::Day,
             chain_size: Some(15),
-            strike_interval: Some(pos!(5.0)),
+            strike_interval: Some(pos_or_panic!(5.0)),
             skew_slope: Some(dec!(-0.2)),
             smile_curve: Some(dec!(0.5)),
-            spread: Some(pos!(0.02)),
+            spread: Some(pos_or_panic!(0.02)),
             seed: None,
         };
 
@@ -559,7 +559,7 @@ mod tests_simulation_parameters_serialization {
 
         // Check a few key fields to verify successful deserialization
         assert_eq!(deserialized.symbol, "AAPL");
-        assert_eq!(deserialized.initial_price, pos!(150.75));
+        assert_eq!(deserialized.initial_price, pos_or_panic!(150.75));
         assert_eq!(deserialized.chain_size, Some(15));
 
         // For method, we need to match the enum variant
@@ -569,9 +569,9 @@ mod tests_simulation_parameters_serialization {
                 drift,
                 volatility,
             } => {
-                assert_eq!(dt, pos!(0.0027));
+                assert_eq!(dt, pos_or_panic!(0.0027));
                 assert_eq!(drift, dec!(0.05));
-                assert_eq!(volatility, pos!(0.25));
+                assert_eq!(volatility, pos_or_panic!(0.25));
             }
             _ => panic!("Wrong simulation method variant deserialized"),
         }
@@ -583,15 +583,15 @@ mod tests_simulation_parameters_serialization {
         let params = SimulationParameters {
             symbol: "SPY".to_string(),
             steps: 20,
-            initial_price: pos!(420.50),
-            days_to_expiration: pos!(30.0),
-            volatility: pos!(0.18),
+            initial_price: pos_or_panic!(420.50),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.18),
             risk_free_rate: dec!(0.035),
-            dividend_yield: pos!(0.01),
+            dividend_yield: pos_or_panic!(0.01),
             method: SimulationMethod::Brownian {
-                dt: pos!(0.0027),
+                dt: pos_or_panic!(0.0027),
                 drift: dec!(0.0),
-                volatility: pos!(0.18),
+                volatility: pos_or_panic!(0.18),
             },
             time_frame: TimeFrame::Day,
             chain_size: None,
@@ -653,16 +653,16 @@ mod tests_simulation_parameters_serialization {
         // Verify fields
         assert_eq!(params.symbol, "TSLA");
         assert_eq!(params.steps, 50);
-        assert_eq!(params.initial_price, pos!(240.35));
-        assert_eq!(params.days_to_expiration, pos!(60.0));
-        assert_eq!(params.volatility, pos!(0.35));
+        assert_eq!(params.initial_price, pos_or_panic!(240.35));
+        assert_eq!(params.days_to_expiration, pos_or_panic!(60.0));
+        assert_eq!(params.volatility, pos_or_panic!(0.35));
         assert_eq!(params.risk_free_rate, dec!(0.045));
-        assert_eq!(params.dividend_yield, pos!(0.0));
+        assert_eq!(params.dividend_yield, pos_or_panic!(0.0));
         assert_eq!(params.time_frame, TimeFrame::Day);
         assert_eq!(params.chain_size, Some(20));
-        assert_eq!(params.strike_interval, Some(pos!(10.0)));
+        assert_eq!(params.strike_interval, Some(pos_or_panic!(10.0)));
         assert_eq!(params.smile_curve, Some(dec!(0.001)));
-        assert_eq!(params.spread, Some(pos!(0.025)));
+        assert_eq!(params.spread, Some(pos_or_panic!(0.025)));
 
         // Check method variant
         match params.method {
@@ -671,9 +671,9 @@ mod tests_simulation_parameters_serialization {
                 drift,
                 volatility,
             } => {
-                assert_eq!(dt, pos!(0.0027));
+                assert_eq!(dt, pos_or_panic!(0.0027));
                 assert_eq!(drift, dec!(0.02));
-                assert_eq!(volatility, pos!(0.35));
+                assert_eq!(volatility, pos_or_panic!(0.35));
             }
             _ => panic!("Wrong simulation method variant deserialized"),
         }
@@ -687,23 +687,23 @@ mod tests_simulation_parameters_serialization {
         let params_mr = SimulationParameters {
             symbol: "GLD".to_string(),
             steps: 40,
-            initial_price: pos!(1950.0),
-            days_to_expiration: pos!(90.0),
-            volatility: pos!(0.15),
+            initial_price: pos_or_panic!(1950.0),
+            days_to_expiration: pos_or_panic!(90.0),
+            volatility: pos_or_panic!(0.15),
             risk_free_rate: dec!(0.04),
-            dividend_yield: pos!(0.0),
+            dividend_yield: pos_or_panic!(0.0),
             method: SimulationMethod::MeanReverting {
-                dt: pos!(0.0027),
-                volatility: pos!(0.15),
-                speed: pos!(0.5),
-                mean: pos!(2000.0),
+                dt: pos_or_panic!(0.0027),
+                volatility: pos_or_panic!(0.15),
+                speed: pos_or_panic!(0.5),
+                mean: pos_or_panic!(2000.0),
             },
             time_frame: TimeFrame::Day,
             chain_size: Some(25),
-            strike_interval: Some(pos!(25.0)),
+            strike_interval: Some(pos_or_panic!(25.0)),
             skew_slope: None,
             smile_curve: None,
-            spread: Some(pos!(0.01)),
+            spread: Some(pos_or_panic!(0.01)),
             seed: None,
         };
 
@@ -717,10 +717,10 @@ mod tests_simulation_parameters_serialization {
                 speed,
                 mean,
             } => {
-                assert_eq!(dt, pos!(0.0027));
-                assert_eq!(volatility, pos!(0.15));
-                assert_eq!(speed, pos!(0.5));
-                assert_eq!(mean, pos!(2000.0));
+                assert_eq!(dt, pos_or_panic!(0.0027));
+                assert_eq!(volatility, pos_or_panic!(0.15));
+                assert_eq!(speed, pos_or_panic!(0.5));
+                assert_eq!(mean, pos_or_panic!(2000.0));
             }
             _ => panic!("Wrong simulation method variant deserialized"),
         }
@@ -729,19 +729,25 @@ mod tests_simulation_parameters_serialization {
         let params_hist = SimulationParameters {
             symbol: "OIL".to_string(),
             steps: 30,
-            initial_price: pos!(75.0),
-            days_to_expiration: pos!(30.0),
-            volatility: pos!(0.25),
+            initial_price: pos_or_panic!(75.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.25),
             risk_free_rate: dec!(0.035),
-            dividend_yield: pos!(0.0),
+            dividend_yield: pos_or_panic!(0.0),
             method: SimulationMethod::Historical {
                 timeframe: TimeFrame::Day,
-                prices: vec![pos!(75.0), pos!(76.2), pos!(74.8), pos!(77.5), pos!(78.1)],
+                prices: vec![
+                    pos_or_panic!(75.0),
+                    pos_or_panic!(76.2),
+                    pos_or_panic!(74.8),
+                    pos_or_panic!(77.5),
+                    pos_or_panic!(78.1),
+                ],
                 symbol: None,
             },
             time_frame: TimeFrame::Day,
             chain_size: Some(15),
-            strike_interval: Some(pos!(5.0)),
+            strike_interval: Some(pos_or_panic!(5.0)),
             skew_slope: None,
             smile_curve: None,
             spread: None,
@@ -757,8 +763,8 @@ mod tests_simulation_parameters_serialization {
             } => {
                 assert_eq!(timeframe, TimeFrame::Day);
                 assert_eq!(prices.len(), 5);
-                assert_eq!(prices[0], pos!(75.0));
-                assert_eq!(prices[4], pos!(78.1));
+                assert_eq!(prices[0], pos_or_panic!(75.0));
+                assert_eq!(prices[4], pos_or_panic!(78.1));
             }
             _ => panic!("Wrong simulation method variant deserialized"),
         }
@@ -779,15 +785,15 @@ mod tests_simulation_parameters_serialization {
             let params = SimulationParameters {
                 symbol: "TEST".to_string(),
                 steps: 10,
-                initial_price: pos!(100.0),
-                days_to_expiration: pos!(30.0),
-                volatility: pos!(0.2),
+                initial_price: pos_or_panic!(100.0),
+                days_to_expiration: pos_or_panic!(30.0),
+                volatility: pos_or_panic!(0.2),
                 risk_free_rate: dec!(0.03),
-                dividend_yield: pos!(0.01),
+                dividend_yield: pos_or_panic!(0.01),
                 method: SimulationMethod::GeometricBrownian {
-                    dt: pos!(0.0027),
+                    dt: pos_or_panic!(0.0027),
                     drift: dec!(0.0),
-                    volatility: pos!(0.2),
+                    volatility: pos_or_panic!(0.2),
                 },
                 time_frame: tf,
                 chain_size: None,
@@ -814,25 +820,25 @@ mod tests_simulation_parameters_serialization {
         let params = SimulationParameters {
             symbol: "INDEX".to_string(),
             steps: 25,
-            initial_price: pos!(1000.0),
-            days_to_expiration: pos!(30.0),
-            volatility: pos!(0.2),
+            initial_price: pos_or_panic!(1000.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.2),
             risk_free_rate: dec!(-0.01), // Negative rate
-            dividend_yield: pos!(0.02),
+            dividend_yield: pos_or_panic!(0.02),
             method: SimulationMethod::JumpDiffusion {
-                dt: pos!(0.0027),
+                dt: pos_or_panic!(0.0027),
                 drift: dec!(-0.02), // Negative drift
-                volatility: pos!(0.2),
-                intensity: pos!(2.0),
+                volatility: pos_or_panic!(0.2),
+                intensity: pos_or_panic!(2.0),
                 jump_mean: dec!(-0.05), // Negative jump mean
-                jump_volatility: pos!(0.1),
+                jump_volatility: pos_or_panic!(0.1),
             },
             time_frame: TimeFrame::Day,
             chain_size: Some(10),
-            strike_interval: Some(pos!(10.0)),
+            strike_interval: Some(pos_or_panic!(10.0)),
             skew_slope: Some(dec!(-0.2)),
             smile_curve: Some(dec!(-0.5)), // Negative skew
-            spread: Some(pos!(0.015)),
+            spread: Some(pos_or_panic!(0.015)),
             seed: None,
         };
 
@@ -936,7 +942,7 @@ mod tests_session_state {
 #[cfg(test)]
 mod tests_session {
     use super::*;
-    use optionstratlib::spos;
+    use positive::spos;
     use rust_decimal_macros::dec;
     use std::time::Duration;
     use uuid::Uuid;
@@ -946,15 +952,15 @@ mod tests_session {
         SimulationParameters {
             symbol: "TEST".to_string(),
             steps: 10,
-            initial_price: pos!(100.0),
-            days_to_expiration: pos!(30.0),
-            volatility: pos!(0.25),
-            risk_free_rate: Decimal::new(5, 2), // 0.05
-            dividend_yield: pos!(0.02),         // 0.02
+            initial_price: pos_or_panic!(100.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.25),
+            risk_free_rate: Decimal::new(5, 2),  // 0.05
+            dividend_yield: pos_or_panic!(0.02), // 0.02
             method: SimulationMethod::Brownian {
-                dt: pos!(0.0027),
+                dt: pos_or_panic!(0.0027),
                 drift: dec!(0.0),
-                volatility: pos!(0.25),
+                volatility: pos_or_panic!(0.25),
             },
             time_frame: TimeFrame::Day,
             chain_size: Some(10),

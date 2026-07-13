@@ -2,8 +2,8 @@ use chrono::{DateTime, Duration, Utc};
 use optionchain_simulator::infrastructure::{
     ClickHouseClient, ClickHouseConfig, ClickHouseHistoricalRepository, HistoricalDataRepository,
 };
-use optionstratlib::Positive;
 use optionstratlib::utils::{TimeFrame, setup_logger};
+use positive::Positive;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info};

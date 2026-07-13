@@ -1,6 +1,6 @@
 use optionstratlib::utils::time::convert_time_frame;
 use optionstratlib::utils::{TimeFrame, setup_logger};
-use optionstratlib::{Positive, pos, spos};
+use positive::{Positive, pos_or_panic, spos};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::sync::Arc;
@@ -69,15 +69,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Creates simulation parameters for testing
 fn create_simulation_parameters() -> SimulationParameters {
-    let volatility = pos!(0.2);
+    let volatility = pos_or_panic!(0.2);
     let time_frame = TimeFrame::Minute;
     let dt = convert_time_frame(Positive::ONE, &time_frame, &TimeFrame::Day);
     SimulationParameters {
         symbol: "CL".to_string(),
         steps: 30,
-        initial_price: pos!(1000.0),
-        days_to_expiration: pos!(30.0),
-        volatility: pos!(0.2),
+        initial_price: pos_or_panic!(1000.0),
+        days_to_expiration: pos_or_panic!(30.0),
+        volatility: pos_or_panic!(0.2),
         risk_free_rate: Decimal::ZERO,
         dividend_yield: Positive::ZERO,
         method: SimulationMethod::GeometricBrownian {
@@ -135,7 +135,7 @@ async fn run_session_lifecycle(
     let mut modified_params = create_simulation_parameters();
 
     // Increase volatility
-    let volatility = pos!(0.3); // Increased from 0.2 to 0.3
+    let volatility = pos_or_panic!(0.3); // Increased from 0.2 to 0.3
     let time_frame = TimeFrame::Minute;
     let dt = convert_time_frame(Positive::ONE, &time_frame, &TimeFrame::Day);
 

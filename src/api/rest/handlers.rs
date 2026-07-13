@@ -10,7 +10,7 @@ use crate::session::{SessionManager, SimulationParameters};
 use crate::utils::ChainError;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, Utc};
-use optionstratlib::pos;
+use positive::pos_or_panic;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::sync::Arc;
@@ -368,15 +368,15 @@ pub(crate) async fn update_session(
     }
 
     if let Some(initial_price) = json_req.initial_price {
-        updated_params.initial_price = pos!(initial_price);
+        updated_params.initial_price = pos_or_panic!(initial_price);
     }
 
     if let Some(days_to_expiration) = json_req.days_to_expiration {
-        updated_params.days_to_expiration = pos!(days_to_expiration);
+        updated_params.days_to_expiration = pos_or_panic!(days_to_expiration);
     }
 
     if let Some(volatility) = json_req.volatility {
-        updated_params.volatility = pos!(volatility);
+        updated_params.volatility = pos_or_panic!(volatility);
     }
 
     if let Some(risk_free_rate) = json_req.risk_free_rate {
@@ -384,7 +384,7 @@ pub(crate) async fn update_session(
     }
 
     if let Some(dividend_yield) = json_req.dividend_yield {
-        updated_params.dividend_yield = pos!(dividend_yield);
+        updated_params.dividend_yield = pos_or_panic!(dividend_yield);
     }
 
     if let Some(method) = &json_req.method {
@@ -400,7 +400,7 @@ pub(crate) async fn update_session(
     }
 
     if let Some(strike_interval) = json_req.strike_interval {
-        updated_params.strike_interval = Some(pos!(strike_interval));
+        updated_params.strike_interval = Some(pos_or_panic!(strike_interval));
     }
 
     if let Some(smile_curve) = json_req.smile_curve {
@@ -408,7 +408,7 @@ pub(crate) async fn update_session(
     }
 
     if let Some(spread) = json_req.spread {
-        updated_params.spread = Some(pos!(spread));
+        updated_params.spread = Some(pos_or_panic!(spread));
     }
 
     if let Some(seed) = json_req.seed {

@@ -12,37 +12,34 @@ keywords = ["finance", "options", "trading"]
 categories = ["finance", "data-structures"]
 
 [dependencies]
-# Pinned exactly: 0.7.x patch releases have added WalkType variants, which
-# breaks the exhaustive matches in api::rest::models
-optionstratlib = "=0.7.3"
-tracing = "0.1.41"
-rust_decimal = { version = "1.37.1", features = ["maths", "serde"] }
-rust_decimal_macros = "1.37.1"
-serde_json = "1.0.140"
-serde = "1.0.219"
-uuid = { version = "1.16.0", features = ["v4", "v5", "serde"] }
-chrono = { version = "0.4.41", features = ["serde"] }
-clickhouse = "0.13.2"
-tokio = { version = "1.44.2", features = ["full"] }
-async-trait = "0.1.88"
-actix-web = { version = "4.10.2", features = ["rustls"] }
-actix-files = "0.6.6"
-redis = "0.32"
-utoipa = { version = "5.3.1", features = ["actix_extras"] }
-utoipa-swagger-ui = { version = "9.0.1", features = ["actix-web"] }
-rand = "0.9.1"
-rand_distr = "0.5"
-prometheus = "0.14.0"
-futures = "0.3.31"
-mongodb = "3.2.3"
-
+optionstratlib = { workspace = true }
+positive = { workspace = true }
+tracing = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+clickhouse = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+actix-web = { workspace = true }
+actix-files = { workspace = true }
+redis = { workspace = true }
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+prometheus = { workspace = true }
+futures = { workspace = true }
+mongodb = { workspace = true }
 
 [dev-dependencies]
-mockall = "0.13.1" 
-tempfile = "3.19.1"
-once_cell = "1.21.3"
-tokio = { version = "1.44.2", features = ["full", "test-util"] }
-
+mockall = { workspace = true }
+tempfile = { workspace = true }
+once_cell = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [workspace]
 members = [
@@ -51,5 +48,31 @@ members = [
 ]
 
 [workspace.dependencies]
-optionstratlib = "=0.7.3"
-tracing = "0.1.41"
+optionchain_simulator = { path = "." }
+optionstratlib = "0.18"
+positive = "0.5"
+tracing = "0.1"
+rust_decimal = { version = "1.42", features = ["maths", "serde"] }
+rust_decimal_macros = "1.40"
+serde_json = "1.0"
+serde = "1.0"
+uuid = { version = "1.23", features = ["v4", "v5", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clickhouse = "0.15"
+tokio = { version = "1.52", features = ["full"] }
+async-trait = "0.1"
+actix-web = { version = "4.14", features = ["rustls"] }
+actix-files = "0.6"
+redis = "1.3"
+# actix_extras is unavailable: optionstratlib enables utoipa/axum_extras,
+# and utoipa's framework extras are mutually exclusive
+utoipa = "5.5"
+utoipa-swagger-ui = { version = "9.0", features = ["actix-web"] }
+rand = "0.10"
+rand_distr = "0.6"
+prometheus = "0.14"
+futures = "0.3"
+mongodb = "3.8"
+mockall = "0.15"
+tempfile = "3.27"
+once_cell = "1.21"

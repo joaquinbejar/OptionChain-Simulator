@@ -7,19 +7,19 @@ use crate::session::{Session, SessionState, SimulationMethod};
 use crate::utils::ChainError;
 use optionstratlib::utils::{Len, TimeFrame};
 use optionstratlib::{
-    ExpirationDate, Positive,
+    ExpirationDate,
     chains::{
         OptionChainBuildParams, chain::OptionChain, generator_optionchain,
         utils::OptionDataPriceParams,
     },
-    pos,
     simulation::{
         WalkParams,
         randomwalk::RandomWalk,
         steps::{Step, Xstep, Ystep},
     },
 };
-use rand::Rng;
+use positive::{Positive, pos_or_panic};
+use rand::RngExt;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -267,7 +267,7 @@ impl Simulator {
         let strike_interval = params.strike_interval;
         let skew_slope = params.skew_slope.unwrap_or(DEFAULT_SKEW_SLOPE);
         let smile_curve = params.smile_curve.unwrap_or(DEFAULT_SMILE_CURVE);
-        let spread = params.spread.unwrap_or(pos!(0.01));
+        let spread = params.spread.unwrap_or(pos_or_panic!(0.01));
 
         // Create option data price parameters
         let price_params = OptionDataPriceParams::new(
@@ -293,7 +293,8 @@ impl Simulator {
         );
 
         // Build the initial chain
-        let initial_chain = OptionChain::build_chain(&build_params);
+        let initial_chain = OptionChain::build_chain(&build_params)
+            .map_err(|e| ChainError::Internal(format!("Failed to build option chain: {}", e)))?;
 
         // Create walker for a random walk, seeded when the session requests
         // reproducibility so the same seed always yields the same walk
@@ -322,7 +323,8 @@ impl Simulator {
             format!("Session_{}", session.id),
             &walk_params,
             generator_optionchain,
-        );
+        )
+        .map_err(|e| ChainError::Internal(format!("Failed to create random walk: {}", e)))?;
 
         info!(
             session_id = %session.id,
@@ -364,7 +366,7 @@ mod tests {
     use mockall::predicate::*;
     use mockall::*;
     use optionstratlib::utils::TimeFrame;
-    use optionstratlib::{Positive, pos};
+    use positive::{Positive, pos_or_panic};
     use rust_decimal_macros::dec;
     use std::sync::Arc;
     use uuid::Uuid;
@@ -397,22 +399,22 @@ mod tests {
         let params = SimulationParameters {
             symbol: "TEST".to_string(),
             steps: 10,
-            initial_price: pos!(100.0),
-            days_to_expiration: pos!(30.0),
-            volatility: pos!(0.2),
+            initial_price: pos_or_panic!(100.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.2),
             risk_free_rate: dec!(0.0),
-            dividend_yield: pos!(0.0),
+            dividend_yield: pos_or_panic!(0.0),
             method: SimulationMethod::GeometricBrownian {
-                dt: pos!(0.004),
+                dt: pos_or_panic!(0.004),
                 drift: dec!(0.0),
-                volatility: pos!(0.2),
+                volatility: pos_or_panic!(0.2),
             },
             time_frame: TimeFrame::Day,
             chain_size: Some(10),
-            strike_interval: Some(pos!(5.0)),
+            strike_interval: Some(pos_or_panic!(5.0)),
             skew_slope: Some(dec!(-0.2)),
             smile_curve: Some(dec!(0.5)),
-            spread: Some(pos!(0.01)),
+            spread: Some(pos_or_panic!(0.01)),
             seed: None,
         };
 
@@ -488,7 +490,7 @@ mod tests {
     fn create_test_historical_data(count: usize) -> Vec<Positive> {
         let mut data = Vec::with_capacity(count);
         for i in 0..count {
-            data.push(pos!(100.0 + i as f64));
+            data.push(pos_or_panic!(100.0 + i as f64));
         }
         data
     }

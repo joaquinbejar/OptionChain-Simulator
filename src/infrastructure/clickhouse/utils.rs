@@ -1,7 +1,7 @@
 use crate::utils::ChainError;
 use chrono::{DateTime, Duration, Utc};
 use optionstratlib::utils::TimeFrame;
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 /// Calculates the required duration based on timeframe and steps
 pub fn calculate_required_duration(timeframe: &TimeFrame, steps: usize) -> Duration {

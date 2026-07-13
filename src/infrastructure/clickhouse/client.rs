@@ -3,8 +3,8 @@ use crate::infrastructure::clickhouse::model::{ClickHouseRow, OHLCVData, PriceTy
 use crate::utils::ChainError;
 use chrono::{DateTime, Utc};
 use clickhouse::Client;
-use optionstratlib::Positive;
 use optionstratlib::utils::TimeFrame;
+use positive::Positive;
 use rust_decimal::Decimal;
 use tracing::{debug, info, instrument};
 
@@ -382,7 +382,7 @@ impl ClickHouseClient {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use optionstratlib::{Positive, pos};
+    use positive::{Positive, pos_or_panic};
     use rust_decimal::Decimal;
 
     #[test]
@@ -560,19 +560,19 @@ mod tests {
             OHLCVData {
                 symbol: "AAPL".to_string(),
                 timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap(),
-                open: pos!(150.0),
-                high: pos!(155.0),
-                low: pos!(149.0),
-                close: pos!(153.0),
+                open: pos_or_panic!(150.0),
+                high: pos_or_panic!(155.0),
+                low: pos_or_panic!(149.0),
+                close: pos_or_panic!(153.0),
                 volume: 10000,
             },
             OHLCVData {
                 symbol: "AAPL".to_string(),
                 timestamp: Utc.with_ymd_and_hms(2023, 1, 1, 11, 0, 0).unwrap(),
-                open: pos!(153.0),
-                high: pos!(157.0),
-                low: pos!(152.0),
-                close: pos!(156.0),
+                open: pos_or_panic!(153.0),
+                high: pos_or_panic!(157.0),
+                low: pos_or_panic!(152.0),
+                close: pos_or_panic!(156.0),
                 volume: 15000,
             },
         ];
@@ -583,13 +583,24 @@ mod tests {
         let close_prices = extract_prices(&data, PriceType::Close);
         let typical_prices = extract_prices(&data, PriceType::Typical);
 
-        assert_eq!(open_prices, vec![pos!(150.0), pos!(153.0)]);
-        assert_eq!(high_prices, vec![pos!(155.0), pos!(157.0)]);
-        assert_eq!(low_prices, vec![pos!(149.0), pos!(152.0)]);
-        assert_eq!(close_prices, vec![pos!(153.0), pos!(156.0)]);
+        assert_eq!(
+            open_prices,
+            vec![pos_or_panic!(150.0), pos_or_panic!(153.0)]
+        );
+        assert_eq!(
+            high_prices,
+            vec![pos_or_panic!(155.0), pos_or_panic!(157.0)]
+        );
+        assert_eq!(low_prices, vec![pos_or_panic!(149.0), pos_or_panic!(152.0)]);
+        assert_eq!(
+            close_prices,
+            vec![pos_or_panic!(153.0), pos_or_panic!(156.0)]
+        );
 
-        let expected_typical_1 = (pos!(155.0) + pos!(149.0) + pos!(153.0)) / Decimal::from(3);
-        let expected_typical_2 = (pos!(157.0) + pos!(152.0) + pos!(156.0)) / Decimal::from(3);
+        let expected_typical_1 =
+            (pos_or_panic!(155.0) + pos_or_panic!(149.0) + pos_or_panic!(153.0)) / Decimal::from(3);
+        let expected_typical_2 =
+            (pos_or_panic!(157.0) + pos_or_panic!(152.0) + pos_or_panic!(156.0)) / Decimal::from(3);
 
         assert_eq!(typical_prices[0], expected_typical_1);
         assert_eq!(typical_prices[1], expected_typical_2);

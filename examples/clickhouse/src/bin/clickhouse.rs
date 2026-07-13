@@ -4,7 +4,7 @@ use optionchain_simulator::infrastructure::{
     PriceType,
 };
 use optionstratlib::utils::{TimeFrame, setup_logger};
-use optionstratlib::{Positive, pos};
+use positive::{Positive, pos_or_panic};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -143,7 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info!("High-Low Range: {}", range);
 
                         // Calculate percentage change from open to close
-                        let pct_change = ((sample.close - sample.open) / sample.open) * pos!(100.0);
+                        let pct_change =
+                            ((sample.close - sample.open) / sample.open) * pos_or_panic!(100.0);
                         info!("Percent Change: {}%", pct_change);
                     }
                 }

@@ -357,7 +357,8 @@ mod tests_create_session_request {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use optionstratlib::{Positive, chains::OptionChain, pos, simulation::WalkType};
+    use optionstratlib::{chains::OptionChain, simulation::WalkType};
+    use positive::{Positive, pos_or_panic};
     use rust_decimal::Decimal;
     use uuid::Uuid;
 
@@ -378,22 +379,22 @@ mod tests {
             let params = SimulationParameters {
                 symbol: "AAPL".to_string(),
                 steps: 10,
-                initial_price: pos!(100.0),
-                days_to_expiration: pos!(30.0),
-                volatility: pos!(0.2),
+                initial_price: pos_or_panic!(100.0),
+                days_to_expiration: pos_or_panic!(30.0),
+                volatility: pos_or_panic!(0.2),
                 risk_free_rate: Decimal::ZERO,
                 dividend_yield: Positive::ZERO,
                 method: WalkType::Brownian {
-                    dt: pos!(1.0 / 252.0),
+                    dt: pos_or_panic!(1.0 / 252.0),
                     drift: Decimal::ZERO,
-                    volatility: pos!(0.2),
+                    volatility: pos_or_panic!(0.2),
                 },
                 time_frame: TimeFrame::Day,
                 chain_size: Some(15),
-                strike_interval: Some(pos!(1.0)),
+                strike_interval: Some(pos_or_panic!(1.0)),
                 skew_slope: None,
                 smile_curve: None,
-                spread: Some(pos!(0.02)),
+                spread: Some(pos_or_panic!(0.02)),
                 seed: None,
             };
 
@@ -415,22 +416,22 @@ mod tests {
             let params = SimulationParameters {
                 symbol: "AAPL".to_string(),
                 steps: 5,
-                initial_price: pos!(100.0),
-                days_to_expiration: pos!(30.0),
-                volatility: pos!(0.2),
+                initial_price: pos_or_panic!(100.0),
+                days_to_expiration: pos_or_panic!(30.0),
+                volatility: pos_or_panic!(0.2),
                 risk_free_rate: Decimal::ZERO,
                 dividend_yield: Positive::ZERO,
                 method: WalkType::Brownian {
-                    dt: pos!(1.0 / 252.0),
+                    dt: pos_or_panic!(1.0 / 252.0),
                     drift: Decimal::ZERO,
-                    volatility: pos!(0.2),
+                    volatility: pos_or_panic!(0.2),
                 },
                 time_frame: TimeFrame::Day,
                 chain_size: Some(15),
-                strike_interval: Some(pos!(1.0)),
+                strike_interval: Some(pos_or_panic!(1.0)),
                 skew_slope: None,
                 smile_curve: None,
-                spread: Some(pos!(0.02)),
+                spread: Some(pos_or_panic!(0.02)),
                 seed: None,
             };
 
@@ -466,22 +467,22 @@ mod tests {
             let params = SimulationParameters {
                 symbol: "AAPL".to_string(),
                 steps: 10,
-                initial_price: pos!(100.0),
-                days_to_expiration: pos!(30.0),
-                volatility: pos!(0.2),
+                initial_price: pos_or_panic!(100.0),
+                days_to_expiration: pos_or_panic!(30.0),
+                volatility: pos_or_panic!(0.2),
                 risk_free_rate: Decimal::new(3, 2), // 3%
                 dividend_yield: Positive::ZERO,
                 method: WalkType::GeometricBrownian {
-                    dt: pos!(1.0 / 252.0),
+                    dt: pos_or_panic!(1.0 / 252.0),
                     drift: Decimal::new(5, 2), // 5%
-                    volatility: pos!(0.2),
+                    volatility: pos_or_panic!(0.2),
                 },
                 time_frame: TimeFrame::Day,
                 chain_size: Some(15),
-                strike_interval: Some(pos!(1.0)),
+                strike_interval: Some(pos_or_panic!(1.0)),
                 skew_slope: None,
                 smile_curve: None,
-                spread: Some(pos!(0.02)),
+                spread: Some(pos_or_panic!(0.02)),
                 seed: None,
             };
 
@@ -501,25 +502,26 @@ mod tests {
     // Option Chain Generation Tests
     mod option_chain_tests {
         use super::*;
+        use optionstratlib::ExpirationDate;
         use optionstratlib::chains::OptionChainBuildParams;
         use optionstratlib::chains::utils::OptionDataPriceParams;
-        use optionstratlib::{ExpirationDate, spos};
+        use positive::spos;
         use rust_decimal_macros::dec;
 
         #[test]
         fn test_option_chain_generation() {
-            let initial_price = pos!(100.0);
-            let expiration = ExpirationDate::Days(pos!(30.0));
+            let initial_price = pos_or_panic!(100.0);
+            let expiration = ExpirationDate::Days(pos_or_panic!(30.0));
 
             let chain_params = OptionChainBuildParams::new(
                 "AAPL".to_string(),
-                Some(pos!(1000.0)), // Volume
-                15,                 // Chain size
-                spos!(1.0),         // Strike interval
-                dec!(-0.2),         // Skew slope
-                Decimal::new(5, 1), // Skew curve
-                pos!(0.02),         // Spread
-                2,                  // Decimal places
+                Some(pos_or_panic!(1000.0)), // Volume
+                15,                          // Chain size
+                spos!(1.0),                  // Strike interval
+                dec!(-0.2),                  // Skew slope
+                Decimal::new(5, 1),          // Skew curve
+                pos_or_panic!(0.02),         // Spread
+                2,                           // Decimal places
                 OptionDataPriceParams::new(
                     Some(Box::new(initial_price)),
                     Some(expiration),
@@ -527,10 +529,11 @@ mod tests {
                     Some(Positive::ZERO), // Dividend yield
                     Some("AAPL".to_string()),
                 ),
-                pos!(0.2), // Implied volatility
+                pos_or_panic!(0.2), // Implied volatility
             );
 
-            let option_chain = OptionChain::build_chain(&chain_params);
+            let option_chain =
+                OptionChain::build_chain(&chain_params).expect("Failed to build option chain");
 
             assert_eq!(option_chain.symbol, "AAPL");
             assert_eq!(option_chain.underlying_price, initial_price);
@@ -561,9 +564,9 @@ mod tests {
         #[test]
         fn test_invalid_simulation_parameters() {
             let invalid_params = SimulationParameters {
-                symbol: "".to_string(),   // Invalid: empty symbol
-                steps: 0,                 // Invalid: zero steps
-                initial_price: pos!(0.0), // Invalid: zero initial price
+                symbol: "".to_string(),            // Invalid: empty symbol
+                steps: 0,                          // Invalid: zero steps
+                initial_price: pos_or_panic!(0.0), // Invalid: zero initial price
                 days_to_expiration: Default::default(),
                 volatility: Default::default(),
                 risk_free_rate: Default::default(),
