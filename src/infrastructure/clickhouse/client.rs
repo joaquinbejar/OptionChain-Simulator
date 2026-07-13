@@ -1,8 +1,10 @@
 use crate::infrastructure::ClickHouseConfig;
 use crate::infrastructure::clickhouse::model::{ClickHouseRow, OHLCVData, PriceType};
+use crate::infrastructure::clickhouse::validate_symbol;
 use crate::utils::ChainError;
 use chrono::{DateTime, Utc};
 use clickhouse::Client;
+use clickhouse::query::Query;
 use optionstratlib::utils::TimeFrame;
 use positive::Positive;
 use rust_decimal::Decimal;
@@ -98,6 +100,73 @@ impl Default for ClickHouseClient {
     }
 }
 
+/// Builds the SQL text for a timeframe query using `?` placeholders for the
+/// user-controlled values (symbol, start timestamp and limit, in that order).
+///
+/// The interval literals (`INTERVAL 1 HOUR`, etc.) are derived from the internal
+/// `TimeFrame` match and are never user input, so they stay inline. No external
+/// value is ever interpolated into the returned string; callers must bind the
+/// three parameters before executing.
+///
+/// # Errors
+///
+/// Returns [`ChainError::ClickHouseError`] when the timeframe is not supported.
+fn timeframe_query_template(timeframe: &TimeFrame) -> Result<String, ChainError> {
+    // Base query for minute data (smallest timeframe supported)
+    if *timeframe == TimeFrame::Minute {
+        return Ok(
+            "SELECT symbol, toInt64(toUnixTimestamp(timestamp)) as timestamp, \
+            open, high, low, close, toUInt64(volume) as volume \
+            FROM ohlcv \
+            WHERE symbol = ? \
+            AND timestamp >= FROM_UNIXTIME(?) \
+            ORDER BY timestamp LIMIT ?"
+                .to_string(),
+        );
+    }
+
+    // For larger timeframes, we need to aggregate the minute data. The interval
+    // literal comes exclusively from this internal match, never from user input.
+    let interval = match timeframe {
+        TimeFrame::Minute => "1 MINUTE", // Already handled above, but included for completeness
+        TimeFrame::Hour => "1 HOUR",
+        TimeFrame::Day => "1 DAY",
+        TimeFrame::Week => "1 WEEK",
+        TimeFrame::Month => "1 MONTH",
+        _ => {
+            return Err(ChainError::ClickHouseError(format!(
+                "Unsupported timeframe: {:?}",
+                timeframe
+            )));
+        }
+    };
+
+    // Query with aggregation for larger timeframes
+    Ok(format!(
+        "WITH intervals AS (
+            SELECT
+                symbol,
+                toStartOfInterval(timestamp, INTERVAL {}) as interval_start,
+                any(open) as open,
+                max(high) as high,
+                min(low) as low,
+                any(close) as close,
+                sum(volume) as volume
+            FROM ohlcv
+            WHERE symbol = ? \
+            AND timestamp >= FROM_UNIXTIME(?) \
+            GROUP BY symbol, interval_start
+            ORDER BY interval_start
+        )
+        SELECT
+            symbol,
+            toInt64(toUnixTimestamp(interval_start)) as timestamp,
+            open, high, low, close, volume
+        FROM intervals LIMIT ?",
+        interval
+    ))
+}
+
 impl ClickHouseClient {
     /// Creates a new ClickHouse client with the provided configuration
     #[instrument(name = "clickhouse_client_new", skip(config), level = "debug")]
@@ -125,12 +194,16 @@ impl ClickHouseClient {
         start_date: &DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<Positive>, ChainError> {
+        validate_symbol(symbol)?;
+
         debug!(
-            "Fetching historical {} prices for {} from {} with timeframe {:?}",
-            limit, symbol, start_date, timeframe
+            symbol = %symbol,
+            limit,
+            ?timeframe,
+            "fetching historical prices"
         );
 
-        // Build the SQL query based on the timeframe
+        // Build the parameterized SQL query based on the timeframe and bind values
         let query = self.build_timeframe_query(symbol, timeframe, start_date, limit)?;
 
         // Execute the query
@@ -153,12 +226,16 @@ impl ClickHouseClient {
         start_date: &DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<OHLCVData>, ChainError> {
+        validate_symbol(symbol)?;
+
         debug!(
-            "Fetching {} OHLCV data for {} from {} with timeframe {:?}",
-            limit, symbol, start_date, timeframe
+            symbol = %symbol,
+            limit,
+            ?timeframe,
+            "fetching OHLCV data"
         );
 
-        // Build the SQL query based on the timeframe
+        // Build the parameterized SQL query based on the timeframe and bind values
         let query = self.build_timeframe_query(symbol, timeframe, start_date, limit)?;
 
         // Execute the query directly
@@ -182,8 +259,11 @@ impl ClickHouseClient {
     /// - `end_date`: A reference to a `DateTime<Utc>` indicating the end of the time range for the query.
     ///
     /// ### Returns
-    /// - On success: A `Result<String, ChainError>` containing the SQL query as a string.
-    /// - On error: A `ChainError::ClickHouseError` if the provided timeframe is unsupported.
+    /// - On success: A `Result<clickhouse::query::Query, ChainError>` holding a
+    ///   prepared query whose SQL uses `?` placeholders with the symbol, start
+    ///   timestamp and limit already bound as escaped parameters.
+    /// - On error: A `ChainError::ClickHouseError` if the symbol is invalid or the
+    ///   provided timeframe is unsupported.
     ///
     /// ### Behavior
     /// 1. If the timeframe is `TimeFrame::Minute`, it directly constructs a query to retrieve minute-level data
@@ -213,64 +293,28 @@ impl ClickHouseClient {
         timeframe: &TimeFrame,
         start_date: &DateTime<Utc>,
         limit: usize,
-    ) -> Result<String, ChainError> {
+    ) -> Result<Query, ChainError> {
+        // Defense in depth: reject anything outside the allowed symbol pattern
+        // before it ever reaches the driver.
+        validate_symbol(symbol)?;
+
+        // Build the SQL text with `?` placeholders (no user input interpolated).
+        let sql = timeframe_query_template(timeframe)?;
+
         // Convert date to Unix timestamp for the query
         let start_timestamp = start_date.timestamp();
 
-        // Base query for minute data (smallest timeframe supported)
-        if *timeframe == TimeFrame::Minute {
-            let query = format!(
-                "SELECT symbol, toInt64(toUnixTimestamp(timestamp)) as timestamp, 
-            open, high, low, close, toUInt64(volume) as volume \
-            FROM ohlcv \
-            WHERE symbol = '{}' \
-            AND timestamp >= FROM_UNIXTIME({}) \
-            ORDER BY timestamp LIMIT {}",
-                symbol, start_timestamp, limit
-            );
+        debug!(symbol = %symbol, sql = %sql, "running timeframe query");
 
-            return Ok(query);
-        }
-
-        // For larger timeframes, we need to aggregate the minute data
-        let interval = match timeframe {
-            TimeFrame::Minute => "1 MINUTE", // Already handled above, but included for completeness
-            TimeFrame::Hour => "1 HOUR",
-            TimeFrame::Day => "1 DAY",
-            TimeFrame::Week => "1 WEEK",
-            TimeFrame::Month => "1 MONTH",
-            _ => {
-                return Err(ChainError::ClickHouseError(format!(
-                    "Unsupported timeframe: {:?}",
-                    timeframe
-                )));
-            }
-        };
-
-        // Query with aggregation for larger timeframes
-        let query = format!(
-            "WITH intervals AS (
-            SELECT 
-                symbol,
-                toStartOfInterval(timestamp, INTERVAL {}) as interval_start,
-                any(open) as open,
-                max(high) as high,
-                min(low) as low,
-                any(close) as close,
-                sum(volume) as volume
-            FROM ohlcv
-            WHERE symbol = '{}' \
-            AND timestamp >= FROM_UNIXTIME({}) \
-            GROUP BY symbol, interval_start
-            ORDER BY interval_start
-        )
-        SELECT 
-            symbol,
-            toInt64(toUnixTimestamp(interval_start)) as timestamp,
-            open, high, low, close, volume
-        FROM intervals LIMIT {}",
-            interval, symbol, start_timestamp, limit
-        );
+        // Bind the user-controlled values as query parameters (escaped by the
+        // driver). Binding order must match the placeholder order in the SQL:
+        // symbol, start_timestamp, limit.
+        let query = self
+            .client
+            .query(&sql)
+            .bind(symbol)
+            .bind(start_timestamp)
+            .bind(limit as u64);
 
         Ok(query)
     }
@@ -280,7 +324,8 @@ impl ClickHouseClient {
     /// # Arguments
     ///
     /// * `&self` - Reference to the instance of the implementing struct.
-    /// * `query` - A `String` containing the ClickHouse query to execute.
+    /// * `query` - A prepared `clickhouse::query::Query` (with all parameters
+    ///   already bound) to execute.
     ///
     /// # Returns
     ///
@@ -317,10 +362,8 @@ impl ClickHouseClient {
     ///
     /// Ensure the query fetches all the required fields (`symbol`, `timestamp`, `open`, `high`, `low`, `close`, `volume`)
     /// to avoid `ChainError` during runtime.
-    async fn execute_query(&self, query: String) -> Result<Vec<OHLCVData>, ChainError> {
-        debug!("Executing ClickHouse query: {}", query);
-
-        let rows: Vec<ClickHouseRow> = self.client.query(&query).fetch_all().await?;
+    async fn execute_query(&self, query: Query) -> Result<Vec<OHLCVData>, ChainError> {
+        let rows: Vec<ClickHouseRow> = query.fetch_all().await?;
 
         let mut results = Vec::new();
 
@@ -386,155 +429,61 @@ mod tests {
     use rust_decimal::Decimal;
 
     #[test]
-    fn test_build_timeframe_query_minute() {
-        let _config = ClickHouseConfig {
+    fn test_timeframe_query_template_minute_uses_placeholders() {
+        let sql = timeframe_query_template(&TimeFrame::Minute).unwrap();
+
+        // The three user-controlled values are bound, never interpolated.
+        assert!(sql.contains("WHERE symbol = ?"));
+        assert!(sql.contains("FROM_UNIXTIME(?)"));
+        assert!(sql.contains("LIMIT ?"));
+        assert!(sql.contains("FROM ohlcv"));
+
+        // A malicious symbol can never appear in the SQL text because the SQL
+        // template does not carry the symbol at all.
+        assert!(!sql.contains("EVIL'--"));
+        assert!(!sql.contains('\''));
+    }
+
+    #[test]
+    fn test_timeframe_query_template_day_uses_placeholders() {
+        let sql = timeframe_query_template(&TimeFrame::Day).unwrap();
+
+        // The interval literal is internal and stays inline.
+        assert!(sql.contains("toStartOfInterval(timestamp, INTERVAL 1 DAY)"));
+        assert!(sql.contains("GROUP BY symbol, interval_start"));
+        assert!(sql.contains("max(high) as high"));
+        assert!(sql.contains("min(low) as low"));
+        assert!(sql.contains("sum(volume) as volume"));
+
+        // User-controlled values are bound as `?` placeholders.
+        assert!(sql.contains("WHERE symbol = ?"));
+        assert!(sql.contains("FROM_UNIXTIME(?)"));
+        assert!(sql.contains("LIMIT ?"));
+        assert!(!sql.contains("EVIL'--"));
+        assert!(!sql.contains('\''));
+    }
+
+    #[test]
+    fn test_timeframe_query_template_unsupported_timeframe() {
+        let result = timeframe_query_template(&TimeFrame::Year);
+        assert!(matches!(result, Err(ChainError::ClickHouseError(_))));
+    }
+
+    #[test]
+    fn test_build_timeframe_query_rejects_invalid_symbol() {
+        let client = ClickHouseClient::new(ClickHouseConfig {
             host: "test-host".to_string(),
             port: 8123,
             username: "test-user".to_string(),
             password: "test-pass".to_string(),
             database: "test-db".to_string(),
-        };
+        })
+        .unwrap();
 
-        fn build_timeframe_query(
-            symbol: &str,
-            timeframe: &TimeFrame,
-            start_date: &DateTime<Utc>,
-            end_date: &DateTime<Utc>,
-        ) -> Result<String, ChainError> {
-            let start_date_str = start_date.format("%Y-%m-%d %H:%M:%S").to_string();
-            let end_date_str = end_date.format("%Y-%m-%d %H:%M:%S").to_string();
-
-            if *timeframe == TimeFrame::Minute {
-                return Ok(format!(
-                    "SELECT symbol, timestamp, open, high, low, close, volume \
-                    FROM ohlcv \
-                    WHERE symbol = '{}' \
-                    AND timestamp BETWEEN '{}' AND '{}' \
-                    ORDER BY timestamp",
-                    symbol, start_date_str, end_date_str
-                ));
-            }
-
-            let interval = match timeframe {
-                TimeFrame::Minute => "1 MINUTE",
-                TimeFrame::Hour => "1 HOUR",
-                TimeFrame::Day => "1 DAY",
-                TimeFrame::Week => "1 WEEK",
-                TimeFrame::Month => "1 MONTH",
-                _ => {
-                    return Err(ChainError::ClickHouseError(format!(
-                        "Unsupported timeframe: {:?}",
-                        timeframe
-                    )));
-                }
-            };
-
-            Ok(format!(
-                "SELECT 
-                    symbol,
-                    toStartOfInterval(timestamp, INTERVAL {}) as timestamp,
-                    any(open) as open,
-                    max(high) as high,
-                    min(low) as low,
-                    any(arrayElement(
-                        groupArray(close), 
-                        length(groupArray(close))
-                    )) as close,
-                    sum(volume) as volume
-                FROM ohlcv
-                WHERE symbol = '{}' 
-                AND timestamp BETWEEN '{}' AND '{}'
-                GROUP BY symbol, timestamp
-                ORDER BY timestamp",
-                interval, symbol, start_date_str, end_date_str
-            ))
-        }
-
-        let symbol = "AAPL";
-        let timeframe = TimeFrame::Minute;
         let start_date = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-        let end_date = Utc.with_ymd_and_hms(2023, 1, 2, 0, 0, 0).unwrap();
+        let result = client.build_timeframe_query("EVIL'--", &TimeFrame::Minute, &start_date, 10);
 
-        let query = build_timeframe_query(symbol, &timeframe, &start_date, &end_date).unwrap();
-
-        assert!(query.contains("SELECT symbol, timestamp, open, high, low, close, volume"));
-        assert!(query.contains("FROM ohlcv"));
-        assert!(query.contains("WHERE symbol = 'AAPL'"));
-        assert!(
-            query.contains("AND timestamp BETWEEN '2023-01-01 00:00:00' AND '2023-01-02 00:00:00'")
-        );
-        assert!(query.contains("ORDER BY timestamp"));
-    }
-
-    #[test]
-    fn test_build_timeframe_query_day() {
-        fn build_timeframe_query(
-            symbol: &str,
-            timeframe: &TimeFrame,
-            start_date: &DateTime<Utc>,
-            end_date: &DateTime<Utc>,
-        ) -> Result<String, ChainError> {
-            let start_date_str = start_date.format("%Y-%m-%d %H:%M:%S").to_string();
-            let end_date_str = end_date.format("%Y-%m-%d %H:%M:%S").to_string();
-
-            if *timeframe == TimeFrame::Minute {
-                return Ok(format!(
-                    "SELECT symbol, timestamp, open, high, low, close, volume \
-                    FROM ohlcv \
-                    WHERE symbol = '{}' \
-                    AND timestamp BETWEEN '{}' AND '{}' \
-                    ORDER BY timestamp",
-                    symbol, start_date_str, end_date_str
-                ));
-            }
-
-            let interval = match timeframe {
-                TimeFrame::Minute => "1 MINUTE",
-                TimeFrame::Hour => "1 HOUR",
-                TimeFrame::Day => "1 DAY",
-                TimeFrame::Week => "1 WEEK",
-                TimeFrame::Month => "1 MONTH",
-                _ => {
-                    return Err(ChainError::ClickHouseError(format!(
-                        "Unsupported timeframe: {:?}",
-                        timeframe
-                    )));
-                }
-            };
-
-            Ok(format!(
-                "SELECT 
-                    symbol,
-                    toStartOfInterval(timestamp, INTERVAL {}) as timestamp,
-                    any(open) as open,
-                    max(high) as high,
-                    min(low) as low,
-                    any(arrayElement(
-                        groupArray(close), 
-                        length(groupArray(close))
-                    )) as close,
-                    sum(volume) as volume
-                FROM ohlcv
-                WHERE symbol = '{}' 
-                AND timestamp BETWEEN '{}' AND '{}'
-                GROUP BY symbol, timestamp
-                ORDER BY timestamp",
-                interval, symbol, start_date_str, end_date_str
-            ))
-        }
-
-        let symbol = "AAPL";
-        let timeframe = TimeFrame::Day;
-        let start_date = Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap();
-        let end_date = Utc.with_ymd_and_hms(2023, 1, 31, 0, 0, 0).unwrap();
-
-        let query = build_timeframe_query(symbol, &timeframe, &start_date, &end_date).unwrap();
-
-        assert!(query.contains("toStartOfInterval(timestamp, INTERVAL 1 DAY)"));
-        assert!(query.contains("GROUP BY symbol, timestamp"));
-        assert!(query.contains("max(high) as high"));
-        assert!(query.contains("min(low) as low"));
-        assert!(query.contains("sum(volume) as volume"));
+        assert!(matches!(result, Err(ChainError::ClickHouseError(_))));
     }
 
     #[test]

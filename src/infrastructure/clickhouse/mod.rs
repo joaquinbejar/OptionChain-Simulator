@@ -5,4 +5,4 @@ pub(crate) mod utils;
 
 pub use client::ClickHouseClient;
 pub use interface::HistoricalDataRepository;
-pub(crate) use utils::{calculate_required_duration, select_random_date};
+pub(crate) use utils::{calculate_required_duration, select_random_date, validate_symbol};
