@@ -145,6 +145,14 @@ impl SessionManager {
                 "session completed; no further steps".to_string(),
             ));
         }
+        // `Error` is the other terminal state: reject it BEFORE simulating so a
+        // dead session neither builds a walk nor serves a snapshot (matches the
+        // peek path and `advance_state`'s own terminal handling).
+        if session.state == SessionState::Error {
+            return Err(ChainError::InvalidState(
+                "Session is in error state".to_string(),
+            ));
+        }
 
         // Serve the snapshot at the current cursor. The simulator sees the pre-advance
         // state, so a `Reinitialized` session rebuilds its walk before serving.
@@ -222,7 +230,14 @@ impl SessionManager {
         Ok((session, chain))
     }
 
-    /// Updates an existing simulation session with new parameters.
+    /// Updates an existing simulation session with new parameters (PATCH).
+    ///
+    /// A parameter change restarts the session's tape: the new parameters may alter
+    /// the walk (steps, volatility, seed, ...), so the cursor is reset to 0 and the
+    /// session is marked `Reinitialized`. The next [`SessionManager::get_next_step`]
+    /// then rebuilds the walk from the new parameters and serves index 0. This is
+    /// implemented via [`Session::reinitialize`], which also syncs `total_steps` to
+    /// `params.steps` so a PATCH that changes the step count stays coherent.
     ///
     /// # Parameters
     ///
@@ -248,11 +263,9 @@ impl SessionManager {
     ) -> Result<Session, ChainError> {
         let mut session = self.store.get(id)?;
 
-        // Update parameters
-        session.modify_parameters(params);
-
-        // Reset progression
-        self.state_handler.reset_progression(&mut session)?;
+        // A parameter change restarts the tape: reset the cursor, sync total_steps,
+        // and mark the session Reinitialized so the next advance rebuilds the walk.
+        session.reinitialize(params);
 
         // Save updated session
         self.store.save(session.clone())?;
@@ -260,16 +273,20 @@ impl SessionManager {
         Ok(session)
     }
 
-    /// Reinitializes an existing simulation session with new parameters and resets its progression.
+    /// Reinitializes an existing simulation session with new parameters and resets its
+    /// progression (PUT).
     ///
-    /// This method retrieves a session by its UUID, updates its parameters and total steps,
-    /// resets its progression state, and saves the updated session in the session store.
+    /// This method retrieves a session by its UUID and applies
+    /// [`Session::reinitialize`], which replaces the parameters, syncs `total_steps`
+    /// to `params.steps`, resets `current_step` to 0, and marks the session
+    /// `Reinitialized`. The next [`SessionManager::get_next_step`] observes the
+    /// `Reinitialized` state, rebuilds the walk from the new parameters/seed, and
+    /// serves index 0.
     ///
     /// # Parameters
     ///
     /// - `id`: The unique identifier (`Uuid`) of the session to be reinitialized.
     /// - `params`: The new `SimulationParameters` to apply to the session.
-    /// - `total_steps`: The total number of steps for the simulation.
     ///
     /// # Returns
     ///
@@ -280,7 +297,6 @@ impl SessionManager {
     ///
     /// This function returns an error in the following scenarios:
     /// - If the session with the provided `id` cannot be found in the store.
-    /// - If there is a failure in resetting the session's progression.
     /// - If there is an issue saving the updated session to the store.
     ///
     pub fn reinitialize_session(
@@ -290,11 +306,8 @@ impl SessionManager {
     ) -> Result<Session, ChainError> {
         let mut session = self.store.get(id)?;
 
-        // Reinitialize session
+        // Reinitialize session: reset cursor, sync total_steps, mark Reinitialized.
         session.reinitialize(params);
-
-        // Reset progression
-        self.state_handler.reset_progression(&mut session)?;
 
         // Save updated session
         self.store.save(session.clone())?;
@@ -698,5 +711,193 @@ mod tests {
             }
             other => panic!("expected InvalidState for errored peek, got {other:?}"),
         }
+    }
+
+    /// Advance on an `Error`-state session must reject before simulating,
+    /// matching the peek path and never touching the store.
+    #[tokio::test]
+    async fn test_advance_on_error_session_returns_invalid_state() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let session = manager
+            .create_session(test_parameters())
+            .expect("failed to create session");
+        let id = session.id;
+
+        let mut errored = store.get(id).expect("session missing from store");
+        errored.state = SessionState::Error;
+        store
+            .save(errored)
+            .expect("failed to persist errored session");
+
+        match manager.get_next_step(id).await {
+            Err(ChainError::InvalidState(msg)) => {
+                assert_eq!(msg, "Session is in error state");
+            }
+            other => panic!("expected InvalidState for errored advance, got {other:?}"),
+        }
+        let stored = store.get(id).expect("session missing from store");
+        assert_eq!(stored.state, SessionState::Error);
+        assert_eq!(stored.current_step, 0);
+    }
+
+    /// Collects the full `steps`-long tape of a freshly created session by advancing it
+    /// to completion via `get_next_step`.
+    async fn collect_full_tape(
+        manager: &SessionManager,
+        params: SimulationParameters,
+    ) -> Vec<Positive> {
+        let steps = params.steps;
+        let session = manager
+            .create_session(params)
+            .expect("failed to create session for reference tape");
+        let mut tape = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let (_s, chain) = manager
+                .get_next_step(session.id)
+                .await
+                .expect("reference advance failed");
+            tape.push(chain.underlying_price);
+        }
+        tape
+    }
+
+    /// Issue #4 (PUT path): after `reinitialize_session` a session must NOT stick at
+    /// step 0. Two consecutive advances serve indices 0 then 1 of the rebuilt walk,
+    /// the cursor increases monotonically, and the stored state leaves `Reinitialized`
+    /// after the FIRST advance — proving the walk is evicted/rebuilt exactly once
+    /// rather than on every request.
+    #[tokio::test]
+    async fn test_reinitialized_session_advances_after_put() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+
+        // Reference tape for the NEW seed so we can assert index alignment after reset.
+        let ref_tape = collect_full_tape(&manager, seeded_parameters(3, 22)).await;
+
+        // Original session (seed 11); advance once so it is mid-tape before the reset.
+        let session = manager
+            .create_session(seeded_parameters(3, 11))
+            .expect("failed to create session");
+        let id = session.id;
+        manager
+            .get_next_step(id)
+            .await
+            .expect("initial advance failed");
+
+        // PUT: reinitialize with the new seed. Cursor resets to 0, state Reinitialized.
+        let reinit = manager
+            .reinitialize_session(id, seeded_parameters(3, 22))
+            .expect("reinitialize failed");
+        assert_eq!(reinit.current_step, 0);
+        assert_eq!(reinit.state, SessionState::Reinitialized);
+
+        // First advance after reset serves index 0 of the rebuilt walk, moves the
+        // cursor to 1, and persists InProgress (Reinitialized left after ONE call).
+        let (after_first, first_chain) = manager
+            .get_next_step(id)
+            .await
+            .expect("first post-reset advance failed");
+        assert_eq!(after_first.current_step, 1);
+        assert_eq!(after_first.state, SessionState::InProgress);
+        assert_eq!(first_chain.underlying_price, ref_tape[0]);
+        let stored = store.get(id).expect("session missing from store");
+        assert_eq!(stored.state, SessionState::InProgress);
+
+        // Second advance serves index 1 from the CACHED walk (no rebuild), cursor -> 2.
+        let (after_second, second_chain) = manager
+            .get_next_step(id)
+            .await
+            .expect("second post-reset advance failed");
+        assert_eq!(after_second.current_step, 2);
+        assert_eq!(second_chain.underlying_price, ref_tape[1]);
+        // Monotonic, no repeats: index 1 differs from index 0.
+        assert_ne!(second_chain.underlying_price, first_chain.underlying_price);
+    }
+
+    /// Issue #4 (PATCH path): `update_session` restarts the tape, and the session
+    /// advances normally afterwards (indices 0 then 1), leaving `Reinitialized` after
+    /// a single advance — the same non-stuck behavior as the PUT path.
+    #[tokio::test]
+    async fn test_reinitialized_session_advances_after_patch() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+
+        let ref_tape = collect_full_tape(&manager, seeded_parameters(3, 44)).await;
+
+        let session = manager
+            .create_session(seeded_parameters(3, 33))
+            .expect("failed to create session");
+        let id = session.id;
+        manager
+            .get_next_step(id)
+            .await
+            .expect("initial advance failed");
+
+        // PATCH: update parameters. Cursor resets to 0, state Reinitialized.
+        let patched = manager
+            .update_session(id, seeded_parameters(3, 44))
+            .expect("update failed");
+        assert_eq!(patched.current_step, 0);
+        assert_eq!(patched.state, SessionState::Reinitialized);
+
+        let (after_first, first_chain) = manager
+            .get_next_step(id)
+            .await
+            .expect("first post-reset advance failed");
+        assert_eq!(after_first.current_step, 1);
+        assert_eq!(after_first.state, SessionState::InProgress);
+        assert_eq!(first_chain.underlying_price, ref_tape[0]);
+        let stored = store.get(id).expect("session missing from store");
+        assert_eq!(stored.state, SessionState::InProgress);
+
+        let (after_second, second_chain) = manager
+            .get_next_step(id)
+            .await
+            .expect("second post-reset advance failed");
+        assert_eq!(after_second.current_step, 2);
+        assert_eq!(second_chain.underlying_price, ref_tape[1]);
+        assert_ne!(second_chain.underlying_price, first_chain.underlying_price);
+    }
+
+    /// Issue #4: reinitializing with a DIFFERENT seed rebuilds the walk from the new
+    /// parameters. Index 0 of the walk is always the initial chain (seed-independent),
+    /// so the difference shows from index 1 onward: the post-reset tape matches the
+    /// new seed's reference tape and diverges from the original seed's tape — proving
+    /// the rebuild picked up the new seed instead of replaying the old cached walk.
+    #[tokio::test]
+    async fn test_reinitialize_with_different_seed_changes_tape() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+
+        // Reference tapes for two very different seeds.
+        let ref_tape_old = collect_full_tape(&manager, seeded_parameters(3, 1000)).await;
+        let ref_tape_new = collect_full_tape(&manager, seeded_parameters(3, 987654321)).await;
+        // Sanity: the two seeds really do produce different tapes.
+        assert_ne!(ref_tape_old, ref_tape_new);
+
+        // Create a session on the old seed and populate its cached walk via a peek.
+        let session = manager
+            .create_session(seeded_parameters(3, 1000))
+            .expect("failed to create session");
+        let id = session.id;
+        manager.peek_current_step(id).await.expect("peek failed");
+
+        // Reinitialize with the very different seed; then walk the whole rebuilt tape.
+        manager
+            .reinitialize_session(id, seeded_parameters(3, 987654321))
+            .expect("reinitialize failed");
+        let mut post_reset = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let (_s, chain) = manager
+                .get_next_step(id)
+                .await
+                .expect("post-reset advance failed");
+            post_reset.push(chain.underlying_price);
+        }
+
+        // The rebuilt tape matches the NEW seed and differs from the OLD seed.
+        assert_eq!(post_reset, ref_tape_new);
+        assert_ne!(post_reset, ref_tape_old);
     }
 }
