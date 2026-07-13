@@ -1,7 +1,11 @@
 use std::{env, fmt};
 
 /// Configuration for a Redis connection
-#[derive(Clone, Debug)]
+///
+/// `Debug` is implemented manually (not derived) so that credentials are never
+/// leaked through `{:?}` logging; both `Debug` and `Display` render the same
+/// redacted form.
+#[derive(Clone)]
 pub struct RedisConfig {
     /// The hostname of the Redis server
     pub host: String,
@@ -81,10 +85,18 @@ impl Default for RedisConfig {
 
 impl fmt::Display for RedisConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let url = self.url();
+        // Redact any credentials embedded in the connection URL before writing.
+        let url = super::redact_userinfo(&self.url());
 
-        // Write the complete URL and timeout
+        // Write the redacted URL and timeout
         write!(f, "{} (timeout: {}s)", url, self.timeout)
+    }
+}
+
+impl fmt::Debug for RedisConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never leak credentials through `{:?}`; render the redacted form.
+        write!(f, "{}", self)
     }
 }
 
@@ -223,9 +235,10 @@ mod tests {
             timeout: 30,
         };
 
+        // Credentials must be redacted, never printed.
         assert_eq!(
             format!("{}", config),
-            "redis://testuser@localhost:6379 (timeout: 30s)"
+            "redis://***@localhost:6379 (timeout: 30s)"
         );
     }
 
@@ -240,9 +253,10 @@ mod tests {
             timeout: 30,
         };
 
+        // Credentials must be redacted, never printed.
         assert_eq!(
             format!("{}", config),
-            "redis://:testpass@localhost:6379 (timeout: 30s)"
+            "redis://***@localhost:6379 (timeout: 30s)"
         );
     }
 
@@ -257,9 +271,10 @@ mod tests {
             timeout: 30,
         };
 
+        // Credentials must be redacted, never printed.
         assert_eq!(
             format!("{}", config),
-            "redis://testuser:testpass@localhost:6379 (timeout: 30s)"
+            "redis://***@localhost:6379 (timeout: 30s)"
         );
     }
 
@@ -291,10 +306,39 @@ mod tests {
             timeout: 45,
         };
 
+        // Credentials must be redacted, never printed.
         assert_eq!(
             format!("{}", config),
-            "redis://admin:s3cret@redis.example.com:6380/5 (timeout: 45s)"
+            "redis://***@redis.example.com:6380/5 (timeout: 45s)"
         );
+    }
+
+    #[test]
+    fn test_display_and_debug_redact_password() {
+        let config = RedisConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            username: Some("admin".to_string()),
+            password: Some("s3ntinel-pw".to_string()),
+            database: 0,
+            timeout: 30,
+        };
+
+        let display = format!("{}", config);
+        let debug = format!("{:?}", config);
+
+        // Neither Display nor Debug may leak the password or the username.
+        assert!(!display.contains("s3ntinel-pw"));
+        assert!(!display.contains("admin"));
+        assert!(display.contains("***"));
+        assert!(!debug.contains("s3ntinel-pw"));
+        assert!(!debug.contains("admin"));
+        assert!(debug.contains("***"));
+
+        // The connection URL must still carry the real credentials so the
+        // connection path keeps working.
+        assert!(config.url().contains("s3ntinel-pw"));
+        assert!(config.url().contains("admin"));
     }
 
     #[test]

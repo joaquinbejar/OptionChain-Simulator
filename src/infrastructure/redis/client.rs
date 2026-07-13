@@ -1,3 +1,4 @@
+use crate::infrastructure::config::redact_userinfo;
 use crate::infrastructure::config::redis::RedisConfig;
 use redis::{Client, Commands, Connection, RedisError, RedisResult};
 use std::sync::{Arc, Mutex};
@@ -15,16 +16,28 @@ impl RedisClient {
     /// Creates a new Redis client with the provided configuration
     #[instrument(skip(config), level = "debug")]
     pub fn new(config: RedisConfig) -> Result<Self, RedisError> {
-        // Build Redis connection URL
+        // Build Redis connection URL (used only to connect, never logged raw).
         let url = config.url();
-        info!("Connecting to Redis at {}", url);
+        // The config's Display impl is already credential-redacted.
+        info!("Connecting to Redis at {}", config);
 
         // Create Redis client
-        let client = Client::open(url)?;
+        let client = Client::open(url).inspect_err(|e| {
+            // Sanitize in case the driver echoes the URL back in its error.
+            error!(
+                "Failed to open Redis client: {}",
+                redact_userinfo(&e.to_string())
+            );
+        })?;
 
         // Create a single connection for now
         // In a production system, you might want to use a more robust connection pool
-        let connection = client.get_connection()?;
+        let connection = client.get_connection().inspect_err(|e| {
+            error!(
+                "Failed to connect to Redis: {}",
+                redact_userinfo(&e.to_string())
+            );
+        })?;
         let connection_pool = Arc::new(Mutex::new(connection));
 
         info!("Successfully connected to Redis");

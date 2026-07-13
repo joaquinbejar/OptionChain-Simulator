@@ -1,8 +1,11 @@
-use mongodb::bson::doc;
-use serde::{Deserialize, Serialize};
-
 /// Configuration for MongoDB connection
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The `uri` may embed credentials, so `Debug` is implemented manually (not
+/// derived) and, together with `Display`, renders the userinfo redacted so the
+/// URI is never leaked through logs. `Serialize`/`Deserialize` are intentionally
+/// not implemented: nothing in the crate persists this config, and deriving them
+/// would risk writing the raw URI to disk or logs.
+#[derive(Clone)]
 pub struct MongoDBConfig {
     /// MongoDB connection URI
     pub uri: String,
@@ -37,11 +40,20 @@ impl Default for MongoDBConfig {
 
 impl std::fmt::Display for MongoDBConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact any credentials embedded in the connection URI before writing.
+        let uri = super::redact_userinfo(&self.uri);
         write!(
             f,
             "{}/{} steps={}, events={} (timeout: {}s)",
-            self.uri, self.database, self.steps_collection, self.events_collection, self.timeout,
+            uri, self.database, self.steps_collection, self.events_collection, self.timeout,
         )
+    }
+}
+
+impl std::fmt::Debug for MongoDBConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never leak credentials through `{:?}`; render the redacted form.
+        write!(f, "MongoDBConfig({})", self)
     }
 }
 
@@ -199,34 +211,27 @@ mod tests {
     }
 
     #[test]
-    fn test_serialization_deserialization() {
+    fn test_display_and_debug_redact_credentials() {
         let config = MongoDBConfig {
-            uri: "mongodb://localhost:27017".to_string(),
+            uri: "mongodb://admin:s3ntinel-pw@localhost:27017".to_string(),
             database: "testdb".to_string(),
-            steps_collection: "steps_collection".to_string(),
-            events_collection: "events_collection".to_string(),
-            timeout: 45,
+            steps_collection: "steps".to_string(),
+            events_collection: "events".to_string(),
+            timeout: 30,
         };
 
-        // Serialize to JSON
-        let serialized = serde_json::to_string(&config).expect("Failed to serialize config");
+        let display = format!("{}", config);
+        let debug = format!("{:?}", config);
 
-        // Validate JSON contains expected fields
-        assert!(serialized.contains("mongodb://localhost:27017"));
-        assert!(serialized.contains("testdb"));
-        assert!(serialized.contains("steps_collection"));
-        assert!(serialized.contains("events_collection"));
-        assert!(serialized.contains("45"));
+        // Neither Display nor Debug may leak the password or the username.
+        assert!(!display.contains("s3ntinel-pw"));
+        assert!(!display.contains("admin"));
+        assert!(display.contains("***"));
+        assert!(!debug.contains("s3ntinel-pw"));
+        assert!(!debug.contains("admin"));
+        assert!(debug.contains("***"));
 
-        // Deserialize back to object
-        let deserialized: MongoDBConfig =
-            serde_json::from_str(&serialized).expect("Failed to deserialize");
-
-        // Check all fields match
-        assert_eq!(deserialized.uri, config.uri);
-        assert_eq!(deserialized.database, config.database);
-        assert_eq!(deserialized.steps_collection, config.steps_collection);
-        assert_eq!(deserialized.events_collection, config.events_collection);
-        assert_eq!(deserialized.timeout, config.timeout);
+        // The raw URI (used to connect) must still carry the real credentials.
+        assert!(config.uri.contains("s3ntinel-pw"));
     }
 }
