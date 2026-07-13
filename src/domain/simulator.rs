@@ -74,13 +74,18 @@ impl Simulator {
             "Simulating next step"
         );
 
-        // First check if we need to create a new random walk
+        // First check if we need to create a new random walk.
+        //
+        // Under serve-then-advance the cursor no longer needs a `current_step == 0`
+        // trigger: a fresh session is simply not cached yet, so `!contains_key` builds
+        // it once. Dropping the `== 0` trigger keeps peek(cursor 0) and the next advance
+        // serving the SAME cached walk (they would otherwise rebuild — and, for an
+        // unseeded walker, diverge — on every step-0 access).
         let need_new_walk;
         {
             let cache = self.simulation_cache.lock().await;
-            need_new_walk = !cache.contains_key(&session.id)
-                || session.current_step == 0
-                || session.state == SessionState::Reinitialized;
+            need_new_walk =
+                !cache.contains_key(&session.id) || session.state == SessionState::Reinitialized;
 
             // If the session is reinitialized, remove it from cache
             if session.state == SessionState::Reinitialized && cache.contains_key(&session.id) {
@@ -451,9 +456,10 @@ mod tests {
     #[tokio::test]
     async fn test_same_seed_produces_identical_tape() {
         // Complete-tape test: two sessions with identical parameters and the
-        // same seed must produce the same sequence of snapshots
-        let mut session_a = create_test_session(None);
-        let mut session_b = create_test_session(None);
+        // same seed must produce the same sequence of snapshots. Distinct ids keep
+        // them as independent cache entries (as real sessions always are).
+        let mut session_a = create_test_session(Some(Uuid::new_v4()));
+        let mut session_b = create_test_session(Some(Uuid::new_v4()));
         session_a.parameters.seed = Some(20260713);
         session_b.parameters.seed = Some(20260713);
 
@@ -470,8 +476,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_different_seeds_produce_different_tapes() {
-        let mut session_a = create_test_session(None);
-        let mut session_b = create_test_session(None);
+        // Distinct ids keep the two walks in independent cache entries so the seeds,
+        // not a shared cache slot, drive the difference.
+        let mut session_a = create_test_session(Some(Uuid::new_v4()));
+        let mut session_b = create_test_session(Some(Uuid::new_v4()));
         session_a.parameters.seed = Some(1);
         session_b.parameters.seed = Some(2);
 
