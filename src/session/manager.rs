@@ -145,6 +145,14 @@ impl SessionManager {
                 "session completed; no further steps".to_string(),
             ));
         }
+        // `Error` is the other terminal state: reject it BEFORE simulating so a
+        // dead session neither builds a walk nor serves a snapshot (matches the
+        // peek path and `advance_state`'s own terminal handling).
+        if session.state == SessionState::Error {
+            return Err(ChainError::InvalidState(
+                "Session is in error state".to_string(),
+            ));
+        }
 
         // Serve the snapshot at the current cursor. The simulator sees the pre-advance
         // state, so a `Reinitialized` session rebuilds its walk before serving.
@@ -703,6 +711,34 @@ mod tests {
             }
             other => panic!("expected InvalidState for errored peek, got {other:?}"),
         }
+    }
+
+    /// Advance on an `Error`-state session must reject before simulating,
+    /// matching the peek path and never touching the store.
+    #[tokio::test]
+    async fn test_advance_on_error_session_returns_invalid_state() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let session = manager
+            .create_session(test_parameters())
+            .expect("failed to create session");
+        let id = session.id;
+
+        let mut errored = store.get(id).expect("session missing from store");
+        errored.state = SessionState::Error;
+        store
+            .save(errored)
+            .expect("failed to persist errored session");
+
+        match manager.get_next_step(id).await {
+            Err(ChainError::InvalidState(msg)) => {
+                assert_eq!(msg, "Session is in error state");
+            }
+            other => panic!("expected InvalidState for errored advance, got {other:?}"),
+        }
+        let stored = store.get(id).expect("session missing from store");
+        assert_eq!(stored.state, SessionState::Error);
+        assert_eq!(stored.current_step, 0);
     }
 
     /// Collects the full `steps`-long tape of a freshly created session by advancing it
