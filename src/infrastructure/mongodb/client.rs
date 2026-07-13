@@ -3,7 +3,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::infrastructure::config::mongo::MongoDBConfig;
-use crate::infrastructure::config::redact_userinfo;
+use crate::infrastructure::config::{redact_uri, redact_userinfo};
 use crate::utils::ChainError;
 use mongodb::options::ClientOptions;
 use serde::Serialize;
@@ -25,7 +25,7 @@ impl MongoDBClient {
     #[instrument(skip(config), level = "debug")]
     pub async fn new(config: MongoDBConfig) -> Result<Self, ChainError> {
         // The URI may embed credentials; never log it raw.
-        info!("Connecting to MongoDB at {}", redact_userinfo(&config.uri));
+        info!("Connecting to MongoDB at {}", redact_uri(&config.uri));
 
         // Driver errors can echo the connection URI back, so every error string
         // is passed through `redact_userinfo` before it reaches a log or a

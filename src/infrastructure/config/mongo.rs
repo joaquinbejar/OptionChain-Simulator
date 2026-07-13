@@ -41,7 +41,7 @@ impl Default for MongoDBConfig {
 impl std::fmt::Display for MongoDBConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Redact any credentials embedded in the connection URI before writing.
-        let uri = super::redact_userinfo(&self.uri);
+        let uri = super::redact_uri(&self.uri);
         write!(
             f,
             "{}/{} steps={}, events={} (timeout: {}s)",
@@ -208,6 +208,27 @@ mod tests {
         // Clean up
         remove_var("MONGODB_URI");
         remove_var("MONGODB_TIMEOUT");
+    }
+
+    #[test]
+    fn test_display_and_debug_redact_delimiter_passwords() {
+        // Whole-URI redaction bounds userinfo by the LAST '@', so passwords
+        // containing '/', whitespace, or '@' never leak.
+        for pw in ["p/secret-pw", "p secret-pw", "p@secret-pw"] {
+            let config = MongoDBConfig {
+                uri: format!("mongodb://admin:{pw}@localhost:27017"),
+                database: "db".to_string(),
+                steps_collection: "steps".to_string(),
+                events_collection: "events".to_string(),
+                timeout: 30,
+            };
+            let display = format!("{}", config);
+            let debug = format!("{:?}", config);
+            assert!(!display.contains(pw), "Display leaked {pw:?}: {display}");
+            assert!(!debug.contains(pw), "Debug leaked {pw:?}: {debug}");
+            assert!(display.contains("***@localhost:27017"));
+            assert!(config.uri.contains(pw));
+        }
     }
 
     #[test]

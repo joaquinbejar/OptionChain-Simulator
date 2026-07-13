@@ -85,11 +85,19 @@ impl Default for RedisConfig {
 
 impl fmt::Display for RedisConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Redact any credentials embedded in the connection URL before writing.
-        let url = super::redact_userinfo(&self.url());
-
-        // Write the redacted URL and timeout
-        write!(f, "{} (timeout: {}s)", url, self.timeout)
+        // Build the redacted form directly from the fields: the password never
+        // enters the formatted string, so no parser can be defeated by
+        // delimiter-containing credentials (`/`, whitespace, `@`, ...).
+        let creds = if self.username.is_some() || self.password.is_some() {
+            "***@"
+        } else {
+            ""
+        };
+        write!(f, "redis://{}{}:{}", creds, self.host, self.port)?;
+        if self.database > 0 {
+            write!(f, "/{}", self.database)?;
+        }
+        write!(f, " (timeout: {}s)", self.timeout)
     }
 }
 
@@ -311,6 +319,29 @@ mod tests {
             format!("{}", config),
             "redis://***@redis.example.com:6380/5 (timeout: 45s)"
         );
+    }
+
+    #[test]
+    fn test_display_and_debug_redact_delimiter_passwords() {
+        // Display/Debug are built from fields, so passwords containing URL
+        // delimiters ('/', whitespace, '@') can never leak through parsing.
+        for pw in ["p/secret-pw", "p secret-pw", "p@secret-pw"] {
+            let config = RedisConfig {
+                host: "localhost".to_string(),
+                port: 6379,
+                username: Some("user".to_string()),
+                password: Some(pw.to_string()),
+                database: 0,
+                timeout: 30,
+            };
+            let display = format!("{}", config);
+            let debug = format!("{:?}", config);
+            assert!(!display.contains(pw), "Display leaked {pw:?}: {display}");
+            assert!(!debug.contains(pw), "Debug leaked {pw:?}: {debug}");
+            assert!(display.contains("***@"));
+            // The connection URL still carries the real credential.
+            assert!(config.url().contains(pw));
+        }
     }
 
     #[test]
