@@ -1,4 +1,5 @@
 use prometheus::{Gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// MetricsCollector is responsible for tracking and exporting API metrics
@@ -13,6 +14,12 @@ pub struct MetricsCollector {
     active_sessions: IntGauge,
     session_creation_counter: IntCounter,
     session_deletion_counter: IntCounter,
+    /// Sessions created (and not yet deleted) BY THIS PROCESS. Gates the
+    /// `active_sessions` decrement so deleting a session that predates the
+    /// process (the store outlives us; the gauge restarts at zero) can never
+    /// drive the gauge negative. Not registered - it is bookkeeping for the
+    /// gauge, not a metric of its own.
+    owned_active_sessions: AtomicU64,
 
     // Simulation metrics
     simulation_steps_counter: IntCounterVec,
@@ -143,6 +150,7 @@ impl MetricsCollector {
             active_sessions,
             session_creation_counter,
             session_deletion_counter,
+            owned_active_sessions: AtomicU64::new(0),
             simulation_steps_counter,
             simulation_duration,
             cache_hit_counter,
@@ -184,6 +192,7 @@ impl MetricsCollector {
     /// process restarts are not reflected here (documented known drift; a
     /// store-derived gauge is future work).
     pub fn record_session_created(&self) {
+        self.owned_active_sessions.fetch_add(1, Ordering::AcqRel);
         self.active_sessions.inc();
         self.session_creation_counter.inc();
     }
@@ -193,15 +202,25 @@ impl MetricsCollector {
     ///
     /// Call this ONLY after a session was actually deleted (the delete returned
     /// `Ok(true)`). Invalid ids, not-found (`Ok(false)`), and errors must record
-    /// nothing. Prometheus allows a gauge to go negative, so repeated calls
-    /// without a matching create CAN drive `active_sessions` below zero at this
-    /// level — the protection against that is the call-site gating in the delete
-    /// handler, not this method. Like the creation counterpart, the gauge is a
-    /// process-local approximation (Redis TTL expiry and restarts are not
-    /// reflected — documented known drift; a store-derived gauge is future work).
+    /// nothing.
+    ///
+    /// The gauge decrement is gated on `owned_active_sessions`: only deletions
+    /// of sessions this process counted decrement the gauge. A persistent store
+    /// outlives the process, so after a restart the gauge starts at zero while
+    /// valid sessions remain deletable — an unconditional decrement would drive
+    /// `active_sessions` negative. Such deletions still bump the deletion
+    /// counter; they only skip the gauge. The atomic `checked_sub` update keeps
+    /// the guard race-free under concurrent deletes. The gauge remains a
+    /// process-local approximation (Redis TTL expiry is not reflected —
+    /// documented known drift; a store-derived gauge is future work).
     pub fn record_session_deleted(&self) {
-        self.active_sessions.dec();
         self.session_deletion_counter.inc();
+        let owned_one =
+            self.owned_active_sessions
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        if owned_one.is_ok() {
+            self.active_sessions.dec();
+        }
     }
 
     /// Records a simulation step
@@ -418,19 +437,36 @@ mod tests {
     }
 
     #[test]
-    fn test_record_session_deleted_can_go_negative_at_collector_level() {
-        // Prometheus permits an IntGauge to go negative. Deleting without a
-        // matching create drives active_sessions below zero at this level; the
-        // protection is the delete handler only calling this on Ok(true), never
-        // this method. This test documents that behavior so the call-site gating
-        // is understood as the real guard.
+    fn test_unmatched_delete_never_drives_gauge_negative() {
+        // Restart scenario: the store retained sessions but this process never
+        // counted them, so its gauge starts at zero. Deleting those sessions
+        // bumps the deletion counter but must NOT decrement the gauge — an
+        // unconditional decrement would report a negative session count.
         let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
 
         collector.record_session_deleted();
+        collector.record_session_deleted();
 
         let metrics = collector.export_metrics();
-        assert!(metrics.contains("active_sessions -1"));
-        assert!(metrics.contains("session_deletions_total 1"));
+        assert!(metrics.contains("active_sessions 0"));
+        assert!(metrics.contains("session_deletions_total 2"));
+    }
+
+    #[test]
+    fn test_delete_beyond_owned_sessions_clamps_gauge_at_zero() {
+        // One owned session, two deletions (the second targets a pre-restart
+        // session): the first delete decrements the gauge, the second only
+        // counts. The gauge bottoms out at zero instead of going negative.
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        collector.record_session_created();
+        collector.record_session_deleted();
+        collector.record_session_deleted();
+
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("active_sessions 0"));
+        assert!(metrics.contains("session_creations_total 1"));
+        assert!(metrics.contains("session_deletions_total 2"));
     }
 
     #[test]
