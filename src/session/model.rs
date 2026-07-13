@@ -475,10 +475,21 @@ impl Session {
     /// `reinitialize`) are deliberately kept as pure state changes and do NOT
     /// touch the version. The [`SessionManager`] calls this helper right before a
     /// compare-and-swap save so the persisted revision advances exactly once per
-    /// successfully served mutation. Uses `saturating_add` so an (unreachable in
-    /// practice) overflow cannot panic on a production path.
-    pub fn bump_version(&mut self) {
-        self.version = self.version.saturating_add(1);
+    /// successfully served mutation. Uses `checked_add` (the ruleset forbids
+    /// `saturating_*`): saturating at `u64::MAX` would freeze the revision and let
+    /// several concurrent writers pass the compare-and-swap, so an overflow is
+    /// surfaced as an error instead of being silently clamped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Internal`] if the counter would overflow `u64`
+    /// (unreachable in practice — it would take 2^64 mutations of one session).
+    pub fn bump_version(&mut self) -> Result<(), ChainError> {
+        self.version = self
+            .version
+            .checked_add(1)
+            .ok_or_else(|| ChainError::Internal("session version overflow".to_string()))?;
+        Ok(())
     }
 }
 
@@ -1440,10 +1451,28 @@ mod tests_session {
         let mut session = Session::new_with_generator(params, &uuid_gen);
 
         assert_eq!(session.version, 0);
-        session.bump_version();
+        assert!(session.bump_version().is_ok());
         assert_eq!(session.version, 1);
-        session.bump_version();
+        assert!(session.bump_version().is_ok());
         assert_eq!(session.version, 2);
+    }
+
+    /// The revision counter must never silently clamp: at `u64::MAX` a bump
+    /// returns [`ChainError::Internal`] instead of saturating (which would let
+    /// multiple stale writers pass the compare-and-swap).
+    #[test]
+    fn test_bump_version_overflow_returns_internal_error() {
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(params, &uuid_gen);
+        session.version = u64::MAX;
+
+        match session.bump_version() {
+            Err(ChainError::Internal(msg)) => assert!(msg.contains("overflow")),
+            other => panic!("expected Internal overflow error, got {other:?}"),
+        }
+        // The counter is left untouched on overflow.
+        assert_eq!(session.version, u64::MAX);
     }
 
     /// Stored-session compatibility: a `Session` persisted before the optimistic

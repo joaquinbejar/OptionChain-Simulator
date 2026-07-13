@@ -354,7 +354,7 @@ mod tests {
         // Mutate a clone and bump its version, then CAS against the observed v0.
         session.current_step = 3;
         session.state = SessionState::InProgress;
-        session.bump_version();
+        assert!(session.bump_version().is_ok());
         assert!(store.save_cas(session, 0).await.is_ok());
 
         let stored = store.get(id).await.unwrap();
@@ -374,13 +374,13 @@ mod tests {
 
         // A first CAS advances the stored revision from 0 to 1.
         session.current_step = 1;
-        session.bump_version();
+        assert!(session.bump_version().is_ok());
         assert!(store.save_cas(session.clone(), 0).await.is_ok());
 
         // A second writer that still believes it is at v0 must be rejected.
         let mut stale = session.clone();
         stale.current_step = 99;
-        stale.bump_version();
+        assert!(stale.bump_version().is_ok());
         match store.save_cas(stale, 0).await {
             Err(ChainError::Conflict(_)) => {}
             other => panic!("expected Conflict, got {other:?}"),

@@ -20,17 +20,24 @@ pub struct InRedisSessionStore {
 
 /// Server-side Lua for an atomic session compare-and-swap.
 ///
-/// Redis runs a script as a single, uninterruptible unit, so the GET, the
-/// version comparison, and the conditional SET happen without any interleaving
-/// from another connection — this is what makes the CAS race-free. The stored
-/// version is read from the persisted JSON with the built-in `cjson` decoder
-/// (`cjson.decode(stored).version`), keeping the version's single source of
-/// truth INSIDE the session document (no companion key to keep in sync from
-/// `create`/`save`). A session written before the `version` field existed
-/// decodes to `nil`, so `or 0` treats it as revision 0.
+/// Redis runs a script as a single, uninterruptible unit, so the two GETs, the
+/// version comparison, and the conditional SETs happen without any interleaving
+/// from another connection — this is what makes the CAS race-free.
 ///
-/// Arguments: `KEYS[1]` = session key; `ARGV[1]` = new session JSON;
-/// `ARGV[2]` = expected version; `ARGV[3]` = TTL in seconds.
+/// The version compared for the CAS is NOT read from the JSON document: decoding
+/// it with `cjson` would round the integer through an IEEE-754 double, which
+/// cannot represent every `u64`, so two adjacent revisions above `2^53` collapse
+/// to the same value and a stale writer could pass the check. Instead the version
+/// lives in a COMPANION key (`{session_key}:ver`) as a plain integer STRING and is
+/// compared as a string (`ver ~= ARGV[2]`), i.e. an exact byte comparison with no
+/// floating-point rounding. A session written before this companion key existed
+/// has no `:ver` key; `GET` then returns `false`, so `or '0'` treats it as
+/// revision `0`.
+///
+/// Keys: `KEYS[1]` = session key; `KEYS[2]` = companion version key.
+/// Arguments: `ARGV[1]` = new session JSON; `ARGV[2]` = expected version string;
+/// `ARGV[3]` = new version string; `ARGV[4]` = TTL in seconds. Both keys are
+/// rewritten with the same TTL so they always expire together.
 ///
 /// Return codes: `-1` = key missing (NotFound); `-2` = version mismatch
 /// (Conflict); `1` = written.
@@ -39,11 +46,12 @@ local cur = redis.call('GET', KEYS[1])
 if not cur then
     return -1
 end
-local v = cjson.decode(cur)['version'] or 0
-if v ~= tonumber(ARGV[2]) then
+local ver = redis.call('GET', KEYS[2]) or '0'
+if ver ~= ARGV[2] then
     return -2
 end
-redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[3]))
+redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[4]))
+redis.call('SET', KEYS[2], ARGV[3], 'EX', tonumber(ARGV[4]))
 return 1
 "#;
 
@@ -112,6 +120,15 @@ impl InRedisSessionStore {
         format!("{}{}", self.key_prefix, id)
     }
 
+    /// Constructs the companion version key for a session ID (`{session_key}:ver`).
+    ///
+    /// This key holds the optimistic-concurrency revision as an integer STRING so
+    /// [`SAVE_CAS_SCRIPT`] can compare it exactly, avoiding the IEEE-754 rounding
+    /// that a `cjson`-decoded `u64` would suffer above `2^53`.
+    fn version_key(&self, id: Uuid) -> String {
+        format!("{}:ver", self.session_key(id))
+    }
+
     /// Maps a Redis error to a ChainError
     fn map_redis_error(err: RedisError) -> ChainError {
         ChainError::Internal(format!("Redis error: {}", err))
@@ -159,6 +176,7 @@ impl SessionStore for InRedisSessionStore {
     #[instrument(skip(self, session), level = "debug")]
     async fn create(&self, session: Session) -> Result<(), ChainError> {
         let key = self.session_key(session.id);
+        let version_key = self.version_key(session.id);
         debug!(session_id = %session.id, key = %key, "Creating session in Redis");
 
         // Serialize session to JSON
@@ -180,6 +198,19 @@ impl SessionStore for InRedisSessionStore {
             .await
         {
             Ok(true) => {
+                // Seed the companion version key the CAS script compares against.
+                // create/save/delete are NOT the compare-and-swap race surface (only
+                // `save_cas` races), so plain sequential commands are fine here; the
+                // script defaults a missing `:ver` key to "0", so even a half-written
+                // pair still compares safely.
+                self.client
+                    .set(
+                        &version_key,
+                        session.version.to_string(),
+                        Some(self.session_ttl),
+                    )
+                    .await
+                    .map_err(Self::map_redis_error)?;
                 debug!(session_id = %session.id, "Session created successfully");
                 Ok(())
             }
@@ -200,6 +231,7 @@ impl SessionStore for InRedisSessionStore {
     #[instrument(skip(self, session), level = "debug")]
     async fn save(&self, session: Session) -> Result<(), ChainError> {
         let key = self.session_key(session.id);
+        let version_key = self.version_key(session.id);
         debug!(session_id = %session.id, key = %key, "Saving session to Redis");
 
         // Serialize session to JSON
@@ -214,27 +246,32 @@ impl SessionStore for InRedisSessionStore {
             }
         };
 
-        // Save to Redis with TTL
-        match self
-            .client
+        // Blind upsert: write the document, then keep the companion version key in
+        // sync. `save` is not the compare-and-swap race surface (see `create`), so
+        // two sequential SETs are fine — a torn write only leaves the pair briefly
+        // inconsistent and the CAS script tolerates a missing `:ver` key.
+        self.client
             .set(&key, json_str, Some(self.session_ttl))
             .await
-        {
-            Ok(_) => {
-                debug!(session_id = %session.id, "Session saved successfully");
-                Ok(())
-            }
-            Err(e) => {
-                error!(session_id = %session.id, error = %e, "Redis error while saving session");
-                Err(Self::map_redis_error(e))
-            }
-        }
+            .map_err(Self::map_redis_error)?;
+        self.client
+            .set(
+                &version_key,
+                session.version.to_string(),
+                Some(self.session_ttl),
+            )
+            .await
+            .map_err(Self::map_redis_error)?;
+
+        debug!(session_id = %session.id, "Session saved successfully");
+        Ok(())
     }
 
     #[instrument(skip(self, session), level = "debug")]
     async fn save_cas(&self, session: Session, expected_version: u64) -> Result<(), ChainError> {
         let id = session.id;
         let key = self.session_key(id);
+        let version_key = self.version_key(id);
         debug!(session_id = %id, key = %key, expected_version, "CAS-saving session to Redis");
 
         // Serialize session to JSON
@@ -251,12 +288,17 @@ impl SessionStore for InRedisSessionStore {
 
         // Run the compare-and-swap atomically server-side. The manager (the block
         // scheduler) supplies `expected_version`; the script only writes when the
-        // stored revision still matches, so a concurrent advance cannot be lost.
+        // companion version key still matches, so a concurrent advance cannot be
+        // lost. Versions cross the boundary as STRINGS so the Lua comparison is exact
+        // for every `u64` (no cjson double rounding). `session.version` was already
+        // bumped past `expected_version` by the manager.
         let mut conn = self.client.connection_manager();
         let code: i64 = redis::Script::new(SAVE_CAS_SCRIPT)
             .key(&key)
+            .key(&version_key)
             .arg(json_str)
-            .arg(expected_version)
+            .arg(expected_version.to_string())
+            .arg(session.version.to_string())
             .arg(self.session_ttl)
             .invoke_async(&mut conn)
             .await
@@ -270,18 +312,25 @@ impl SessionStore for InRedisSessionStore {
     #[instrument(skip(self), level = "debug")]
     async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
         let key = self.session_key(id);
+        let version_key = self.version_key(id);
         debug!(session_id = %id, key = %key, "Deleting session from Redis");
 
-        match self.client.delete(&key).await {
-            Ok(deleted) => {
-                debug!(session_id = %id, deleted = deleted, "Session delete result");
-                Ok(deleted)
-            }
-            Err(e) => {
-                error!(session_id = %id, error = %e, "Redis error while deleting session");
-                Err(Self::map_redis_error(e))
-            }
-        }
+        // Remove BOTH the session document and its companion version key. Sequential
+        // deletes are fine (delete is not the CAS race surface); the session key's
+        // result is what determines whether a session actually existed, and deleting
+        // an already-absent `:ver` key is harmless.
+        let deleted = self
+            .client
+            .delete(&key)
+            .await
+            .map_err(Self::map_redis_error)?;
+        self.client
+            .delete(&version_key)
+            .await
+            .map_err(Self::map_redis_error)?;
+
+        debug!(session_id = %id, deleted = deleted, "Session delete result");
+        Ok(deleted)
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -303,6 +352,7 @@ impl SessionStore for InRedisSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infrastructure::RedisConfig;
     use crate::session::{SessionState, SimulationMethod, SimulationParameters};
     use optionstratlib::utils::TimeFrame;
     use positive::{Positive, pos_or_panic};
@@ -338,9 +388,20 @@ mod tests {
             format!("{}{}", self.key_prefix, id)
         }
 
-        // Helper to get store size for tests
+        // Companion version key mirroring the real store (`{session_key}:ver`).
+        fn version_key(&self, id: Uuid) -> String {
+            format!("{}:ver", self.session_key(id))
+        }
+
+        // Helper to get store size for tests. Counts only session documents, not the
+        // companion `:ver` keys, so "one session" reads as size 1 as before.
         fn get_store_size(&self) -> usize {
-            self.sessions.lock().unwrap().len()
+            self.sessions
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| !k.ends_with(":ver"))
+                .count()
         }
     }
 
@@ -372,6 +433,7 @@ mod tests {
 
         async fn create(&self, session: Session) -> Result<(), ChainError> {
             let key = self.session_key(session.id);
+            let version_key = self.version_key(session.id);
 
             // Serialize session to JSON
             let json_str = match serde_json::to_string(&session) {
@@ -384,7 +446,8 @@ mod tests {
                 }
             };
 
-            // Mirror the real store's SET NX behaviour: reject id collisions.
+            // Mirror the real store's SET NX behaviour: reject id collisions, and
+            // seed the companion version key alongside the document.
             let mut sessions = self.sessions.lock().unwrap();
             if sessions.contains_key(&key) {
                 return Err(ChainError::AlreadyExists(format!(
@@ -393,12 +456,14 @@ mod tests {
                 )));
             }
             sessions.insert(key, json_str);
+            sessions.insert(version_key, session.version.to_string());
 
             Ok(())
         }
 
         async fn save(&self, session: Session) -> Result<(), ChainError> {
             let key = self.session_key(session.id);
+            let version_key = self.version_key(session.id);
 
             // Serialize session to JSON
             let json_str = match serde_json::to_string(&session) {
@@ -411,9 +476,10 @@ mod tests {
                 }
             };
 
-            // Save to our in-memory store
+            // Upsert the document and keep the companion version key in sync.
             let mut sessions = self.sessions.lock().unwrap();
             sessions.insert(key, json_str);
+            sessions.insert(version_key, session.version.to_string());
 
             Ok(())
         }
@@ -424,6 +490,7 @@ mod tests {
             expected_version: u64,
         ) -> Result<(), ChainError> {
             let key = self.session_key(session.id);
+            let version_key = self.version_key(session.id);
 
             let json_str = match serde_json::to_string(&session) {
                 Ok(s) => s,
@@ -435,20 +502,20 @@ mod tests {
                 }
             };
 
-            // Mirror the Lua CAS: read the stored version from the persisted JSON
-            // (defaulting to 0 for a pre-version payload), compare, then write.
+            // Mirror the Lua CAS: the companion version key is the source of truth.
+            // A missing `:ver` key defaults to 0 (a legacy session written before the
+            // companion key existed); compare it exactly, then rewrite both keys.
             let mut sessions = self.sessions.lock().unwrap();
-            let stored_version = match sessions.get(&key) {
-                None => {
-                    return Err(ChainError::NotFound(format!(
-                        "Session with id {} not found",
-                        session.id
-                    )));
-                }
-                Some(stored) => serde_json::from_str::<Session>(stored)
-                    .map(|s| s.version)
-                    .unwrap_or(0),
-            };
+            if !sessions.contains_key(&key) {
+                return Err(ChainError::NotFound(format!(
+                    "Session with id {} not found",
+                    session.id
+                )));
+            }
+            let stored_version: u64 = sessions
+                .get(&version_key)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
             if stored_version != expected_version {
                 return Err(ChainError::Conflict(format!(
                     "Session {} was modified concurrently (expected version {}, found {})",
@@ -456,15 +523,20 @@ mod tests {
                 )));
             }
             sessions.insert(key, json_str);
+            sessions.insert(version_key, session.version.to_string());
 
             Ok(())
         }
 
         async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
             let key = self.session_key(id);
+            let version_key = self.version_key(id);
 
+            // Remove both keys; the session document's presence decides the result.
             let mut sessions = self.sessions.lock().unwrap();
-            Ok(sessions.remove(&key).is_some())
+            let removed = sessions.remove(&key).is_some();
+            sessions.remove(&version_key);
+            Ok(removed)
         }
 
         async fn cleanup(&self) -> Result<usize, ChainError> {
@@ -705,13 +777,18 @@ mod tests {
     }
 
     /// Issue #8: the CAS Lua script is the atomicity contract. Assert the string
-    /// constant carries the exact server-side logic the store relies on: read via
-    /// GET, decode the version from the stored JSON with `cjson`, and the three
-    /// documented return codes.
+    /// constant carries the exact server-side logic the store relies on: read the
+    /// session via GET, compare the revision against the COMPANION version key as an
+    /// exact string (not a `cjson`-decoded double that collapses above 2^53),
+    /// default a missing companion key to legacy "0", and the three documented
+    /// return codes.
     #[test]
     fn test_save_cas_script_encodes_the_contract() {
-        assert!(SAVE_CAS_SCRIPT.contains("redis.call('GET', KEYS[1])"));
-        assert!(SAVE_CAS_SCRIPT.contains("cjson.decode(cur)['version']"));
+        assert!(SAVE_CAS_SCRIPT.contains("redis.call('GET', KEYS[1])")); // session doc
+        assert!(SAVE_CAS_SCRIPT.contains("redis.call('GET', KEYS[2])")); // companion version key
+        assert!(SAVE_CAS_SCRIPT.contains("or '0'")); // missing version → legacy 0
+        assert!(SAVE_CAS_SCRIPT.contains("ver ~= ARGV[2]")); // exact string compare, no doubles
+        assert!(!SAVE_CAS_SCRIPT.contains("cjson")); // the lossy decoder is gone
         assert!(SAVE_CAS_SCRIPT.contains("return -1")); // NotFound
         assert!(SAVE_CAS_SCRIPT.contains("return -2")); // Conflict
         assert!(SAVE_CAS_SCRIPT.contains("return 1")); // committed
@@ -761,14 +838,14 @@ mod tests {
 
         // Matching version → commit (stored revision advances to 1).
         session.current_step = 2;
-        session.bump_version();
+        assert!(session.bump_version().is_ok());
         assert!(store.save_cas(session.clone(), 0).await.is_ok());
         assert_eq!(store.get(id).await.unwrap().version, 1);
 
         // Stale version → Conflict, store unchanged.
         let mut stale = session.clone();
         stale.current_step = 77;
-        stale.bump_version();
+        assert!(stale.bump_version().is_ok());
         match store.save_cas(stale, 0).await {
             Err(ChainError::Conflict(_)) => {}
             other => panic!("expected Conflict, got {other:?}"),
@@ -776,6 +853,83 @@ mod tests {
         let stored = store.get(id).await.unwrap();
         assert_eq!(stored.current_step, 2);
         assert_eq!(stored.version, 1);
+    }
+
+    /// Issue #8: the Lua script is the production atomicity boundary, so exercise it
+    /// against a REAL Redis (the test doubles above only approximate it). Two
+    /// `save_cas` calls that both read version 0 race through the single-threaded Lua
+    /// engine: exactly one commits and one gets `Conflict`, the stored session ends at
+    /// version 1, and a late third writer still expecting 0 also conflicts. Ignored by
+    /// default because it needs a Redis on localhost:6379; run with `-- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires live Redis on localhost:6379; run with -- --ignored"]
+    async fn test_save_cas_is_atomic_against_live_redis() {
+        // Build a client straight against a local, password-less Redis. If CI later
+        // provides a redis service on localhost:6379 this runs there unchanged.
+        let config = RedisConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            username: None,
+            password: None,
+            database: 0,
+            timeout: 5,
+            connect_timeout: 5,
+        };
+        let client = Arc::new(
+            RedisClient::new(config)
+                .await
+                .expect("connect to Redis on localhost:6379"),
+        );
+
+        // A unique prefix (with a random uuid) isolates this run's keys so parallel or
+        // repeated `--ignored` runs never collide.
+        let prefix = format!("test-cas:{}:", Uuid::new_v4());
+        let store = InRedisSessionStore::new(client, Some(prefix), Some(60));
+
+        let base = create_test_session();
+        let id = base.id;
+        store
+            .create(base.clone())
+            .await
+            .expect("create session in Redis");
+
+        // Two racing writers: both observed version 0 and bumped their clone to 1.
+        let mut a = base.clone();
+        a.current_step = 1;
+        a.bump_version().expect("bump writer a");
+        let mut b = base.clone();
+        b.current_step = 2;
+        b.bump_version().expect("bump writer b");
+
+        let (ra, rb) = tokio::join!(store.save_cas(a, 0), store.save_cas(b, 0));
+        let results = [ra, rb];
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let conflict_count = results
+            .iter()
+            .filter(|r| matches!(r, Err(ChainError::Conflict(_))))
+            .count();
+        assert_eq!(ok_count, 1, "exactly one concurrent CAS must commit");
+        assert_eq!(
+            conflict_count, 1,
+            "exactly one concurrent CAS must conflict"
+        );
+
+        // The single winner advanced the persisted revision to exactly 1.
+        let stored = store.get(id).await.expect("load stored session");
+        assert_eq!(stored.version, 1, "one winning advance leaves version at 1");
+
+        // A late writer that still believes it is at version 0 must also conflict,
+        // because the companion version key is now "1".
+        let mut stale = base.clone();
+        stale.current_step = 3;
+        stale.bump_version().expect("bump stale writer");
+        match store.save_cas(stale, 0).await {
+            Err(ChainError::Conflict(_)) => {}
+            other => panic!("expected Conflict for a stale writer, got {other:?}"),
+        }
+
+        // Clean up: delete removes both the document and its companion version key.
+        assert!(store.delete(id).await.expect("cleanup session"));
     }
 
     // TestErrorInRedisSessionStore - to test error cases

@@ -177,7 +177,7 @@ impl SessionManager {
         // Bump the revision and persist via compare-and-swap. On a concurrent race the
         // save returns `ChainError::Conflict` (HTTP 409) and the client retries; there
         // is deliberately no silent retry loop here.
-        session.bump_version();
+        session.bump_version()?;
         self.store
             .save_cas(session.clone(), expected_version)
             .await?;
@@ -284,7 +284,7 @@ impl SessionManager {
         // Persist via compare-and-swap so a PATCH cannot clobber a newer revision
         // written by a concurrent advance/update; a race yields `ChainError::Conflict`
         // (HTTP 409) for the client to retry.
-        session.bump_version();
+        session.bump_version()?;
         self.store
             .save_cas(session.clone(), expected_version)
             .await?;
@@ -332,7 +332,7 @@ impl SessionManager {
         // Persist via compare-and-swap so a PUT cannot clobber a newer revision
         // written by a concurrent advance/update; a race yields `ChainError::Conflict`
         // (HTTP 409) for the client to retry.
-        session.bump_version();
+        session.bump_version()?;
         self.store
             .save_cas(session.clone(), expected_version)
             .await?;
