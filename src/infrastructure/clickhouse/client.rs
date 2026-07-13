@@ -584,4 +584,96 @@ mod tests {
         assert_eq!(typical_prices[0], expected_typical_1);
         assert_eq!(typical_prices[1], expected_typical_2);
     }
+
+    /// Live-ClickHouse fixture for issue #14 acceptance: rows are inserted in a
+    /// SHUFFLED (non-chronological) order as separate inserts, so each row lands in
+    /// its own part and an `any(open)`/`any(close)` aggregation would be free to pick
+    /// a mid-interval row. The hourly aggregate must nevertheless report the
+    /// chronologically first open, last close, max high, min low and summed volume —
+    /// which only holds with the timestamp-aware `argMin`/`argMax` aggregates.
+    #[tokio::test]
+    #[ignore = "requires live ClickHouse on localhost:8123 (override via CLICKHOUSE_* env)"]
+    async fn test_hourly_aggregation_deterministic_against_live_clickhouse() {
+        let client = ClickHouseClient::new(ClickHouseConfig::default())
+            .expect("failed to build ClickHouse client");
+
+        client
+            .client
+            .query(
+                "CREATE TABLE IF NOT EXISTS ohlcv (\
+                 symbol String, timestamp DateTime, \
+                 open Float32, high Float32, low Float32, close Float32, \
+                 volume UInt64) \
+                 ENGINE = MergeTree ORDER BY (symbol, timestamp)",
+            )
+            .execute()
+            .await
+            .expect("failed to ensure ohlcv table");
+
+        // Unique symbol per run keeps concurrent/repeated executions independent.
+        let symbol = format!("OCSTEST{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+
+        // One hourly bucket (2021-01-01 10:00 UTC). Chronological truth:
+        // open 100.0 at 10:00, close 107.0 at 10:59, high 110.0, low 95.0, volume 60.
+        // Inserted SHUFFLED (10:30, 10:59, 10:00), one insert per row, so each row
+        // sits in its own part and part order disagrees with timestamp order.
+        let base = 1_609_495_200_i64; // 2021-01-01 10:00:00 UTC
+        let rows: [(i64, f32, f32, f32, f32, u64); 3] = [
+            (base + 30 * 60, 102.0, 110.0, 95.0, 103.0, 20),
+            (base + 59 * 60, 104.0, 108.0, 100.0, 107.0, 30),
+            (base, 100.0, 105.0, 99.0, 101.0, 10),
+        ];
+        for (ts, open, high, low, close, volume) in rows {
+            client
+                .client
+                .query(
+                    "INSERT INTO ohlcv \
+                     (symbol, timestamp, open, high, low, close, volume) \
+                     VALUES (?, FROM_UNIXTIME(?), ?, ?, ?, ?, ?)",
+                )
+                .bind(symbol.as_str())
+                .bind(ts)
+                .bind(open)
+                .bind(high)
+                .bind(low)
+                .bind(close)
+                .bind(volume)
+                .execute()
+                .await
+                .expect("failed to insert fixture row");
+        }
+
+        let start = Utc
+            .timestamp_opt(base, 0)
+            .single()
+            .expect("valid fixture timestamp");
+        let data = client
+            .fetch_ohlcv_data(&symbol, &TimeFrame::Hour, &start, 10)
+            .await
+            .expect("failed to fetch aggregated OHLCV data");
+
+        // Best-effort cleanup before asserting, so a failed assert does not leak rows.
+        let _ = client
+            .client
+            .query("DELETE FROM ohlcv WHERE symbol = ?")
+            .bind(symbol.as_str())
+            .execute()
+            .await;
+
+        assert_eq!(data.len(), 1, "three minute rows form one hourly bucket");
+        let bucket = &data[0];
+        assert_eq!(
+            bucket.open,
+            pos_or_panic!(100.0),
+            "open is the row with the EARLIEST timestamp"
+        );
+        assert_eq!(
+            bucket.close,
+            pos_or_panic!(107.0),
+            "close is the row with the LATEST timestamp"
+        );
+        assert_eq!(bucket.high, pos_or_panic!(110.0));
+        assert_eq!(bucket.low, pos_or_panic!(95.0));
+        assert_eq!(bucket.volume, 60);
+    }
 }
