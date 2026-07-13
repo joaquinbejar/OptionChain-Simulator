@@ -182,6 +182,15 @@ impl RedisClient {
     pub fn get_config(&self) -> &RedisConfig {
         &self.config
     }
+
+    /// Returns a clone of the multiplexed [`ConnectionManager`] for callers that
+    /// need to issue commands the typed helpers on this client do not cover — for
+    /// example running a `redis::Script` (server-side Lua) for an atomic
+    /// compare-and-swap. Cloning is cheap (an internal `Arc`) and clones share the
+    /// same multiplexed socket, so this does not introduce a per-op lock.
+    pub fn connection_manager(&self) -> ConnectionManager {
+        self.manager.clone()
+    }
 }
 
 #[cfg(test)]

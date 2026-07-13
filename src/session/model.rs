@@ -260,6 +260,15 @@ pub struct Session {
     pub total_steps: usize,
     /// * `state` - The current state of the session, represented by an instance
     pub state: SessionState,
+    /// * `version` - Optimistic-concurrency revision counter. It starts at `0` at
+    ///   creation and is bumped by the [`SessionManager`] (via
+    ///   [`Session::bump_version`]) immediately before a compare-and-swap save, so
+    ///   two concurrent mutations that read the same snapshot cannot silently
+    ///   overwrite one another: the second save fails with
+    ///   [`ChainError::Conflict`]. Carries `#[serde(default)]` so sessions
+    ///   persisted before this field existed still deserialize (defaulting to 0).
+    #[serde(default)]
+    pub version: u64,
 }
 
 impl Session {
@@ -296,6 +305,7 @@ impl Session {
             total_steps: parameters.steps,
             parameters,
             state: SessionState::Initialized,
+            version: 0,
         }
     }
 
@@ -349,6 +359,7 @@ impl Session {
             total_steps: parameters.steps,
             parameters,
             state: SessionState::Initialized,
+            version: 0,
         }
     }
 
@@ -457,6 +468,29 @@ impl Session {
     pub fn is_active(&self) -> bool {
         self.state != SessionState::Completed && self.state != SessionState::Error
     }
+
+    /// Increments the optimistic-concurrency [`Session::version`] counter by one.
+    ///
+    /// The state-transition methods (`advance_step`, `modify_parameters`,
+    /// `reinitialize`) are deliberately kept as pure state changes and do NOT
+    /// touch the version. The [`SessionManager`] calls this helper right before a
+    /// compare-and-swap save so the persisted revision advances exactly once per
+    /// successfully served mutation. Uses `checked_add` (the ruleset forbids
+    /// `saturating_*`): saturating at `u64::MAX` would freeze the revision and let
+    /// several concurrent writers pass the compare-and-swap, so an overflow is
+    /// surfaced as an error instead of being silently clamped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Internal`] if the counter would overflow `u64`
+    /// (unreachable in practice — it would take 2^64 mutations of one session).
+    pub fn bump_version(&mut self) -> Result<(), ChainError> {
+        self.version = self
+            .version
+            .checked_add(1)
+            .ok_or_else(|| ChainError::Internal("session version overflow".to_string()))?;
+        Ok(())
+    }
 }
 
 impl Default for Session {
@@ -496,6 +530,7 @@ impl Default for Session {
             current_step: 0,
             total_steps: 20,
             state: SessionState::Initialized,
+            version: 0,
         }
     }
 }
@@ -1394,6 +1429,75 @@ mod tests_session {
         // Error state
         session.state = SessionState::Error;
         assert!(!session.is_active());
+    }
+
+    #[test]
+    fn test_new_session_starts_at_version_zero() {
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+
+        assert_eq!(
+            Session::new_with_generator(params.clone(), &uuid_gen).version,
+            0
+        );
+        assert_eq!(Session::with_random_id(params).version, 0);
+        assert_eq!(Session::default().version, 0);
+    }
+
+    #[test]
+    fn test_bump_version_increments_by_one() {
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(params, &uuid_gen);
+
+        assert_eq!(session.version, 0);
+        assert!(session.bump_version().is_ok());
+        assert_eq!(session.version, 1);
+        assert!(session.bump_version().is_ok());
+        assert_eq!(session.version, 2);
+    }
+
+    /// The revision counter must never silently clamp: at `u64::MAX` a bump
+    /// returns [`ChainError::Internal`] instead of saturating (which would let
+    /// multiple stale writers pass the compare-and-swap).
+    #[test]
+    fn test_bump_version_overflow_returns_internal_error() {
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(params, &uuid_gen);
+        session.version = u64::MAX;
+
+        match session.bump_version() {
+            Err(ChainError::Internal(msg)) => assert!(msg.contains("overflow")),
+            other => panic!("expected Internal overflow error, got {other:?}"),
+        }
+        // The counter is left untouched on overflow.
+        assert_eq!(session.version, u64::MAX);
+    }
+
+    /// Stored-session compatibility: a `Session` persisted before the optimistic
+    /// `version` field existed (its JSON has no `version` key) must still
+    /// deserialize, defaulting to version 0. The round-trip strips the key from a
+    /// freshly serialized session to reproduce the OLD stored shape exactly.
+    #[test]
+    fn test_deserialization_without_version_defaults_to_zero() {
+        let params = create_test_parameters();
+        let uuid_gen = UuidGenerator::new(Uuid::new_v4());
+        let mut session = Session::new_with_generator(params, &uuid_gen);
+        session.version = 7;
+
+        // Serialize, then drop the `version` key to mimic an older stored payload.
+        let mut value: serde_json::Value = serde_json::to_value(&session).unwrap();
+        value
+            .as_object_mut()
+            .expect("session serializes to a JSON object")
+            .remove("version");
+        assert!(value.get("version").is_none());
+
+        let restored: Session = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.version, 0);
+        assert_eq!(restored.id, session.id);
+        assert_eq!(restored.current_step, session.current_step);
     }
 
     #[test]
