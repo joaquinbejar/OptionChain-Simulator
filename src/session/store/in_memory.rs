@@ -60,6 +60,22 @@ impl SessionStore for InMemorySessionStore {
             .ok_or_else(|| ChainError::NotFound(format!("Session with id {} not found", id)))
     }
 
+    fn create(&self, session: Session) -> Result<(), ChainError> {
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            ChainError::Internal("Failed to acquire lock on session store".to_string())
+        })?;
+
+        if sessions.contains_key(&session.id) {
+            return Err(ChainError::AlreadyExists(format!(
+                "Session with id {} already exists",
+                session.id
+            )));
+        }
+
+        sessions.insert(session.id, session);
+        Ok(())
+    }
+
     fn save(&self, session: Session) -> Result<(), ChainError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ChainError::Internal("Failed to acquire lock on session store".to_string())
@@ -203,6 +219,53 @@ mod tests {
         assert_eq!(retrieved_session.id, id);
         assert_eq!(retrieved_session.parameters.symbol, "TEST");
         assert_eq!(retrieved_session.state, SessionState::Initialized);
+    }
+
+    #[test]
+    fn test_create_new_session() {
+        let store = InMemorySessionStore::new();
+        let session = create_test_session(None);
+        let id = session.id;
+
+        // create succeeds on a new id
+        assert!(store.create(session).is_ok());
+
+        // and the session is retrievable
+        assert!(store.get(id).is_ok());
+    }
+
+    #[test]
+    fn test_create_duplicate_returns_already_exists() {
+        let store = InMemorySessionStore::new();
+        let session = create_test_session(None);
+
+        // first create wins
+        assert!(store.create(session.clone()).is_ok());
+
+        // second create with the same id is rejected instead of overwriting
+        match store.create(session) {
+            Err(ChainError::AlreadyExists(msg)) => {
+                assert!(msg.contains("already exists"));
+            }
+            other => panic!("Expected AlreadyExists error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_save_still_updates_after_create() {
+        let store = InMemorySessionStore::new();
+        let mut session = create_test_session(None);
+        let id = session.id;
+
+        // create the session, then save (upsert) an updated copy
+        assert!(store.create(session.clone()).is_ok());
+        session.current_step = 7;
+        session.state = SessionState::InProgress;
+        assert!(store.save(session).is_ok());
+
+        let retrieved = store.get(id).unwrap();
+        assert_eq!(retrieved.current_step, 7);
+        assert_eq!(retrieved.state, SessionState::InProgress);
     }
 
     #[test]

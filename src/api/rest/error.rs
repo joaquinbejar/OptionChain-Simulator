@@ -6,6 +6,9 @@ pub(crate) fn map_error(error: ChainError) -> HttpResponse {
         ChainError::NotFound(_) => {
             HttpResponse::NotFound().json(serde_json::json!({"error": error.to_string()}))
         }
+        ChainError::AlreadyExists(_) => {
+            HttpResponse::Conflict().json(serde_json::json!({"error": error.to_string()}))
+        }
         ChainError::InvalidState(_) => {
             HttpResponse::BadRequest().json(serde_json::json!({"error": error.to_string()}))
         }
@@ -31,6 +34,18 @@ mod tests {
         let err = ChainError::NotFound("item_xyz".into());
         let resp: HttpResponse = map_error(err.clone());
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!({"error": err.to_string()}));
+    }
+
+    /// AlreadyExists should map to 409 with the error message from `Display`.
+    #[actix_web::test]
+    async fn test_map_error_already_exists() {
+        let err = ChainError::AlreadyExists("session_abc".into());
+        let resp: HttpResponse = map_error(err.clone());
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
 
         let body = to_bytes(resp.into_body()).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();

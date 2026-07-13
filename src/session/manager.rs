@@ -2,13 +2,15 @@ use crate::domain::Simulator;
 use crate::session::SessionStore;
 use crate::session::model::{Session, SimulationParameters};
 use crate::session::state_handler::StateProgressionHandler;
-use crate::utils::UuidGenerator;
 use crate::utils::error::ChainError;
 use optionstratlib::chains::OptionChain;
 use std::string::ToString;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Deterministic UUID namespace kept for the `Default for Session` impl in
+/// `src/session/model.rs`. New session ids are random (`Uuid::new_v4`) so a
+/// restarted manager or a second replica never reproduces an id sequence.
 pub(crate) const DEFAULT_NAMESPACE: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 
 /// Manages the lifecycle of simulation sessions
@@ -16,7 +18,6 @@ pub struct SessionManager {
     store: Arc<dyn SessionStore>,
     state_handler: StateProgressionHandler,
     simulator: Simulator,
-    uuid_generator: UuidGenerator,
 }
 
 impl SessionManager {
@@ -37,20 +38,10 @@ impl SessionManager {
     ///   specific processes or operations as per the required functionality.
     ///
     pub fn new(store: Arc<dyn SessionStore>) -> Self {
-        // Create a new namespace for each session manager instance
-        // let namespace_uuid = Uuid::new_v4().to_string();
-        // let namespace = Uuid::parse_str(&namespace_uuid)
-        //     .expect("Failed to parse default UUID namespace");
-
-        // Create a default namespace for compatibility
-        let namespace =
-            Uuid::parse_str(DEFAULT_NAMESPACE).expect("Failed to parse default UUID namespace");
-        let uuid_generator = UuidGenerator::new(namespace);
         Self {
             store,
             state_handler: StateProgressionHandler::new(),
             simulator: Simulator::new(),
-            uuid_generator,
         }
     }
 
@@ -72,8 +63,11 @@ impl SessionManager {
     /// - When the session fails to be stored in the backend storage.
     ///
     pub fn create_session(&self, params: SimulationParameters) -> Result<Session, ChainError> {
-        let session = Session::new(params, &self.uuid_generator);
-        self.store.save(session.clone())?;
+        // Random session ids (see `Session::with_random_id`) plus a non-overwriting
+        // `create` guarantee a fresh session never clobbers a live one after a restart
+        // or across replicas.
+        let session = Session::with_random_id(params);
+        self.store.create(session.clone())?;
         Ok(session)
     }
 
@@ -271,5 +265,69 @@ impl SessionManager {
     /// storage backend is properly equipped to remove outdated or invalid sessions.
     pub fn cleanup_sessions(&self) -> Result<usize, ChainError> {
         self.store.cleanup()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{InMemorySessionStore, SimulationMethod};
+    use optionstratlib::utils::TimeFrame;
+    use positive::{Positive, pos_or_panic};
+    use rust_decimal::Decimal;
+
+    fn test_parameters() -> SimulationParameters {
+        SimulationParameters {
+            symbol: "AAPL".to_string(),
+            steps: 10,
+            initial_price: pos_or_panic!(100.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.2),
+            risk_free_rate: Decimal::ZERO,
+            dividend_yield: Positive::ZERO,
+            method: SimulationMethod::Brownian {
+                dt: pos_or_panic!(1.0 / 252.0),
+                drift: Decimal::ZERO,
+                volatility: pos_or_panic!(0.2),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(15),
+            strike_interval: Some(pos_or_panic!(1.0)),
+            skew_slope: None,
+            smile_curve: None,
+            spread: Some(pos_or_panic!(0.02)),
+            seed: None,
+        }
+    }
+
+    /// Regression for issue #7: two freshly built managers (each with its own store,
+    /// as after a restart or on a second replica) must not emit the same first id.
+    #[test]
+    fn test_fresh_managers_produce_different_first_ids() {
+        let manager_a = SessionManager::new(Arc::new(InMemorySessionStore::new()));
+        let manager_b = SessionManager::new(Arc::new(InMemorySessionStore::new()));
+
+        let session_a = manager_a
+            .create_session(test_parameters())
+            .expect("first manager failed to create session");
+        let session_b = manager_b
+            .create_session(test_parameters())
+            .expect("second manager failed to create session");
+
+        assert_ne!(
+            session_a.id, session_b.id,
+            "fresh managers must not reproduce the same id sequence"
+        );
+    }
+
+    /// Successive creates on the same manager also yield distinct ids.
+    #[test]
+    fn test_sequential_creates_have_unique_ids() {
+        let manager = SessionManager::new(Arc::new(InMemorySessionStore::new()));
+
+        let first = manager.create_session(test_parameters()).unwrap();
+        let second = manager.create_session(test_parameters()).unwrap();
+
+        assert_ne!(first.id, second.id);
     }
 }

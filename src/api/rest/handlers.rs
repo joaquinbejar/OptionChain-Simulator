@@ -49,6 +49,7 @@ use uuid::Uuid;
     responses(
         (status = 201, description = "Session created successfully", body = SessionResponse),
         (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 409, description = "Session id already exists", body = ErrorResponse),
         (status = 500, description = "Internal server error")
     )
 )]

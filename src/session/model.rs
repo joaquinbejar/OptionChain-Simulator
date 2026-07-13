@@ -264,6 +264,40 @@ impl Session {
         Self::new_with_generator(parameters, uuid_generator)
     }
 
+    /// Creates a new session with a randomly generated identifier (`Uuid::new_v4`).
+    ///
+    /// Unlike [`Session::new_with_generator`], this constructor does not derive the id
+    /// from a deterministic namespace + counter sequence. Random ids guarantee that a
+    /// freshly started manager (after a restart, or a second service replica) never
+    /// reproduces the id sequence of a manager that is still holding live sessions, so
+    /// a create can no longer collide with — and silently overwrite — an existing one.
+    ///
+    /// # Arguments
+    ///
+    /// * `parameters` - The `SimulationParameters` that configure the session; the
+    ///   session's `total_steps` is taken from `parameters.steps`.
+    ///
+    /// # Returns
+    ///
+    /// A new `Session` with:
+    ///   - `id`: a random v4 UUID.
+    ///   - `created_at` / `updated_at`: the current system time.
+    ///   - `current_step`: 0.
+    ///   - `total_steps`: `parameters.steps`.
+    ///   - `state`: `SessionState::Initialized`.
+    pub fn with_random_id(parameters: SimulationParameters) -> Self {
+        let now = SystemTime::now();
+        Self {
+            id: Uuid::new_v4(),
+            created_at: now,
+            updated_at: now,
+            current_step: 0,
+            total_steps: parameters.steps,
+            parameters,
+            state: SessionState::Initialized,
+        }
+    }
+
     /// Advances the session to the next step while updating its state and timestamp.
     ///
     /// # Behavior
