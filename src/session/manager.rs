@@ -178,6 +178,14 @@ impl SessionManager {
                 "session completed; no current step".to_string(),
             ));
         }
+        // `Error` is the other terminal state (`Session::is_active`); a peek
+        // must reject it like the advance path does instead of serving a
+        // snapshot from a session that can no longer progress.
+        if session.state == SessionState::Error {
+            return Err(ChainError::InvalidState(
+                "Session is in error state".to_string(),
+            ));
+        }
 
         // Read-only: build/read the walk at the current step. This never advances the
         // counter and never persists the session.
@@ -462,6 +470,31 @@ mod tests {
                 assert_eq!(msg, "session completed; no current step");
             }
             other => panic!("expected SimulatorError for completed peek, got {other:?}"),
+        }
+    }
+
+    /// `Error` is terminal too: a peek must reject it instead of serving a
+    /// snapshot from a session that can no longer progress.
+    #[tokio::test]
+    async fn test_peek_on_error_session_returns_invalid_state() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let session = manager
+            .create_session(test_parameters())
+            .expect("failed to create session");
+        let id = session.id;
+
+        let mut errored = store.get(id).expect("session missing from store");
+        errored.state = SessionState::Error;
+        store
+            .save(errored)
+            .expect("failed to persist errored session");
+
+        match manager.peek_current_step(id).await {
+            Err(ChainError::InvalidState(msg)) => {
+                assert_eq!(msg, "Session is in error state");
+            }
+            other => panic!("expected InvalidState for errored peek, got {other:?}"),
         }
     }
 }

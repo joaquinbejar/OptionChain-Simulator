@@ -14,8 +14,10 @@ use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, Utc};
 use optionstratlib::chains::OptionChain;
 use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// Builds the `ChainResponse` DTO shared by the advance (`POST /api/v1/chain/step`) and
@@ -167,19 +169,39 @@ pub(crate) async fn create_session(
     }
 }
 
+/// Query parameters for the advance-step command: the session id plus an
+/// optional expected-cursor precondition for safe retries.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub(crate) struct AdvanceStepQuery {
+    /// ID of the session to advance one step.
+    #[serde(rename = "sessionid")]
+    pub(crate) session_id: String,
+    /// Optional expected cursor: when provided, the advance only proceeds if
+    /// the session's current step matches — otherwise 412 is returned with
+    /// the actual cursor, letting a client resolve an ambiguous retry
+    /// (response lost after the save) without consuming another step.
+    #[serde(default)]
+    pub(crate) expected_step: Option<usize>,
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/chain/step",
     description = "Advance the session one step and return the served snapshot. This is an \
         explicit, state-mutating command (the former GET behavior): it serves the next \
-        step and persists the advance. Use GET /api/v1/chain for a safe, repeatable peek.",
+        step and persists the advance. Use GET /api/v1/chain for a safe, repeatable peek. \
+        Pass `expected_step` (the cursor you believe the session is at) to make retries \
+        safe: if a previous attempt already consumed the step, the call returns 412 with \
+        the actual cursor instead of consuming another one.",
     params(
-        ("sessionid" = String, Query, description = "ID of the session to advance one step")
+        ("sessionid" = String, Query, description = "ID of the session to advance one step"),
+        ("expected_step" = Option<usize>, Query, description = "Expected current cursor; mismatch returns 412 without advancing")
     ),
     responses(
         (status = 200, description = "Advanced one step; served snapshot returned", body = ChainResponse),
         (status = 404, description = "Session not found"),
         (status = 410, description = "Simulation completed. No more steps available"),
+        (status = 412, description = "expected_step does not match the session's current cursor; body carries `error` and `current_step`"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -188,7 +210,7 @@ pub(crate) async fn advance_step(
     session_manager: web::Data<Arc<SessionManager>>,
     metrics_collector: web::Data<Arc<MetricsCollector>>,
     mongodb_repo: web::Data<Arc<MongoDBRepository>>,
-    query: web::Query<SessionId>,
+    query: web::Query<AdvanceStepQuery>,
 ) -> impl Responder {
     info!(
         "{} {}: session_id={}",
@@ -207,6 +229,22 @@ pub(crate) async fn advance_step(
             ));
         }
     };
+
+    // Expected-cursor precondition: a transport-level check (412) so an
+    // ambiguous retry can be resolved without consuming another step.
+    if let Some(expected) = query.expected_step {
+        match session_manager.get_session(session_id) {
+            Ok(session) => {
+                if session.current_step != expected {
+                    return HttpResponse::PreconditionFailed().json(serde_json::json!({
+                        "error": "expected_step does not match the session's current cursor",
+                        "current_step": session.current_step,
+                    }));
+                }
+            }
+            Err(error) => return map_error(error),
+        }
+    }
 
     // Advance the session one step (mutates state and persists it).
     match session_manager.get_next_step(session_id).await {
@@ -645,5 +683,25 @@ pub(crate) async fn delete_session(
             error!("{}", error);
             map_error(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_advance_step_query {
+    use super::AdvanceStepQuery;
+
+    #[test]
+    fn test_expected_step_absent_deserializes_to_none() {
+        let q: AdvanceStepQuery =
+            serde_json::from_str(r#"{"sessionid":"abc"}"#).expect("query must parse");
+        assert_eq!(q.session_id, "abc");
+        assert_eq!(q.expected_step, None);
+    }
+
+    #[test]
+    fn test_expected_step_present_deserializes_to_some() {
+        let q: AdvanceStepQuery = serde_json::from_str(r#"{"sessionid":"abc","expected_step":3}"#)
+            .expect("query must parse");
+        assert_eq!(q.expected_step, Some(3));
     }
 }
