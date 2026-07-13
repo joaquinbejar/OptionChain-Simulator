@@ -365,7 +365,7 @@ pub(crate) async fn advance_step(
     // Expected-cursor precondition: a transport-level check (412) so an
     // ambiguous retry can be resolved without consuming another step.
     if let Some(expected) = query.expected_step {
-        match session_manager.get_session(session_id) {
+        match session_manager.get_session(session_id).await {
             Ok(session) => {
                 if session.current_step != expected {
                     return HttpResponse::PreconditionFailed().json(serde_json::json!({

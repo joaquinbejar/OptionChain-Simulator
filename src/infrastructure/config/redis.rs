@@ -415,6 +415,7 @@ mod tests {
                 password: Some(pw.to_string()),
                 database: 0,
                 timeout: 30,
+                connect_timeout: 5,
             };
             let display = format!("{}", config);
             let debug = format!("{:?}", config);

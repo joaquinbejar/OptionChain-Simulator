@@ -711,13 +711,15 @@ mod tests {
         let manager = SessionManager::new(store.clone());
         let session = manager
             .create_session(test_parameters())
+            .await
             .expect("failed to create session");
         let id = session.id;
 
-        let mut errored = store.get(id).expect("session missing from store");
+        let mut errored = store.get(id).await.expect("session missing from store");
         errored.state = SessionState::Error;
         store
             .save(errored)
+            .await
             .expect("failed to persist errored session");
 
         match manager.peek_current_step(id).await {
@@ -736,13 +738,15 @@ mod tests {
         let manager = SessionManager::new(store.clone());
         let session = manager
             .create_session(test_parameters())
+            .await
             .expect("failed to create session");
         let id = session.id;
 
-        let mut errored = store.get(id).expect("session missing from store");
+        let mut errored = store.get(id).await.expect("session missing from store");
         errored.state = SessionState::Error;
         store
             .save(errored)
+            .await
             .expect("failed to persist errored session");
 
         match manager.get_next_step(id).await {
@@ -751,7 +755,7 @@ mod tests {
             }
             other => panic!("expected InvalidState for errored advance, got {other:?}"),
         }
-        let stored = store.get(id).expect("session missing from store");
+        let stored = store.get(id).await.expect("session missing from store");
         assert_eq!(stored.state, SessionState::Error);
         assert_eq!(stored.current_step, 0);
     }
