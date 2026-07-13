@@ -1,6 +1,5 @@
 use crate::session::{Session, SessionState};
 use crate::utils::error::ChainError;
-use tracing::debug;
 
 /// Handles state transitions for simulation sessions
 pub struct StateProgressionHandler;
@@ -10,6 +9,15 @@ impl StateProgressionHandler {
         Self
     }
 
+    /// Advances the session one step under serve-then-advance semantics.
+    ///
+    /// The `Reinitialized` branch mirrors `Initialized`/`Modified`: the snapshot at
+    /// cursor 0 has already been served (the simulator rebuilt the walk because it
+    /// observed the pre-advance `Reinitialized` state), so this transitions the
+    /// session out of `Reinitialized` into `InProgress` and advances the cursor. That
+    /// leaves the persisted state as `InProgress`, so the NEXT advance serves the
+    /// cached walk instead of triggering another eviction/rebuild — the fix for a
+    /// reinitialized session getting stuck at step 0 forever (issue #4).
     pub fn advance_state(&self, session: &mut Session) -> Result<(), ChainError> {
         match session.state {
             SessionState::Initialized => {
@@ -27,7 +35,8 @@ impl StateProgressionHandler {
                 Ok(())
             }
             SessionState::Reinitialized => {
-                debug!("Reinitializing session");
+                session.state = SessionState::InProgress;
+                session.advance_step()?;
                 Ok(())
             }
             SessionState::Completed => Err(ChainError::InvalidState(
@@ -37,12 +46,6 @@ impl StateProgressionHandler {
                 "Session is in error state".to_string(),
             )),
         }
-    }
-
-    pub fn reset_progression(&self, session: &mut Session) -> Result<(), ChainError> {
-        session.current_step = 0;
-        session.state = SessionState::Reinitialized;
-        Ok(())
     }
 }
 
@@ -128,14 +131,18 @@ mod tests {
 
     #[test]
     fn test_advance_state_reinitialized() {
+        // Issue #4: a reinitialized session must not stick at step 0. After the
+        // snapshot at cursor 0 is served, advancing transitions the session out of
+        // `Reinitialized` into `InProgress` and moves the cursor to 1, so the next
+        // advance serves the cached walk instead of rebuilding it forever.
         let handler = StateProgressionHandler::new();
         let mut session = create_test_session(SessionState::Reinitialized);
 
         let result = handler.advance_state(&mut session);
 
         assert!(result.is_ok());
-        assert_eq!(session.state, SessionState::Reinitialized);
-        assert_eq!(session.current_step, 0);
+        assert_eq!(session.state, SessionState::InProgress);
+        assert_eq!(session.current_step, 1);
     }
 
     #[test]
@@ -168,18 +175,5 @@ mod tests {
             }
             _ => panic!("Expected InvalidState error"),
         }
-    }
-
-    #[test]
-    fn test_reset_progression() {
-        let handler = StateProgressionHandler::new();
-        let mut session = create_test_session(SessionState::InProgress);
-        session.current_step = 5; // Set to a mid-point step
-
-        let result = handler.reset_progression(&mut session);
-
-        assert!(result.is_ok());
-        assert_eq!(session.current_step, 0);
-        assert_eq!(session.state, SessionState::Reinitialized);
     }
 }
