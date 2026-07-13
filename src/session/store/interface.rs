@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::session::model::Session;
@@ -52,6 +53,7 @@ use crate::utils::error::ChainError;
 ///   - `Ok(usize)`: The number of sessions that were cleaned up.
 ///   - `Err(ChainError)`: An error if cleanup fails.
 ///
+#[async_trait]
 pub trait SessionStore: Send + Sync {
     /// Retrieves a `Session` by its unique identifier.
     ///
@@ -67,7 +69,7 @@ pub trait SessionStore: Send + Sync {
     /// - The session with the provided `id` does not exist.
     /// - There is an issue with the underlying storage or retrieval process.
     ///
-    fn get(&self, id: Uuid) -> Result<Session, ChainError>;
+    async fn get(&self, id: Uuid) -> Result<Session, ChainError>;
 
     /// Creates a brand-new session, failing if one with the same id already exists.
     ///
@@ -87,7 +89,7 @@ pub trait SessionStore: Send + Sync {
     /// # Errors
     /// Returns `ChainError::AlreadyExists` on an id collision, or another `ChainError`
     /// variant on a storage/serialization failure.
-    fn create(&self, session: Session) -> Result<(), ChainError>;
+    async fn create(&self, session: Session) -> Result<(), ChainError>;
 
     /// Saves the provided session into persistent storage or memory.
     ///
@@ -103,7 +105,7 @@ pub trait SessionStore: Send + Sync {
     /// - Issues with accessing the storage system.
     /// - Serialization or persistence failures.
     ///
-    fn save(&self, session: Session) -> Result<(), ChainError>;
+    async fn save(&self, session: Session) -> Result<(), ChainError>;
 
     /// Deletes an entity identified by the given `id`.
     ///
@@ -119,7 +121,7 @@ pub trait SessionStore: Send + Sync {
     /// This function returns a `ChainError` if there is an issue with the deletion process,
     /// such as database communication errors or invalid input.
     ///
-    fn delete(&self, id: Uuid) -> Result<bool, ChainError>;
+    async fn delete(&self, id: Uuid) -> Result<bool, ChainError>;
 
     /// Cleans up stale or unnecessary data within the chain and performs housekeeping tasks.
     ///
@@ -135,7 +137,7 @@ pub trait SessionStore: Send + Sync {
     /// This function will return a `ChainError` in case of failures, such as issues
     /// accessing resources, file system problems, or other internal errors during
     /// cleanup.
-    fn cleanup(&self) -> Result<usize, ChainError>;
+    async fn cleanup(&self) -> Result<usize, ChainError>;
 }
 
 #[cfg(test)]
@@ -151,15 +153,17 @@ mod tests {
     use std::time::SystemTime;
     use uuid::Uuid;
 
-    // Create a mock implementation of SessionStore for testing
+    // Create a mock implementation of SessionStore for testing. mockall renders
+    // the async trait via the same `#[async_trait]` attribute on the impl block.
     mock! {
         pub SessionStore {}
+        #[async_trait]
         impl SessionStore for SessionStore {
-            fn get(&self, id: Uuid) -> Result<Session, ChainError>;
-            fn create(&self, session: Session) -> Result<(), ChainError>;
-            fn save(&self, session: Session) -> Result<(), ChainError>;
-            fn delete(&self, id: Uuid) -> Result<bool, ChainError>;
-            fn cleanup(&self) -> Result<usize, ChainError>;
+            async fn get(&self, id: Uuid) -> Result<Session, ChainError>;
+            async fn create(&self, session: Session) -> Result<(), ChainError>;
+            async fn save(&self, session: Session) -> Result<(), ChainError>;
+            async fn delete(&self, id: Uuid) -> Result<bool, ChainError>;
+            async fn cleanup(&self) -> Result<usize, ChainError>;
         }
     }
 
@@ -176,8 +180,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl SessionStore for TestSessionStore {
-        fn get(&self, id: Uuid) -> Result<Session, ChainError> {
+        async fn get(&self, id: Uuid) -> Result<Session, ChainError> {
             let sessions = self.sessions.lock().unwrap();
             match sessions.get(&id) {
                 Some(session) => Ok(session.clone()),
@@ -188,7 +193,7 @@ mod tests {
             }
         }
 
-        fn create(&self, session: Session) -> Result<(), ChainError> {
+        async fn create(&self, session: Session) -> Result<(), ChainError> {
             let mut sessions = self.sessions.lock().unwrap();
             if sessions.contains_key(&session.id) {
                 return Err(ChainError::AlreadyExists(format!(
@@ -200,18 +205,18 @@ mod tests {
             Ok(())
         }
 
-        fn save(&self, session: Session) -> Result<(), ChainError> {
+        async fn save(&self, session: Session) -> Result<(), ChainError> {
             let mut sessions = self.sessions.lock().unwrap();
             sessions.insert(session.id, session);
             Ok(())
         }
 
-        fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
+        async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
             let mut sessions = self.sessions.lock().unwrap();
             Ok(sessions.remove(&id).is_some())
         }
 
-        fn cleanup(&self) -> Result<usize, ChainError> {
+        async fn cleanup(&self) -> Result<usize, ChainError> {
             let now = SystemTime::now();
             let mut sessions = self.sessions.lock().unwrap();
 
@@ -263,17 +268,17 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_get_existing_session() {
+    #[tokio::test]
+    async fn test_get_existing_session() {
         let store = TestSessionStore::new();
         let session = create_test_session(None);
         let session_id = session.id;
 
         // Save the session first
-        store.save(session.clone()).unwrap();
+        store.save(session.clone()).await.unwrap();
 
         // Then try to get it
-        let result = store.get(session_id);
+        let result = store.get(session_id).await;
         assert!(result.is_ok());
 
         let retrieved_session = result.unwrap();
@@ -282,12 +287,12 @@ mod tests {
         assert_eq!(retrieved_session.total_steps, session.total_steps);
     }
 
-    #[test]
-    fn test_get_non_existing_session() {
+    #[tokio::test]
+    async fn test_get_non_existing_session() {
         let store = TestSessionStore::new();
         let non_existent_id = Uuid::new_v4();
 
-        let result = store.get(non_existent_id);
+        let result = store.get(non_existent_id).await;
         assert!(result.is_err());
 
         match result {
@@ -296,108 +301,108 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_save_new_session() {
+    #[tokio::test]
+    async fn test_save_new_session() {
         let store = TestSessionStore::new();
         let session = create_test_session(None);
         let session_id = session.id;
 
-        let save_result = store.save(session);
+        let save_result = store.save(session).await;
         assert!(save_result.is_ok());
 
         // Verify it was saved by retrieving it
-        let get_result = store.get(session_id);
+        let get_result = store.get(session_id).await;
         assert!(get_result.is_ok());
     }
 
-    #[test]
-    fn test_create_new_session() {
+    #[tokio::test]
+    async fn test_create_new_session() {
         let store = TestSessionStore::new();
         let session = create_test_session(None);
         let session_id = session.id;
 
         // First create succeeds on a fresh id
-        let create_result = store.create(session);
+        let create_result = store.create(session).await;
         assert!(create_result.is_ok());
 
         // Verify it was stored
-        assert!(store.get(session_id).is_ok());
+        assert!(store.get(session_id).await.is_ok());
     }
 
-    #[test]
-    fn test_create_duplicate_session_returns_already_exists() {
+    #[tokio::test]
+    async fn test_create_duplicate_session_returns_already_exists() {
         let store = TestSessionStore::new();
         let session = create_test_session(None);
 
         // First create succeeds
-        assert!(store.create(session.clone()).is_ok());
+        assert!(store.create(session.clone()).await.is_ok());
 
         // Second create with the same id must be rejected, not overwrite
-        let dup_result = store.create(session);
+        let dup_result = store.create(session).await;
         match dup_result {
             Err(ChainError::AlreadyExists(_)) => {}
             other => panic!("Expected AlreadyExists error, got {:?}", other),
         }
     }
 
-    #[test]
-    fn test_save_existing_session() {
+    #[tokio::test]
+    async fn test_save_existing_session() {
         let store = TestSessionStore::new();
         let mut session = create_test_session(None);
         let session_id = session.id;
 
         // Save the session first
-        store.save(session.clone()).unwrap();
+        store.save(session.clone()).await.unwrap();
 
         // Update the session and save again
         session.current_step = 50;
-        let save_result = store.save(session.clone());
+        let save_result = store.save(session.clone()).await;
         assert!(save_result.is_ok());
 
         // Verify the update by retrieving it
-        let get_result = store.get(session_id).unwrap();
+        let get_result = store.get(session_id).await.unwrap();
         assert_eq!(get_result.current_step, 50);
     }
 
-    #[test]
-    fn test_delete_existing_session() {
+    #[tokio::test]
+    async fn test_delete_existing_session() {
         let store = TestSessionStore::new();
         let session = create_test_session(None);
         let session_id = session.id;
 
         // Save the session first
-        store.save(session).unwrap();
+        store.save(session).await.unwrap();
 
         // Then delete it
-        let delete_result = store.delete(session_id);
+        let delete_result = store.delete(session_id).await;
         assert!(delete_result.is_ok());
         assert!(delete_result.unwrap()); // Should return true for successful deletion
 
         // Verify it was deleted
-        let get_result = store.get(session_id);
+        let get_result = store.get(session_id).await;
         assert!(get_result.is_err());
     }
 
-    #[test]
-    fn test_delete_non_existing_session() {
+    #[tokio::test]
+    async fn test_delete_non_existing_session() {
         let store = TestSessionStore::new();
         let non_existent_id = Uuid::new_v4();
 
-        let delete_result = store.delete(non_existent_id);
+        let delete_result = store.delete(non_existent_id).await;
         assert!(delete_result.is_ok());
         assert!(!delete_result.unwrap()); // Should return false for non-existent session
     }
 
-    #[test]
-    fn test_cleanup_with_no_expired_sessions() {
+    #[tokio::test]
+    async fn test_cleanup_with_no_expired_sessions() {
         let store = TestSessionStore::new();
 
         // Add a few fresh sessions
         for _ in 0..5 {
-            store.save(create_test_session(None)).unwrap();
+            store.save(create_test_session(None)).await.unwrap();
         }
 
-        let cleanup_result = store.cleanup();
+        let cleanup_result = store.cleanup().await;
         assert!(cleanup_result.is_ok());
         assert_eq!(cleanup_result.unwrap(), 0); // No sessions should be cleaned up
     }

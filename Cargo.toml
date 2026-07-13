@@ -63,7 +63,7 @@ tokio = { version = "1.52", features = ["full"] }
 async-trait = "0.1"
 actix-web = { version = "4.14", features = ["rustls"] }
 actix-files = "0.6"
-redis = "1.3"
+redis = { version = "1.3", features = ["tokio-comp", "connection-manager"] }
 # actix_extras is unavailable: optionstratlib enables utoipa/axum_extras,
 # and utoipa's framework extras are mutually exclusive
 utoipa = "5.5"

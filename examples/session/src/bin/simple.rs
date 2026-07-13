@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a new simulation session
     info!("Creating a new simulation session");
-    let session_result = session_manager.create_session(params);
+    let session_result = session_manager.create_session(params).await;
 
     match session_result {
         Ok(session) => {
@@ -53,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Cleanup expired sessions
-            match session_manager.cleanup_sessions() {
+            match session_manager.cleanup_sessions().await {
                 Ok(count) => info!("Cleaned up {} expired sessions", count),
                 Err(e) => error!("Error cleaning up sessions: {}", e),
             }
@@ -146,7 +146,10 @@ async fn run_session_lifecycle(
         volatility,
     };
 
-    match session_manager.update_session(session_id, modified_params) {
+    match session_manager
+        .update_session(session_id, modified_params)
+        .await
+    {
         Ok(modified_session) => {
             info!(
                 session_id = %session_id,
@@ -181,7 +184,7 @@ async fn run_session_lifecycle(
 
     // Step 7: Delete the session
     info!(session_id = %session_id, "Deleting session");
-    match session_manager.delete_session(session_id) {
+    match session_manager.delete_session(session_id).await {
         Ok(deleted) => {
             info!(session_id = %session_id, deleted = deleted, "Session deletion result");
         }

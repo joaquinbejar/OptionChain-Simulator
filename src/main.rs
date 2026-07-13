@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a session store
     let redis_config = RedisConfig::default();
     info!("Connecting to Redis at {}", redis_config);
-    let redis_client = Arc::new(RedisClient::new(redis_config)?);
+    let redis_client = Arc::new(RedisClient::new(redis_config).await?);
     let store = Arc::new(InRedisSessionStore::new(
         redis_client,
         Some("optionchain:session:".to_string()), // Custom key prefix

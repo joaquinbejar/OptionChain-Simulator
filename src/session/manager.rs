@@ -62,12 +62,15 @@ impl SessionManager {
     /// - When there is an error in creating or initializing the session.
     /// - When the session fails to be stored in the backend storage.
     ///
-    pub fn create_session(&self, params: SimulationParameters) -> Result<Session, ChainError> {
+    pub async fn create_session(
+        &self,
+        params: SimulationParameters,
+    ) -> Result<Session, ChainError> {
         // Random session ids (see `Session::with_random_id`) plus a non-overwriting
         // `create` guarantee a fresh session never clobbers a live one after a restart
         // or across replicas.
         let session = Session::with_random_id(params);
-        self.store.create(session.clone())?;
+        self.store.create(session.clone()).await?;
         Ok(session)
     }
 
@@ -87,8 +90,8 @@ impl SessionManager {
     /// This function will return a `ChainError` if:
     /// - The session corresponding to the provided ID does not exist in the underlying store.
     /// - There is an error in accessing or querying the storage mechanism.
-    pub fn get_session(&self, id: Uuid) -> Result<Session, ChainError> {
-        self.store.get(id)
+    pub async fn get_session(&self, id: Uuid) -> Result<Session, ChainError> {
+        self.store.get(id).await
     }
 
     /// Advances the session by one step, serving the snapshot at the current cursor.
@@ -135,7 +138,7 @@ impl SessionManager {
     ///   the store.
     ///
     pub async fn get_next_step(&self, id: Uuid) -> Result<(Session, OptionChain), ChainError> {
-        let mut session = self.store.get(id)?;
+        let mut session = self.store.get(id).await?;
 
         // Completed guard: a session that has served all of its snapshots has nothing
         // left to serve. Mirror the exhausted-advance path (410 Gone) and leave the
@@ -167,7 +170,7 @@ impl SessionManager {
 
         // Always persist after a successfully served snapshot, including the advance
         // that transitions the session to Completed.
-        self.store.save(session.clone())?;
+        self.store.save(session.clone()).await?;
 
         Ok((session, chain))
     }
@@ -201,7 +204,7 @@ impl SessionManager {
     ///   exhausted-advance path.
     /// - Any error surfaced by the simulator while building the current snapshot.
     pub async fn peek_current_step(&self, id: Uuid) -> Result<(Session, OptionChain), ChainError> {
-        let session = self.store.get(id)?;
+        let session = self.store.get(id).await?;
 
         // A completed session has no current step to serve; mirror the exhausted-advance
         // path (410 Gone) rather than returning stale data.
@@ -256,19 +259,19 @@ impl SessionManager {
     /// - The session identified by `id` does not exist in the store.
     /// - The updated session cannot be saved back to the store.
     ///
-    pub fn update_session(
+    pub async fn update_session(
         &self,
         id: Uuid,
         params: SimulationParameters,
     ) -> Result<Session, ChainError> {
-        let mut session = self.store.get(id)?;
+        let mut session = self.store.get(id).await?;
 
         // A parameter change restarts the tape: reset the cursor, sync total_steps,
         // and mark the session Reinitialized so the next advance rebuilds the walk.
         session.reinitialize(params);
 
         // Save updated session
-        self.store.save(session.clone())?;
+        self.store.save(session.clone()).await?;
 
         Ok(session)
     }
@@ -299,18 +302,18 @@ impl SessionManager {
     /// - If the session with the provided `id` cannot be found in the store.
     /// - If there is an issue saving the updated session to the store.
     ///
-    pub fn reinitialize_session(
+    pub async fn reinitialize_session(
         &self,
         id: Uuid,
         params: SimulationParameters,
     ) -> Result<Session, ChainError> {
-        let mut session = self.store.get(id)?;
+        let mut session = self.store.get(id).await?;
 
         // Reinitialize session: reset cursor, sync total_steps, mark Reinitialized.
         session.reinitialize(params);
 
         // Save updated session
-        self.store.save(session.clone())?;
+        self.store.save(session.clone()).await?;
 
         Ok(session)
     }
@@ -332,8 +335,8 @@ impl SessionManager {
     ///
     /// This function will return a `ChainError` if there is an issue interacting with the store.
     ///
-    pub fn delete_session(&self, id: Uuid) -> Result<bool, ChainError> {
-        self.store.delete(id)
+    pub async fn delete_session(&self, id: Uuid) -> Result<bool, ChainError> {
+        self.store.delete(id).await
     }
 
     /// Cleans up outdated or inactive sessions in the underlying storage.
@@ -358,8 +361,8 @@ impl SessionManager {
     /// The specific behavior of this function depends on how the `cleanup` method
     /// is implemented in the underlying `store`. Ensure that the `cleanup` logic in the
     /// storage backend is properly equipped to remove outdated or invalid sessions.
-    pub fn cleanup_sessions(&self) -> Result<usize, ChainError> {
-        self.store.cleanup()
+    pub async fn cleanup_sessions(&self) -> Result<usize, ChainError> {
+        self.store.cleanup().await
     }
 }
 
@@ -414,6 +417,7 @@ mod tests {
         let manager = SessionManager::new(store.clone());
         let session = manager
             .create_session(seeded_parameters(3, 20260713))
+            .await
             .expect("failed to create session");
         let id = session.id;
 
@@ -432,7 +436,7 @@ mod tests {
         }
 
         // Completion is persisted: the cursor reached total_steps and the state is Completed.
-        let stored = store.get(id).expect("session missing from store");
+        let stored = store.get(id).await.expect("session missing from store");
         assert_eq!(stored.state, SessionState::Completed);
         assert_eq!(stored.current_step, 3);
     }
@@ -446,6 +450,7 @@ mod tests {
         let manager = SessionManager::new(store.clone());
         let session = manager
             .create_session(seeded_parameters(4, 777))
+            .await
             .expect("failed to create session");
         let id = session.id;
 
@@ -482,6 +487,7 @@ mod tests {
         let n = 3;
         let session = manager
             .create_session(seeded_parameters(n, 55))
+            .await
             .expect("failed to create session");
         let id = session.id;
 
@@ -489,7 +495,7 @@ mod tests {
             manager.get_next_step(id).await.expect("advance failed");
         }
 
-        let after_completion = store.get(id).expect("session missing from store");
+        let after_completion = store.get(id).await.expect("session missing from store");
         assert_eq!(after_completion.state, SessionState::Completed);
         assert_eq!(after_completion.current_step, n);
         let updated_at = after_completion.updated_at;
@@ -499,7 +505,7 @@ mod tests {
             Err(ChainError::SimulatorError(_)) => {}
             other => panic!("expected terminal SimulatorError, got {other:?}"),
         }
-        let unchanged = store.get(id).expect("session missing from store");
+        let unchanged = store.get(id).await.expect("session missing from store");
         assert_eq!(unchanged.state, SessionState::Completed);
         assert_eq!(unchanged.current_step, n);
         assert_eq!(unchanged.updated_at, updated_at);
@@ -514,6 +520,7 @@ mod tests {
         let n = 4;
         let session = manager
             .create_session(seeded_parameters(n, 999))
+            .await
             .expect("failed to create session");
         let id = session.id;
 
@@ -548,9 +555,11 @@ mod tests {
 
         let session_a = manager
             .create_session(seeded_parameters(n, seed))
+            .await
             .expect("failed to create session a");
         let session_b = manager
             .create_session(seeded_parameters(n, seed))
+            .await
             .expect("failed to create session b");
 
         let mut tape_a = Vec::with_capacity(n);
@@ -575,16 +584,18 @@ mod tests {
 
     /// Regression for issue #7: two freshly built managers (each with its own store,
     /// as after a restart or on a second replica) must not emit the same first id.
-    #[test]
-    fn test_fresh_managers_produce_different_first_ids() {
+    #[tokio::test]
+    async fn test_fresh_managers_produce_different_first_ids() {
         let manager_a = SessionManager::new(Arc::new(InMemorySessionStore::new()));
         let manager_b = SessionManager::new(Arc::new(InMemorySessionStore::new()));
 
         let session_a = manager_a
             .create_session(test_parameters())
+            .await
             .expect("first manager failed to create session");
         let session_b = manager_b
             .create_session(test_parameters())
+            .await
             .expect("second manager failed to create session");
 
         assert_ne!(
@@ -594,12 +605,12 @@ mod tests {
     }
 
     /// Successive creates on the same manager also yield distinct ids.
-    #[test]
-    fn test_sequential_creates_have_unique_ids() {
+    #[tokio::test]
+    async fn test_sequential_creates_have_unique_ids() {
         let manager = SessionManager::new(Arc::new(InMemorySessionStore::new()));
 
-        let first = manager.create_session(test_parameters()).unwrap();
-        let second = manager.create_session(test_parameters()).unwrap();
+        let first = manager.create_session(test_parameters()).await.unwrap();
+        let second = manager.create_session(test_parameters()).await.unwrap();
 
         assert_ne!(first.id, second.id);
     }
@@ -612,6 +623,7 @@ mod tests {
         let manager = SessionManager::new(store.clone());
         let session = manager
             .create_session(test_parameters())
+            .await
             .expect("failed to create session");
         let id = session.id;
 
@@ -630,7 +642,7 @@ mod tests {
         assert_eq!(first.state, SessionState::Initialized);
 
         // Peek is read-only: the stored session is untouched.
-        let stored = store.get(id).expect("session missing from store");
+        let stored = store.get(id).await.expect("session missing from store");
         assert_eq!(stored.current_step, 0);
         assert_eq!(stored.state, SessionState::Initialized);
     }
@@ -642,6 +654,7 @@ mod tests {
         let manager = SessionManager::new(store.clone());
         let session = manager
             .create_session(test_parameters())
+            .await
             .expect("failed to create session");
         let id = session.id;
 
@@ -656,7 +669,7 @@ mod tests {
             .expect("peek after advance failed");
         assert_eq!(peeked.current_step, advanced.current_step);
 
-        let stored = store.get(id).expect("session missing from store");
+        let stored = store.get(id).await.expect("session missing from store");
         assert_eq!(stored.current_step, 1);
         assert_eq!(stored.state, SessionState::InProgress);
     }
@@ -669,15 +682,17 @@ mod tests {
         let manager = SessionManager::new(store.clone());
         let session = manager
             .create_session(test_parameters())
+            .await
             .expect("failed to create session");
         let id = session.id;
 
         // Force the session into the Completed state directly in the store.
-        let mut completed = store.get(id).expect("session missing from store");
+        let mut completed = store.get(id).await.expect("session missing from store");
         completed.current_step = completed.total_steps;
         completed.state = SessionState::Completed;
         store
             .save(completed)
+            .await
             .expect("failed to persist completed session");
 
         match manager.peek_current_step(id).await {
@@ -750,6 +765,7 @@ mod tests {
         let steps = params.steps;
         let session = manager
             .create_session(params)
+            .await
             .expect("failed to create session for reference tape");
         let mut tape = Vec::with_capacity(steps);
         for _ in 0..steps {
@@ -778,6 +794,7 @@ mod tests {
         // Original session (seed 11); advance once so it is mid-tape before the reset.
         let session = manager
             .create_session(seeded_parameters(3, 11))
+            .await
             .expect("failed to create session");
         let id = session.id;
         manager
@@ -788,6 +805,7 @@ mod tests {
         // PUT: reinitialize with the new seed. Cursor resets to 0, state Reinitialized.
         let reinit = manager
             .reinitialize_session(id, seeded_parameters(3, 22))
+            .await
             .expect("reinitialize failed");
         assert_eq!(reinit.current_step, 0);
         assert_eq!(reinit.state, SessionState::Reinitialized);
@@ -801,7 +819,7 @@ mod tests {
         assert_eq!(after_first.current_step, 1);
         assert_eq!(after_first.state, SessionState::InProgress);
         assert_eq!(first_chain.underlying_price, ref_tape[0]);
-        let stored = store.get(id).expect("session missing from store");
+        let stored = store.get(id).await.expect("session missing from store");
         assert_eq!(stored.state, SessionState::InProgress);
 
         // Second advance serves index 1 from the CACHED walk (no rebuild), cursor -> 2.
@@ -827,6 +845,7 @@ mod tests {
 
         let session = manager
             .create_session(seeded_parameters(3, 33))
+            .await
             .expect("failed to create session");
         let id = session.id;
         manager
@@ -837,6 +856,7 @@ mod tests {
         // PATCH: update parameters. Cursor resets to 0, state Reinitialized.
         let patched = manager
             .update_session(id, seeded_parameters(3, 44))
+            .await
             .expect("update failed");
         assert_eq!(patched.current_step, 0);
         assert_eq!(patched.state, SessionState::Reinitialized);
@@ -848,7 +868,7 @@ mod tests {
         assert_eq!(after_first.current_step, 1);
         assert_eq!(after_first.state, SessionState::InProgress);
         assert_eq!(first_chain.underlying_price, ref_tape[0]);
-        let stored = store.get(id).expect("session missing from store");
+        let stored = store.get(id).await.expect("session missing from store");
         assert_eq!(stored.state, SessionState::InProgress);
 
         let (after_second, second_chain) = manager
@@ -879,6 +899,7 @@ mod tests {
         // Create a session on the old seed and populate its cached walk via a peek.
         let session = manager
             .create_session(seeded_parameters(3, 1000))
+            .await
             .expect("failed to create session");
         let id = session.id;
         manager.peek_current_step(id).await.expect("peek failed");
@@ -886,6 +907,7 @@ mod tests {
         // Reinitialize with the very different seed; then walk the whole rebuilt tape.
         manager
             .reinitialize_session(id, seeded_parameters(3, 987654321))
+            .await
             .expect("reinitialize failed");
         let mut post_reset = Vec::with_capacity(3);
         for _ in 0..3 {
@@ -912,11 +934,13 @@ mod tests {
         // Start with 2 steps, PATCH up to 5.
         let session = manager
             .create_session(seeded_parameters(2, 7))
+            .await
             .expect("failed to create session");
         let id = session.id;
 
         let patched = manager
             .update_session(id, seeded_parameters(5, 7))
+            .await
             .expect("update failed");
         assert_eq!(patched.parameters.steps, patched.total_steps);
         assert_eq!(patched.total_steps, 5);
@@ -927,13 +951,14 @@ mod tests {
             assert_eq!(s.current_step, expected_cursor);
         }
         assert!(manager.get_next_step(id).await.is_err());
-        let stored = store.get(id).expect("session missing from store");
+        let stored = store.get(id).await.expect("session missing from store");
         assert_eq!(stored.state, SessionState::Completed);
         assert_eq!(stored.total_steps, 5);
 
         // PATCH down to 3: metadata stays consistent and only 3 advances succeed.
         let patched_down = manager
             .update_session(id, seeded_parameters(3, 7))
+            .await
             .expect("downward update failed");
         assert_eq!(patched_down.parameters.steps, patched_down.total_steps);
         assert_eq!(patched_down.total_steps, 3);
@@ -943,5 +968,30 @@ mod tests {
             assert_eq!(s.current_step, expected_cursor);
         }
         assert!(manager.get_next_step(id).await.is_err());
+    }
+
+    /// Issue #19: with the async store trait, two `create_session` calls for
+    /// DIFFERENT sessions can be in flight concurrently over one shared manager
+    /// and both complete — no head-of-line blocking on a shared connection lock.
+    /// `tokio::join!` drives both futures on a single task; the test proves the
+    /// call sites are `&self` async and compose concurrently, and that both
+    /// sessions land independently with distinct ids.
+    #[tokio::test]
+    async fn test_concurrent_create_sessions_do_not_serialize() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+
+        let (res_a, res_b) = tokio::join!(
+            manager.create_session(test_parameters()),
+            manager.create_session(test_parameters()),
+        );
+
+        let session_a = res_a.expect("concurrent create a failed");
+        let session_b = res_b.expect("concurrent create b failed");
+
+        // Two distinct sessions were persisted concurrently.
+        assert_ne!(session_a.id, session_b.id);
+        assert!(store.get(session_a.id).await.is_ok());
+        assert!(store.get(session_b.id).await.is_ok());
     }
 }

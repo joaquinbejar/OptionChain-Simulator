@@ -1,6 +1,7 @@
 use crate::infrastructure::RedisClient;
 use crate::session::{Session, SessionStore};
 use crate::utils::ChainError;
+use async_trait::async_trait;
 use redis::RedisError;
 use serde_json;
 use std::sync::Arc;
@@ -62,13 +63,14 @@ impl InRedisSessionStore {
     }
 }
 
+#[async_trait]
 impl SessionStore for InRedisSessionStore {
     #[instrument(skip(self), level = "debug")]
-    fn get(&self, id: Uuid) -> Result<Session, ChainError> {
+    async fn get(&self, id: Uuid) -> Result<Session, ChainError> {
         let key = self.session_key(id);
         debug!(session_id = %id, key = %key, "Getting session from Redis");
 
-        match self.client.get::<String>(&key) {
+        match self.client.get::<String>(&key).await {
             Ok(Some(json_str)) => {
                 // Try to deserialize the session
                 match serde_json::from_str::<Session>(&json_str) {
@@ -100,7 +102,7 @@ impl SessionStore for InRedisSessionStore {
     }
 
     #[instrument(skip(self, session), level = "debug")]
-    fn create(&self, session: Session) -> Result<(), ChainError> {
+    async fn create(&self, session: Session) -> Result<(), ChainError> {
         let key = self.session_key(session.id);
         debug!(session_id = %session.id, key = %key, "Creating session in Redis");
 
@@ -117,7 +119,11 @@ impl SessionStore for InRedisSessionStore {
         };
 
         // SET NX guarantees we never overwrite an existing session id.
-        match self.client.set_nx(&key, json_str, Some(self.session_ttl)) {
+        match self
+            .client
+            .set_nx(&key, json_str, Some(self.session_ttl))
+            .await
+        {
             Ok(true) => {
                 debug!(session_id = %session.id, "Session created successfully");
                 Ok(())
@@ -137,7 +143,7 @@ impl SessionStore for InRedisSessionStore {
     }
 
     #[instrument(skip(self, session), level = "debug")]
-    fn save(&self, session: Session) -> Result<(), ChainError> {
+    async fn save(&self, session: Session) -> Result<(), ChainError> {
         let key = self.session_key(session.id);
         debug!(session_id = %session.id, key = %key, "Saving session to Redis");
 
@@ -154,7 +160,11 @@ impl SessionStore for InRedisSessionStore {
         };
 
         // Save to Redis with TTL
-        match self.client.set(&key, json_str, Some(self.session_ttl)) {
+        match self
+            .client
+            .set(&key, json_str, Some(self.session_ttl))
+            .await
+        {
             Ok(_) => {
                 debug!(session_id = %session.id, "Session saved successfully");
                 Ok(())
@@ -167,11 +177,11 @@ impl SessionStore for InRedisSessionStore {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
+    async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
         let key = self.session_key(id);
         debug!(session_id = %id, key = %key, "Deleting session from Redis");
 
-        match self.client.delete(&key) {
+        match self.client.delete(&key).await {
             Ok(deleted) => {
                 debug!(session_id = %id, deleted = deleted, "Session delete result");
                 Ok(deleted)
@@ -184,7 +194,7 @@ impl SessionStore for InRedisSessionStore {
     }
 
     #[instrument(skip(self), level = "debug")]
-    fn cleanup(&self) -> Result<usize, ChainError> {
+    async fn cleanup(&self) -> Result<usize, ChainError> {
         debug!("Cleaning up expired sessions from Redis");
 
         // Redis automatically expires keys, so we don't need to manually
@@ -245,8 +255,9 @@ mod tests {
 
     // Implement SessionStore for our test double
     // using the same logic as the original but with in-memory storage
+    #[async_trait]
     impl SessionStore for TestInRedisSessionStore {
-        fn get(&self, id: Uuid) -> Result<Session, ChainError> {
+        async fn get(&self, id: Uuid) -> Result<Session, ChainError> {
             let key = self.session_key(id);
 
             let sessions = self.sessions.lock().unwrap();
@@ -268,7 +279,7 @@ mod tests {
             }
         }
 
-        fn create(&self, session: Session) -> Result<(), ChainError> {
+        async fn create(&self, session: Session) -> Result<(), ChainError> {
             let key = self.session_key(session.id);
 
             // Serialize session to JSON
@@ -295,7 +306,7 @@ mod tests {
             Ok(())
         }
 
-        fn save(&self, session: Session) -> Result<(), ChainError> {
+        async fn save(&self, session: Session) -> Result<(), ChainError> {
             let key = self.session_key(session.id);
 
             // Serialize session to JSON
@@ -316,14 +327,14 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
+        async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
             let key = self.session_key(id);
 
             let mut sessions = self.sessions.lock().unwrap();
             Ok(sessions.remove(&key).is_some())
         }
 
-        fn cleanup(&self) -> Result<usize, ChainError> {
+        async fn cleanup(&self) -> Result<usize, ChainError> {
             // Redis handles expiration automatically, so our test double
             // should also just return 0
             Ok(0)
@@ -391,22 +402,22 @@ mod tests {
         assert_eq!(key, "test:f47ac10b-58cc-4372-a567-0e02b2c3d479");
     }
 
-    #[test]
-    fn test_save_and_get_session() {
+    #[tokio::test]
+    async fn test_save_and_get_session() {
         let store = TestInRedisSessionStore::new(None, None);
 
         let session = create_test_session();
         let session_id = session.id;
 
         // Save the session
-        let save_result = store.save(session.clone());
+        let save_result = store.save(session.clone()).await;
         assert!(save_result.is_ok());
 
         // Check that something was stored
         assert_eq!(store.get_store_size(), 1);
 
         // Get the session back
-        let get_result = store.get(session_id);
+        let get_result = store.get(session_id).await;
         assert!(get_result.is_ok());
 
         let retrieved_session = get_result.unwrap();
@@ -416,32 +427,32 @@ mod tests {
         assert_eq!(retrieved_session.total_steps, 10);
     }
 
-    #[test]
-    fn test_create_new_session() {
+    #[tokio::test]
+    async fn test_create_new_session() {
         let store = TestInRedisSessionStore::new(None, None);
 
         let session = create_test_session();
         let session_id = session.id;
 
         // create succeeds on a fresh id
-        assert!(store.create(session).is_ok());
+        assert!(store.create(session).await.is_ok());
         assert_eq!(store.get_store_size(), 1);
 
         // and the session is retrievable
-        assert!(store.get(session_id).is_ok());
+        assert!(store.get(session_id).await.is_ok());
     }
 
-    #[test]
-    fn test_create_duplicate_returns_already_exists() {
+    #[tokio::test]
+    async fn test_create_duplicate_returns_already_exists() {
         let store = TestInRedisSessionStore::new(None, None);
 
         let session = create_test_session();
 
         // first create wins
-        assert!(store.create(session.clone()).is_ok());
+        assert!(store.create(session.clone()).await.is_ok());
 
         // second create with the same id is rejected instead of overwriting
-        match store.create(session) {
+        match store.create(session).await {
             Err(ChainError::AlreadyExists(msg)) => {
                 assert!(msg.contains("already exists"));
             }
@@ -452,31 +463,31 @@ mod tests {
         assert_eq!(store.get_store_size(), 1);
     }
 
-    #[test]
-    fn test_save_still_updates_after_create() {
+    #[tokio::test]
+    async fn test_save_still_updates_after_create() {
         let store = TestInRedisSessionStore::new(None, None);
 
         let mut session = create_test_session();
         let session_id = session.id;
 
-        assert!(store.create(session.clone()).is_ok());
+        assert!(store.create(session.clone()).await.is_ok());
 
         // save is still an upsert on top of a created session
         session.current_step = 3;
         session.state = SessionState::InProgress;
-        assert!(store.save(session).is_ok());
+        assert!(store.save(session).await.is_ok());
 
-        let updated = store.get(session_id).unwrap();
+        let updated = store.get(session_id).await.unwrap();
         assert_eq!(updated.current_step, 3);
         assert_eq!(updated.state, SessionState::InProgress);
     }
 
-    #[test]
-    fn test_get_non_existent_session() {
+    #[tokio::test]
+    async fn test_get_non_existent_session() {
         let store = TestInRedisSessionStore::new(None, None);
 
         let non_existent_id = Uuid::new_v4();
-        let result = store.get(non_existent_id);
+        let result = store.get(non_existent_id).await;
 
         assert!(result.is_err());
         match result {
@@ -487,19 +498,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_delete_existing_session() {
+    #[tokio::test]
+    async fn test_delete_existing_session() {
         let store = TestInRedisSessionStore::new(None, None);
 
         let session = create_test_session();
         let session_id = session.id;
 
         // Save the session first
-        store.save(session).unwrap();
+        store.save(session).await.unwrap();
         assert_eq!(store.get_store_size(), 1);
 
         // Delete the session
-        let delete_result = store.delete(session_id);
+        let delete_result = store.delete(session_id).await;
         assert!(delete_result.is_ok());
         assert!(delete_result.unwrap());
 
@@ -507,51 +518,51 @@ mod tests {
         assert_eq!(store.get_store_size(), 0);
 
         // Try to get the deleted session
-        let get_result = store.get(session_id);
+        let get_result = store.get(session_id).await;
         assert!(get_result.is_err());
     }
 
-    #[test]
-    fn test_delete_non_existent_session() {
+    #[tokio::test]
+    async fn test_delete_non_existent_session() {
         let store = TestInRedisSessionStore::new(None, None);
 
         let non_existent_id = Uuid::new_v4();
-        let result = store.delete(non_existent_id);
+        let result = store.delete(non_existent_id).await;
 
         assert!(result.is_ok());
         assert!(!result.unwrap());
     }
 
-    #[test]
-    fn test_cleanup() {
+    #[tokio::test]
+    async fn test_cleanup() {
         let store = TestInRedisSessionStore::new(None, None);
 
-        let result = store.cleanup();
+        let result = store.cleanup().await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }
 
-    #[test]
-    fn test_update_existing_session() {
+    #[tokio::test]
+    async fn test_update_existing_session() {
         let store = TestInRedisSessionStore::new(None, None);
 
         // Create and save initial session
         let mut session = create_test_session();
         let session_id = session.id;
 
-        store.save(session.clone()).unwrap();
+        store.save(session.clone()).await.unwrap();
 
         // Modify the session
         session.current_step = 5;
         session.state = SessionState::InProgress;
 
         // Update the session
-        let update_result = store.save(session.clone());
+        let update_result = store.save(session.clone()).await;
         assert!(update_result.is_ok());
 
         // Retrieve and check the updated session
-        let get_result = store.get(session_id);
+        let get_result = store.get(session_id).await;
         assert!(get_result.is_ok());
 
         let updated_session = get_result.unwrap();
@@ -564,63 +575,64 @@ mod tests {
         // Store that always generates errors
     }
 
+    #[async_trait]
     impl SessionStore for TestErrorInRedisSessionStore {
-        fn get(&self, id: Uuid) -> Result<Session, ChainError> {
+        async fn get(&self, id: Uuid) -> Result<Session, ChainError> {
             Err(ChainError::Internal(format!(
                 "Simulated error for session {}",
                 id
             )))
         }
 
-        fn create(&self, session: Session) -> Result<(), ChainError> {
+        async fn create(&self, session: Session) -> Result<(), ChainError> {
             Err(ChainError::Internal(format!(
                 "Simulated error creating session {}",
                 session.id
             )))
         }
 
-        fn save(&self, session: Session) -> Result<(), ChainError> {
+        async fn save(&self, session: Session) -> Result<(), ChainError> {
             Err(ChainError::Internal(format!(
                 "Simulated error saving session {}",
                 session.id
             )))
         }
 
-        fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
+        async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
             Err(ChainError::Internal(format!(
                 "Simulated error deleting session {}",
                 id
             )))
         }
 
-        fn cleanup(&self) -> Result<usize, ChainError> {
+        async fn cleanup(&self) -> Result<usize, ChainError> {
             Err(ChainError::Internal(
                 "Simulated error during cleanup".to_string(),
             ))
         }
     }
 
-    #[test]
-    fn test_error_handling() {
+    #[tokio::test]
+    async fn test_error_handling() {
         let error_store = TestErrorInRedisSessionStore {};
 
         let session = create_test_session();
         let session_id = session.id;
 
         // Test that errors are properly propagated
-        let create_result = error_store.create(session.clone());
+        let create_result = error_store.create(session.clone()).await;
         assert!(create_result.is_err());
 
-        let save_result = error_store.save(session);
+        let save_result = error_store.save(session).await;
         assert!(save_result.is_err());
 
-        let get_result = error_store.get(session_id);
+        let get_result = error_store.get(session_id).await;
         assert!(get_result.is_err());
 
-        let delete_result = error_store.delete(session_id);
+        let delete_result = error_store.delete(session_id).await;
         assert!(delete_result.is_err());
 
-        let cleanup_result = error_store.cleanup();
+        let cleanup_result = error_store.cleanup().await;
         assert!(cleanup_result.is_err());
     }
 }

@@ -418,6 +418,7 @@ mod tests {
 
             let session = session_manager
                 .create_session(params.clone())
+                .await
                 .expect("Session creation failed");
 
             assert_eq!(session.parameters.symbol, "AAPL");
@@ -455,6 +456,7 @@ mod tests {
 
             let session = session_manager
                 .create_session(params)
+                .await
                 .expect("Session creation failed");
 
             // Advance through steps

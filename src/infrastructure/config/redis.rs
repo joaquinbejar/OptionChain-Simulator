@@ -17,8 +17,14 @@ pub struct RedisConfig {
     pub password: Option<String>,
     /// Database number to use
     pub database: u8,
-    /// Connection timeout in seconds
+    /// Response timeout in seconds, applied to every command sent over the
+    /// connection manager (`REDIS_TIMEOUT`, default 30). Guards against a hung
+    /// server holding an async worker indefinitely.
     pub timeout: u64,
+    /// Timeout in seconds for establishing a new connection to the server
+    /// (`REDIS_CONNECT_TIMEOUT`, default 5). Bounds how long a (re)connect
+    /// attempt may block before the manager retries.
+    pub connect_timeout: u64,
 }
 impl RedisConfig {
     pub(crate) fn url(&self) -> String {
@@ -72,13 +78,24 @@ impl Default for RedisConfig {
         let username = env::var("REDIS_USER").ok();
         let password = env::var("REDIS_PASSWORD").ok();
 
+        let timeout = env::var("REDIS_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+
+        let connect_timeout = env::var("REDIS_CONNECT_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5);
+
         Self {
             host: env::var("REDIS_HOST").unwrap_or_else(|_| "localhost".to_string()),
             port,
             username,
             password,
             database,
-            timeout: 30,
+            timeout,
+            connect_timeout,
         }
     }
 }
@@ -141,6 +158,8 @@ mod tests {
         remove_var("REDIS_USER");
         remove_var("REDIS_PASSWORD");
         remove_var("REDIS_DB");
+        remove_var("REDIS_TIMEOUT");
+        remove_var("REDIS_CONNECT_TIMEOUT");
 
         let config = RedisConfig::default();
 
@@ -151,6 +170,7 @@ mod tests {
         assert_eq!(config.password, None);
         assert_eq!(config.database, 0);
         assert_eq!(config.timeout, 30);
+        assert_eq!(config.connect_timeout, 5);
     }
 
     #[test]
@@ -163,6 +183,8 @@ mod tests {
         set_var("REDIS_USER", "testuser");
         set_var("REDIS_PASSWORD", "testpass");
         set_var("REDIS_DB", "2");
+        set_var("REDIS_TIMEOUT", "45");
+        set_var("REDIS_CONNECT_TIMEOUT", "7");
 
         let config = RedisConfig::default();
 
@@ -172,8 +194,9 @@ mod tests {
         assert_eq!(config.username, Some("testuser".to_string()));
         assert_eq!(config.password, Some("testpass".to_string()));
         assert_eq!(config.database, 2);
-        // Timeout is still default as it's not configurable via env vars
-        assert_eq!(config.timeout, 30);
+        // Both timeouts are now configurable via env vars.
+        assert_eq!(config.timeout, 45);
+        assert_eq!(config.connect_timeout, 7);
 
         // Clean up
         remove_var("REDIS_HOST");
@@ -181,6 +204,25 @@ mod tests {
         remove_var("REDIS_USER");
         remove_var("REDIS_PASSWORD");
         remove_var("REDIS_DB");
+        remove_var("REDIS_TIMEOUT");
+        remove_var("REDIS_CONNECT_TIMEOUT");
+    }
+
+    #[test]
+    fn test_invalid_timeouts_fall_back_to_defaults() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+
+        // Non-numeric timeouts must fall back to the documented defaults.
+        set_var("REDIS_TIMEOUT", "not_a_number");
+        set_var("REDIS_CONNECT_TIMEOUT", "also_bad");
+
+        let config = RedisConfig::default();
+
+        assert_eq!(config.timeout, 30);
+        assert_eq!(config.connect_timeout, 5);
+
+        remove_var("REDIS_TIMEOUT");
+        remove_var("REDIS_CONNECT_TIMEOUT");
     }
 
     #[test]
@@ -224,6 +266,7 @@ mod tests {
             password: None,
             database: 0,
             timeout: 30,
+            connect_timeout: 5,
         };
 
         assert_eq!(
@@ -241,6 +284,7 @@ mod tests {
             password: None,
             database: 0,
             timeout: 30,
+            connect_timeout: 5,
         };
 
         // Credentials must be redacted, never printed.
@@ -259,6 +303,7 @@ mod tests {
             password: Some("testpass".to_string()),
             database: 0,
             timeout: 30,
+            connect_timeout: 5,
         };
 
         // Credentials must be redacted, never printed.
@@ -277,6 +322,7 @@ mod tests {
             password: Some("testpass".to_string()),
             database: 0,
             timeout: 30,
+            connect_timeout: 5,
         };
 
         // Credentials must be redacted, never printed.
@@ -295,6 +341,7 @@ mod tests {
             password: None,
             database: 3,
             timeout: 30,
+            connect_timeout: 5,
         };
 
         assert_eq!(
@@ -312,6 +359,7 @@ mod tests {
             password: Some("s3cret".to_string()),
             database: 5,
             timeout: 45,
+            connect_timeout: 5,
         };
 
         // Credentials must be redacted, never printed.
@@ -353,6 +401,7 @@ mod tests {
             password: Some("s3ntinel-pw".to_string()),
             database: 0,
             timeout: 30,
+            connect_timeout: 5,
         };
 
         let display = format!("{}", config);
@@ -381,6 +430,7 @@ mod tests {
             password: Some("testpass".to_string()),
             database: 2,
             timeout: 45,
+            connect_timeout: 8,
         };
 
         let cloned = original.clone();
@@ -391,5 +441,6 @@ mod tests {
         assert_eq!(cloned.password, Some("testpass".to_string()));
         assert_eq!(cloned.database, 2);
         assert_eq!(cloned.timeout, 45);
+        assert_eq!(cloned.connect_timeout, 8);
     }
 }
