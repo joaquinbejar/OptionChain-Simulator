@@ -134,9 +134,45 @@ pub(crate) fn time_frame_field(field: &str, value: ApiTimeFrame) -> Result<TimeF
     Ok(value.into())
 }
 
+/// Validates a client-supplied symbol at the REST boundary.
+///
+/// Delegates to the ClickHouse-layer identifier check (charset
+/// `[A-Za-z0-9._-]`, 1–32 chars) but reports the failure as a
+/// [`ChainError::Validation`] naming the request field, so a bad symbol is a
+/// client-input 400 instead of surfacing later as an adapter 500. The
+/// ClickHouse-layer check remains in place as defense in depth.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Validation`] when the symbol violates the identifier
+/// format.
+#[must_use = "the validation result must be used"]
+pub(crate) fn symbol_field(field: &str, symbol: &str) -> Result<(), ChainError> {
+    crate::infrastructure::validate_symbol(symbol).map_err(|e| ChainError::Validation {
+        field: field.to_string(),
+        reason: match e {
+            ChainError::ClickHouseError(msg) => msg,
+            other => other.to_string(),
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_symbol_field_accepts_valid_symbol() {
+        assert!(symbol_field("method.symbol", "BRK.B").is_ok());
+    }
+
+    #[test]
+    fn test_symbol_field_rejects_injection_as_validation() {
+        match symbol_field("method.symbol", "A' OR '1'='1") {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "method.symbol"),
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_time_frame_field_accepts_named_variants() {

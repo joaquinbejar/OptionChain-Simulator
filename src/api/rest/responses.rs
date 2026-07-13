@@ -126,6 +126,18 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// Error body returned for request-validation failures (HTTP 400): the
+/// human-readable message plus the exact request field that failed, so
+/// generated clients match the actual wire shape.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
+pub struct ValidationErrorResponse {
+    /// Human-readable description of the validation failure.
+    pub error: String,
+    /// The request field that failed validation (e.g. `initial_price`,
+    /// `method.symbol`).
+    pub field: String,
+}
+
 /// Default implementation for SessionParametersResponse
 impl Default for SessionParametersResponse {
     fn default() -> Self {

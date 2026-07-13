@@ -13,10 +13,14 @@ pub(crate) fn map_error(error: ChainError) -> HttpResponse {
             HttpResponse::BadRequest().json(serde_json::json!({"error": error.to_string()}))
         }
         // Validation failures carry the offending field so clients can point the user
-        // at the exact parameter; the body keeps the `{"error": ...}` shape and adds a
-        // `field` key.
-        ChainError::Validation { ref field, .. } => HttpResponse::BadRequest()
-            .json(serde_json::json!({"error": error.to_string(), "field": field})),
+        // at the exact parameter; the wire shape is the documented
+        // `ValidationErrorResponse` ({"error", "field"}).
+        ChainError::Validation { ref field, .. } => {
+            HttpResponse::BadRequest().json(crate::api::rest::responses::ValidationErrorResponse {
+                error: error.to_string(),
+                field: field.clone(),
+            })
+        }
         ChainError::SimulatorError(err) => {
             HttpResponse::Gone().json(serde_json::json!({"error": err}))
         }

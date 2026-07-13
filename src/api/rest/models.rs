@@ -1,6 +1,7 @@
 use crate::api::rest::limits::MAX_HISTORICAL_PRICES;
 use crate::api::rest::validation::{
-    bounded_decimal_field, decimal_field, positive_field, strictly_positive_field,
+    bounded_decimal_field, decimal_field, positive_field, strictly_positive_field, symbol_field,
+    time_frame_field,
 };
 use crate::utils::ChainError;
 use optionstratlib::simulation::WalkType;
@@ -470,13 +471,29 @@ impl TryFrom<ApiWalkType> for WalkType {
                 volatility,
                 alpha,
                 beta,
-            } => WalkType::Garch {
-                dt: strictly_positive_field("dt", dt)?,
-                drift: decimal_field("drift", drift)?,
-                volatility: positive_field("volatility", volatility)?,
-                alpha: positive_field("alpha", alpha)?,
-                beta: positive_field("beta", beta)?,
-            },
+            } => {
+                let alpha_p = positive_field("alpha", alpha)?;
+                let beta_p = positive_field("beta", beta)?;
+                // GARCH(1,1) stationarity: alpha + beta < 1. Rejecting here
+                // keeps invalid model domains from being stored and failing
+                // later inside the simulation.
+                if alpha + beta >= 1.0 {
+                    return Err(ChainError::Validation {
+                        field: "alpha".to_string(),
+                        reason: format!(
+                            "alpha + beta must be < 1 for GARCH stationarity, got {}",
+                            alpha + beta
+                        ),
+                    });
+                }
+                WalkType::Garch {
+                    dt: strictly_positive_field("dt", dt)?,
+                    drift: decimal_field("drift", drift)?,
+                    volatility: positive_field("volatility", volatility)?,
+                    alpha: alpha_p,
+                    beta: beta_p,
+                }
+            }
             ApiWalkType::Heston {
                 dt,
                 drift,
@@ -492,7 +509,7 @@ impl TryFrom<ApiWalkType> for WalkType {
                 kappa: positive_field("kappa", kappa)?,
                 theta: positive_field("theta", theta)?,
                 xi: positive_field("xi", xi)?,
-                rho: decimal_field("rho", rho)?,
+                rho: bounded_decimal_field("rho", rho, -1.0, 1.0)?,
             },
             ApiWalkType::Custom {
                 dt,
@@ -545,12 +562,15 @@ impl TryFrom<ApiWalkType> for WalkType {
                         ),
                     });
                 }
+                if let Some(ref sym) = symbol {
+                    symbol_field("method.symbol", sym)?;
+                }
                 let mut converted = Vec::with_capacity(prices.len());
                 for price in prices {
                     converted.push(strictly_positive_field("prices", price)?);
                 }
                 WalkType::Historical {
-                    timeframe: timeframe.into(),
+                    timeframe: time_frame_field("method.timeframe", timeframe)?,
                     prices: converted,
                     symbol,
                 }
@@ -848,6 +868,78 @@ mod api_walktype_tests {
         match WalkType::try_from(api) {
             Err(ChainError::Validation { field, .. }) => assert_eq!(field, "prices"),
             other => panic!("expected Validation error for prices, got {other:?}"),
+        }
+    }
+
+    /// A negative or zero custom timeframe on a Historical walk must be a 400,
+    /// not a worker panic through the infallible conversion.
+    #[test]
+    fn test_apiwalktype_historical_negative_custom_timeframe_is_validation_error() {
+        for bad in [-1.0, 0.0] {
+            let api = ApiWalkType::Historical {
+                timeframe: ApiTimeFrame::Custom(bad),
+                prices: vec![100.0, 101.0],
+                symbol: None,
+            };
+            match WalkType::try_from(api) {
+                Err(ChainError::Validation { field, .. }) => {
+                    assert_eq!(field, "method.timeframe")
+                }
+                other => panic!("expected Validation error for timeframe {bad}, got {other:?}"),
+            }
+        }
+    }
+
+    /// An injection-shaped historical symbol must be rejected as client input
+    /// (400) at the conversion boundary, not surface later as an adapter 500.
+    #[test]
+    fn test_apiwalktype_historical_invalid_symbol_is_validation_error() {
+        let api = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices: vec![],
+            symbol: Some("A' OR '1'='1".to_string()),
+        };
+        match WalkType::try_from(api) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "method.symbol"),
+            other => panic!("expected Validation error for symbol, got {other:?}"),
+        }
+    }
+
+    /// Heston correlation outside [-1, 1] must be rejected at creation.
+    #[test]
+    fn test_apiwalktype_heston_rho_out_of_range_is_validation_error() {
+        let api = ApiWalkType::Heston {
+            dt: 0.004,
+            drift: 0.05,
+            volatility: 0.2,
+            kappa: 1.0,
+            theta: 0.04,
+            xi: 0.3,
+            rho: 1.5,
+        };
+        match WalkType::try_from(api) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "rho"),
+            other => panic!("expected Validation error for rho, got {other:?}"),
+        }
+    }
+
+    /// GARCH parameters violating stationarity (alpha + beta >= 1) must be
+    /// rejected before the session is stored.
+    #[test]
+    fn test_apiwalktype_garch_nonstationary_is_validation_error() {
+        let api = ApiWalkType::Garch {
+            dt: 0.004,
+            drift: 0.0,
+            volatility: 0.2,
+            alpha: 0.6,
+            beta: 0.5,
+        };
+        match WalkType::try_from(api) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "alpha");
+                assert!(reason.contains("stationarity"));
+            }
+            other => panic!("expected Validation error for alpha+beta, got {other:?}"),
         }
     }
 }

@@ -17,6 +17,7 @@ use utoipa::OpenApi;
             crate::api::rest::requests::CreateSessionRequest,
             crate::api::rest::requests::UpdateSessionRequest,
             crate::api::rest::models::SessionId,
+            crate::api::rest::responses::ValidationErrorResponse,
         )
     ),
     tags(

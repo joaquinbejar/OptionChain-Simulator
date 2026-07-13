@@ -4,7 +4,7 @@ use crate::api::rest::models::SessionId;
 use crate::api::rest::requests::{CreateSessionRequest, UpdateSessionRequest};
 use crate::api::rest::responses::{
     ChainResponse, ErrorResponse, OptionContractResponse, OptionPriceResponse, SessionInfoResponse,
-    SessionParametersResponse, SessionResponse,
+    SessionParametersResponse, SessionResponse, ValidationErrorResponse,
 };
 use crate::api::rest::validation::{self, decimal_field, positive_field, strictly_positive_field};
 use crate::infrastructure::{MetricsCollector, MongoDBRepository};
@@ -48,7 +48,7 @@ use uuid::Uuid;
     ),
     responses(
         (status = 201, description = "Session created successfully", body = SessionResponse),
-        (status = 400, description = "Validation failed: a parameter was non-finite, out of range (e.g. negative price/volatility), or steps/chain_size exceeded the configured limits. The body includes an `error` message and the offending `field`.", body = ErrorResponse),
+        (status = 400, description = "Validation failed: a parameter was non-finite, out of range (e.g. negative price/volatility), or steps/chain_size exceeded the configured limits.", body = ValidationErrorResponse),
         (status = 409, description = "Session id already exists", body = ErrorResponse),
         (status = 500, description = "Internal server error")
     )
@@ -236,7 +236,7 @@ pub(crate) async fn get_next_step(
     ),
     responses(
         (status = 200, description = "Session replaced", body = SessionResponse),
-        (status = 400, description = "Validation failed: a parameter was non-finite, out of range, or exceeded the configured limits. The body includes an `error` message and the offending `field`."),
+        (status = 400, description = "Validation failed: a parameter was non-finite, out of range, or exceeded the configured limits.", body = ValidationErrorResponse),
         (status = 404, description = "Session not found"),
         (status = 500, description = "Internal server error")
     )
@@ -331,7 +331,7 @@ pub(crate) async fn replace_session(
     responses(
         (status = 200, description = "Session updated", body = SessionResponse),
         (status = 404, description = "Session not found"),
-        (status = 400, description = "Validation failed: a supplied parameter was non-finite, out of range, or exceeded the configured limits. The body includes an `error` message and the offending `field`."),
+        (status = 400, description = "Validation failed: a supplied parameter was non-finite, out of range, or exceeded the configured limits.", body = ValidationErrorResponse),
         (status = 500, description = "Internal server error")
     )
 )]
