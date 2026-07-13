@@ -332,6 +332,7 @@ pub(crate) struct AdvanceStepQuery {
     responses(
         (status = 200, description = "Advanced one step; served snapshot returned", body = ChainResponse),
         (status = 404, description = "Session not found"),
+        (status = 409, description = "Concurrent modification: another request advanced or modified the session; retry"),
         (status = 410, description = "Simulation completed. No more steps available"),
         (status = 412, description = "expected_step does not match the session's current cursor; body carries `error` and `current_step`"),
         (status = 500, description = "Internal server error")
@@ -469,6 +470,7 @@ pub(crate) async fn get_current_step(
         (status = 200, description = "Session replaced", body = SessionResponse),
         (status = 400, description = "Validation failed: a parameter was non-finite, out of range, or exceeded the configured limits.", body = ValidationErrorResponse),
         (status = 404, description = "Session not found"),
+        (status = 409, description = "Concurrent modification: another request advanced or modified the session; retry"),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -581,6 +583,7 @@ pub(crate) async fn replace_session(
         (status = 200, description = "Session updated", body = SessionResponse),
         (status = 404, description = "Session not found"),
         (status = 400, description = "Validation failed: a supplied parameter was non-finite, out of range, or exceeded the configured limits.", body = ValidationErrorResponse),
+        (status = 409, description = "Concurrent modification: another request advanced or modified the session; retry"),
         (status = 500, description = "Internal server error")
     )
 )]

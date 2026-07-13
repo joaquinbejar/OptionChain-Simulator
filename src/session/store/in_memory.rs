@@ -87,6 +87,33 @@ impl SessionStore for InMemorySessionStore {
         Ok(())
     }
 
+    async fn save_cas(&self, session: Session, expected_version: u64) -> Result<(), ChainError> {
+        // The whole compare-and-swap runs under the map lock, held only for this
+        // synchronous section (no `.await` inside), so the read of the stored
+        // version and the conditional write are one atomic step: two concurrent
+        // callers cannot both observe `expected_version` and both commit.
+        let mut sessions = self.sessions.lock().map_err(|_| {
+            ChainError::Internal("Failed to acquire lock on session store".to_string())
+        })?;
+
+        match sessions.get(&session.id) {
+            None => Err(ChainError::NotFound(format!(
+                "Session with id {} not found",
+                session.id
+            ))),
+            Some(existing) if existing.version != expected_version => {
+                Err(ChainError::Conflict(format!(
+                    "Session {} was modified concurrently (expected version {}, found {})",
+                    session.id, expected_version, existing.version
+                )))
+            }
+            Some(_) => {
+                sessions.insert(session.id, session);
+                Ok(())
+            }
+        }
+    }
+
     async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ChainError::Internal("Failed to acquire lock on session store".to_string())
@@ -173,6 +200,7 @@ mod tests {
                 total_steps: params.steps,
                 parameters: params,
                 state: SessionState::Initialized,
+                version: 0,
             }
         } else {
             Session::new(params, &uuid_generator)
@@ -312,6 +340,70 @@ mod tests {
         assert_eq!(retrieved.current_step, 1);
     }
 
+    /// Issue #8: `save_cas` commits when the expected version matches the stored
+    /// revision, and the stored session reflects the mutation.
+    #[tokio::test]
+    async fn test_save_cas_matching_version_commits() {
+        let store = InMemorySessionStore::new();
+        let mut session = create_test_session(None);
+        let id = session.id;
+        assert_eq!(session.version, 0);
+
+        assert!(store.create(session.clone()).await.is_ok());
+
+        // Mutate a clone and bump its version, then CAS against the observed v0.
+        session.current_step = 3;
+        session.state = SessionState::InProgress;
+        session.bump_version();
+        assert!(store.save_cas(session, 0).await.is_ok());
+
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.current_step, 3);
+        assert_eq!(stored.state, SessionState::InProgress);
+        assert_eq!(stored.version, 1);
+    }
+
+    /// Issue #8: a stale `expected_version` is rejected with `Conflict` and the
+    /// stored session is left untouched (no lost update).
+    #[tokio::test]
+    async fn test_save_cas_stale_version_conflicts_and_leaves_store_unchanged() {
+        let store = InMemorySessionStore::new();
+        let mut session = create_test_session(None);
+        let id = session.id;
+        assert!(store.create(session.clone()).await.is_ok());
+
+        // A first CAS advances the stored revision from 0 to 1.
+        session.current_step = 1;
+        session.bump_version();
+        assert!(store.save_cas(session.clone(), 0).await.is_ok());
+
+        // A second writer that still believes it is at v0 must be rejected.
+        let mut stale = session.clone();
+        stale.current_step = 99;
+        stale.bump_version();
+        match store.save_cas(stale, 0).await {
+            Err(ChainError::Conflict(_)) => {}
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // The store still holds the winner's write, not the stale one.
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.current_step, 1);
+        assert_eq!(stored.version, 1);
+    }
+
+    /// Issue #8: `save_cas` on an id that is not stored returns `NotFound`.
+    #[tokio::test]
+    async fn test_save_cas_missing_id_returns_not_found() {
+        let store = InMemorySessionStore::new();
+        let session = create_test_session(None);
+
+        match store.save_cas(session, 0).await {
+            Err(ChainError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_delete_session() {
         let store = InMemorySessionStore::new();
@@ -361,6 +453,7 @@ mod tests {
             total_steps: 10,
             parameters: current_session.parameters.clone(),
             state: SessionState::Initialized,
+            version: 0,
         };
 
         // Guardar ambas sesiones

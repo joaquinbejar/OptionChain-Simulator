@@ -31,6 +31,14 @@ pub enum ChainError {
     ///   created again. Raised by `SessionStore::create` when a session id is already
     ///   present, guarding against silently overwriting a live session.
     AlreadyExists(String),
+    /// - `Conflict(String)`
+    ///   Denotes an optimistic-concurrency conflict: a compare-and-swap save
+    ///   (`SessionStore::save_cas`) found the stored session at a different
+    ///   revision than the caller expected, meaning another writer advanced or
+    ///   modified it in between. Raised so concurrent mutations cannot silently
+    ///   overwrite one another; the caller (client) should re-read and retry. Maps
+    ///   to HTTP 409 at the REST boundary.
+    Conflict(String),
     /// - `SimulatorError(String)`
     ///   Indicates an error specific to a simulation process. Provides a `String` for more context.
     SimulatorError(String),
@@ -99,6 +107,7 @@ impl fmt::Display for ChainError {
             ChainError::Internal(msg) => write!(f, "Internal Error: {}", msg),
             ChainError::NotFound(msg) => write!(f, "Not Found: {}", msg),
             ChainError::AlreadyExists(msg) => write!(f, "Already Exists: {}", msg),
+            ChainError::Conflict(msg) => write!(f, "Conflict: {}", msg),
             ChainError::SimulatorError(msg) => write!(f, "Simulator Error: {}", msg),
             ChainError::ClickHouseError(msg) => write!(f, "ClickHouse Error: {}", msg),
             ChainError::NotEnoughData(msg) => write!(f, "Not Enough Data: {}", msg),
@@ -206,6 +215,10 @@ mod tests {
                 "Already Exists: resource present",
             ),
             (
+                ChainError::Conflict("version mismatch".to_string()),
+                "Conflict: version mismatch",
+            ),
+            (
                 ChainError::SimulatorError("simulation failed".to_string()),
                 "Simulator Error: simulation failed",
             ),
@@ -253,6 +266,7 @@ mod tests {
             ChainError::Internal("internal issue".to_string()),
             ChainError::NotFound("not found".to_string()),
             ChainError::AlreadyExists("already exists".to_string()),
+            ChainError::Conflict("version conflict".to_string()),
             ChainError::SimulatorError("simulation problem".to_string()),
             ChainError::ClickHouseError("database issue".to_string()),
             ChainError::NotEnoughData("insufficient data".to_string()),
@@ -270,6 +284,7 @@ mod tests {
                 ChainError::Internal(msg) => assert_eq!(msg, "internal issue"),
                 ChainError::NotFound(msg) => assert_eq!(msg, "not found"),
                 ChainError::AlreadyExists(msg) => assert_eq!(msg, "already exists"),
+                ChainError::Conflict(msg) => assert_eq!(msg, "version conflict"),
                 ChainError::SimulatorError(msg) => assert_eq!(msg, "simulation problem"),
                 ChainError::ClickHouseError(msg) => assert_eq!(msg, "database issue"),
                 ChainError::NotEnoughData(msg) => assert_eq!(msg, "insufficient data"),

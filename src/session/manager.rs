@@ -140,6 +140,12 @@ impl SessionManager {
     pub async fn get_next_step(&self, id: Uuid) -> Result<(Session, OptionChain), ChainError> {
         let mut session = self.store.get(id).await?;
 
+        // Capture the revision we read; the compare-and-swap save below commits only
+        // if the stored session is still at this version, so two concurrent advances
+        // that both read the same snapshot cannot both persist (the loser gets a
+        // Conflict) — no lost update, no duplicate step.
+        let expected_version = session.version;
+
         // Completed guard: a session that has served all of its snapshots has nothing
         // left to serve. Mirror the exhausted-advance path (410 Gone) and leave the
         // store untouched so a repeated call keeps returning the terminal error.
@@ -168,9 +174,13 @@ impl SessionManager {
         // Advance the cursor; the advance that serves the last snapshot marks Completed.
         self.state_handler.advance_state(&mut session)?;
 
-        // Always persist after a successfully served snapshot, including the advance
-        // that transitions the session to Completed.
-        self.store.save(session.clone()).await?;
+        // Bump the revision and persist via compare-and-swap. On a concurrent race the
+        // save returns `ChainError::Conflict` (HTTP 409) and the client retries; there
+        // is deliberately no silent retry loop here.
+        session.bump_version();
+        self.store
+            .save_cas(session.clone(), expected_version)
+            .await?;
 
         Ok((session, chain))
     }
@@ -265,13 +275,19 @@ impl SessionManager {
         params: SimulationParameters,
     ) -> Result<Session, ChainError> {
         let mut session = self.store.get(id).await?;
+        let expected_version = session.version;
 
         // A parameter change restarts the tape: reset the cursor, sync total_steps,
         // and mark the session Reinitialized so the next advance rebuilds the walk.
         session.reinitialize(params);
 
-        // Save updated session
-        self.store.save(session.clone()).await?;
+        // Persist via compare-and-swap so a PATCH cannot clobber a newer revision
+        // written by a concurrent advance/update; a race yields `ChainError::Conflict`
+        // (HTTP 409) for the client to retry.
+        session.bump_version();
+        self.store
+            .save_cas(session.clone(), expected_version)
+            .await?;
 
         Ok(session)
     }
@@ -308,12 +324,18 @@ impl SessionManager {
         params: SimulationParameters,
     ) -> Result<Session, ChainError> {
         let mut session = self.store.get(id).await?;
+        let expected_version = session.version;
 
         // Reinitialize session: reset cursor, sync total_steps, mark Reinitialized.
         session.reinitialize(params);
 
-        // Save updated session
-        self.store.save(session.clone()).await?;
+        // Persist via compare-and-swap so a PUT cannot clobber a newer revision
+        // written by a concurrent advance/update; a race yields `ChainError::Conflict`
+        // (HTTP 409) for the client to retry.
+        session.bump_version();
+        self.store
+            .save_cas(session.clone(), expected_version)
+            .await?;
 
         Ok(session)
     }
@@ -997,5 +1019,157 @@ mod tests {
         assert_ne!(session_a.id, session_b.id);
         assert!(store.get(session_a.id).await.is_ok());
         assert!(store.get(session_b.id).await.is_ok());
+    }
+
+    /// Test store that wraps `InMemorySessionStore` and blocks every `get` on a
+    /// shared `tokio::sync::Barrier` before delegating. This forces two concurrent
+    /// manager mutations to BOTH read the same snapshot before either reaches its
+    /// compare-and-swap save, making the lost-update race deterministic instead of
+    /// timing-dependent. Every other operation passes straight through, and tests
+    /// verify final state through the inner store (which never touches the barrier),
+    /// so the single-generation barrier never deadlocks.
+    struct BarrierGetStore {
+        inner: Arc<InMemorySessionStore>,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStore for BarrierGetStore {
+        async fn get(&self, id: Uuid) -> Result<Session, ChainError> {
+            // Read first, THEN rendezvous: both concurrent readers must complete
+            // their load (observing the same stored version) before either is
+            // released to proceed to its compare-and-swap save. Waiting before the
+            // read would instead let the first arrival finish its whole mutation
+            // before the second even reads, defeating the race we want to exercise.
+            let result = self.inner.get(id).await;
+            self.barrier.wait().await;
+            result
+        }
+
+        async fn create(&self, session: Session) -> Result<(), ChainError> {
+            self.inner.create(session).await
+        }
+
+        async fn save(&self, session: Session) -> Result<(), ChainError> {
+            self.inner.save(session).await
+        }
+
+        async fn save_cas(
+            &self,
+            session: Session,
+            expected_version: u64,
+        ) -> Result<(), ChainError> {
+            self.inner.save_cas(session, expected_version).await
+        }
+
+        async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
+            self.inner.delete(id).await
+        }
+
+        async fn cleanup(&self) -> Result<usize, ChainError> {
+            self.inner.cleanup().await
+        }
+    }
+
+    /// Issue #8 acceptance: two `get_next_step` calls that TRULY overlap (both read
+    /// the session at version 0 before either saves, forced by the barrier) must not
+    /// both persist. Exactly one advance wins with cursor 1; the other loses the
+    /// compare-and-swap with `Conflict`. The persisted session shows a single
+    /// advance — cursor 1, version 1 — so there is no lost update and no duplicate
+    /// step.
+    #[tokio::test]
+    async fn test_concurrent_advances_one_wins_one_conflicts() {
+        let inner = Arc::new(InMemorySessionStore::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let store = Arc::new(BarrierGetStore {
+            inner: inner.clone(),
+            barrier,
+        });
+        let manager = Arc::new(SessionManager::new(store));
+
+        // A session at cursor 0 with room for well over two steps.
+        let session = manager
+            .create_session(seeded_parameters(5, 1234))
+            .await
+            .expect("failed to create session");
+        let id = session.id;
+
+        let m1 = manager.clone();
+        let m2 = manager.clone();
+        let (r1, r2) = tokio::join!(async move { m1.get_next_step(id).await }, async move {
+            m2.get_next_step(id).await
+        },);
+
+        let results = [r1, r2];
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let conflict_count = results
+            .iter()
+            .filter(|r| matches!(r, Err(ChainError::Conflict(_))))
+            .count();
+        assert_eq!(ok_count, 1, "exactly one concurrent advance must win");
+        assert_eq!(
+            conflict_count, 1,
+            "exactly one concurrent advance must conflict"
+        );
+
+        // The winner served exactly one step.
+        let winner = results
+            .iter()
+            .find_map(|r| r.as_ref().ok())
+            .expect("a winning advance");
+        assert_eq!(winner.0.current_step, 1);
+
+        // Persisted state proves a single, non-duplicated advance.
+        let stored = inner.get(id).await.expect("session missing from store");
+        assert_eq!(stored.current_step, 1);
+        assert_eq!(stored.version, 1);
+    }
+
+    /// Issue #8: a PATCH racing an advance is the same lost-update hazard. With both
+    /// forced to read version 0, exactly one of `update_session` / `get_next_step`
+    /// commits and the other gets `Conflict`; the store ends at version 1 (a single
+    /// successful mutation), so neither silently clobbers the other.
+    #[tokio::test]
+    async fn test_concurrent_patch_and_advance_one_conflicts() {
+        let inner = Arc::new(InMemorySessionStore::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let store = Arc::new(BarrierGetStore {
+            inner: inner.clone(),
+            barrier,
+        });
+        let manager = Arc::new(SessionManager::new(store));
+
+        let session = manager
+            .create_session(seeded_parameters(5, 4321))
+            .await
+            .expect("failed to create session");
+        let id = session.id;
+
+        let m1 = manager.clone();
+        let m2 = manager.clone();
+        let (advance, patch) = tokio::join!(
+            async move { m1.get_next_step(id).await.map(|_| ()) },
+            async move {
+                m2.update_session(id, seeded_parameters(7, 4321))
+                    .await
+                    .map(|_| ())
+            },
+        );
+
+        let results = [advance, patch];
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let conflict_count = results
+            .iter()
+            .filter(|r| matches!(r, Err(ChainError::Conflict(_))))
+            .count();
+        assert_eq!(ok_count, 1, "exactly one of PATCH/advance must win");
+        assert_eq!(
+            conflict_count, 1,
+            "exactly one of PATCH/advance must conflict"
+        );
+
+        // A single successful mutation left the stored revision at 1.
+        let stored = inner.get(id).await.expect("session missing from store");
+        assert_eq!(stored.version, 1);
     }
 }

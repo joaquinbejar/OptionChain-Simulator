@@ -9,6 +9,12 @@ pub(crate) fn map_error(error: ChainError) -> HttpResponse {
         ChainError::AlreadyExists(_) => {
             HttpResponse::Conflict().json(serde_json::json!({"error": error.to_string()}))
         }
+        // Optimistic-concurrency conflict: another writer advanced/modified the
+        // session between our read and our compare-and-swap save. 409 so the
+        // client re-reads and retries (same shape as the AlreadyExists arm).
+        ChainError::Conflict(_) => {
+            HttpResponse::Conflict().json(serde_json::json!({"error": error.to_string()}))
+        }
         ChainError::InvalidState(_) => {
             HttpResponse::BadRequest().json(serde_json::json!({"error": error.to_string()}))
         }
@@ -53,6 +59,18 @@ mod tests {
     #[actix_web::test]
     async fn test_map_error_already_exists() {
         let err = ChainError::AlreadyExists("session_abc".into());
+        let resp: HttpResponse = map_error(err.clone());
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!({"error": err.to_string()}));
+    }
+
+    /// Conflict should map to 409 with the error message from `Display`.
+    #[actix_web::test]
+    async fn test_map_error_conflict() {
+        let err = ChainError::Conflict("session modified concurrently".into());
         let resp: HttpResponse = map_error(err.clone());
         assert_eq!(resp.status(), StatusCode::CONFLICT);
 

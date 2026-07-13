@@ -107,6 +107,37 @@ pub trait SessionStore: Send + Sync {
     ///
     async fn save(&self, session: Session) -> Result<(), ChainError>;
 
+    /// Atomically persists `session` ONLY IF the stored revision still equals
+    /// `expected_version` (an optimistic-concurrency compare-and-swap).
+    ///
+    /// This is the safe counterpart to the blind-upsert [`SessionStore::save`]: it
+    /// closes the read-modify-write race where two concurrent mutations both read
+    /// the same snapshot and one silently overwrites the other. The caller reads a
+    /// session, captures its `version`, mutates a clone, bumps the version, and
+    /// calls `save_cas` with the captured (pre-mutation) `expected_version`. The
+    /// write commits only when no other writer changed the stored revision in
+    /// between; otherwise it is rejected and the store is left untouched.
+    ///
+    /// # Parameters
+    /// - `session`: The mutated `Session` to persist (its `version` should already
+    ///   be bumped past `expected_version`).
+    /// - `expected_version`: The `version` the caller observed when it read the
+    ///   session, i.e. the revision the stored copy must still be at for the write
+    ///   to succeed.
+    ///
+    /// # Returns
+    /// - `Ok(())`: The stored revision matched and the session was persisted.
+    /// - `Err(ChainError::NotFound)`: No session with that id exists.
+    /// - `Err(ChainError::Conflict)`: The stored revision differed from
+    ///   `expected_version` (a concurrent writer won the race); the store is
+    ///   unchanged.
+    /// - `Err(ChainError)`: Any underlying storage/serialization failure.
+    ///
+    /// # Errors
+    /// Returns `ChainError::NotFound` when the id is absent, `ChainError::Conflict`
+    /// on a version mismatch, or another `ChainError` variant on a backend failure.
+    async fn save_cas(&self, session: Session, expected_version: u64) -> Result<(), ChainError>;
+
     /// Deletes an entity identified by the given `id`.
     ///
     /// # Parameters
@@ -162,6 +193,7 @@ mod tests {
             async fn get(&self, id: Uuid) -> Result<Session, ChainError>;
             async fn create(&self, session: Session) -> Result<(), ChainError>;
             async fn save(&self, session: Session) -> Result<(), ChainError>;
+            async fn save_cas(&self, session: Session, expected_version: u64) -> Result<(), ChainError>;
             async fn delete(&self, id: Uuid) -> Result<bool, ChainError>;
             async fn cleanup(&self) -> Result<usize, ChainError>;
         }
@@ -209,6 +241,30 @@ mod tests {
             let mut sessions = self.sessions.lock().unwrap();
             sessions.insert(session.id, session);
             Ok(())
+        }
+
+        async fn save_cas(
+            &self,
+            session: Session,
+            expected_version: u64,
+        ) -> Result<(), ChainError> {
+            let mut sessions = self.sessions.lock().unwrap();
+            match sessions.get(&session.id) {
+                None => Err(ChainError::NotFound(format!(
+                    "Session with id {} not found",
+                    session.id
+                ))),
+                Some(existing) if existing.version != expected_version => {
+                    Err(ChainError::Conflict(format!(
+                        "Session {} was modified concurrently (expected version {}, found {})",
+                        session.id, expected_version, existing.version
+                    )))
+                }
+                Some(_) => {
+                    sessions.insert(session.id, session);
+                    Ok(())
+                }
+            }
         }
 
         async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
@@ -265,6 +321,7 @@ mod tests {
             current_step: 0,
             total_steps: 100,
             state: SessionState::Initialized,
+            version: 0,
         }
     }
 

@@ -18,6 +18,61 @@ pub struct InRedisSessionStore {
     session_ttl: u64,
 }
 
+/// Server-side Lua for an atomic session compare-and-swap.
+///
+/// Redis runs a script as a single, uninterruptible unit, so the GET, the
+/// version comparison, and the conditional SET happen without any interleaving
+/// from another connection — this is what makes the CAS race-free. The stored
+/// version is read from the persisted JSON with the built-in `cjson` decoder
+/// (`cjson.decode(stored).version`), keeping the version's single source of
+/// truth INSIDE the session document (no companion key to keep in sync from
+/// `create`/`save`). A session written before the `version` field existed
+/// decodes to `nil`, so `or 0` treats it as revision 0.
+///
+/// Arguments: `KEYS[1]` = session key; `ARGV[1]` = new session JSON;
+/// `ARGV[2]` = expected version; `ARGV[3]` = TTL in seconds.
+///
+/// Return codes: `-1` = key missing (NotFound); `-2` = version mismatch
+/// (Conflict); `1` = written.
+const SAVE_CAS_SCRIPT: &str = r#"
+local cur = redis.call('GET', KEYS[1])
+if not cur then
+    return -1
+end
+local v = cjson.decode(cur)['version'] or 0
+if v ~= tonumber(ARGV[2]) then
+    return -2
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[3]))
+return 1
+"#;
+
+/// Translates the integer result code returned by [`SAVE_CAS_SCRIPT`] into the
+/// crate's `ChainError` boundary. Pure and side-effect free so the mapping is
+/// unit-testable without a live Redis.
+///
+/// - `1` → `Ok(())` (the CAS committed);
+/// - `-1` → [`ChainError::NotFound`] (no session at that key);
+/// - `-2` → [`ChainError::Conflict`] (stored revision differed);
+/// - anything else → [`ChainError::Internal`] (script contract violation).
+fn map_cas_result(code: i64, id: Uuid, expected_version: u64) -> Result<(), ChainError> {
+    match code {
+        1 => Ok(()),
+        -1 => Err(ChainError::NotFound(format!(
+            "Session with id {} not found",
+            id
+        ))),
+        -2 => Err(ChainError::Conflict(format!(
+            "Session {} was modified concurrently (expected version {})",
+            id, expected_version
+        ))),
+        other => Err(ChainError::Internal(format!(
+            "Unexpected CAS result code {} for session {}",
+            other, id
+        ))),
+    }
+}
+
 impl InRedisSessionStore {
     /// Creates a new Redis-backed session store
     ///
@@ -176,6 +231,42 @@ impl SessionStore for InRedisSessionStore {
         }
     }
 
+    #[instrument(skip(self, session), level = "debug")]
+    async fn save_cas(&self, session: Session, expected_version: u64) -> Result<(), ChainError> {
+        let id = session.id;
+        let key = self.session_key(id);
+        debug!(session_id = %id, key = %key, expected_version, "CAS-saving session to Redis");
+
+        // Serialize session to JSON
+        let json_str = match serde_json::to_string(&session) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(session_id = %id, error = %e, "Failed to serialize session");
+                return Err(ChainError::Internal(format!(
+                    "Failed to serialize session: {}",
+                    e
+                )));
+            }
+        };
+
+        // Run the compare-and-swap atomically server-side. The manager (the block
+        // scheduler) supplies `expected_version`; the script only writes when the
+        // stored revision still matches, so a concurrent advance cannot be lost.
+        let mut conn = self.client.connection_manager();
+        let code: i64 = redis::Script::new(SAVE_CAS_SCRIPT)
+            .key(&key)
+            .arg(json_str)
+            .arg(expected_version)
+            .arg(self.session_ttl)
+            .invoke_async(&mut conn)
+            .await
+            .map_err(Self::map_redis_error)?;
+
+        map_cas_result(code, id, expected_version).inspect_err(|e| {
+            debug!(session_id = %id, error = %e, "CAS save rejected");
+        })
+    }
+
     #[instrument(skip(self), level = "debug")]
     async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
         let key = self.session_key(id);
@@ -327,6 +418,48 @@ mod tests {
             Ok(())
         }
 
+        async fn save_cas(
+            &self,
+            session: Session,
+            expected_version: u64,
+        ) -> Result<(), ChainError> {
+            let key = self.session_key(session.id);
+
+            let json_str = match serde_json::to_string(&session) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(ChainError::Internal(format!(
+                        "Failed to serialize session: {}",
+                        e
+                    )));
+                }
+            };
+
+            // Mirror the Lua CAS: read the stored version from the persisted JSON
+            // (defaulting to 0 for a pre-version payload), compare, then write.
+            let mut sessions = self.sessions.lock().unwrap();
+            let stored_version = match sessions.get(&key) {
+                None => {
+                    return Err(ChainError::NotFound(format!(
+                        "Session with id {} not found",
+                        session.id
+                    )));
+                }
+                Some(stored) => serde_json::from_str::<Session>(stored)
+                    .map(|s| s.version)
+                    .unwrap_or(0),
+            };
+            if stored_version != expected_version {
+                return Err(ChainError::Conflict(format!(
+                    "Session {} was modified concurrently (expected version {}, found {})",
+                    session.id, expected_version, stored_version
+                )));
+            }
+            sessions.insert(key, json_str);
+
+            Ok(())
+        }
+
         async fn delete(&self, id: Uuid) -> Result<bool, ChainError> {
             let key = self.session_key(id);
 
@@ -373,6 +506,7 @@ mod tests {
             total_steps: 10,
             parameters: params,
             state: SessionState::Initialized,
+            version: 0,
         }
     }
 
@@ -570,6 +704,80 @@ mod tests {
         assert_eq!(updated_session.state, SessionState::InProgress);
     }
 
+    /// Issue #8: the CAS Lua script is the atomicity contract. Assert the string
+    /// constant carries the exact server-side logic the store relies on: read via
+    /// GET, decode the version from the stored JSON with `cjson`, and the three
+    /// documented return codes.
+    #[test]
+    fn test_save_cas_script_encodes_the_contract() {
+        assert!(SAVE_CAS_SCRIPT.contains("redis.call('GET', KEYS[1])"));
+        assert!(SAVE_CAS_SCRIPT.contains("cjson.decode(cur)['version']"));
+        assert!(SAVE_CAS_SCRIPT.contains("return -1")); // NotFound
+        assert!(SAVE_CAS_SCRIPT.contains("return -2")); // Conflict
+        assert!(SAVE_CAS_SCRIPT.contains("return 1")); // committed
+        assert!(SAVE_CAS_SCRIPT.contains("'EX'")); // TTL preserved on write
+    }
+
+    /// Issue #8: the pure return-code mapper turns each documented script code
+    /// into the right `ChainError` boundary (and rejects an out-of-contract code).
+    #[test]
+    fn test_map_cas_result_maps_each_code() {
+        let id = Uuid::new_v4();
+
+        assert!(map_cas_result(1, id, 0).is_ok());
+
+        match map_cas_result(-1, id, 0) {
+            Err(ChainError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        match map_cas_result(-2, id, 4) {
+            Err(ChainError::Conflict(msg)) => assert!(msg.contains("version 4")),
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        match map_cas_result(42, id, 0) {
+            Err(ChainError::Internal(_)) => {}
+            other => panic!("expected Internal for an unexpected code, got {other:?}"),
+        }
+    }
+
+    /// Issue #8: the in-memory Redis double mirrors the Lua CAS — a matching
+    /// expected version commits, a stale one conflicts without overwriting, and a
+    /// missing key is NotFound.
+    #[tokio::test]
+    async fn test_test_double_save_cas_behaves_like_lua() {
+        let store = TestInRedisSessionStore::new(None, None);
+        let mut session = create_test_session();
+        let id = session.id;
+
+        // Missing key → NotFound.
+        match store.save_cas(session.clone(), 0).await {
+            Err(ChainError::NotFound(_)) => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+
+        store.create(session.clone()).await.unwrap();
+
+        // Matching version → commit (stored revision advances to 1).
+        session.current_step = 2;
+        session.bump_version();
+        assert!(store.save_cas(session.clone(), 0).await.is_ok());
+        assert_eq!(store.get(id).await.unwrap().version, 1);
+
+        // Stale version → Conflict, store unchanged.
+        let mut stale = session.clone();
+        stale.current_step = 77;
+        stale.bump_version();
+        match store.save_cas(stale, 0).await {
+            Err(ChainError::Conflict(_)) => {}
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        let stored = store.get(id).await.unwrap();
+        assert_eq!(stored.current_step, 2);
+        assert_eq!(stored.version, 1);
+    }
+
     // TestErrorInRedisSessionStore - to test error cases
     struct TestErrorInRedisSessionStore {
         // Store that always generates errors
@@ -594,6 +802,17 @@ mod tests {
         async fn save(&self, session: Session) -> Result<(), ChainError> {
             Err(ChainError::Internal(format!(
                 "Simulated error saving session {}",
+                session.id
+            )))
+        }
+
+        async fn save_cas(
+            &self,
+            session: Session,
+            _expected_version: u64,
+        ) -> Result<(), ChainError> {
+            Err(ChainError::Internal(format!(
+                "Simulated error CAS-saving session {}",
                 session.id
             )))
         }
@@ -623,8 +842,11 @@ mod tests {
         let create_result = error_store.create(session.clone()).await;
         assert!(create_result.is_err());
 
-        let save_result = error_store.save(session).await;
+        let save_result = error_store.save(session.clone()).await;
         assert!(save_result.is_err());
+
+        let save_cas_result = error_store.save_cas(session, 0).await;
+        assert!(save_cas_result.is_err());
 
         let get_result = error_store.get(session_id).await;
         assert!(get_result.is_err());
