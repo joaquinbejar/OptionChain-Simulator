@@ -632,6 +632,64 @@ mod tests {
         assert_ne!(tape_a, tape_b);
     }
 
+    // JumpDiffusion method with lambda_dt = intensity * dt = 1.0 * 0.004 < 1,
+    // so the Bernoulli jump approximation is valid (issue #11).
+    fn jump_diffusion_method() -> SimulationMethod {
+        SimulationMethod::JumpDiffusion {
+            dt: pos_or_panic!(0.004),
+            drift: dec!(0.0),
+            volatility: pos_or_panic!(0.2),
+            intensity: pos_or_panic!(1.0),
+            jump_mean: dec!(0.0),
+            jump_volatility: pos_or_panic!(0.1),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_jump_diffusion_same_seed_same_tape() {
+        // Issue #11: the corrected Bernoulli jump draw stays deterministic —
+        // two JumpDiffusion sessions with the same seed produce the identical
+        // tape through the full Simulator/generator path. Distinct ids keep
+        // them as independent cache entries.
+        let mut session_a = create_test_session(Some(Uuid::new_v4()));
+        let mut session_b = create_test_session(Some(Uuid::new_v4()));
+        session_a.parameters.method = jump_diffusion_method();
+        session_b.parameters.method = jump_diffusion_method();
+        session_a.parameters.seed = Some(20260713);
+        session_b.parameters.seed = Some(20260713);
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        let tape_a = collect_tape(&simulator, &mut session_a).await;
+        let tape_b = collect_tape(&simulator, &mut session_b).await;
+
+        assert_eq!(tape_a, tape_b);
+    }
+
+    #[tokio::test]
+    async fn test_jump_diffusion_different_seeds_different_tapes() {
+        // Distinct seeds must drive distinct JumpDiffusion tapes.
+        let mut session_a = create_test_session(Some(Uuid::new_v4()));
+        let mut session_b = create_test_session(Some(Uuid::new_v4()));
+        session_a.parameters.method = jump_diffusion_method();
+        session_b.parameters.method = jump_diffusion_method();
+        session_a.parameters.seed = Some(1);
+        session_b.parameters.seed = Some(2);
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        let tape_a = collect_tape(&simulator, &mut session_a).await;
+        let tape_b = collect_tape(&simulator, &mut session_b).await;
+
+        assert_ne!(tape_a, tape_b);
+    }
+
     #[tokio::test]
     async fn test_remove_session_evicts_cached_walk() {
         // Issue #9: remove_session drops the cached walk and reports presence.

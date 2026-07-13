@@ -2,8 +2,8 @@ use optionstratlib::chains::OptionChain;
 use optionstratlib::error::SimulationError;
 use optionstratlib::simulation::{WalkParams, WalkPath, WalkType, WalkTypeAble};
 use positive::Positive;
-use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::{Decimal, MathematicalOps};
@@ -34,9 +34,37 @@ impl Walker {
     /// Draws a standard normal sample from the walker's own RNG instead of the
     /// process-wide thread-local one used by optionstratlib's default methods.
     fn normal_sample(&self) -> Decimal {
-        let mut rng = self.rng.lock().unwrap();
+        // A poisoned mutex only means another thread panicked while holding
+        // the guard; the RNG state itself stays valid, so recover the inner
+        // value instead of propagating the panic onto a request path.
+        let mut rng = self.rng.lock().unwrap_or_else(|e| e.into_inner());
         let z: f64 = StandardNormal.sample(&mut *rng);
         Decimal::from_f64(z).unwrap_or(Decimal::ZERO)
+    }
+
+    /// Draws a uniform sample in `[0, 1)` from the walker's own RNG, as a
+    /// `Decimal`. Used for Bernoulli-style occurrence tests where a probability
+    /// must be compared against a *uniform* variate — not a standard-normal one
+    /// (see [`Walker::bernoulli_jump`] and issue #11).
+    fn uniform_sample(&self) -> Decimal {
+        // Same poison recovery as `normal_sample`: the RNG state is still
+        // valid after another thread's panic.
+        let mut rng = self.rng.lock().unwrap_or_else(|e| e.into_inner());
+        let u: f64 = rng.random::<f64>();
+        Decimal::from_f64(u).unwrap_or(Decimal::ZERO)
+    }
+
+    /// Bernoulli occurrence test for a jump-diffusion step: returns `true` with
+    /// probability `lambda_dt` (= λ·dt) by comparing a uniform `[0, 1)` variate
+    /// against the probability.
+    ///
+    /// This is the correct draw for a Bernoulli(λ·dt) event. It is split out of
+    /// [`jump_diffusion`](WalkTypeAble::jump_diffusion) so the empirical jump
+    /// frequency can be asserted directly and deterministically under a fixed
+    /// seed. Callers must guarantee `lambda_dt < 1` (validated once up front in
+    /// `jump_diffusion`); this helper does not re-check it.
+    fn bernoulli_jump(&self, lambda_dt: Decimal) -> bool {
+        self.uniform_sample() < lambda_dt
     }
 
     /// Ornstein-Uhlenbeck path drawn from the walker's RNG. Mirrors
@@ -475,6 +503,28 @@ impl WalkTypeAble<Positive, OptionChain> for Walker {
         }
     }
 
+    /// Merton-style jump-diffusion path, seeded from the walker's own RNG.
+    ///
+    /// The jump-count process is approximated as a Bernoulli event per step: a
+    /// single jump occurs with probability `λ·dt` (`intensity * dt`), tested
+    /// with a *uniform* draw via [`Walker::bernoulli_jump`]. This requires
+    /// `λ·dt < 1`; a full Poisson jump count per step (allowing more than one
+    /// jump) is explicitly out of scope and rejected with a
+    /// [`SimulationError::WalkError`]. The jump *size* stays
+    /// `jump_mean + N(0,1) * jump_volatility` (a standard-normal draw — correct).
+    ///
+    /// INTENTIONAL DIVERGENCE FROM UPSTREAM (issue #11): optionstratlib's
+    /// `jump_diffusion` kernel in `simulation/traits.rs` tests jump occurrence
+    /// with `decimal_normal_sample() < λ·dt` — comparing a STANDARD NORMAL
+    /// sample against the probability, which implements probability `Φ(λ·dt)`
+    /// (≈50% for small `λ·dt`), not `λ·dt`. This seeded mirror deliberately
+    /// diverges to implement the documented model (`P(jump) = λ·dt`). Any
+    /// re-sync against an upstream upgrade MUST PRESERVE this fix — do not
+    /// restore the normal-as-Bernoulli draw.
+    ///
+    /// This fix is TAPE-BREAKING for `JumpDiffusion` seeds relative to releases
+    /// before issue #11: the same seed now produces a different — and correct —
+    /// tape. The same-seed ⇒ identical-tape contract still holds within a build.
     fn jump_diffusion(
         &self,
         params: &WalkParams<Positive, OptionChain>,
@@ -488,12 +538,21 @@ impl WalkTypeAble<Positive, OptionChain> for Walker {
                 jump_mean,
                 jump_volatility,
             } => {
+                let sqrt_dt = dt.sqrt();
+                let lambda_dt = (intensity * dt).to_dec();
+
+                // The Bernoulli(λ·dt) approximation is only valid as a probability
+                // when λ·dt < 1; a Poisson jump count per step is out of scope.
+                // Validate up front so bad parameters fail before any state is built.
+                if lambda_dt >= Decimal::ONE {
+                    return Err(SimulationError::walk_error(
+                        "jump_diffusion: intensity * dt must be < 1 (Bernoulli approximation); use a smaller dt or intensity",
+                    ));
+                }
+
                 let mut values = Vec::with_capacity(params.size + 1);
                 let mut x: Decimal = params.ystep_as_positive()?.to_dec();
                 values.push(Positive::new_decimal(x).unwrap_or(Positive::ZERO));
-
-                let sqrt_dt = dt.sqrt();
-                let lambda_dt = intensity * dt;
 
                 for _ in 1..params.size {
                     let z = self.normal_sample();
@@ -501,8 +560,11 @@ impl WalkTypeAble<Positive, OptionChain> for Walker {
                     let diffusion = sigma_abs * sqrt_dt.to_dec() * z;
 
                     let drift_term = drift * dt;
-                    let jump = if self.normal_sample() < lambda_dt.to_dec() {
-                        // Bernoulli(λdt)
+                    // Jump occurrence is a Bernoulli(λ·dt) event tested with a
+                    // uniform draw (see the method doc: intentional divergence
+                    // from upstream's normal-as-Bernoulli bug, issue #11). The
+                    // jump size below keeps upstream's standard-normal draw.
+                    let jump = if self.bernoulli_jump(lambda_dt) {
                         jump_mean + self.normal_sample() * jump_volatility
                     } else {
                         Decimal::ZERO
@@ -582,9 +644,67 @@ impl WalkTypeAble<Positive, OptionChain> for Walker {
 mod tests {
     use super::*;
     use positive::pos_or_panic;
+    use rust_decimal_macros::dec;
 
     fn sample_series(walker: &Walker, n: usize) -> Vec<Decimal> {
         (0..n).map(|_| walker.normal_sample()).collect()
+    }
+
+    /// Builds a `JumpDiffusion` [`WalkParams`] over a real [`OptionChain`] Ystep
+    /// with `dt = 1/252` and the given `intensity`, so `jump_diffusion` can be
+    /// driven directly in tests. The `walker` field is a placeholder — direct
+    /// calls dispatch on the receiver, not on `params.walker`.
+    fn jump_diffusion_params(
+        intensity: Positive,
+        size: usize,
+    ) -> WalkParams<Positive, OptionChain> {
+        use optionstratlib::ExpirationDate;
+        use optionstratlib::chains::OptionChainBuildParams;
+        use optionstratlib::chains::utils::OptionDataPriceParams;
+        use optionstratlib::simulation::steps::{Step, Xstep, Ystep};
+        use optionstratlib::utils::TimeFrame;
+
+        let initial_price = pos_or_panic!(100.0);
+        let days = pos_or_panic!(30.0);
+        let symbol = "TEST".to_string();
+
+        let price_params = OptionDataPriceParams::new(
+            Some(Box::new(initial_price)),
+            Some(ExpirationDate::Days(days)),
+            Some(Decimal::ZERO),
+            Some(Positive::ZERO),
+            Some(symbol.clone()),
+        );
+        let build_params = OptionChainBuildParams::new(
+            symbol.clone(),
+            Some(Positive::ONE),
+            10,
+            Some(pos_or_panic!(5.0)),
+            dec!(-0.2),
+            dec!(0.5),
+            pos_or_panic!(0.01),
+            2,
+            price_params,
+            pos_or_panic!(0.2),
+        );
+        let chain = OptionChain::build_chain(&build_params).expect("failed to build test chain");
+
+        WalkParams {
+            size,
+            init_step: Step {
+                x: Xstep::new(Positive::ONE, TimeFrame::Day, ExpirationDate::Days(days)),
+                y: Ystep::new(0, chain),
+            },
+            walk_type: WalkType::JumpDiffusion {
+                dt: pos_or_panic!(1.0 / 252.0),
+                drift: Decimal::ZERO,
+                volatility: pos_or_panic!(0.2),
+                intensity,
+                jump_mean: Decimal::ZERO,
+                jump_volatility: pos_or_panic!(0.1),
+            },
+            walker: Box::new(Walker::new_with_seed(1)),
+        }
     }
 
     #[test]
@@ -635,5 +755,55 @@ mod tests {
             50,
         );
         assert_eq!(pa, pb);
+    }
+
+    #[test]
+    fn test_jump_diffusion_empirical_jump_frequency() {
+        // Issue #11: the jump-occurrence draw is Bernoulli(p) via a UNIFORM
+        // sample, so over many trials it fires with frequency ~p. The old bug
+        // compared a standard-normal draw to p, giving Φ(p) ≈ 0.5 for small p.
+        // Deterministic under a fixed seed.
+        let walker = Walker::new_with_seed(20260713);
+        let p = dec!(0.004);
+        let trials = 100_000usize;
+        let hits = (0..trials).filter(|_| walker.bernoulli_jump(p)).count();
+        let freq = hits as f64 / trials as f64;
+        assert!(
+            (0.002..=0.006).contains(&freq),
+            "empirical jump frequency {freq} out of [0.002, 0.006] for p = 0.004 (hits = {hits})"
+        );
+    }
+
+    #[test]
+    fn test_jump_diffusion_rejects_lambda_dt_ge_one() {
+        // intensity = 300, dt = 1/252 => lambda_dt ~= 1.19 >= 1: the Bernoulli
+        // approximation is invalid, so jump_diffusion must reject with WalkError.
+        let walker = Walker::new_with_seed(1);
+        let params = jump_diffusion_params(pos_or_panic!(300.0), 50);
+        match walker.jump_diffusion(&params) {
+            Err(SimulationError::WalkError { reason }) => {
+                assert!(
+                    reason.contains("intensity * dt must be < 1"),
+                    "unexpected walk_error reason: {reason}"
+                );
+            }
+            other => panic!("expected WalkError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_jump_diffusion_valid_lambda_dt_is_reproducible() {
+        // With lambda_dt < 1 the walk succeeds, and the same seed reproduces the
+        // identical path (same-seed => same-tape holds within the build).
+        let a = Walker::new_with_seed(99);
+        let b = Walker::new_with_seed(99);
+        let pa = a
+            .jump_diffusion(&jump_diffusion_params(pos_or_panic!(1.0), 50))
+            .expect("jump_diffusion should succeed for lambda_dt < 1");
+        let pb = b
+            .jump_diffusion(&jump_diffusion_params(pos_or_panic!(1.0), 50))
+            .expect("jump_diffusion should succeed for lambda_dt < 1");
+        assert_eq!(pa, pb);
+        assert_eq!(pa.len(), 50);
     }
 }
