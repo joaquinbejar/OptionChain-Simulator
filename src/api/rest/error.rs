@@ -12,6 +12,15 @@ pub(crate) fn map_error(error: ChainError) -> HttpResponse {
         ChainError::InvalidState(_) => {
             HttpResponse::BadRequest().json(serde_json::json!({"error": error.to_string()}))
         }
+        // Validation failures carry the offending field so clients can point the user
+        // at the exact parameter; the wire shape is the documented
+        // `ValidationErrorResponse` ({"error", "field"}).
+        ChainError::Validation { ref field, .. } => {
+            HttpResponse::BadRequest().json(crate::api::rest::responses::ValidationErrorResponse {
+                error: error.to_string(),
+                field: field.clone(),
+            })
+        }
         ChainError::SimulatorError(err) => {
             HttpResponse::Gone().json(serde_json::json!({"error": err}))
         }
@@ -74,6 +83,24 @@ mod tests {
         let body = to_bytes(resp.into_body()).await.unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json, serde_json::json!({"error": "sim_fail"}));
+    }
+
+    /// Validation should map to 400 with the error message and the offending field.
+    #[actix_web::test]
+    async fn test_map_error_validation() {
+        let err = ChainError::Validation {
+            field: "initial_price".into(),
+            reason: "must be a finite number".into(),
+        };
+        let resp: HttpResponse = map_error(err.clone());
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"error": err.to_string(), "field": "initial_price"})
+        );
     }
 
     /// Any other variant (e.g., SessionError) should map to 500 with a generic message.

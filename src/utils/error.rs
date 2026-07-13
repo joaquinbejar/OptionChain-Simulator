@@ -40,6 +40,18 @@ pub enum ChainError {
     /// - `NotEnoughData(String)`
     ///   Represents errors when there isn't enough data to fulfill the requested steps.
     NotEnoughData(String),
+    /// - `Validation { field, reason }`
+    ///   Indicates that a client-supplied request parameter failed validation before it
+    ///   could be converted into a domain type (e.g. a negative `initial_price`, a
+    ///   non-finite volatility, or an out-of-range `steps` count). `field` names the
+    ///   offending request field and `reason` explains why it was rejected. This maps to
+    ///   an HTTP 400 at the REST boundary instead of panicking during conversion.
+    Validation {
+        /// The name of the request field that failed validation.
+        field: String,
+        /// A human-readable explanation of why the value was rejected.
+        reason: String,
+    },
 }
 
 impl<'a> From<&'a str> for ChainError {
@@ -90,6 +102,9 @@ impl fmt::Display for ChainError {
             ChainError::SimulatorError(msg) => write!(f, "Simulator Error: {}", msg),
             ChainError::ClickHouseError(msg) => write!(f, "ClickHouse Error: {}", msg),
             ChainError::NotEnoughData(msg) => write!(f, "Not Enough Data: {}", msg),
+            ChainError::Validation { field, reason } => {
+                write!(f, "Validation Error: {}: {}", field, reason)
+            }
         }
     }
 }
@@ -202,6 +217,13 @@ mod tests {
                 ChainError::NotEnoughData("insufficient data points".to_string()),
                 "Not Enough Data: insufficient data points",
             ),
+            (
+                ChainError::Validation {
+                    field: "initial_price".to_string(),
+                    reason: "must be greater than zero".to_string(),
+                },
+                "Validation Error: initial_price: must be greater than zero",
+            ),
         ];
 
         for (error, expected_str) in test_cases {
@@ -234,6 +256,10 @@ mod tests {
             ChainError::SimulatorError("simulation problem".to_string()),
             ChainError::ClickHouseError("database issue".to_string()),
             ChainError::NotEnoughData("insufficient data".to_string()),
+            ChainError::Validation {
+                field: "steps".to_string(),
+                reason: "out of range".to_string(),
+            },
         ];
 
         for error in errors {
@@ -247,7 +273,24 @@ mod tests {
                 ChainError::SimulatorError(msg) => assert_eq!(msg, "simulation problem"),
                 ChainError::ClickHouseError(msg) => assert_eq!(msg, "database issue"),
                 ChainError::NotEnoughData(msg) => assert_eq!(msg, "insufficient data"),
+                ChainError::Validation { field, reason } => {
+                    assert_eq!(field, "steps");
+                    assert_eq!(reason, "out of range");
+                }
             }
         }
+    }
+
+    // Validation error Display names the field and reason.
+    #[test]
+    fn test_validation_display_names_field_and_reason() {
+        let error = ChainError::Validation {
+            field: "volatility".to_string(),
+            reason: "must be a finite number".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Validation Error: volatility: must be a finite number"
+        );
     }
 }

@@ -1,17 +1,17 @@
 use crate::api::rest::error::map_error;
+use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS};
 use crate::api::rest::models::SessionId;
 use crate::api::rest::requests::{CreateSessionRequest, UpdateSessionRequest};
 use crate::api::rest::responses::{
     ChainResponse, ErrorResponse, OptionContractResponse, OptionPriceResponse, SessionInfoResponse,
-    SessionParametersResponse, SessionResponse,
+    SessionParametersResponse, SessionResponse, ValidationErrorResponse,
 };
+use crate::api::rest::validation::{self, decimal_field, positive_field, strictly_positive_field};
 use crate::infrastructure::{MetricsCollector, MongoDBRepository};
 use crate::session::{SessionManager, SimulationParameters};
 use crate::utils::ChainError;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, Utc};
-use positive::pos_or_panic;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -48,7 +48,7 @@ use uuid::Uuid;
     ),
     responses(
         (status = 201, description = "Session created successfully", body = SessionResponse),
-        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 400, description = "Validation failed: a parameter was non-finite, out of range (e.g. negative price/volatility), or steps/chain_size exceeded the configured limits.", body = ValidationErrorResponse),
         (status = 409, description = "Session id already exists", body = ErrorResponse),
         (status = 500, description = "Internal server error")
     )
@@ -61,10 +61,17 @@ pub(crate) async fn create_session(
     json_req: web::Json<CreateSessionRequest>,
 ) -> impl Responder {
     info!("{} {}: body={}", req.method(), req.path(), json_req.0);
-    metrics_collector.increment_active_sessions();
 
-    // Convert request to domain SimulationParameters
-    let simulation_params: SimulationParameters = json_req.0.into();
+    // Validate and convert the request into domain SimulationParameters. Invalid input
+    // (negative/non-finite numerics, out-of-range steps/chain_size, ...) yields a 400
+    // instead of panicking during conversion. Validate before touching the active-session
+    // metric so a rejected request does not inflate the counter.
+    let simulation_params: SimulationParameters = match json_req.0.try_into() {
+        Ok(params) => params,
+        Err(error) => return map_error(error),
+    };
+
+    metrics_collector.increment_active_sessions();
 
     // Create session using session manager
     match session_manager.create_session(simulation_params) {
@@ -229,7 +236,7 @@ pub(crate) async fn get_next_step(
     ),
     responses(
         (status = 200, description = "Session replaced", body = SessionResponse),
-        (status = 400, description = "Invalid request parameters"),
+        (status = 400, description = "Validation failed: a parameter was non-finite, out of range, or exceeded the configured limits.", body = ValidationErrorResponse),
         (status = 404, description = "Session not found"),
         (status = 500, description = "Internal server error")
     )
@@ -260,8 +267,12 @@ pub(crate) async fn replace_session(
         }
     };
 
-    // Convert request to domain SimulationParameters
-    let simulation_params: SimulationParameters = json_req.0.into();
+    // Validate and convert the request into domain SimulationParameters; reuse the same
+    // fallible conversion as create so PUT cannot bypass the parameter bounds.
+    let simulation_params: SimulationParameters = match json_req.0.try_into() {
+        Ok(params) => params,
+        Err(error) => return map_error(error),
+    };
 
     // Replace session using session manager
     match session_manager.reinitialize_session(session_id, simulation_params) {
@@ -320,7 +331,7 @@ pub(crate) async fn replace_session(
     responses(
         (status = 200, description = "Session updated", body = SessionResponse),
         (status = 404, description = "Session not found"),
-        (status = 400, description = "Invalid request parameters"),
+        (status = 400, description = "Validation failed: a supplied parameter was non-finite, out of range, or exceeded the configured limits.", body = ValidationErrorResponse),
         (status = 500, description = "Internal server error")
     )
 )]
@@ -359,57 +370,109 @@ pub(crate) async fn update_session(
     // Create a new SimulationParameters object with updated values
     let mut updated_params = current_session.parameters.clone();
 
-    // Update only the fields that are provided in the request
+    // Update only the fields that are provided in the request. Every user-supplied
+    // numeric is validated with the same helpers as the create/replace conversions, so a
+    // bad float yields a 400 instead of panicking during the PATCH merge.
     if let Some(symbol) = &json_req.symbol {
         updated_params.symbol = symbol.clone();
     }
 
     if let Some(steps) = json_req.steps {
+        if steps < 1 {
+            return map_error(ChainError::Validation {
+                field: "steps".to_string(),
+                reason: "must be at least 1".to_string(),
+            });
+        }
+        if steps > *MAX_STEPS {
+            return map_error(ChainError::Validation {
+                field: "steps".to_string(),
+                reason: format!("must not exceed {}, got {}", *MAX_STEPS, steps),
+            });
+        }
         updated_params.steps = steps;
     }
 
     if let Some(initial_price) = json_req.initial_price {
-        updated_params.initial_price = pos_or_panic!(initial_price);
+        updated_params.initial_price = match positive_field("initial_price", initial_price) {
+            Ok(value) => value,
+            Err(error) => return map_error(error),
+        };
     }
 
     if let Some(days_to_expiration) = json_req.days_to_expiration {
-        updated_params.days_to_expiration = pos_or_panic!(days_to_expiration);
+        updated_params.days_to_expiration =
+            match positive_field("days_to_expiration", days_to_expiration) {
+                Ok(value) => value,
+                Err(error) => return map_error(error),
+            };
     }
 
     if let Some(volatility) = json_req.volatility {
-        updated_params.volatility = pos_or_panic!(volatility);
+        updated_params.volatility = match positive_field("volatility", volatility) {
+            Ok(value) => value,
+            Err(error) => return map_error(error),
+        };
     }
 
     if let Some(risk_free_rate) = json_req.risk_free_rate {
-        updated_params.risk_free_rate = Decimal::try_from(risk_free_rate).unwrap_or_default();
+        updated_params.risk_free_rate = match decimal_field("risk_free_rate", risk_free_rate) {
+            Ok(value) => value,
+            Err(error) => return map_error(error),
+        };
     }
 
     if let Some(dividend_yield) = json_req.dividend_yield {
-        updated_params.dividend_yield = pos_or_panic!(dividend_yield);
+        updated_params.dividend_yield = match positive_field("dividend_yield", dividend_yield) {
+            Ok(value) => value,
+            Err(error) => return map_error(error),
+        };
     }
 
     if let Some(method) = &json_req.method {
-        updated_params.method = method.clone().into();
+        updated_params.method = match method.clone().try_into() {
+            Ok(value) => value,
+            Err(error) => return map_error(error),
+        };
     }
 
     if let Some(time_frame) = json_req.time_frame {
-        updated_params.time_frame = time_frame.into();
+        updated_params.time_frame = match validation::time_frame_field("time_frame", time_frame) {
+            Ok(value) => value,
+            Err(error) => return map_error(error),
+        };
     }
 
     if let Some(chain_size) = json_req.chain_size {
+        if chain_size > *MAX_CHAIN_SIZE {
+            return map_error(ChainError::Validation {
+                field: "chain_size".to_string(),
+                reason: format!("must not exceed {}, got {}", *MAX_CHAIN_SIZE, chain_size),
+            });
+        }
         updated_params.chain_size = Some(chain_size);
     }
 
     if let Some(strike_interval) = json_req.strike_interval {
-        updated_params.strike_interval = Some(pos_or_panic!(strike_interval));
+        updated_params.strike_interval =
+            match strictly_positive_field("strike_interval", strike_interval) {
+                Ok(value) => Some(value),
+                Err(error) => return map_error(error),
+            };
     }
 
     if let Some(smile_curve) = json_req.smile_curve {
-        updated_params.smile_curve = Some(Decimal::try_from(smile_curve).unwrap_or_default());
+        updated_params.smile_curve = match decimal_field("smile_curve", smile_curve) {
+            Ok(value) => Some(value),
+            Err(error) => return map_error(error),
+        };
     }
 
     if let Some(spread) = json_req.spread {
-        updated_params.spread = Some(pos_or_panic!(spread));
+        updated_params.spread = match positive_field("spread", spread) {
+            Ok(value) => Some(value),
+            Err(error) => return map_error(error),
+        };
     }
 
     if let Some(seed) = json_req.seed {

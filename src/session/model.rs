@@ -1,4 +1,6 @@
 use crate::api::CreateSessionRequest;
+use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS};
+use crate::api::rest::validation::{decimal_field, positive_field, strictly_positive_field};
 use crate::session::manager::DEFAULT_NAMESPACE;
 use crate::utils::{ChainError, UuidGenerator};
 pub use optionstratlib::simulation::WalkType as SimulationMethod;
@@ -145,32 +147,84 @@ impl fmt::Display for SimulationParameters {
     }
 }
 
-impl From<CreateSessionRequest> for SimulationParameters {
-    fn from(req: CreateSessionRequest) -> Self {
-        Self {
+impl TryFrom<CreateSessionRequest> for SimulationParameters {
+    type Error = ChainError;
+
+    /// Validates a client-supplied [`CreateSessionRequest`] and converts it into the
+    /// domain [`SimulationParameters`]. This is the single place where the REST `f64`
+    /// boundary is turned into `Positive`/`Decimal`, so it rejects every out-of-domain
+    /// value here rather than panicking downstream:
+    ///
+    /// - `steps` must be in `1..=MAX_STEPS`;
+    /// - `chain_size`, when provided, must not exceed `MAX_CHAIN_SIZE`;
+    /// - numeric fields must be finite (no `NaN`/`±inf`) and, where a `Positive` is
+    ///   required, non-negative (`strike_interval` must be strictly positive);
+    /// - `risk_free_rate`, `skew_slope`, and `smile_curve` must be representable as a
+    ///   `Decimal`.
+    ///
+    /// The effective-seed contract is preserved: when the client omits the seed, one is
+    /// generated so the session stays reproducible and the seed can be reported back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Validation`] naming the first field that fails validation.
+    fn try_from(req: CreateSessionRequest) -> Result<Self, Self::Error> {
+        if req.steps < 1 {
+            return Err(ChainError::Validation {
+                field: "steps".to_string(),
+                reason: "must be at least 1".to_string(),
+            });
+        }
+        if req.steps > *MAX_STEPS {
+            return Err(ChainError::Validation {
+                field: "steps".to_string(),
+                reason: format!("must not exceed {}, got {}", *MAX_STEPS, req.steps),
+            });
+        }
+        if let Some(chain_size) = req.chain_size
+            && chain_size > *MAX_CHAIN_SIZE
+        {
+            return Err(ChainError::Validation {
+                field: "chain_size".to_string(),
+                reason: format!("must not exceed {}, got {}", *MAX_CHAIN_SIZE, chain_size),
+            });
+        }
+
+        Ok(Self {
             symbol: req.symbol,
             steps: req.steps,
-            initial_price: pos_or_panic!(req.initial_price),
-            days_to_expiration: pos_or_panic!(req.days_to_expiration),
-            volatility: pos_or_panic!(req.volatility),
-            risk_free_rate: Decimal::try_from(req.risk_free_rate).unwrap_or_default(),
-            dividend_yield: pos_or_panic!(req.dividend_yield),
-            method: req.method.into(),
-            time_frame: req.time_frame.into(),
+            initial_price: positive_field("initial_price", req.initial_price)?,
+            days_to_expiration: positive_field("days_to_expiration", req.days_to_expiration)?,
+            volatility: positive_field("volatility", req.volatility)?,
+            risk_free_rate: decimal_field("risk_free_rate", req.risk_free_rate)?,
+            dividend_yield: positive_field("dividend_yield", req.dividend_yield)?,
+            method: req.method.try_into()?,
+            time_frame: crate::api::rest::validation::time_frame_field(
+                "time_frame",
+                req.time_frame,
+            )?,
             chain_size: req.chain_size,
-            strike_interval: req.strike_interval.map(|v| pos_or_panic!(v)),
+            strike_interval: req
+                .strike_interval
+                .map(|v| strictly_positive_field("strike_interval", v))
+                .transpose()?,
             skew_slope: req
                 .skew_slope
-                .map(|v| Decimal::try_from(v).unwrap_or_default()),
+                .map(|v| decimal_field("skew_slope", v))
+                .transpose()?,
             smile_curve: req
                 .smile_curve
-                .map(|v| Decimal::try_from(v).unwrap_or_default()),
-            spread: req.spread.map(|v| pos_or_panic!(v)),
+                .map(|v| decimal_field("smile_curve", v))
+                .transpose()?,
+            spread: req
+                .spread
+                .map(|v| positive_field("spread", v))
+                .transpose()?,
             // When the client does not provide a seed, generate one so the
             // session is still reproducible and the effective seed can be
             // reported back in the session response.
             seed: Some(req.seed.unwrap_or_else(|| rand::rng().random())),
-        }
+        })
     }
 }
 
@@ -466,7 +520,7 @@ mod tests_seed_conversion {
             ..Default::default()
         };
 
-        let params: SimulationParameters = req.into();
+        let params: SimulationParameters = req.try_into().expect("valid request converts");
         assert_eq!(params.seed, Some(42));
     }
 
@@ -478,7 +532,7 @@ mod tests_seed_conversion {
             ..Default::default()
         };
 
-        let params: SimulationParameters = req.into();
+        let params: SimulationParameters = req.try_into().expect("valid request converts");
         // An effective seed must be generated so the session is reproducible
         // and the seed can be reported back to the client
         assert!(params.seed.is_some());
@@ -491,7 +545,7 @@ mod tests_seed_conversion {
             seed: Some(7),
             ..Default::default()
         };
-        let params: SimulationParameters = req.into();
+        let params: SimulationParameters = req.try_into().expect("valid request converts");
 
         let json = serde_json::to_string(&params).unwrap();
         let restored: SimulationParameters = serde_json::from_str(&json).unwrap();
@@ -521,6 +575,99 @@ mod tests_seed_conversion {
 
         let params: SimulationParameters = serde_json::from_str(json).unwrap();
         assert_eq!(params.seed, None);
+    }
+}
+
+#[cfg(test)]
+mod tests_try_from_validation {
+    use super::*;
+    use crate::api::rest::limits::MAX_STEPS;
+
+    #[test]
+    fn test_negative_initial_price_is_validation_error() {
+        let req = CreateSessionRequest {
+            initial_price: -1.0,
+            ..Default::default()
+        };
+        match SimulationParameters::try_from(req) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "initial_price"),
+            other => panic!("expected Validation error for initial_price, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_nan_volatility_is_validation_error() {
+        let req = CreateSessionRequest {
+            volatility: f64::NAN,
+            ..Default::default()
+        };
+        match SimulationParameters::try_from(req) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "volatility"),
+            other => panic!("expected Validation error for volatility, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_infinite_risk_free_rate_is_validation_error() {
+        let req = CreateSessionRequest {
+            risk_free_rate: f64::INFINITY,
+            ..Default::default()
+        };
+        match SimulationParameters::try_from(req) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "risk_free_rate"),
+            other => panic!("expected Validation error for risk_free_rate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_zero_steps_is_validation_error() {
+        let req = CreateSessionRequest {
+            steps: 0,
+            ..Default::default()
+        };
+        match SimulationParameters::try_from(req) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "steps");
+                assert!(reason.contains("at least 1"));
+            }
+            other => panic!("expected Validation error for steps, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_steps_over_max_is_validation_error() {
+        let req = CreateSessionRequest {
+            steps: *MAX_STEPS + 1,
+            ..Default::default()
+        };
+        match SimulationParameters::try_from(req) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "steps"),
+            other => panic!("expected Validation error for steps, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_chain_size_over_max_is_validation_error() {
+        let req = CreateSessionRequest {
+            chain_size: Some(*MAX_CHAIN_SIZE + 1),
+            ..Default::default()
+        };
+        match SimulationParameters::try_from(req) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "chain_size"),
+            other => panic!("expected Validation error for chain_size, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_valid_request_converts_and_preserves_seed() {
+        let req = CreateSessionRequest {
+            seed: Some(99),
+            ..Default::default()
+        };
+        let params = SimulationParameters::try_from(req).expect("valid request converts");
+        assert_eq!(params.seed, Some(99));
+        assert_eq!(params.initial_price, pos_or_panic!(100.0));
+        assert_eq!(params.steps, 20);
     }
 }
 
