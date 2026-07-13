@@ -1,4 +1,5 @@
 use prometheus::{Gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, Registry};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// MetricsCollector is responsible for tracking and exporting API metrics
@@ -13,6 +14,12 @@ pub struct MetricsCollector {
     active_sessions: IntGauge,
     session_creation_counter: IntCounter,
     session_deletion_counter: IntCounter,
+    /// Sessions created (and not yet deleted) BY THIS PROCESS. Gates the
+    /// `active_sessions` decrement so deleting a session that predates the
+    /// process (the store outlives us; the gauge restarts at zero) can never
+    /// drive the gauge negative. Not registered - it is bookkeeping for the
+    /// gauge, not a metric of its own.
+    owned_active_sessions: AtomicU64,
 
     // Simulation metrics
     simulation_steps_counter: IntCounterVec,
@@ -143,6 +150,7 @@ impl MetricsCollector {
             active_sessions,
             session_creation_counter,
             session_deletion_counter,
+            owned_active_sessions: AtomicU64::new(0),
             simulation_steps_counter,
             simulation_duration,
             cache_hit_counter,
@@ -175,16 +183,44 @@ impl MetricsCollector {
             .inc();
     }
 
-    /// Increments the active sessions counter
-    pub fn increment_active_sessions(&self) {
+    /// Records that a session was created: bumps the `active_sessions` gauge and
+    /// the `session_creations_total` counter.
+    ///
+    /// Call this ONLY after the create operation has succeeded — a rejected or
+    /// failed create must not inflate either metric. The gauge is a
+    /// process-local approximation of live sessions: Redis TTL expiry and
+    /// process restarts are not reflected here (documented known drift; a
+    /// store-derived gauge is future work).
+    pub fn record_session_created(&self) {
+        self.owned_active_sessions.fetch_add(1, Ordering::AcqRel);
         self.active_sessions.inc();
         self.session_creation_counter.inc();
     }
 
-    /// Decrements the active sessions counter
-    pub fn decrement_active_sessions(&self) {
-        self.active_sessions.dec();
+    /// Records that a session was deleted: decrements the `active_sessions`
+    /// gauge and bumps the `session_deletions_total` counter.
+    ///
+    /// Call this ONLY after a session was actually deleted (the delete returned
+    /// `Ok(true)`). Invalid ids, not-found (`Ok(false)`), and errors must record
+    /// nothing.
+    ///
+    /// The gauge decrement is gated on `owned_active_sessions`: only deletions
+    /// of sessions this process counted decrement the gauge. A persistent store
+    /// outlives the process, so after a restart the gauge starts at zero while
+    /// valid sessions remain deletable — an unconditional decrement would drive
+    /// `active_sessions` negative. Such deletions still bump the deletion
+    /// counter; they only skip the gauge. The atomic `checked_sub` update keeps
+    /// the guard race-free under concurrent deletes. The gauge remains a
+    /// process-local approximation (Redis TTL expiry is not reflected —
+    /// documented known drift; a store-derived gauge is future work).
+    pub fn record_session_deleted(&self) {
         self.session_deletion_counter.inc();
+        let owned_one =
+            self.owned_active_sessions
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+        if owned_one.is_ok() {
+            self.active_sessions.dec();
+        }
     }
 
     /// Records a simulation step
@@ -341,16 +377,96 @@ mod tests {
         // Create a new MetricsCollector
         let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
 
-        // Increment and decrement active sessions
-        collector.increment_active_sessions();
-        collector.increment_active_sessions();
-        collector.decrement_active_sessions();
+        // Record two creations and one deletion
+        collector.record_session_created();
+        collector.record_session_created();
+        collector.record_session_deleted();
 
         // Check that the gauge and counters were updated correctly
         let metrics = collector.export_metrics();
         assert!(metrics.contains("active_sessions 1"));
         assert!(metrics.contains("session_creations_total 2"));
         assert!(metrics.contains("session_deletions_total 1"));
+    }
+
+    #[test]
+    fn test_record_session_created_bumps_gauge_and_creation_counter() {
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        collector.record_session_created();
+
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("active_sessions 1"));
+        assert!(metrics.contains("session_creations_total 1"));
+        // A creation must not touch the deletion counter.
+        assert!(metrics.contains("session_deletions_total 0"));
+    }
+
+    #[test]
+    fn test_record_session_deleted_decrements_gauge_and_bumps_deletion_counter() {
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        collector.record_session_created();
+        collector.record_session_deleted();
+
+        let metrics = collector.export_metrics();
+        // created then deleted returns the gauge to zero.
+        assert!(metrics.contains("active_sessions 0"));
+        assert!(metrics.contains("session_creations_total 1"));
+        assert!(metrics.contains("session_deletions_total 1"));
+    }
+
+    #[test]
+    fn test_created_then_deleted_returns_gauge_to_zero() {
+        // The collector-level pairing invariant: one create balanced by one delete
+        // leaves the gauge at zero. The handler is responsible for only pairing a
+        // delete with an actual deletion.
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        for _ in 0..5 {
+            collector.record_session_created();
+        }
+        for _ in 0..5 {
+            collector.record_session_deleted();
+        }
+
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("active_sessions 0"));
+        assert!(metrics.contains("session_creations_total 5"));
+        assert!(metrics.contains("session_deletions_total 5"));
+    }
+
+    #[test]
+    fn test_unmatched_delete_never_drives_gauge_negative() {
+        // Restart scenario: the store retained sessions but this process never
+        // counted them, so its gauge starts at zero. Deleting those sessions
+        // bumps the deletion counter but must NOT decrement the gauge — an
+        // unconditional decrement would report a negative session count.
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        collector.record_session_deleted();
+        collector.record_session_deleted();
+
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("active_sessions 0"));
+        assert!(metrics.contains("session_deletions_total 2"));
+    }
+
+    #[test]
+    fn test_delete_beyond_owned_sessions_clamps_gauge_at_zero() {
+        // One owned session, two deletions (the second targets a pre-restart
+        // session): the first delete decrements the gauge, the second only
+        // counts. The gauge bottoms out at zero instead of going negative.
+        let collector = MetricsCollector::new().expect("Failed to create MetricsCollector");
+
+        collector.record_session_created();
+        collector.record_session_deleted();
+        collector.record_session_deleted();
+
+        let metrics = collector.export_metrics();
+        assert!(metrics.contains("active_sessions 0"));
+        assert!(metrics.contains("session_creations_total 1"));
+        assert!(metrics.contains("session_deletions_total 2"));
     }
 
     #[test]
@@ -458,7 +574,7 @@ mod tests {
 
         // Record various metrics
         collector.record_request("/api/v1/chain", "GET", "200");
-        collector.increment_active_sessions();
+        collector.record_session_created();
 
         // Export metrics
         let metrics = collector.export_metrics();
