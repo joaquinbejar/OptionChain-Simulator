@@ -69,6 +69,26 @@ pub trait SessionStore: Send + Sync {
     ///
     fn get(&self, id: Uuid) -> Result<Session, ChainError>;
 
+    /// Creates a brand-new session, failing if one with the same id already exists.
+    ///
+    /// Unlike [`SessionStore::save`], which is a blind upsert, `create` must never
+    /// overwrite an existing session. This is what makes a fresh manager (after a
+    /// restart, or a second replica) safe: a colliding id is rejected instead of
+    /// silently clobbering a live session.
+    ///
+    /// # Parameters
+    /// - `session`: The `Session` to insert.
+    ///
+    /// # Returns
+    /// - `Ok(())`: If the session was inserted.
+    /// - `Err(ChainError::AlreadyExists)`: If a session with the same id already exists.
+    /// - `Err(ChainError)`: If the underlying storage operation fails.
+    ///
+    /// # Errors
+    /// Returns `ChainError::AlreadyExists` on an id collision, or another `ChainError`
+    /// variant on a storage/serialization failure.
+    fn create(&self, session: Session) -> Result<(), ChainError>;
+
     /// Saves the provided session into persistent storage or memory.
     ///
     /// # Parameters
@@ -136,6 +156,7 @@ mod tests {
         pub SessionStore {}
         impl SessionStore for SessionStore {
             fn get(&self, id: Uuid) -> Result<Session, ChainError>;
+            fn create(&self, session: Session) -> Result<(), ChainError>;
             fn save(&self, session: Session) -> Result<(), ChainError>;
             fn delete(&self, id: Uuid) -> Result<bool, ChainError>;
             fn cleanup(&self) -> Result<usize, ChainError>;
@@ -165,6 +186,18 @@ mod tests {
                     id
                 ))),
             }
+        }
+
+        fn create(&self, session: Session) -> Result<(), ChainError> {
+            let mut sessions = self.sessions.lock().unwrap();
+            if sessions.contains_key(&session.id) {
+                return Err(ChainError::AlreadyExists(format!(
+                    "Session with id {} already exists",
+                    session.id
+                )));
+            }
+            sessions.insert(session.id, session);
+            Ok(())
         }
 
         fn save(&self, session: Session) -> Result<(), ChainError> {
@@ -275,6 +308,36 @@ mod tests {
         // Verify it was saved by retrieving it
         let get_result = store.get(session_id);
         assert!(get_result.is_ok());
+    }
+
+    #[test]
+    fn test_create_new_session() {
+        let store = TestSessionStore::new();
+        let session = create_test_session(None);
+        let session_id = session.id;
+
+        // First create succeeds on a fresh id
+        let create_result = store.create(session);
+        assert!(create_result.is_ok());
+
+        // Verify it was stored
+        assert!(store.get(session_id).is_ok());
+    }
+
+    #[test]
+    fn test_create_duplicate_session_returns_already_exists() {
+        let store = TestSessionStore::new();
+        let session = create_test_session(None);
+
+        // First create succeeds
+        assert!(store.create(session.clone()).is_ok());
+
+        // Second create with the same id must be rejected, not overwrite
+        let dup_result = store.create(session);
+        match dup_result {
+            Err(ChainError::AlreadyExists(_)) => {}
+            other => panic!("Expected AlreadyExists error, got {:?}", other),
+        }
     }
 
     #[test]

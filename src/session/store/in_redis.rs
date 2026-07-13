@@ -100,6 +100,43 @@ impl SessionStore for InRedisSessionStore {
     }
 
     #[instrument(skip(self, session), level = "debug")]
+    fn create(&self, session: Session) -> Result<(), ChainError> {
+        let key = self.session_key(session.id);
+        debug!(session_id = %session.id, key = %key, "Creating session in Redis");
+
+        // Serialize session to JSON
+        let json_str = match serde_json::to_string(&session) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(session_id = %session.id, error = %e, "Failed to serialize session");
+                return Err(ChainError::Internal(format!(
+                    "Failed to serialize session: {}",
+                    e
+                )));
+            }
+        };
+
+        // SET NX guarantees we never overwrite an existing session id.
+        match self.client.set_nx(&key, json_str, Some(self.session_ttl)) {
+            Ok(true) => {
+                debug!(session_id = %session.id, "Session created successfully");
+                Ok(())
+            }
+            Ok(false) => {
+                error!(session_id = %session.id, "Session id already exists in Redis");
+                Err(ChainError::AlreadyExists(format!(
+                    "Session with id {} already exists",
+                    session.id
+                )))
+            }
+            Err(e) => {
+                error!(session_id = %session.id, error = %e, "Redis error while creating session");
+                Err(Self::map_redis_error(e))
+            }
+        }
+    }
+
+    #[instrument(skip(self, session), level = "debug")]
     fn save(&self, session: Session) -> Result<(), ChainError> {
         let key = self.session_key(session.id);
         debug!(session_id = %session.id, key = %key, "Saving session to Redis");
@@ -231,6 +268,33 @@ mod tests {
             }
         }
 
+        fn create(&self, session: Session) -> Result<(), ChainError> {
+            let key = self.session_key(session.id);
+
+            // Serialize session to JSON
+            let json_str = match serde_json::to_string(&session) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(ChainError::Internal(format!(
+                        "Failed to serialize session: {}",
+                        e
+                    )));
+                }
+            };
+
+            // Mirror the real store's SET NX behaviour: reject id collisions.
+            let mut sessions = self.sessions.lock().unwrap();
+            if sessions.contains_key(&key) {
+                return Err(ChainError::AlreadyExists(format!(
+                    "Session with id {} already exists",
+                    session.id
+                )));
+            }
+            sessions.insert(key, json_str);
+
+            Ok(())
+        }
+
         fn save(&self, session: Session) -> Result<(), ChainError> {
             let key = self.session_key(session.id);
 
@@ -353,6 +417,61 @@ mod tests {
     }
 
     #[test]
+    fn test_create_new_session() {
+        let store = TestInRedisSessionStore::new(None, None);
+
+        let session = create_test_session();
+        let session_id = session.id;
+
+        // create succeeds on a fresh id
+        assert!(store.create(session).is_ok());
+        assert_eq!(store.get_store_size(), 1);
+
+        // and the session is retrievable
+        assert!(store.get(session_id).is_ok());
+    }
+
+    #[test]
+    fn test_create_duplicate_returns_already_exists() {
+        let store = TestInRedisSessionStore::new(None, None);
+
+        let session = create_test_session();
+
+        // first create wins
+        assert!(store.create(session.clone()).is_ok());
+
+        // second create with the same id is rejected instead of overwriting
+        match store.create(session) {
+            Err(ChainError::AlreadyExists(msg)) => {
+                assert!(msg.contains("already exists"));
+            }
+            other => panic!("Expected AlreadyExists error, got {:?}", other),
+        }
+
+        // still exactly one stored entry (no overwrite / no duplicate)
+        assert_eq!(store.get_store_size(), 1);
+    }
+
+    #[test]
+    fn test_save_still_updates_after_create() {
+        let store = TestInRedisSessionStore::new(None, None);
+
+        let mut session = create_test_session();
+        let session_id = session.id;
+
+        assert!(store.create(session.clone()).is_ok());
+
+        // save is still an upsert on top of a created session
+        session.current_step = 3;
+        session.state = SessionState::InProgress;
+        assert!(store.save(session).is_ok());
+
+        let updated = store.get(session_id).unwrap();
+        assert_eq!(updated.current_step, 3);
+        assert_eq!(updated.state, SessionState::InProgress);
+    }
+
+    #[test]
     fn test_get_non_existent_session() {
         let store = TestInRedisSessionStore::new(None, None);
 
@@ -453,6 +572,13 @@ mod tests {
             )))
         }
 
+        fn create(&self, session: Session) -> Result<(), ChainError> {
+            Err(ChainError::Internal(format!(
+                "Simulated error creating session {}",
+                session.id
+            )))
+        }
+
         fn save(&self, session: Session) -> Result<(), ChainError> {
             Err(ChainError::Internal(format!(
                 "Simulated error saving session {}",
@@ -482,6 +608,9 @@ mod tests {
         let session_id = session.id;
 
         // Test that errors are properly propagated
+        let create_result = error_store.create(session.clone());
+        assert!(create_result.is_err());
+
         let save_result = error_store.save(session);
         assert!(save_result.is_err());
 

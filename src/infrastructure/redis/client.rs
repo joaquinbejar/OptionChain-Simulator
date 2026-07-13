@@ -100,6 +100,52 @@ impl RedisClient {
         }
     }
 
+    /// Atomically sets a value in Redis only if the key does not already exist
+    /// (`SET key value NX [EX secs]`), with an optional expiration in seconds.
+    ///
+    /// # Returns
+    /// - `Ok(true)` if the key was created (it did not exist before).
+    /// - `Ok(false)` if the key already existed and was left untouched.
+    /// - `Err(RedisError)` if the command failed.
+    #[instrument(skip(self, value), level = "debug")]
+    pub fn set_nx<T: redis::ToSingleRedisArg>(
+        &self,
+        key: &str,
+        value: T,
+        expiry_secs: Option<u64>,
+    ) -> RedisResult<bool> {
+        let mut connection = self.get_connection()?;
+        let connection = &mut *connection;
+
+        // Redis replies with "OK" when the key was set and nil when NX prevented
+        // the write; deserializing into `Option<String>` distinguishes the two.
+        let outcome: Option<String> = match expiry_secs {
+            Some(secs) => {
+                debug!(
+                    "Setting key '{}' in Redis with NX and expiry of {} seconds",
+                    key, secs
+                );
+                redis::cmd("SET")
+                    .arg(key)
+                    .arg(value)
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(secs)
+                    .query(connection)?
+            }
+            None => {
+                debug!("Setting key '{}' in Redis with NX and no expiry", key);
+                redis::cmd("SET")
+                    .arg(key)
+                    .arg(value)
+                    .arg("NX")
+                    .query(connection)?
+            }
+        };
+
+        Ok(outcome.is_some())
+    }
+
     /// Deletes a key from Redis
     #[instrument(skip(self), level = "debug")]
     pub fn delete(&self, key: &str) -> RedisResult<bool> {

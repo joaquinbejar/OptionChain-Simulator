@@ -26,6 +26,11 @@ pub enum ChainError {
     /// - `NotFound(String)`
     ///   Denotes that a requested resource or item was not found. Includes a `String` detailing what was not found.
     NotFound(String),
+    /// - `AlreadyExists(String)`
+    ///   Denotes that a resource with the given identifier already exists and cannot be
+    ///   created again. Raised by `SessionStore::create` when a session id is already
+    ///   present, guarding against silently overwriting a live session.
+    AlreadyExists(String),
     /// - `SimulatorError(String)`
     ///   Indicates an error specific to a simulation process. Provides a `String` for more context.
     SimulatorError(String),
@@ -81,6 +86,7 @@ impl fmt::Display for ChainError {
             ChainError::InvalidState(msg) => write!(f, "Invalid State: {}", msg),
             ChainError::Internal(msg) => write!(f, "Internal Error: {}", msg),
             ChainError::NotFound(msg) => write!(f, "Not Found: {}", msg),
+            ChainError::AlreadyExists(msg) => write!(f, "Already Exists: {}", msg),
             ChainError::SimulatorError(msg) => write!(f, "Simulator Error: {}", msg),
             ChainError::ClickHouseError(msg) => write!(f, "ClickHouse Error: {}", msg),
             ChainError::NotEnoughData(msg) => write!(f, "Not Enough Data: {}", msg),
@@ -181,6 +187,10 @@ mod tests {
                 "Not Found: resource missing",
             ),
             (
+                ChainError::AlreadyExists("resource present".to_string()),
+                "Already Exists: resource present",
+            ),
+            (
                 ChainError::SimulatorError("simulation failed".to_string()),
                 "Simulator Error: simulation failed",
             ),
@@ -220,6 +230,7 @@ mod tests {
             ChainError::InvalidState("invalid state".to_string()),
             ChainError::Internal("internal issue".to_string()),
             ChainError::NotFound("not found".to_string()),
+            ChainError::AlreadyExists("already exists".to_string()),
             ChainError::SimulatorError("simulation problem".to_string()),
             ChainError::ClickHouseError("database issue".to_string()),
             ChainError::NotEnoughData("insufficient data".to_string()),
@@ -232,6 +243,7 @@ mod tests {
                 ChainError::InvalidState(msg) => assert_eq!(msg, "invalid state"),
                 ChainError::Internal(msg) => assert_eq!(msg, "internal issue"),
                 ChainError::NotFound(msg) => assert_eq!(msg, "not found"),
+                ChainError::AlreadyExists(msg) => assert_eq!(msg, "already exists"),
                 ChainError::SimulatorError(msg) => assert_eq!(msg, "simulation problem"),
                 ChainError::ClickHouseError(msg) => assert_eq!(msg, "database issue"),
                 ChainError::NotEnoughData(msg) => assert_eq!(msg, "insufficient data"),
