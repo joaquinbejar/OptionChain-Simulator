@@ -19,7 +19,8 @@ use optionstratlib::{
     },
 };
 use positive::{Positive, pos_or_panic};
-use rand::RngExt;
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
@@ -36,6 +37,15 @@ const DEFAULT_SMILE_CURVE: Decimal = dec!(0.4);
 
 /// Default upper bound on the number of random walks held in the simulation cache.
 const DEFAULT_MAX_CACHED_WALKS: usize = 1000;
+
+/// Domain-separation salt (ASCII "HISTORY") mixed into the session seed to derive
+/// the RNG that selects the historical symbol and start date (issue #12).
+///
+/// XORing the seed with a fixed salt keeps the historical-selection stream
+/// deterministic per seed while decoupling it from the walker's own stream, so the
+/// same session seed always loads the same data series without perturbing — or being
+/// perturbed by — the walk's stochastic draws.
+const HISTORICAL_STREAM_SALT: u64 = 0x0048_4953_544F_5259;
 
 /// Hard bound on the number of random walks the simulation cache may hold
 /// (`OCS_MAX_CACHED_WALKS`).
@@ -67,55 +77,45 @@ static MAX_CACHED_WALKS: LazyLock<usize> =
 /// `last_access` drives least-recently-accessed eviction: every cache hit refreshes
 /// it so active sessions survive the [`MAX_CACHED_WALKS`] bound while idle ones age out.
 ///
-/// `evictable` gates whether the entry may be chosen as an LRU victim. It is set at
-/// insert time: `false` for a `SimulationMethod::Historical` walk, `true` otherwise.
-/// A historical walk is pinned because, at this point in the stack, its symbol/date
-/// selection still draws from an unseeded `rand::rng()` — evicting it mid-session
-/// would rebuild a DIFFERENT tape. This is a temporary conservatism: the stacked
-/// seeded-historical PR makes historical selection reproducible and lifts the pin so
-/// every walk becomes evictable again.
+/// `resolved_method` carries the RESOLVED `SimulationMethod::Historical` (chosen
+/// symbol + loaded prices) when this walk's build fetched its series from the
+/// database, `None` otherwise. It rides with the entry so EVERY serve — cache miss
+/// or cache hit — can write the resolution back into the session it serves. Without
+/// it, a read-only peek that builds the walk would discard its session copy, and the
+/// following advance (a cache hit) would persist the original UNRESOLVED method.
+///
+/// The historical eviction pin from the cache-eviction PR is lifted here: with the
+/// symbol/date selection drawn from a seed-derived RNG (issue #12), an evicted
+/// historical walk rebuilds the identical tape — either from the persisted embedded
+/// prices or by replaying the seeded selection — so every entry is evictable again.
 struct CacheEntry {
     walk: RandomWalk<Positive, OptionChain>,
     last_access: Instant,
-    evictable: bool,
+    resolved_method: Option<SimulationMethod>,
 }
 
-/// Evicts least-recently-accessed **evictable** entries until `cache` holds at most
-/// `max` entries.
+/// Evicts least-recently-accessed entries until `cache` holds at most `max` entries.
 ///
 /// Pure over the cache map (no I/O, no locking) so it can be unit-tested directly.
 /// The insert path calls it with `max = MAX_CACHED_WALKS - 1` BEFORE inserting the
-/// new entry, so the id being inserted is absent and can never be the victim, and a
-/// cache of only evictable entries never exceeds `MAX_CACHED_WALKS` after the insert.
-/// An `O(n)` scan per eviction is acceptable at these cache sizes.
+/// new entry, so the id being inserted is absent and can never be the victim, and the
+/// cache never exceeds `MAX_CACHED_WALKS` after the insert. An `O(n)` scan per
+/// eviction is acceptable at these cache sizes.
 ///
-/// Only entries with `evictable == true` are considered as victims. If the cache is
-/// over `max` but every remaining entry is non-evictable (active historical walks,
-/// see [`CacheEntry`]), eviction is skipped and the cache is allowed to exceed the
-/// bound — never evict a historical walk mid-session, because at this stack level its
-/// rebuild would draw a different tape. A `tracing::warn!` names the over-capacity
-/// count. This conservatism is temporary: the stacked seeded-historical PR makes all
-/// walks evictable and this filter becomes a no-op.
+/// Every entry is a candidate victim, historical walks included: their seeded
+/// symbol/date selection (issue #12) makes an evict-and-rebuild reproduce the
+/// identical tape, which lifted the earlier pin on historical entries.
 fn enforce_capacity(cache: &mut HashMap<Uuid, CacheEntry>, max: usize) {
     while cache.len() > max {
         let victim = cache
             .iter()
-            .filter(|(_, entry)| entry.evictable)
             .min_by_key(|(_, entry)| entry.last_access)
             .map(|(id, _)| *id);
         match victim {
             Some(id) => {
                 cache.remove(&id);
             }
-            None => {
-                warn!(
-                    cache_len = cache.len(),
-                    max,
-                    "cache over capacity but all entries are non-evictable \
-                     (active historical walks); skipping eviction"
-                );
-                break;
-            }
+            None => break,
         }
     }
 }
@@ -163,9 +163,23 @@ impl Simulator {
         }
     }
 
-    /// Simulates the next step based on the session parameters and returns an OptionChain
+    /// Simulates the next step based on the session parameters and returns an OptionChain.
+    ///
+    /// Documented side effect (issue #12): when the walk's build resolved a
+    /// `Historical` source (an empty/insufficient price series triggers a seeded
+    /// database fetch), the resolved method — the chosen symbol plus the loaded
+    /// prices — is written back into `session.parameters.method` on EVERY serve,
+    /// cache hits included (the resolution is stored in the cache entry). This makes
+    /// the write-back independent of which call built the walk: a read-only peek may
+    /// build it and discard its session copy, and the next advance still receives —
+    /// and persists, via the manager's save — the resolved method. Reproducibility
+    /// does not depend on this persistence: the seeded selection stream reloads the
+    /// identical series on any rebuild.
     #[instrument(skip(self, session), level = "debug")]
-    pub async fn simulate_next_step(&self, session: &Session) -> Result<OptionChain, ChainError> {
+    pub async fn simulate_next_step(
+        &self,
+        session: &mut Session,
+    ) -> Result<OptionChain, ChainError> {
         debug!(
             session_id = %session.id,
             current_step = session.current_step,
@@ -204,6 +218,7 @@ impl Simulator {
                 "Creating new simulation for session"
             );
             debug!("Reset Random Walk with Session: {}", session);
+
             Some(self.create_random_walk(session).await?)
         } else {
             None
@@ -218,28 +233,21 @@ impl Simulator {
         let step = {
             let mut cache = self.simulation_cache.lock().await;
 
-            let entry = if let Some(random_walk) = random_walk_opt {
-                // Non-historical walks may be LRU-evicted; a Historical walk must not
-                // at this stack level, because its symbol/date selection still uses an
-                // unseeded RNG (see `CacheEntry`) — evicting mid-session would rebuild a
-                // DIFFERENT tape. The stacked seeded-historical PR lifts this pin.
-                let evictable = !matches!(
-                    session.parameters.method,
-                    SimulationMethod::Historical { .. }
-                );
-
-                // Evicting down to `max - 1` before inserting keeps a cache of evictable
-                // entries at or below `MAX_CACHED_WALKS` afterwards. `MAX_CACHED_WALKS`
-                // is validated `>= 1` at parse time (see its definition), so `max - 1`
-                // cannot underflow — no saturating arithmetic (rules forbid it).
+            let entry = if let Some((random_walk, resolved_method)) = random_walk_opt {
+                // Evicting down to `max - 1` before inserting keeps the cache at or
+                // below `MAX_CACHED_WALKS` afterwards. `MAX_CACHED_WALKS` is validated
+                // `>= 1` at parse time (see its definition), so `max - 1` cannot
+                // underflow — no saturating arithmetic (rules forbid it).
                 let max = *MAX_CACHED_WALKS;
                 debug_assert!(max >= 1, "MAX_CACHED_WALKS is validated >= 1 at parse time");
                 enforce_capacity(&mut cache, max - 1);
 
+                // The resolved method rides WITH the entry (not only with this call's
+                // session copy) so a later cache hit can re-apply it — see below.
                 cache.entry(session.id).or_insert(CacheEntry {
                     walk: random_walk,
                     last_access: Instant::now(),
-                    evictable,
+                    resolved_method,
                 })
             } else {
                 cache.get_mut(&session.id).ok_or_else(|| {
@@ -253,6 +261,18 @@ impl Simulator {
             // Refresh recency so an actively served session survives the LRU bound
             // while idle sessions age out.
             entry.last_access = Instant::now();
+
+            // Apply the resolved Historical source (chosen symbol + loaded prices) to
+            // the served session on EVERY serve, hits included. A read-only peek may
+            // have built the walk and discarded its session copy; without this, the
+            // following advance would hit the cache and persist the original
+            // UNRESOLVED method, so a restart or eviction could refetch a different
+            // tape. Safe on a hit: any parameter change marks the session
+            // `Reinitialized`, which evicts the entry above, so a hit implies the
+            // parameters still describe this cached walk. Idempotent once persisted.
+            if let Some(resolved) = &entry.resolved_method {
+                session.parameters.method = resolved.clone();
+            }
 
             // Check if the current step is within range
             if session.current_step >= entry.walk.len() {
@@ -280,23 +300,27 @@ impl Simulator {
         Ok(chain)
     }
 
-    /// Fetches historical data for a given symbol and timeframe with random date range
-    /// If symbol is None, selects a random symbol from available symbols
-    #[instrument(skip(self), level = "debug")]
+    /// Fetches historical data for a given symbol and timeframe with a random date
+    /// range. If `symbol` is `None`, selects a symbol from the available symbols.
+    ///
+    /// Both the symbol choice and the start-date choice draw from the caller-supplied
+    /// `rng` (issue #12). Passing a seed-derived RNG makes historical selection
+    /// reproducible: the same seed loads the same series. Returns the resolved symbol
+    /// alongside the prices so the caller can persist the resolution.
+    #[instrument(skip(self, rng), level = "debug")]
     pub async fn get_historical_data(
         &self,
         symbol: &Option<String>,
         timeframe: &TimeFrame,
         steps: usize,
-    ) -> Result<Vec<Positive>, ChainError> {
+        rng: &mut StdRng,
+    ) -> Result<(String, Vec<Positive>), ChainError> {
         if let Some(repo) = &self.database_repo {
-            let mut thread_rng = rand::rng();
-
             let actual_symbol = if let Some(sym) = symbol {
                 // Use provided symbol
                 sym.clone()
             } else {
-                // Get list of available symbols and choose one randomly
+                // Get list of available symbols and choose one from the seeded RNG
                 let available_symbols = repo
                     .list_available_symbols()
                     .await
@@ -308,8 +332,11 @@ impl Simulator {
                     ));
                 }
 
-                let random_index = thread_rng.random_range(0..available_symbols.len());
-                available_symbols[random_index].clone()
+                let random_index = rng.random_range(0..available_symbols.len());
+                available_symbols
+                    .get(random_index)
+                    .ok_or_else(|| ChainError::Internal("symbol index out of range".to_string()))?
+                    .clone()
             };
 
             debug!("Selected symbol: {}", actual_symbol);
@@ -321,9 +348,9 @@ impl Simulator {
                 .map_err(|e| ChainError::ClickHouseError(e.to_string()))?;
             debug!("Available date range: {} - {}", min_date, max_date);
 
-            // Select random start date ensuring enough data for all steps
-            let start_date =
-                select_random_date(&mut thread_rng, min_date, max_date, timeframe, steps)?;
+            // Select the start date from the seeded RNG, ensuring enough data for
+            // all steps
+            let start_date = select_random_date(rng, min_date, max_date, timeframe, steps)?;
 
             // Calculate end date based on required duration
             let duration = calculate_required_duration(timeframe, steps);
@@ -350,8 +377,8 @@ impl Simulator {
                 )));
             }
 
-            // Return exactly the number of steps requested
-            Ok(prices.into_iter().take(steps).collect())
+            // Return the resolved symbol and exactly the number of steps requested
+            Ok((actual_symbol, prices.into_iter().take(steps).collect()))
         } else {
             Err(ChainError::SimulatorError(
                 "Database not available".to_string(),
@@ -359,34 +386,65 @@ impl Simulator {
         }
     }
 
-    /// Creates a new RandomWalk for a session
+    /// Creates a new RandomWalk for a session.
+    ///
+    /// Returns the walk together with an `Option<SimulationMethod>` carrying the
+    /// RESOLVED method: `Some` only when a `Historical` source was fetched from the
+    /// database on this build (resolved symbol + loaded prices + timeframe), so the
+    /// caller can persist the resolution; `None` for every other case (a non-historical
+    /// method, or a historical method that already carried enough embedded prices).
     #[instrument(skip(self, session), level = "debug")]
     async fn create_random_walk(
         &self,
         session: &Session,
-    ) -> Result<RandomWalk<Positive, OptionChain>, ChainError> {
+    ) -> Result<(RandomWalk<Positive, OptionChain>, Option<SimulationMethod>), ChainError> {
         let params = &session.parameters;
-        let method: SimulationMethod = match &params.method {
+
+        // Resolve the simulation method. A Historical source with a missing or
+        // insufficient embedded price series triggers a database fetch; the symbol and
+        // start date are drawn from a SEEDED, domain-separated RNG so the same session
+        // seed always loads the same series (issue #12). The resolved method is
+        // returned alongside the walk so the caller can persist it.
+        let (method, resolved_method): (SimulationMethod, Option<SimulationMethod>) = match &params
+            .method
+        {
             SimulationMethod::Historical {
                 timeframe,
                 prices,
                 symbol,
             } => {
                 if prices.is_empty() || prices.len() < params.steps {
-                    // load historical prices from database
-                    let prices = self
-                        .get_historical_data(symbol, timeframe, params.steps)
+                    // Derive the historical-selection RNG from the session seed,
+                    // domain-separated from the walker's stream by a fixed salt so
+                    // seeding the walk never perturbs data selection or vice versa.
+                    // A session built without a seed cannot be reproducible here;
+                    // fall back to entropy and warn rather than fail.
+                    let mut selection_rng = match params.seed {
+                        Some(seed) => StdRng::seed_from_u64(seed ^ HISTORICAL_STREAM_SALT),
+                        None => {
+                            warn!(
+                                session_id = %session.id,
+                                "historical session has no seed; data selection is not reproducible"
+                            );
+                            StdRng::from_rng(&mut rand::rng())
+                        }
+                    };
+
+                    // load historical prices from database using the seeded RNG
+                    let (resolved_symbol, loaded_prices) = self
+                        .get_historical_data(symbol, timeframe, params.steps, &mut selection_rng)
                         .await?;
-                    SimulationMethod::Historical {
+                    let resolved = SimulationMethod::Historical {
                         timeframe: *timeframe,
-                        prices,
-                        symbol: symbol.clone(),
-                    }
+                        prices: loaded_prices,
+                        symbol: Some(resolved_symbol),
+                    };
+                    (resolved.clone(), Some(resolved))
                 } else {
-                    params.method.clone()
+                    (params.method.clone(), None)
                 }
             }
-            _ => params.method.clone(),
+            _ => (params.method.clone(), None),
         };
 
         // Extract parameters from session
@@ -468,7 +526,7 @@ impl Simulator {
             "Created random walk for session"
         );
 
-        Ok(random_walk)
+        Ok((random_walk, resolved_method))
     }
 
     /// Removes a session's cached random walk, returning whether one was present.
@@ -693,7 +751,7 @@ mod tests {
     #[tokio::test]
     async fn test_remove_session_evicts_cached_walk() {
         // Issue #9: remove_session drops the cached walk and reports presence.
-        let session = create_test_session(Some(Uuid::new_v4()));
+        let mut session = create_test_session(Some(Uuid::new_v4()));
         let simulator = Simulator {
             simulation_cache: Arc::new(Mutex::new(HashMap::new())),
             database_repo: None,
@@ -701,7 +759,7 @@ mod tests {
 
         // Populate the cache via a simulate, then evict.
         simulator
-            .simulate_next_step(&session)
+            .simulate_next_step(&mut session)
             .await
             .expect("initial simulate failed");
         assert_eq!(simulator.cache_len().await, 1);
@@ -725,7 +783,7 @@ mod tests {
         };
 
         let before = simulator
-            .simulate_next_step(&session)
+            .simulate_next_step(&mut session)
             .await
             .expect("first simulate failed");
         assert_eq!(simulator.cache_len().await, 1);
@@ -735,7 +793,7 @@ mod tests {
         assert_eq!(simulator.cache_len().await, 0);
 
         let after = simulator
-            .simulate_next_step(&session)
+            .simulate_next_step(&mut session)
             .await
             .expect("rebuild simulate failed");
         assert_eq!(simulator.cache_len().await, 1);
@@ -766,25 +824,25 @@ mod tests {
         cache.insert(
             id_old,
             CacheEntry {
-                walk: simulator.create_random_walk(&small).await.unwrap(),
+                walk: simulator.create_random_walk(&small).await.unwrap().0,
                 last_access: now - Duration::from_secs(3),
-                evictable: true,
+                resolved_method: None,
             },
         );
         cache.insert(
             id_mid,
             CacheEntry {
-                walk: simulator.create_random_walk(&small).await.unwrap(),
+                walk: simulator.create_random_walk(&small).await.unwrap().0,
                 last_access: now - Duration::from_secs(2),
-                evictable: true,
+                resolved_method: None,
             },
         );
         cache.insert(
             id_new,
             CacheEntry {
-                walk: simulator.create_random_walk(&small).await.unwrap(),
+                walk: simulator.create_random_walk(&small).await.unwrap().0,
                 last_access: now - Duration::from_secs(1),
-                evictable: true,
+                resolved_method: None,
             },
         );
 
@@ -818,17 +876,17 @@ mod tests {
         cache.insert(
             id_a,
             CacheEntry {
-                walk: simulator.create_random_walk(&small).await.unwrap(),
+                walk: simulator.create_random_walk(&small).await.unwrap().0,
                 last_access: now - Duration::from_secs(2),
-                evictable: true,
+                resolved_method: None,
             },
         );
         cache.insert(
             id_b,
             CacheEntry {
-                walk: simulator.create_random_walk(&small).await.unwrap(),
+                walk: simulator.create_random_walk(&small).await.unwrap().0,
                 last_access: now - Duration::from_secs(1),
-                evictable: true,
+                resolved_method: None,
             },
         );
 
@@ -837,12 +895,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enforce_capacity_skips_non_evictable_and_evicts_oldest_non_historical() {
-        // Fix 1: a non-evictable (historical) entry is never chosen as the victim,
-        // even when it is the least-recently-accessed. With three staggered entries
-        // and max 2, the oldest is historical (pinned) so the victim is the oldest
-        // NON-historical entry instead. The `evictable` flag alone drives this, so the
-        // entries are built from a non-historical walk and their flags set directly.
+    async fn test_enforce_capacity_evicts_historical_entries_like_any_other() {
+        // The historical eviction pin is lifted (issue #12): an entry carrying a
+        // resolved Historical method is an ordinary LRU victim, because the seeded
+        // selection makes its rebuild reproduce the identical tape. With three
+        // staggered entries and max 2, the oldest is evicted even though it is the
+        // historical one.
         use std::time::Duration;
 
         let simulator = Simulator {
@@ -853,33 +911,37 @@ mod tests {
         small.parameters.steps = 2;
 
         let id_hist_old = Uuid::new_v4();
-        let id_nonhist_mid = Uuid::new_v4();
-        let id_nonhist_new = Uuid::new_v4();
+        let id_mid = Uuid::new_v4();
+        let id_new = Uuid::new_v4();
 
         let now = Instant::now();
         let mut cache: HashMap<Uuid, CacheEntry> = HashMap::new();
         cache.insert(
             id_hist_old,
             CacheEntry {
-                walk: simulator.create_random_walk(&small).await.unwrap(),
+                walk: simulator.create_random_walk(&small).await.unwrap().0,
                 last_access: now - Duration::from_secs(3),
-                evictable: false,
+                resolved_method: Some(SimulationMethod::Historical {
+                    timeframe: TimeFrame::Day,
+                    prices: vec![pos_or_panic!(100.0), pos_or_panic!(101.0)],
+                    symbol: Some("SYM0".to_string()),
+                }),
             },
         );
         cache.insert(
-            id_nonhist_mid,
+            id_mid,
             CacheEntry {
-                walk: simulator.create_random_walk(&small).await.unwrap(),
+                walk: simulator.create_random_walk(&small).await.unwrap().0,
                 last_access: now - Duration::from_secs(2),
-                evictable: true,
+                resolved_method: None,
             },
         );
         cache.insert(
-            id_nonhist_new,
+            id_new,
             CacheEntry {
-                walk: simulator.create_random_walk(&small).await.unwrap(),
+                walk: simulator.create_random_walk(&small).await.unwrap().0,
                 last_access: now - Duration::from_secs(1),
-                evictable: true,
+                resolved_method: None,
             },
         );
 
@@ -887,47 +949,11 @@ mod tests {
 
         assert_eq!(cache.len(), 2);
         assert!(
-            cache.contains_key(&id_hist_old),
-            "non-evictable historical entry must survive even as least-recently-accessed"
+            !cache.contains_key(&id_hist_old),
+            "a least-recently-accessed historical entry is evicted like any other"
         );
-        assert!(
-            !cache.contains_key(&id_nonhist_mid),
-            "oldest non-historical entry must be evicted"
-        );
-        assert!(cache.contains_key(&id_nonhist_new));
-    }
-
-    #[tokio::test]
-    async fn test_enforce_capacity_skips_eviction_when_all_non_evictable() {
-        // Fix 1: when every entry is non-evictable (all active historical walks),
-        // eviction is skipped and the cache is left OVER the bound (with a warn),
-        // rather than evicting a historical walk mid-session.
-        use std::time::Duration;
-
-        let simulator = Simulator {
-            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
-            database_repo: None,
-        };
-        let mut small = create_test_session(None);
-        small.parameters.steps = 2;
-
-        let now = Instant::now();
-        let mut cache: HashMap<Uuid, CacheEntry> = HashMap::new();
-        for secs in 1..=3 {
-            cache.insert(
-                Uuid::new_v4(),
-                CacheEntry {
-                    walk: simulator.create_random_walk(&small).await.unwrap(),
-                    last_access: now - Duration::from_secs(secs),
-                    evictable: false,
-                },
-            );
-        }
-
-        enforce_capacity(&mut cache, 2);
-
-        // Nothing evictable: the cache stays at 3, exceeding the bound of 2.
-        assert_eq!(cache.len(), 3);
+        assert!(cache.contains_key(&id_mid));
+        assert!(cache.contains_key(&id_new));
     }
 
     // Helper function to create test historical data
@@ -978,7 +1004,7 @@ mod tests {
     #[tokio::test]
     async fn test_simulate_next_step_new_session() {
         // Test simulating the next step for a brand new session
-        let session = create_test_session(None);
+        let mut session = create_test_session(None);
         let session_id = session.id;
 
         let simulator = Simulator {
@@ -987,7 +1013,7 @@ mod tests {
         };
 
         // The first call should create a new random walk
-        let result = simulator.simulate_next_step(&session).await;
+        let result = simulator.simulate_next_step(&mut session).await;
         assert!(result.is_ok());
 
         // Check that the session was added to the cache
@@ -1007,14 +1033,14 @@ mod tests {
         };
 
         // First call to initialize
-        let _ = simulator.simulate_next_step(&session).await.unwrap();
+        let _ = simulator.simulate_next_step(&mut session).await.unwrap();
 
         // Update session for next step
         session.current_step = 1;
         session.state = SessionState::InProgress;
 
         // Second call should use the cached random walk
-        let result = simulator.simulate_next_step(&session).await;
+        let result = simulator.simulate_next_step(&mut session).await;
         assert!(result.is_ok());
 
         // Check that there's still only one entry in the cache
@@ -1035,13 +1061,13 @@ mod tests {
         };
 
         // First call to initialize
-        let _ = simulator.simulate_next_step(&session).await.unwrap();
+        let _ = simulator.simulate_next_step(&mut session).await.unwrap();
 
         // Update session to reinitialized state
         session.state = SessionState::Reinitialized;
 
         // Next call should create a new random walk
-        let result = simulator.simulate_next_step(&session).await;
+        let result = simulator.simulate_next_step(&mut session).await;
         assert!(result.is_ok());
 
         // Check that there's still only one entry in the cache (the old one was replaced)
@@ -1061,13 +1087,13 @@ mod tests {
         };
 
         // First call to initialize
-        let _ = simulator.simulate_next_step(&session).await.unwrap();
+        let _ = simulator.simulate_next_step(&mut session).await.unwrap();
 
         // Update session to a step beyond the total
         session.current_step = session.parameters.steps + 1;
 
         // This should return an error
-        let result = simulator.simulate_next_step(&session).await;
+        let result = simulator.simulate_next_step(&mut session).await;
         assert!(result.is_err());
 
         match result {
@@ -1101,12 +1127,15 @@ mod tests {
             database_repo: Some(Arc::new(mock_repo)),
         };
 
+        let mut rng = StdRng::seed_from_u64(1);
         let result = simulator
-            .get_historical_data(&symbol, &timeframe, steps)
+            .get_historical_data(&symbol, &timeframe, steps, &mut rng)
             .await;
         assert!(result.is_ok());
 
-        let data = result.unwrap();
+        let (resolved_symbol, data) = result.unwrap();
+        // A supplied symbol is echoed back verbatim as the resolved symbol.
+        assert_eq!(resolved_symbol, "TEST");
         assert_eq!(data.len(), steps);
     }
 
@@ -1136,12 +1165,15 @@ mod tests {
             database_repo: Some(Arc::new(mock_repo)),
         };
 
+        let mut rng = StdRng::seed_from_u64(1);
         let result = simulator
-            .get_historical_data(&symbol, &timeframe, steps)
+            .get_historical_data(&symbol, &timeframe, steps, &mut rng)
             .await;
         assert!(result.is_ok());
 
-        let data = result.unwrap();
+        let (resolved_symbol, data) = result.unwrap();
+        // With no symbol supplied, one of the available symbols is chosen via the RNG.
+        assert!(resolved_symbol == "RANDOM1" || resolved_symbol == "RANDOM2");
         assert_eq!(data.len(), steps);
     }
 
@@ -1157,8 +1189,9 @@ mod tests {
             database_repo: None,
         };
 
+        let mut rng = StdRng::seed_from_u64(1);
         let result = simulator
-            .get_historical_data(&symbol, &timeframe, steps)
+            .get_historical_data(&symbol, &timeframe, steps, &mut rng)
             .await;
         assert!(result.is_err());
 
@@ -1192,8 +1225,9 @@ mod tests {
             database_repo: Some(Arc::new(mock_repo)),
         };
 
+        let mut rng = StdRng::seed_from_u64(1);
         let result = simulator
-            .get_historical_data(&symbol, &timeframe, steps)
+            .get_historical_data(&symbol, &timeframe, steps, &mut rng)
             .await;
         assert!(result.is_err());
 
@@ -1218,7 +1252,7 @@ mod tests {
         let result = simulator.create_random_walk(&session).await;
         assert!(result.is_ok());
 
-        let random_walk = result.unwrap();
+        let (random_walk, _resolved) = result.unwrap();
         assert_eq!(random_walk.len(), session.parameters.steps);
     }
 
@@ -1253,7 +1287,191 @@ mod tests {
         let result = simulator.create_random_walk(&session).await;
         assert!(result.is_ok());
 
-        let random_walk = result.unwrap();
+        let (random_walk, resolved) = result.unwrap();
         assert_eq!(random_walk.len(), steps);
+
+        // A Historical fetch resolves the method: the symbol is now Some and the
+        // loaded prices are embedded so the walk is replayable without another fetch.
+        match resolved {
+            Some(SimulationMethod::Historical { prices, symbol, .. }) => {
+                assert_eq!(symbol, Some("TEST".to_string()));
+                assert_eq!(prices.len(), steps);
+            }
+            other => panic!("expected a resolved Historical method, got {other:?}"),
+        }
+    }
+
+    // A Historical session with an empty embedded price series and no explicit
+    // symbol, so both the symbol and the start date must be selected from the
+    // seed-derived RNG (issue #12).
+    fn historical_session(seed: u64) -> Session {
+        let mut session = create_test_session(Some(Uuid::new_v4()));
+        session.parameters.steps = 5;
+        session.parameters.seed = Some(seed);
+        session.parameters.method = SimulationMethod::Historical {
+            timeframe: TimeFrame::Day,
+            prices: vec![],
+            symbol: None,
+        };
+        session
+    }
+
+    // A fully deterministic historical repository: a fixed 8-symbol universe, a fixed
+    // (wide) date range, and a price series that is a pure function of the requested
+    // symbol and start date. Determinism is what lets the seeded selection be observed
+    // as a same-seed/same-tape property end to end.
+    fn historical_mock() -> MockHistoricalRepository {
+        let mut mock = MockHistoricalRepository::new();
+        mock.expect_list_available_symbols()
+            .returning(|| Ok((0..8).map(|i| format!("SYM{i}")).collect::<Vec<String>>()));
+        mock.expect_get_date_range_for_symbol().returning(|_| {
+            // Fixed range (~1157 days) so selection depends only on the seeded RNG.
+            let min = DateTime::from_timestamp(1_600_000_000, 0).expect("valid min timestamp");
+            let max = DateTime::from_timestamp(1_700_000_000, 0).expect("valid max timestamp");
+            Ok((min, max))
+        });
+        mock.expect_get_historical_prices()
+            .returning(|symbol, _tf, start_date, limit| {
+                // Deterministic in (symbol, start_date): a different symbol OR a
+                // different start date yields a different series, so a divergent
+                // selection is observable in the resulting tape.
+                let base: u64 = symbol.bytes().map(u64::from).sum();
+                let offset = start_date.timestamp().unsigned_abs();
+                let seed_val = base.wrapping_add(offset);
+                let prices = (0..limit)
+                    .map(|i| {
+                        let step = seed_val.wrapping_add(i as u64) % 1000;
+                        pos_or_panic!(100.0 + step as f64 * 0.1)
+                    })
+                    .collect();
+                Ok(prices)
+            });
+        mock
+    }
+
+    #[tokio::test]
+    async fn test_historical_same_seed_identical_selection_and_tape() {
+        // Issue #12: two Historical sessions with the same seed must select the SAME
+        // symbol and date range and therefore load the identical series, producing the
+        // identical tape. Distinct ids keep them as independent cache entries.
+        let seed = 20260713;
+        let mut session_a = historical_session(seed);
+        let mut session_b = historical_session(seed);
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: Some(Arc::new(historical_mock())),
+        };
+
+        let tape_a = collect_tape(&simulator, &mut session_a).await;
+        let tape_b = collect_tape(&simulator, &mut session_b).await;
+
+        assert_eq!(tape_a, tape_b);
+        // The seeded selection resolved to the same symbol + embedded prices.
+        assert_eq!(session_a.parameters.method, session_b.parameters.method);
+    }
+
+    #[tokio::test]
+    async fn test_historical_different_seeds_diverge() {
+        // Different seeds drive different historical selections (symbol and/or start
+        // date), so the tapes differ. With 8 symbols and a ~1157-day range the chance
+        // of both seeds picking the identical (symbol, start date) pair is negligible.
+        let mut session_a = historical_session(1);
+        let mut session_b = historical_session(2);
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: Some(Arc::new(historical_mock())),
+        };
+
+        let tape_a = collect_tape(&simulator, &mut session_a).await;
+        let tape_b = collect_tape(&simulator, &mut session_b).await;
+
+        assert_ne!(tape_a, tape_b);
+    }
+
+    #[tokio::test]
+    async fn test_historical_resolution_persisted_in_session() {
+        // Issue #12: the first simulate on a Historical session writes the resolved
+        // source (chosen symbol + loaded prices) back into the session parameters, so
+        // the manager's advance can persist it and the tape stays replayable.
+        let mut session = historical_session(42);
+        assert!(matches!(
+            session.parameters.method,
+            SimulationMethod::Historical { ref prices, symbol: None, .. } if prices.is_empty()
+        ));
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: Some(Arc::new(historical_mock())),
+        };
+
+        simulator
+            .simulate_next_step(&mut session)
+            .await
+            .expect("historical simulate failed");
+
+        match &session.parameters.method {
+            SimulationMethod::Historical { prices, symbol, .. } => {
+                assert!(!prices.is_empty(), "resolved prices must be embedded");
+                assert!(symbol.is_some(), "resolved symbol must be recorded");
+            }
+            other => panic!("expected a resolved Historical method, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_peek_then_advance_applies_resolution_on_cache_hit() {
+        // Peek-then-advance persistence regression: a read-only peek builds the walk
+        // on ITS session copy, which is then discarded (the peek path never saves).
+        // The following advance loads a fresh, still-unresolved copy from the store
+        // and hits the cache. The resolution stored in the cache entry must be
+        // applied to that copy too, or the advance's save would persist the original
+        // unresolved method and a restart or eviction could refetch a different tape.
+        let session = historical_session(42);
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: Some(Arc::new(historical_mock())),
+        };
+
+        // GET peek: the walk is built and cached, but the mutated session copy is
+        // dropped, exactly as the manager's read-only peek path does.
+        let mut peek_copy = session.clone();
+        let peeked = simulator
+            .simulate_next_step(&mut peek_copy)
+            .await
+            .expect("peek simulate failed");
+        assert_eq!(simulator.cache_len().await, 1);
+        drop(peek_copy);
+
+        // POST advance: a fresh copy of the stored (unresolved) session hits the
+        // cached walk. The entry's resolution must be applied to this copy as well.
+        let mut advance_copy = session.clone();
+        assert!(matches!(
+            advance_copy.parameters.method,
+            SimulationMethod::Historical { ref prices, symbol: None, .. } if prices.is_empty()
+        ));
+        let advanced = simulator
+            .simulate_next_step(&mut advance_copy)
+            .await
+            .expect("advance simulate failed");
+
+        match &advance_copy.parameters.method {
+            SimulationMethod::Historical { prices, symbol, .. } => {
+                assert!(
+                    !prices.is_empty(),
+                    "cache hit must apply the resolved prices to the served session"
+                );
+                assert!(
+                    symbol.is_some(),
+                    "cache hit must apply the resolved symbol to the served session"
+                );
+            }
+            other => panic!("expected a resolved Historical method, got {other:?}"),
+        }
+
+        // Both serves came from the same cached walk at cursor 0.
+        assert_eq!(peeked.underlying_price, advanced.underlying_price);
     }
 }

@@ -506,10 +506,10 @@ mod tests {
                 seed: None,
             };
 
-            let session = Session::new(params, &UuidGenerator::new(Uuid::new_v4()));
+            let mut session = Session::new(params, &UuidGenerator::new(Uuid::new_v4()));
 
             let option_chain = simulator
-                .simulate_next_step(&session)
+                .simulate_next_step(&mut session)
                 .await
                 .expect("Simulation step failed");
 
