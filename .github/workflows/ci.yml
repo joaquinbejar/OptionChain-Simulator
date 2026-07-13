@@ -43,14 +43,32 @@ jobs:
         env:
           LOGLEVEL: WARN
 
-  integration_mongodb:
-    name: Integration (MongoDB)
+  integration_live_services:
+    name: Integration (live services)
     runs-on: ubuntu-latest
     services:
+      # Credentials must match the code's env-driven config defaults
+      # (MONGODB_URI / REDIS_* / CLICKHOUSE_* in src/infrastructure/config/*),
+      # so the ignored live tests authenticate successfully and can ASSERT
+      # success instead of tolerating connection failures.
       mongodb:
         image: mongo:7
+        env:
+          MONGO_INITDB_ROOT_USERNAME: admin
+          MONGO_INITDB_ROOT_PASSWORD: password
         ports:
           - 27017:27017
+      redis:
+        image: redis:7.4
+        ports:
+          - 6379:6379
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8
+        env:
+          CLICKHOUSE_USER: admin
+          CLICKHOUSE_PASSWORD: password
+        ports:
+          - 8123:8123
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -59,3 +77,4 @@ jobs:
       - run: cargo test --workspace -- --ignored
         env:
           LOGLEVEL: WARN
+          MONGODB_URI: mongodb://admin:password@localhost:27017

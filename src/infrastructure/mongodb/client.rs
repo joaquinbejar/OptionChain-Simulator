@@ -226,26 +226,17 @@ mod tests {
     }
 
     /// Live integration test: exercises `init_mongodb` against the default
-    /// (env-driven) configuration. Even though it tolerates a missing server,
-    /// the failure path burns the full configured server-selection timeout
-    /// (30s by default), so it is opt-in with the rest of the live tests.
+    /// (env-driven) configuration and ASSERTS success. The environment must
+    /// provide a reachable MongoDB whose credentials match `MONGODB_URI` (the
+    /// CI integration job provisions admin/password on its service container);
+    /// tolerating `Err` here would let the job stay green without validating
+    /// initialization at all.
     #[test]
-    #[ignore = "exercises a live MongoDB via env config; run with -- --ignored"]
+    #[ignore = "requires a live MongoDB matching MONGODB_URI; run with -- --ignored"]
     async fn test_init_mongodb() {
-        // Test the init_mongodb function
-        let result = crate::infrastructure::repositories::mongo_repo::init_mongodb().await;
-
-        // This might fail if MongoDB is not running, which is expected in CI environments
-        match result {
-            Ok(repo) => {
-                // If it succeeded, verify we got a repository
-                assert!(Arc::strong_count(&repo) >= 1);
-            }
-            Err(e) => {
-                // In CI, we expect this to fail with a connection error
-                println!("MongoDB initialization failed (expected in CI): {:?}", e);
-                // We don't assert because this is expected to fail in environments without MongoDB
-            }
-        }
+        let repo = crate::infrastructure::repositories::mongo_repo::init_mongodb()
+            .await
+            .expect("init_mongodb must succeed against the provisioned live MongoDB");
+        assert!(Arc::strong_count(&repo) >= 1);
     }
 }
