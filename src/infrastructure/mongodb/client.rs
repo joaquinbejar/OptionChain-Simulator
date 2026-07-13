@@ -38,7 +38,14 @@ impl MongoDBClient {
         })?;
 
         client_options.app_name = Some("OptionChain-Simulator".to_string());
-        client_options.connect_timeout = Some(std::time::Duration::from_secs(config.timeout));
+        // `config.timeout` (MONGODB_TIMEOUT, seconds) bounds BOTH phases of
+        // reaching a server: the TCP connect AND server selection. Without the
+        // latter, the startup ping against an unavailable server waits for the
+        // driver's default server-selection timeout (~30s) regardless of the
+        // configured value.
+        let timeout = std::time::Duration::from_secs(config.timeout);
+        client_options.connect_timeout = Some(timeout);
+        client_options.server_selection_timeout = Some(timeout);
 
         let client = mongodb::Client::with_options(client_options).map_err(|e| {
             ChainError::Internal(redact_userinfo(&format!(
@@ -167,6 +174,33 @@ mod tests {
 
         let client = client_result.unwrap();
         assert_eq!(client.get_config().database, "test_db");
+    }
+
+    /// Regression for issue #17: with an unavailable server, `new` must fail
+    /// within the configured timeout instead of the driver's ~30s default
+    /// server-selection timeout. Hermetic — asserts the FAILURE is fast
+    /// (port 1 on localhost refuses connections; server selection retries
+    /// until the configured bound).
+    #[test]
+    async fn test_unavailable_server_fails_within_configured_timeout() {
+        let config = MongoDBConfig {
+            uri: "mongodb://localhost:1".to_string(),
+            database: "test_db".to_string(),
+            steps_collection: "test_steps".to_string(),
+            events_collection: "test_events".to_string(),
+            timeout: 1,
+        };
+
+        let start = std::time::Instant::now();
+        let result = MongoDBClient::new(config).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "connection to a closed port must fail");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "startup failure took {elapsed:?}; the 1s configured timeout must \
+             bound server selection, not the ~30s driver default"
+        );
     }
 
     #[test]
