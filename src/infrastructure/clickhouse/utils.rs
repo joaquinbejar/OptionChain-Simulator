@@ -3,6 +3,38 @@ use chrono::{DateTime, Duration, Utc};
 use optionstratlib::utils::TimeFrame;
 use rand::{Rng, RngExt};
 
+/// Maximum number of characters allowed in a symbol.
+const MAX_SYMBOL_LEN: usize = 32;
+
+/// Validates an externally supplied symbol as a defense-in-depth measure on top
+/// of query parameter binding.
+///
+/// The allowed pattern is `^[A-Za-z0-9._-]{1,32}$`, i.e. between 1 and 32 ASCII
+/// alphanumeric characters, dots, underscores or hyphens. The check is
+/// implemented with plain character inspection to avoid pulling in a regex
+/// dependency, and it rejects any non-ASCII input (e.g. look-alike Unicode
+/// characters) as well as empty or overly long values.
+///
+/// # Errors
+///
+/// Returns [`ChainError::ClickHouseError`] when the symbol is empty, longer than
+/// 32 characters, or contains a character outside the allowed set.
+pub fn validate_symbol(symbol: &str) -> Result<(), ChainError> {
+    let len = symbol.chars().count();
+    let is_valid = (1..=MAX_SYMBOL_LEN).contains(&len)
+        && symbol
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+
+    if is_valid {
+        Ok(())
+    } else {
+        Err(ChainError::ClickHouseError(format!(
+            "invalid symbol: {symbol}"
+        )))
+    }
+}
+
 /// Calculates the required duration based on timeframe and steps
 pub fn calculate_required_duration(timeframe: &TimeFrame, steps: usize) -> Duration {
     match timeframe {
@@ -65,6 +97,38 @@ mod tests {
     mock! {
         pub Row<'a> {
             fn get<T: 'static>(&self, field_name: &str) -> Result<T, ChainError>;
+        }
+    }
+
+    #[test]
+    fn test_validate_symbol_accepts_valid_symbols() {
+        for symbol in ["AAPL", "BRK.B", "BTC-USD", "spx_w", "A", &"X".repeat(32)] {
+            assert!(
+                validate_symbol(symbol).is_ok(),
+                "expected {symbol} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_symbol_rejects_injection_and_unicode() {
+        let cases = [
+            "A'\u{2014}",                // A'— (single quote + em dash)
+            "A' OR '1'='1",              // classic SQL injection payload
+            "A\"; DROP TABLE ohlcv; --", // stacked statement attempt
+            "A\u{0410}",                 // trailing Cyrillic 'А' look-alike
+            "\u{0410}",                  // lone Cyrillic 'А'
+            &"X".repeat(33),             // 33 chars, one over the limit
+            "",                          // empty string
+            "AA PL",                     // embedded space
+        ];
+
+        for symbol in cases {
+            let result = validate_symbol(symbol);
+            assert!(
+                matches!(result, Err(ChainError::ClickHouseError(_))),
+                "expected {symbol:?} to be rejected"
+            );
         }
     }
 

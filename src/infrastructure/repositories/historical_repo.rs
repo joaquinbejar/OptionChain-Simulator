@@ -1,11 +1,14 @@
 //! A repository that interacts with ClickHouse to provide historical financial data.
-use crate::infrastructure::clickhouse::{ClickHouseClient, HistoricalDataRepository};
+use crate::infrastructure::clickhouse::{
+    ClickHouseClient, HistoricalDataRepository, validate_symbol,
+};
 use crate::utils::ChainError;
 use async_trait::async_trait;
 use chrono::Utc;
 use optionstratlib::utils::TimeFrame;
 use positive::Positive;
 use std::sync::Arc;
+use tracing::debug;
 
 /// Represents a repository for accessing historical data stored in a ClickHouse database.
 ///
@@ -22,6 +25,14 @@ use std::sync::Arc;
 /// The `ClickHouseHistoricalRepository` assumes that the provided `ClickHouseClient` is properly
 /// configured to interact with the database (e.g., connection details and authentication).
 ///
+/// SQL template for the per-symbol date range query. The symbol is bound as an
+/// escaped `?` parameter, never interpolated into this string.
+const DATE_RANGE_QUERY: &str = "SELECT \
+        toInt64(toUnixTimestamp(min(timestamp))) as min_date, \
+        toInt64(toUnixTimestamp(max(timestamp))) as max_date \
+    FROM ohlcv \
+    WHERE symbol = ?";
+
 pub struct ClickHouseHistoricalRepository {
     /// The underlying ClickHouse client
     client: Arc<ClickHouseClient>,
@@ -82,6 +93,7 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
         start_date: &chrono::DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<Positive>, ChainError> {
+        validate_symbol(symbol)?;
         self.client
             .fetch_historical_prices(symbol, timeframe, start_date, limit)
             .await
@@ -178,14 +190,9 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
         &self,
         symbol: &str,
     ) -> Result<(chrono::DateTime<Utc>, chrono::DateTime<Utc>), ChainError> {
-        let query = format!(
-            "SELECT 
-                toInt64(toUnixTimestamp(min(timestamp))) as min_date, 
-                toInt64(toUnixTimestamp(max(timestamp))) as max_date 
-            FROM ohlcv 
-            WHERE symbol = '{}'",
-            symbol
-        );
+        validate_symbol(symbol)?;
+
+        debug!(symbol = %symbol, "running date-range query");
 
         #[derive(Debug, clickhouse::Row, serde::Deserialize)]
         struct DateRange {
@@ -193,7 +200,14 @@ impl HistoricalDataRepository for ClickHouseHistoricalRepository {
             max_date: i64,
         }
 
-        let rows: Vec<DateRange> = self.client.client.query(&query).fetch_all().await?;
+        // The symbol is bound as an escaped query parameter, never interpolated.
+        let rows: Vec<DateRange> = self
+            .client
+            .client
+            .query(DATE_RANGE_QUERY)
+            .bind(symbol)
+            .fetch_all()
+            .await?;
 
         if let Some(row) = rows.first() {
             let min_date =
@@ -374,6 +388,15 @@ mod tests {
         assert_eq!(symbols, expected_symbols);
         assert_eq!(symbols.len(), 3);
         assert_eq!(symbols[0], "AAPL");
+    }
+
+    #[test]
+    fn test_date_range_query_uses_placeholder() {
+        // The symbol is bound, never interpolated: the template carries a `?`
+        // and can never contain a malicious symbol value.
+        assert!(DATE_RANGE_QUERY.contains("WHERE symbol = ?"));
+        assert!(!DATE_RANGE_QUERY.contains("EVIL'--"));
+        assert!(!DATE_RANGE_QUERY.contains('\''));
     }
 
     #[test]
