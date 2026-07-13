@@ -8,7 +8,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use optionchain_simulator::session::{InMemorySessionStore, SimulationMethod};
-use optionchain_simulator::session::{Session, SessionManager, SessionState, SimulationParameters};
+use optionchain_simulator::session::{SessionManager, SimulationParameters};
 use optionchain_simulator::utils::error::ChainError;
 
 /// Example demonstrating the usage of SessionManager and Session for option chain simulation
@@ -91,6 +91,7 @@ fn create_simulation_parameters() -> SimulationParameters {
         skew_slope: None,
         smile_curve: None,
         spread: spos!(0.02),
+        seed: None,
     }
 }
 
@@ -101,7 +102,7 @@ async fn run_session_lifecycle(
 ) -> Result<(), ChainError> {
     // Step 1: Get initial option chain
     info!(session_id = %session_id, "Advancing session to first step");
-    let (session, chain) = session_manager.get_next_step(session_id).await?;
+    let (session, _chain) = session_manager.get_next_step(session_id).await?;
 
     info!(
         session_id = %session_id,

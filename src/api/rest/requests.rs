@@ -41,6 +41,12 @@ pub struct CreateSessionRequest {
     /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
+    /// - `seed` (`Option<u64>`): An optional RNG seed that makes the session reproducible.
+    ///   Two sessions created with identical parameters and the same seed produce the same
+    ///   sequence of option chain snapshots. If `None`, a random seed is generated; the
+    ///   effective seed is reported back in the session response so clients can record it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
 }
 
 impl From<SimulationParameters> for CreateSessionRequest {
@@ -60,6 +66,7 @@ impl From<SimulationParameters> for CreateSessionRequest {
             skew_slope: params.skew_slope.map(|d| d.to_f64().unwrap_or(0.0)),
             smile_curve: params.smile_curve.map(|d| d.to_f64().unwrap_or(0.0)),
             spread: params.spread.map(|p| p.to_f64()),
+            seed: params.seed,
         }
     }
 }
@@ -85,6 +92,7 @@ impl Default for CreateSessionRequest {
             skew_slope: None,
             smile_curve: None,
             spread: Some(0.01),
+            seed: None,
         }
     }
 }
@@ -140,6 +148,10 @@ pub struct UpdateSessionRequest {
     /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
+    /// - `seed` (`Option<u64>`): An optional RNG seed for the session's stochastic walk.
+    ///   Providing a value makes regenerated steps reproducible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
 }
 
 impl fmt::Display for UpdateSessionRequest {
@@ -206,6 +218,7 @@ mod tests_create_session_request {
             skew_slope: Some(-0.2),
             smile_curve: Some(0.5),
             spread: Some(0.02),
+            seed: None,
             chain_size: Some(15),
             strike_interval: Some(5.0),
         };
@@ -381,6 +394,7 @@ mod tests {
                 skew_slope: None,
                 smile_curve: None,
                 spread: Some(pos!(0.02)),
+                seed: None,
             };
 
             let session = session_manager
@@ -417,6 +431,7 @@ mod tests {
                 skew_slope: None,
                 smile_curve: None,
                 spread: Some(pos!(0.02)),
+                seed: None,
             };
 
             let session = session_manager
@@ -467,6 +482,7 @@ mod tests {
                 skew_slope: None,
                 smile_curve: None,
                 spread: Some(pos!(0.02)),
+                seed: None,
             };
 
             let session = Session::new(params, &UuidGenerator::new(Uuid::new_v4()));
@@ -505,13 +521,13 @@ mod tests {
                 pos!(0.02),         // Spread
                 2,                  // Decimal places
                 OptionDataPriceParams::new(
-                    initial_price,
-                    expiration,
-                    Some(pos!(0.2)), // Volatility
-                    Decimal::ZERO,   // Risk-free rate
-                    Positive::ZERO,  // Dividend yield
+                    Some(Box::new(initial_price)),
+                    Some(expiration),
+                    Some(Decimal::ZERO),  // Risk-free rate
+                    Some(Positive::ZERO), // Dividend yield
                     Some("AAPL".to_string()),
                 ),
+                pos!(0.2), // Implied volatility
             );
 
             let option_chain = OptionChain::build_chain(&chain_params);
@@ -563,6 +579,7 @@ mod tests {
                 skew_slope: None,
                 smile_curve: None,
                 spread: None,
+                seed: None,
             };
 
             let result = Session::new(invalid_params, &UuidGenerator::new(Uuid::new_v4()));
@@ -642,6 +659,7 @@ mod tests {
                 strike_interval: None,
                 smile_curve: None,
                 spread: None,
+                seed: None,
             };
 
             assert_eq!(update_req.symbol, Some("GOOGL".to_string()));

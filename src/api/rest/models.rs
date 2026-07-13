@@ -175,8 +175,6 @@ pub enum ApiWalkType {
         alpha: f64,
         /// GARCH beta parameter (persistence of volatility)
         beta: f64,
-        /// Long-term variance (unconditional variance)
-        omega: f64,
     },
 
     /// Heston model (stochastic volatility)
@@ -302,14 +300,12 @@ impl From<WalkType> for ApiWalkType {
                 volatility,
                 alpha,
                 beta,
-                omega,
             } => ApiWalkType::Garch {
                 dt: dt.to_f64(),
                 drift: drift.to_f64().unwrap_or(0.0),
                 volatility: volatility.to_f64(),
                 alpha: alpha.to_f64(),
                 beta: beta.to_f64(),
-                omega: omega.to_f64(),
             },
             WalkType::Heston {
                 dt,
@@ -421,14 +417,12 @@ impl From<ApiWalkType> for WalkType {
                 volatility,
                 alpha,
                 beta,
-                omega,
             } => WalkType::Garch {
                 dt: pos!(dt),
                 drift: Decimal::try_from(drift).unwrap_or_default(),
                 volatility: pos!(volatility),
                 alpha: pos!(alpha),
                 beta: pos!(beta),
-                omega: pos!(omega),
             },
             ApiWalkType::Heston {
                 dt,

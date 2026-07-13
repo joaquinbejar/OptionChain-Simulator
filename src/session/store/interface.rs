@@ -222,6 +222,7 @@ mod tests {
                 skew_slope: None,
                 smile_curve: None,
                 spread: None,
+                seed: None,
             },
             current_step: 0,
             total_steps: 100,

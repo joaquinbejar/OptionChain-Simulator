@@ -44,6 +44,9 @@ pub struct SessionParametersResponse {
     pub smile_curve: Option<f64>,
     /// Bid-ask spread factor
     pub spread: Option<f64>,
+    /// RNG seed driving the session's stochastic walk; recreating a session
+    /// with the same parameters and seed reproduces the same snapshot sequence
+    pub seed: Option<u64>,
 }
 
 /// Response containing option chain data directly using OptionChain from OptionStratLib
@@ -137,6 +140,7 @@ impl Default for SessionParametersResponse {
             skew_slope: None,
             smile_curve: None,
             spread: None,
+            seed: None,
         }
     }
 }

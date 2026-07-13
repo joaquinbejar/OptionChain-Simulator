@@ -122,8 +122,7 @@ mod tests {
     // Test conversion from Box<dyn Error>
     #[test]
     fn test_from_boxed_error() {
-        let boxed_error: Box<dyn Error> =
-            Box::new(io::Error::new(io::ErrorKind::Other, "generic error"));
+        let boxed_error: Box<dyn Error> = Box::new(io::Error::other("generic error"));
         let error: ChainError = boxed_error.into();
         assert!(matches!(error, ChainError::StdError(msg) if msg == "generic error"));
     }

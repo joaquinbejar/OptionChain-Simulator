@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 optionchain_simulator = { path = "../../" }
-optionstratlib = "0.4.5"
+optionstratlib = "0.7"
 tracing = "0.1.41"
 uuid = { version = "1.16.0", features = ["v4", "serde"] }
 rust_decimal_macros = "1.37.1"

@@ -39,10 +39,10 @@ impl RedisClient {
     fn get_connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>, RedisError> {
         self.connection_pool.lock().map_err(|e| {
             error!("Failed to acquire Redis connection lock: {}", e);
-            RedisError::from(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to acquire Redis connection lock: {}", e),
-            ))
+            RedisError::from(std::io::Error::other(format!(
+                "Failed to acquire Redis connection lock: {}",
+                e
+            )))
         })
     }
 
@@ -231,10 +231,10 @@ mod tests {
         ) -> RedisResult<Option<String>> {
             let key_str = key.to_string();
             let mut connection = self.connection.lock().map_err(|e| {
-                RedisError::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to acquire Redis connection lock: {}", e),
-                ))
+                RedisError::from(std::io::Error::other(format!(
+                    "Failed to acquire Redis connection lock: {}",
+                    e
+                )))
             })?;
 
             let exists = connection.exists(&key_str)?;
@@ -256,10 +256,10 @@ mod tests {
             let key_str = key.to_string();
             let value_str = value.to_string();
             let mut connection = self.connection.lock().map_err(|e| {
-                RedisError::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to acquire Redis connection lock: {}", e),
-                ))
+                RedisError::from(std::io::Error::other(format!(
+                    "Failed to acquire Redis connection lock: {}",
+                    e
+                )))
             })?;
 
             match expiry_secs {
@@ -271,10 +271,10 @@ mod tests {
         fn delete<T: std::string::ToString>(&self, key: T) -> RedisResult<bool> {
             let key_str = key.to_string();
             let mut connection = self.connection.lock().map_err(|e| {
-                RedisError::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to acquire Redis connection lock: {}", e),
-                ))
+                RedisError::from(std::io::Error::other(format!(
+                    "Failed to acquire Redis connection lock: {}",
+                    e
+                )))
             })?;
 
             let deleted = connection.del(&key_str)?;
@@ -284,10 +284,10 @@ mod tests {
         fn keys<T: std::string::ToString>(&self, pattern: T) -> RedisResult<Vec<String>> {
             let pattern_str = pattern.to_string();
             let mut connection = self.connection.lock().map_err(|e| {
-                RedisError::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to acquire Redis connection lock: {}", e),
-                ))
+                RedisError::from(std::io::Error::other(format!(
+                    "Failed to acquire Redis connection lock: {}",
+                    e
+                )))
             })?;
 
             connection.keys(&pattern_str)
@@ -296,10 +296,10 @@ mod tests {
         fn exists<T: std::string::ToString>(&self, key: T) -> RedisResult<bool> {
             let key_str = key.to_string();
             let mut connection = self.connection.lock().map_err(|e| {
-                RedisError::from(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to acquire Redis connection lock: {}", e),
-                ))
+                RedisError::from(std::io::Error::other(format!(
+                    "Failed to acquire Redis connection lock: {}",
+                    e
+                )))
             })?;
 
             connection.exists(&key_str)

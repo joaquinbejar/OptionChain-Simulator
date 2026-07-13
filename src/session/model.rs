@@ -4,6 +4,7 @@ use crate::utils::{ChainError, UuidGenerator};
 pub use optionstratlib::simulation::WalkType as SimulationMethod;
 use optionstratlib::utils::TimeFrame;
 use optionstratlib::{Positive, pos};
+use rand::Rng;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -128,6 +129,11 @@ pub struct SimulationParameters {
     pub smile_curve: Option<Decimal>,
     /// - `spread` (`Option<Positive>`): An optional parameter to specify the spread value. If `None`, no spread is applied.
     pub spread: Option<Positive>,
+    /// - `seed` (`Option<u64>`): The RNG seed driving the session's stochastic walk.
+    ///   Identical parameters with the same seed produce an identical sequence of
+    ///   option chain snapshots for the session's lifetime.
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 impl fmt::Display for SimulationParameters {
@@ -160,6 +166,10 @@ impl From<CreateSessionRequest> for SimulationParameters {
                 .smile_curve
                 .map(|v| Decimal::try_from(v).unwrap_or_default()),
             spread: req.spread.map(|v| pos!(v)),
+            // When the client does not provide a seed, generate one so the
+            // session is still reproducible and the effective seed can be
+            // reported back in the session response.
+            seed: Some(req.seed.unwrap_or_else(|| rand::rng().random())),
         }
     }
 }
@@ -387,6 +397,7 @@ impl Default for Session {
             skew_slope: Some(dec!(-0.2)),
             smile_curve: Some(dec!(0.4)),
             spread: Some(pos!(0.02)),
+            seed: None,
         };
 
         Self {
@@ -406,6 +417,76 @@ impl fmt::Display for Session {
         // Same approach: convert to JSON string
         let json = serde_json::to_string(self).map_err(|_| fmt::Error)?;
         write!(f, "{}", json)
+    }
+}
+
+#[cfg(test)]
+mod tests_seed_conversion {
+    use super::*;
+
+    #[test]
+    fn test_explicit_seed_is_preserved() {
+        let req = CreateSessionRequest {
+            symbol: "AAPL".to_string(),
+            seed: Some(42),
+            ..Default::default()
+        };
+
+        let params: SimulationParameters = req.into();
+        assert_eq!(params.seed, Some(42));
+    }
+
+    #[test]
+    fn test_missing_seed_generates_effective_seed() {
+        let req = CreateSessionRequest {
+            symbol: "AAPL".to_string(),
+            seed: None,
+            ..Default::default()
+        };
+
+        let params: SimulationParameters = req.into();
+        // An effective seed must be generated so the session is reproducible
+        // and the seed can be reported back to the client
+        assert!(params.seed.is_some());
+    }
+
+    #[test]
+    fn test_seed_survives_serialization_round_trip() {
+        let req = CreateSessionRequest {
+            symbol: "AAPL".to_string(),
+            seed: Some(7),
+            ..Default::default()
+        };
+        let params: SimulationParameters = req.into();
+
+        let json = serde_json::to_string(&params).unwrap();
+        let restored: SimulationParameters = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.seed, Some(7));
+    }
+
+    #[test]
+    fn test_deserialization_without_seed_defaults_to_none() {
+        // Sessions persisted before the seed field existed must still load
+        let json = r#"{
+            "symbol": "TSLA",
+            "steps": 50,
+            "initial_price": 240.35,
+            "days_to_expiration": 60,
+            "volatility": 0.35,
+            "risk_free_rate": "0.045",
+            "dividend_yield": 0,
+            "method": {
+                "Brownian": {
+                    "dt": 0.0027,
+                    "drift": "0.02",
+                    "volatility": 0.35
+                }
+            },
+            "time_frame": "Day"
+        }"#;
+
+        let params: SimulationParameters = serde_json::from_str(json).unwrap();
+        assert_eq!(params.seed, None);
     }
 }
 
@@ -439,6 +520,7 @@ mod tests_simulation_parameters_serialization {
             skew_slope: Some(dec!(-0.2)),
             smile_curve: Some(dec!(0.5)),
             spread: Some(pos!(0.02)),
+            seed: None,
         };
 
         // Serialize to JSON
@@ -517,6 +599,7 @@ mod tests_simulation_parameters_serialization {
             skew_slope: None,
             smile_curve: None,
             spread: None,
+            seed: None,
         };
 
         // Serialize to JSON
@@ -621,6 +704,7 @@ mod tests_simulation_parameters_serialization {
             skew_slope: None,
             smile_curve: None,
             spread: Some(pos!(0.01)),
+            seed: None,
         };
 
         let json_mr = to_string(&params_mr).unwrap();
@@ -661,6 +745,7 @@ mod tests_simulation_parameters_serialization {
             skew_slope: None,
             smile_curve: None,
             spread: None,
+            seed: None,
         };
 
         let json_hist = to_string(&params_hist).unwrap();
@@ -710,6 +795,7 @@ mod tests_simulation_parameters_serialization {
                 skew_slope: None,
                 smile_curve: None,
                 spread: None,
+                seed: None,
             };
 
             let json = to_string(&params).unwrap();
@@ -747,6 +833,7 @@ mod tests_simulation_parameters_serialization {
             skew_slope: Some(dec!(-0.2)),
             smile_curve: Some(dec!(-0.5)), // Negative skew
             spread: Some(pos!(0.015)),
+            seed: None,
         };
 
         let json = to_string(&params).unwrap();
@@ -875,6 +962,7 @@ mod tests_session {
             skew_slope: None,
             smile_curve: Some(Decimal::new(1, 1)), // 0.1
             spread: spos!(0.2),                    // 0.2
+            seed: None,
         }
     }
 

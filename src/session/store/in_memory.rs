@@ -138,6 +138,7 @@ mod tests {
             skew_slope: None,
             smile_curve: None,
             spread: None,
+            seed: None,
         };
 
         let now = SystemTime::now();

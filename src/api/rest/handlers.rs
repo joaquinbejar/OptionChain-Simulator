@@ -87,6 +87,7 @@ pub(crate) async fn create_session(
                     skew_slope: session.parameters.skew_slope.map(|f| f.to_f64().unwrap()),
                     smile_curve: session.parameters.smile_curve.map(|f| f.to_f64().unwrap()),
                     spread: session.parameters.spread.map(|f| f.into()),
+                    seed: session.parameters.seed,
                 },
                 current_step: session.current_step,
                 total_steps: session.total_steps,
@@ -166,7 +167,7 @@ pub(crate) async fn get_next_step(
                         let put_ask = contract.get_put_buy_price();
                         let call_bid = contract.get_call_sell_price();
                         let put_bid = contract.get_put_sell_price();
-                        let volatility = contract.volatility();
+                        let volatility = contract.get_volatility();
                         OptionContractResponse {
                             strike: contract.strike().into(),
                             expiration: expiration.clone(),
@@ -182,7 +183,7 @@ pub(crate) async fn get_next_step(
                                 mid: contract.put_middle.map(|m| m.into()),
                                 delta: put_delta.map(|d| d.to_f64().unwrap()),
                             },
-                            implied_volatility: volatility.map(|iv| iv.into()),
+                            implied_volatility: Some(volatility.into()),
                             gamma: contract.current_gamma().map(|g| g.to_f64().unwrap()),
                         }
                     })
@@ -283,6 +284,7 @@ pub(crate) async fn replace_session(
                     skew_slope: session.parameters.skew_slope.map(|f| f.to_f64().unwrap()),
                     smile_curve: session.parameters.smile_curve.map(|f| f.to_f64().unwrap()),
                     spread: session.parameters.spread.map(|f| f.into()),
+                    seed: session.parameters.seed,
                 },
                 current_step: session.current_step,
                 total_steps: session.total_steps,
@@ -409,6 +411,10 @@ pub(crate) async fn update_session(
         updated_params.spread = Some(pos!(spread));
     }
 
+    if let Some(seed) = json_req.seed {
+        updated_params.seed = Some(seed);
+    }
+
     // Update the session with new parameters
     match session_manager.update_session(session_id, updated_params) {
         Ok(session) => {
@@ -438,6 +444,7 @@ pub(crate) async fn update_session(
                         .smile_curve
                         .map(|f| f.to_f64().unwrap_or(0.0)),
                     spread: session.parameters.spread.map(|f| f.into()),
+                    seed: session.parameters.seed,
                 },
                 current_step: session.current_step,
                 total_steps: session.total_steps,

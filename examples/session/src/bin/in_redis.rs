@@ -108,6 +108,7 @@ fn create_simulation_parameters() -> SimulationParameters {
         skew_slope: None,
         smile_curve: None,
         spread: spos!(0.02),
+        seed: None,
     }
 }
 

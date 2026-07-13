@@ -73,7 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info!("Calculated historical volatility: {}", volatility);
 
                     // Use the most recent price as the initial price for simulation
-                    let initial_price = historical_prices.last().unwrap().clone();
+                    let initial_price = *historical_prices.last().unwrap();
                     info!("Using initial price: {}", initial_price);
 
                     // Step 5: Create simulation parameters based on historical data
@@ -149,6 +149,7 @@ fn create_simulation_parameters(
         skew_slope: None,
         smile_curve: Some(Decimal::new(5, 1)), // 0.5
         spread: spos!(0.02),                   // 2% bid-ask spread
+        seed: None,
     }
 }
 
@@ -210,7 +211,7 @@ async fn run_simulation_steps(
 fn calculate_historical_volatility(
     prices: &[Positive],
 ) -> Result<Positive, Box<dyn std::error::Error>> {
-    let log_return = calculate_log_returns(prices).unwrap_or(Vec::new());
+    let log_return = calculate_log_returns(prices).unwrap_or_default();
     let log_return_dec = log_return
         .iter()
         .map(|r| r.to_dec())

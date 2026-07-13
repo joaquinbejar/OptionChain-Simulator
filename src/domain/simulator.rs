@@ -271,11 +271,10 @@ impl Simulator {
 
         // Create option data price parameters
         let price_params = OptionDataPriceParams::new(
-            initial_price,
-            ExpirationDate::Days(days_to_expiration),
-            Some(volatility),
-            risk_free_rate,
-            dividend_yield,
+            Some(Box::new(initial_price)),
+            Some(ExpirationDate::Days(days_to_expiration)),
+            Some(risk_free_rate),
+            Some(dividend_yield),
             Some(symbol.clone()),
         );
 
@@ -290,13 +289,18 @@ impl Simulator {
             spread,
             2, // Decimal places
             price_params,
+            volatility,
         );
 
         // Build the initial chain
         let initial_chain = OptionChain::build_chain(&build_params);
 
-        // Create walker for a random walk
-        let walker = Box::new(Walker::new());
+        // Create walker for a random walk, seeded when the session requests
+        // reproducibility so the same seed always yields the same walk
+        let walker = Box::new(match params.seed {
+            Some(seed) => Walker::new_with_seed(seed),
+            None => Walker::new(),
+        });
 
         // Create step parameters for a random walk
         let walk_params = WalkParams {
@@ -330,6 +334,7 @@ impl Simulator {
     }
 
     /// Cleans up the simulation cache by removing entries for sessions that are no longer active
+    #[allow(dead_code)] // maintenance API: not wired to a caller yet
     #[instrument(skip(self), level = "debug")]
     pub async fn cleanup_cache(&self, active_session_ids: &[Uuid]) -> Result<usize, ChainError> {
         let mut cache = self.simulation_cache.lock().await;
@@ -408,6 +413,7 @@ mod tests {
             skew_slope: Some(dec!(-0.2)),
             smile_curve: Some(dec!(0.5)),
             spread: Some(pos!(0.01)),
+            seed: None,
         };
 
         let namespace = Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap();
@@ -419,6 +425,63 @@ mod tests {
             session.id = id;
         }
         session
+    }
+
+    // Helper that walks a session through every step and returns the
+    // underlying price observed at each snapshot
+    async fn collect_tape(simulator: &Simulator, session: &mut Session) -> Vec<Positive> {
+        let steps = session.parameters.steps;
+        let mut tape = Vec::with_capacity(steps);
+        for step in 0..steps {
+            session.current_step = step;
+            if step > 0 {
+                session.state = SessionState::InProgress;
+            }
+            let chain = simulator
+                .simulate_next_step(session)
+                .await
+                .expect("Simulation step failed");
+            tape.push(chain.underlying_price);
+        }
+        tape
+    }
+
+    #[tokio::test]
+    async fn test_same_seed_produces_identical_tape() {
+        // Complete-tape test: two sessions with identical parameters and the
+        // same seed must produce the same sequence of snapshots
+        let mut session_a = create_test_session(None);
+        let mut session_b = create_test_session(None);
+        session_a.parameters.seed = Some(20260713);
+        session_b.parameters.seed = Some(20260713);
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        let tape_a = collect_tape(&simulator, &mut session_a).await;
+        let tape_b = collect_tape(&simulator, &mut session_b).await;
+
+        assert_eq!(tape_a, tape_b);
+    }
+
+    #[tokio::test]
+    async fn test_different_seeds_produce_different_tapes() {
+        let mut session_a = create_test_session(None);
+        let mut session_b = create_test_session(None);
+        session_a.parameters.seed = Some(1);
+        session_b.parameters.seed = Some(2);
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        let tape_a = collect_tape(&simulator, &mut session_a).await;
+        let tape_b = collect_tape(&simulator, &mut session_b).await;
+
+        assert_ne!(tape_a, tape_b);
     }
 
     // Helper function to create test historical data
