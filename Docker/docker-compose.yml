@@ -1,9 +1,17 @@
 version: '3.8'
 
+# Service images are pinned to reviewed major.minor tags so a redeploy never
+# silently pulls a different runtime (issue #22). For production, prefer
+# immutable digests (image: name@sha256:...) captured from a verified deploy.
+#
+# Update workflow: bump ONE image tag at a time in a dedicated PR, run the
+# stack locally (make deploy) against the health checks, and record the
+# tested combination in the PR. Never move a tag back to :latest.
+
 services:
   # Redis service configuration
   redis:
-    image: redis:latest
+    image: redis:7.4
     container_name: redis
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-password}
     ports:
@@ -23,7 +31,7 @@ services:
   
   # MongoDB service configuration
   mongodb:
-    image: mongo:latest
+    image: mongo:7.0
     container_name: mongodb
     ports:
       - "27017:27017"
@@ -45,7 +53,7 @@ services:
 
   # MongoDB Express for web-based MongoDB management (optional)
   mongo-express:
-    image: mongo-express:latest
+    image: mongo-express:1.0.2
     container_name: mongo-express
     restart: unless-stopped
     ports:
@@ -63,7 +71,7 @@ services:
 
   # Redis Commander for web-based Redis management (optional)
   redis-commander:
-    image: rediscommander/redis-commander:latest
+    image: rediscommander/redis-commander:redis-commander-210
     container_name: redis-commander
     restart: unless-stopped
     ports:
@@ -78,7 +86,7 @@ services:
       - redis
         
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:24.8
     container_name: clickhouse
     ports:
       - "8123:8123"   # HTTP interface
