@@ -1,7 +1,11 @@
+use crate::api::rest::limits::MAX_HISTORICAL_PRICES;
+use crate::api::rest::validation::{
+    bounded_decimal_field, decimal_field, positive_field, strictly_positive_field,
+};
+use crate::utils::ChainError;
 use optionstratlib::simulation::WalkType;
 use optionstratlib::utils::TimeFrame;
 use positive::pos_or_panic;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -387,26 +391,39 @@ impl From<WalkType> for ApiWalkType {
     }
 }
 
-impl From<ApiWalkType> for WalkType {
-    fn from(value: ApiWalkType) -> Self {
-        match value {
+impl TryFrom<ApiWalkType> for WalkType {
+    type Error = ChainError;
+
+    /// Validates a client-supplied [`ApiWalkType`] and converts it into the domain
+    /// [`WalkType`]. Every raw `f64` field is checked before conversion: `dt` must be
+    /// strictly positive, volatilities and other `Positive` fields must be finite and
+    /// non-negative, `Decimal` fields must be finite, an `autocorrelation` (when present)
+    /// must lie in `[-1, 1]`, and a `Historical` price series must be non-negative and no
+    /// longer than [`MAX_HISTORICAL_PRICES`]. Invalid input yields a
+    /// [`ChainError::Validation`] naming the offending field instead of panicking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Validation`] on the first field that fails validation.
+    fn try_from(value: ApiWalkType) -> Result<Self, Self::Error> {
+        let walk = match value {
             ApiWalkType::Brownian {
                 dt,
                 drift,
                 volatility,
             } => WalkType::Brownian {
-                dt: pos_or_panic!(dt),
-                drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos_or_panic!(volatility),
+                dt: strictly_positive_field("dt", dt)?,
+                drift: decimal_field("drift", drift)?,
+                volatility: positive_field("volatility", volatility)?,
             },
             ApiWalkType::GeometricBrownian {
                 dt,
                 drift,
                 volatility,
             } => WalkType::GeometricBrownian {
-                dt: pos_or_panic!(dt),
-                drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos_or_panic!(volatility),
+                dt: strictly_positive_field("dt", dt)?,
+                drift: decimal_field("drift", drift)?,
+                volatility: positive_field("volatility", volatility)?,
             },
             ApiWalkType::LogReturns {
                 dt,
@@ -414,11 +431,12 @@ impl From<ApiWalkType> for WalkType {
                 volatility,
                 autocorrelation,
             } => WalkType::LogReturns {
-                dt: pos_or_panic!(dt),
-                expected_return: Decimal::try_from(expected_return).unwrap_or_default(),
-                volatility: pos_or_panic!(volatility),
+                dt: strictly_positive_field("dt", dt)?,
+                expected_return: decimal_field("expected_return", expected_return)?,
+                volatility: positive_field("volatility", volatility)?,
                 autocorrelation: autocorrelation
-                    .map(|ac| Decimal::try_from(ac).unwrap_or_default()),
+                    .map(|ac| bounded_decimal_field("autocorrelation", ac, -1.0, 1.0))
+                    .transpose()?,
             },
             ApiWalkType::MeanReverting {
                 dt,
@@ -426,10 +444,10 @@ impl From<ApiWalkType> for WalkType {
                 speed,
                 mean,
             } => WalkType::MeanReverting {
-                dt: pos_or_panic!(dt),
-                volatility: pos_or_panic!(volatility),
-                speed: pos_or_panic!(speed),
-                mean: pos_or_panic!(mean),
+                dt: strictly_positive_field("dt", dt)?,
+                volatility: positive_field("volatility", volatility)?,
+                speed: positive_field("speed", speed)?,
+                mean: positive_field("mean", mean)?,
             },
             ApiWalkType::JumpDiffusion {
                 dt,
@@ -439,12 +457,12 @@ impl From<ApiWalkType> for WalkType {
                 jump_mean,
                 jump_volatility,
             } => WalkType::JumpDiffusion {
-                dt: pos_or_panic!(dt),
-                drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos_or_panic!(volatility),
-                intensity: pos_or_panic!(intensity),
-                jump_mean: Decimal::try_from(jump_mean).unwrap_or_default(),
-                jump_volatility: pos_or_panic!(jump_volatility),
+                dt: strictly_positive_field("dt", dt)?,
+                drift: decimal_field("drift", drift)?,
+                volatility: positive_field("volatility", volatility)?,
+                intensity: positive_field("intensity", intensity)?,
+                jump_mean: decimal_field("jump_mean", jump_mean)?,
+                jump_volatility: positive_field("jump_volatility", jump_volatility)?,
             },
             ApiWalkType::Garch {
                 dt,
@@ -453,11 +471,11 @@ impl From<ApiWalkType> for WalkType {
                 alpha,
                 beta,
             } => WalkType::Garch {
-                dt: pos_or_panic!(dt),
-                drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos_or_panic!(volatility),
-                alpha: pos_or_panic!(alpha),
-                beta: pos_or_panic!(beta),
+                dt: strictly_positive_field("dt", dt)?,
+                drift: decimal_field("drift", drift)?,
+                volatility: positive_field("volatility", volatility)?,
+                alpha: positive_field("alpha", alpha)?,
+                beta: positive_field("beta", beta)?,
             },
             ApiWalkType::Heston {
                 dt,
@@ -468,13 +486,13 @@ impl From<ApiWalkType> for WalkType {
                 xi,
                 rho,
             } => WalkType::Heston {
-                dt: pos_or_panic!(dt),
-                drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos_or_panic!(volatility),
-                kappa: pos_or_panic!(kappa),
-                theta: pos_or_panic!(theta),
-                xi: pos_or_panic!(xi),
-                rho: Decimal::try_from(rho).unwrap_or_default(),
+                dt: strictly_positive_field("dt", dt)?,
+                drift: decimal_field("drift", drift)?,
+                volatility: positive_field("volatility", volatility)?,
+                kappa: positive_field("kappa", kappa)?,
+                theta: positive_field("theta", theta)?,
+                xi: positive_field("xi", xi)?,
+                rho: decimal_field("rho", rho)?,
             },
             ApiWalkType::Custom {
                 dt,
@@ -484,12 +502,12 @@ impl From<ApiWalkType> for WalkType {
                 vol_speed,
                 vol_mean,
             } => WalkType::Custom {
-                dt: pos_or_panic!(dt),
-                drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos_or_panic!(volatility),
-                vov: pos_or_panic!(vov),
-                vol_speed: pos_or_panic!(vol_speed),
-                vol_mean: pos_or_panic!(vol_mean),
+                dt: strictly_positive_field("dt", dt)?,
+                drift: decimal_field("drift", drift)?,
+                volatility: positive_field("volatility", volatility)?,
+                vov: positive_field("vov", vov)?,
+                vol_speed: positive_field("vol_speed", vol_speed)?,
+                vol_mean: positive_field("vol_mean", vol_mean)?,
             },
             ApiWalkType::Telegraph {
                 dt,
@@ -500,24 +518,45 @@ impl From<ApiWalkType> for WalkType {
                 vol_multiplier_up,
                 vol_multiplier_down,
             } => WalkType::Telegraph {
-                dt: pos_or_panic!(dt),
-                drift: Decimal::try_from(drift).unwrap_or_default(),
-                volatility: pos_or_panic!(volatility),
-                lambda_up: pos_or_panic!(lambda_up),
-                lambda_down: pos_or_panic!(lambda_down),
-                vol_multiplier_up: vol_multiplier_up.map(|v| pos_or_panic!(v)),
-                vol_multiplier_down: vol_multiplier_down.map(|v| pos_or_panic!(v)),
+                dt: strictly_positive_field("dt", dt)?,
+                drift: decimal_field("drift", drift)?,
+                volatility: positive_field("volatility", volatility)?,
+                lambda_up: positive_field("lambda_up", lambda_up)?,
+                lambda_down: positive_field("lambda_down", lambda_down)?,
+                vol_multiplier_up: vol_multiplier_up
+                    .map(|v| positive_field("vol_multiplier_up", v))
+                    .transpose()?,
+                vol_multiplier_down: vol_multiplier_down
+                    .map(|v| positive_field("vol_multiplier_down", v))
+                    .transpose()?,
             },
             ApiWalkType::Historical {
                 timeframe,
                 prices,
                 symbol,
-            } => WalkType::Historical {
-                timeframe: timeframe.into(),
-                prices: prices.into_iter().map(|p| pos_or_panic!(p)).collect(),
-                symbol,
-            },
-        }
+            } => {
+                if prices.len() > *MAX_HISTORICAL_PRICES {
+                    return Err(ChainError::Validation {
+                        field: "prices".to_string(),
+                        reason: format!(
+                            "must not exceed {} entries, got {}",
+                            *MAX_HISTORICAL_PRICES,
+                            prices.len()
+                        ),
+                    });
+                }
+                let mut converted = Vec::with_capacity(prices.len());
+                for price in prices {
+                    converted.push(strictly_positive_field("prices", price)?);
+                }
+                WalkType::Historical {
+                    timeframe: timeframe.into(),
+                    prices: converted,
+                    symbol,
+                }
+            }
+        };
+        Ok(walk)
     }
 }
 
@@ -674,7 +713,8 @@ mod api_walktype_tests {
     fn test_walktype_to_api_walktype_conversion() {
         for walk_type in create_test_walk_types() {
             let api_walk_type: ApiWalkType = walk_type.clone().into();
-            let converted_back: WalkType = api_walk_type.into();
+            let converted_back: WalkType =
+                api_walk_type.try_into().expect("valid walk type converts");
 
             // Ensure the converted back type matches the original
             assert_eq!(
@@ -727,13 +767,87 @@ mod api_walktype_tests {
 
         for walk_type in edge_cases {
             let api_walk_type: ApiWalkType = walk_type.clone().into();
-            let converted_back: WalkType = api_walk_type.into();
+            let converted_back: WalkType =
+                api_walk_type.try_into().expect("valid walk type converts");
 
             assert_eq!(
                 walk_type, converted_back,
                 "Edge case conversion failed for {:?}",
                 walk_type
             );
+        }
+    }
+
+    /// A zero `dt` is structurally invalid and must be rejected, not panic.
+    #[test]
+    fn test_apiwalktype_zero_dt_is_validation_error() {
+        let api = ApiWalkType::Brownian {
+            dt: 0.0,
+            drift: 0.05,
+            volatility: 0.2,
+        };
+        match WalkType::try_from(api) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "dt"),
+            other => panic!("expected Validation error for dt, got {other:?}"),
+        }
+    }
+
+    /// A non-finite volatility must be rejected, not panic.
+    #[test]
+    fn test_apiwalktype_nan_volatility_is_validation_error() {
+        let api = ApiWalkType::Brownian {
+            dt: 0.004,
+            drift: 0.05,
+            volatility: f64::NAN,
+        };
+        match WalkType::try_from(api) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "volatility"),
+            other => panic!("expected Validation error for volatility, got {other:?}"),
+        }
+    }
+
+    /// An autocorrelation outside `[-1, 1]` must be rejected.
+    #[test]
+    fn test_apiwalktype_autocorrelation_out_of_range_is_validation_error() {
+        let api = ApiWalkType::LogReturns {
+            dt: 0.004,
+            expected_return: 0.02,
+            volatility: 0.25,
+            autocorrelation: Some(1.5),
+        };
+        match WalkType::try_from(api) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "autocorrelation"),
+            other => panic!("expected Validation error for autocorrelation, got {other:?}"),
+        }
+    }
+
+    /// A negative historical price must be rejected, not panic.
+    #[test]
+    fn test_apiwalktype_negative_historical_price_is_validation_error() {
+        let api = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices: vec![100.0, -1.0, 102.0],
+            symbol: None,
+        };
+        match WalkType::try_from(api) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "prices"),
+            other => panic!("expected Validation error for prices, got {other:?}"),
+        }
+    }
+
+    /// A historical price series longer than the cap must be rejected.
+    #[test]
+    fn test_apiwalktype_oversized_historical_prices_is_validation_error() {
+        use crate::api::rest::limits::MAX_HISTORICAL_PRICES;
+        let prices = vec![100.0; *MAX_HISTORICAL_PRICES + 1];
+        let api = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices,
+            symbol: None,
+        };
+        match WalkType::try_from(api) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "prices"),
+            other => panic!("expected Validation error for prices, got {other:?}"),
         }
     }
 }
