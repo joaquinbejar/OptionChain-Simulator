@@ -1,17 +1,20 @@
 version: '3.8'
 
-# Service images are pinned to reviewed major.minor tags so a redeploy never
-# silently pulls a different runtime (issue #22). For production, prefer
-# immutable digests (image: name@sha256:...) captured from a verified deploy.
+# Service images are pinned by IMMUTABLE digest (image: name:tag@sha256:...)
+# so a redeploy can never silently pull a different build (issue #22). The
+# tag is kept as a readable prefix only; the digest is what the engine
+# resolves. Digests are the multi-arch manifest-list digests from Docker Hub
+# (docker buildx imagetools inspect <image:tag>).
 #
-# Update workflow: bump ONE image tag at a time in a dedicated PR, run the
-# stack locally (make deploy) against the health checks, and record the
-# tested combination in the PR. Never move a tag back to :latest.
+# Update workflow: bump ONE image at a time in a dedicated PR - re-resolve
+# its digest with imagetools inspect, update tag and digest together, run
+# the stack locally (make deploy) against the health checks, and record the
+# tested combination in the PR. Never drop the digest or use :latest.
 
 services:
   # Redis service configuration
   redis:
-    image: redis:7.4
+    image: redis:7.4@sha256:b2b95679e3b46fb51864949ed25ea976fc3a6bcc00a40a1bc00d568cb2822e50
     container_name: redis
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-password}
     ports:
@@ -31,7 +34,7 @@ services:
   
   # MongoDB service configuration
   mongodb:
-    image: mongo:7.0
+    image: mongo:7.0@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703
     container_name: mongodb
     ports:
       - "27017:27017"
@@ -53,7 +56,7 @@ services:
 
   # MongoDB Express for web-based MongoDB management (optional)
   mongo-express:
-    image: mongo-express:1.0.2
+    image: mongo-express:1.0.2@sha256:1b23d7976f0210dbec74045c209e52fbb26d29b2e873d6c6fa3d3f0ae32c2a64
     container_name: mongo-express
     restart: unless-stopped
     ports:
@@ -71,7 +74,7 @@ services:
 
   # Redis Commander for web-based Redis management (optional)
   redis-commander:
-    image: rediscommander/redis-commander:redis-commander-210
+    image: rediscommander/redis-commander:redis-commander-210@sha256:25f93c06111f8614e3ecc8df5c563272bb465459a2e08e7f5364b5fe4c14f87f
     container_name: redis-commander
     restart: unless-stopped
     ports:
@@ -86,7 +89,7 @@ services:
       - redis
         
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
     container_name: clickhouse
     ports:
       - "8123:8123"   # HTTP interface
