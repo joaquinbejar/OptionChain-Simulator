@@ -34,7 +34,10 @@ impl Walker {
     /// Draws a standard normal sample from the walker's own RNG instead of the
     /// process-wide thread-local one used by optionstratlib's default methods.
     fn normal_sample(&self) -> Decimal {
-        let mut rng = self.rng.lock().unwrap();
+        // A poisoned mutex only means another thread panicked while holding
+        // the guard; the RNG state itself stays valid, so recover the inner
+        // value instead of propagating the panic onto a request path.
+        let mut rng = self.rng.lock().unwrap_or_else(|e| e.into_inner());
         let z: f64 = StandardNormal.sample(&mut *rng);
         Decimal::from_f64(z).unwrap_or(Decimal::ZERO)
     }
@@ -44,7 +47,9 @@ impl Walker {
     /// must be compared against a *uniform* variate — not a standard-normal one
     /// (see [`Walker::bernoulli_jump`] and issue #11).
     fn uniform_sample(&self) -> Decimal {
-        let mut rng = self.rng.lock().unwrap();
+        // Same poison recovery as `normal_sample`: the RNG state is still
+        // valid after another thread's panic.
+        let mut rng = self.rng.lock().unwrap_or_else(|e| e.into_inner());
         let u: f64 = rng.random::<f64>();
         Decimal::from_f64(u).unwrap_or(Decimal::ZERO)
     }
