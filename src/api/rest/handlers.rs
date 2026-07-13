@@ -8,14 +8,63 @@ use crate::api::rest::responses::{
 };
 use crate::api::rest::validation::{self, decimal_field, positive_field, strictly_positive_field};
 use crate::infrastructure::{MetricsCollector, MongoDBRepository};
-use crate::session::{SessionManager, SimulationParameters};
+use crate::session::{Session, SessionManager, SimulationParameters};
 use crate::utils::ChainError;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, Utc};
+use optionstratlib::chains::OptionChain;
 use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, info};
+use utoipa::ToSchema;
 use uuid::Uuid;
+
+/// Builds the `ChainResponse` DTO shared by the advance (`POST /api/v1/chain/step`) and
+/// peek (`GET /api/v1/chain`) endpoints from a session and its current option-chain
+/// snapshot. Kept as a single place so both surfaces emit an identical response shape.
+fn build_chain_response(session: &Session, option_chain: &OptionChain) -> ChainResponse {
+    let expiration = option_chain.get_expiration_date();
+    ChainResponse {
+        underlying: option_chain.symbol.clone(),
+        timestamp: Utc::now().to_rfc3339(),
+        price: option_chain.underlying_price.into(),
+        contracts: option_chain
+            .iter()
+            .map(|contract| {
+                let (call_delta, put_delta) = contract.current_deltas();
+                let call_ask = contract.get_call_buy_price();
+                let put_ask = contract.get_put_buy_price();
+                let call_bid = contract.get_call_sell_price();
+                let put_bid = contract.get_put_sell_price();
+                let volatility = contract.get_volatility();
+                OptionContractResponse {
+                    strike: contract.strike().into(),
+                    expiration: expiration.clone(),
+                    call: OptionPriceResponse {
+                        bid: call_bid.map(|b| b.into()),
+                        ask: call_ask.map(|a| a.into()),
+                        mid: contract.call_middle.map(|m| m.into()),
+                        delta: call_delta.map(|d| d.to_f64().unwrap_or(0.0)),
+                    },
+                    put: OptionPriceResponse {
+                        bid: put_bid.map(|b| b.into()),
+                        ask: put_ask.map(|a| a.into()),
+                        mid: contract.put_middle.map(|m| m.into()),
+                        delta: put_delta.map(|d| d.to_f64().unwrap_or(0.0)),
+                    },
+                    implied_volatility: Some(volatility.into()),
+                    gamma: contract.current_gamma().map(|g| g.to_f64().unwrap_or(0.0)),
+                }
+            })
+            .collect(),
+        session_info: SessionInfoResponse {
+            id: session.id.to_string(),
+            current_step: session.current_step,
+            total_steps: session.total_steps,
+        },
+    }
+}
 
 #[utoipa::path(
     post,
@@ -120,25 +169,48 @@ pub(crate) async fn create_session(
     }
 }
 
+/// Query parameters for the advance-step command: the session id plus an
+/// optional expected-cursor precondition for safe retries.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub(crate) struct AdvanceStepQuery {
+    /// ID of the session to advance one step.
+    #[serde(rename = "sessionid")]
+    pub(crate) session_id: String,
+    /// Optional expected cursor: when provided, the advance only proceeds if
+    /// the session's current step matches — otherwise 412 is returned with
+    /// the actual cursor, letting a client resolve an ambiguous retry
+    /// (response lost after the save) without consuming another step.
+    #[serde(default)]
+    pub(crate) expected_step: Option<usize>,
+}
+
 #[utoipa::path(
-    get,
-    path = "/api/v1/chain",
+    post,
+    path = "/api/v1/chain/step",
+    description = "Advance the session one step and return the served snapshot. This is an \
+        explicit, state-mutating command (the former GET behavior): it serves the next \
+        step and persists the advance. Use GET /api/v1/chain for a safe, repeatable peek. \
+        Pass `expected_step` (the cursor you believe the session is at) to make retries \
+        safe: if a previous attempt already consumed the step, the call returns 412 with \
+        the actual cursor instead of consuming another one.",
     params(
-        ("sessionid" = String, Query, description = "ID of the session to get next step for")
+        ("sessionid" = String, Query, description = "ID of the session to advance one step"),
+        ("expected_step" = Option<usize>, Query, description = "Expected current cursor; mismatch returns 412 without advancing")
     ),
     responses(
-        (status = 200, description = "Next step returned", body = ChainResponse),
+        (status = 200, description = "Advanced one step; served snapshot returned", body = ChainResponse),
         (status = 404, description = "Session not found"),
         (status = 410, description = "Simulation completed. No more steps available"),
+        (status = 412, description = "expected_step does not match the session's current cursor; body carries `error` and `current_step`"),
         (status = 500, description = "Internal server error")
     )
 )]
-pub(crate) async fn get_next_step(
+pub(crate) async fn advance_step(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
     metrics_collector: web::Data<Arc<MetricsCollector>>,
     mongodb_repo: web::Data<Arc<MongoDBRepository>>,
-    query: web::Query<SessionId>,
+    query: web::Query<AdvanceStepQuery>,
 ) -> impl Responder {
     info!(
         "{} {}: session_id={}",
@@ -158,50 +230,26 @@ pub(crate) async fn get_next_step(
         }
     };
 
-    // Get next step from session manager
+    // Expected-cursor precondition: a transport-level check (412) so an
+    // ambiguous retry can be resolved without consuming another step.
+    if let Some(expected) = query.expected_step {
+        match session_manager.get_session(session_id) {
+            Ok(session) => {
+                if session.current_step != expected {
+                    return HttpResponse::PreconditionFailed().json(serde_json::json!({
+                        "error": "expected_step does not match the session's current cursor",
+                        "current_step": session.current_step,
+                    }));
+                }
+            }
+            Err(error) => return map_error(error),
+        }
+    }
+
+    // Advance the session one step (mutates state and persists it).
     match session_manager.get_next_step(session_id).await {
         Ok((session, option_chain)) => {
-            // Convert session and option chain to ChainResponse
-            let expiration = option_chain.get_expiration_date();
-            let response = ChainResponse {
-                underlying: option_chain.symbol.clone(),
-                timestamp: Utc::now().to_rfc3339(),
-                price: option_chain.underlying_price.into(),
-                contracts: option_chain
-                    .iter()
-                    .map(|contract| {
-                        let (call_delta, put_delta) = contract.current_deltas();
-                        let call_ask = contract.get_call_buy_price();
-                        let put_ask = contract.get_put_buy_price();
-                        let call_bid = contract.get_call_sell_price();
-                        let put_bid = contract.get_put_sell_price();
-                        let volatility = contract.get_volatility();
-                        OptionContractResponse {
-                            strike: contract.strike().into(),
-                            expiration: expiration.clone(),
-                            call: OptionPriceResponse {
-                                bid: call_bid.map(|b| b.into()),
-                                ask: call_ask.map(|a| a.into()),
-                                mid: contract.call_middle.map(|m| m.into()),
-                                delta: call_delta.map(|d| d.to_f64().unwrap()),
-                            },
-                            put: OptionPriceResponse {
-                                bid: put_bid.map(|b| b.into()),
-                                ask: put_ask.map(|a| a.into()),
-                                mid: contract.put_middle.map(|m| m.into()),
-                                delta: put_delta.map(|d| d.to_f64().unwrap()),
-                            },
-                            implied_volatility: Some(volatility.into()),
-                            gamma: contract.current_gamma().map(|g| g.to_f64().unwrap()),
-                        }
-                    })
-                    .collect(),
-                session_info: SessionInfoResponse {
-                    id: session.id.to_string(),
-                    current_step: session.current_step,
-                    total_steps: session.total_steps,
-                },
-            };
+            let response = build_chain_response(&session, &option_chain);
             let duration = start_time.elapsed();
             metrics_collector.record_simulation_step(&session.parameters.method.to_string());
             metrics_collector.record_simulation_duration(duration);
@@ -218,6 +266,57 @@ pub(crate) async fn get_next_step(
                 error!(session_id = %session_id, "Failed to save chain step to MongoDB: {}", e);
                 // Continue as this is not critical for the main flow
             }
+            HttpResponse::Ok().json(response)
+        }
+        Err(error) => map_error(error),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/chain",
+    description = "Returns the current snapshot without advancing the session; safe and \
+        repeatable (a peek). The same snapshot is returned until an explicit advance via \
+        POST /api/v1/chain/step moves the cursor. This endpoint does not mutate session \
+        state or record a simulation step.",
+    params(
+        ("sessionid" = String, Query, description = "ID of the session to read the current snapshot for")
+    ),
+    responses(
+        (status = 200, description = "Current snapshot returned (read-only; repeatable)", body = ChainResponse),
+        (status = 404, description = "Session not found"),
+        (status = 410, description = "Session completed; no current step available"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub(crate) async fn get_current_step(
+    req: HttpRequest,
+    session_manager: web::Data<Arc<SessionManager>>,
+    query: web::Query<SessionId>,
+) -> impl Responder {
+    info!(
+        "{} {}: session_id={}",
+        req.method(),
+        req.path(),
+        query.session_id
+    );
+
+    // Parse the session ID
+    let session_id = match Uuid::parse_str(&query.session_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return map_error(ChainError::InvalidState(
+                "Invalid session ID format".to_string(),
+            ));
+        }
+    };
+
+    // Peek the current snapshot: read-only, repeatable, no state change and no persistence.
+    // No simulation-step metric is recorded and no chain-step event is written, because the
+    // same step is served repeatedly.
+    match session_manager.peek_current_step(session_id).await {
+        Ok((session, option_chain)) => {
+            let response = build_chain_response(&session, &option_chain);
             HttpResponse::Ok().json(response)
         }
         Err(error) => map_error(error),
@@ -584,5 +683,25 @@ pub(crate) async fn delete_session(
             error!("{}", error);
             map_error(error)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_advance_step_query {
+    use super::AdvanceStepQuery;
+
+    #[test]
+    fn test_expected_step_absent_deserializes_to_none() {
+        let q: AdvanceStepQuery =
+            serde_json::from_str(r#"{"sessionid":"abc"}"#).expect("query must parse");
+        assert_eq!(q.session_id, "abc");
+        assert_eq!(q.expected_step, None);
+    }
+
+    #[test]
+    fn test_expected_step_present_deserializes_to_some() {
+        let q: AdvanceStepQuery = serde_json::from_str(r#"{"sessionid":"abc","expected_step":3}"#)
+            .expect("query must parse");
+        assert_eq!(q.expected_step, Some(3));
     }
 }

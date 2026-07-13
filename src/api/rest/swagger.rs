@@ -4,7 +4,8 @@ use utoipa::OpenApi;
 #[openapi(
     paths(
         crate::api::rest::handlers::create_session,
-        crate::api::rest::handlers::get_next_step,
+        crate::api::rest::handlers::get_current_step,
+        crate::api::rest::handlers::advance_step,
         crate::api::rest::handlers::replace_session,
         crate::api::rest::handlers::update_session,
         crate::api::rest::handlers::delete_session,
@@ -61,7 +62,8 @@ mod tests {
 
         // Expected paths based on the OpenAPI derive macro
         let expected_paths = vec![
-            "/api/v1/chain", // Matches the handlers in the macro
+            "/api/v1/chain",      // create / peek (GET) / replace / update / delete
+            "/api/v1/chain/step", // advance one step (POST)
         ];
 
         for path in expected_paths {

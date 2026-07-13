@@ -1,6 +1,6 @@
 use crate::domain::Simulator;
 use crate::session::SessionStore;
-use crate::session::model::{Session, SimulationParameters};
+use crate::session::model::{Session, SessionState, SimulationParameters};
 use crate::session::state_handler::StateProgressionHandler;
 use crate::utils::error::ChainError;
 use optionstratlib::chains::OptionChain;
@@ -136,6 +136,64 @@ impl SessionManager {
 
         // Save updated session
         self.store.save(session.clone())?;
+
+        Ok((session, chain))
+    }
+
+    /// Returns the session's CURRENT chain snapshot without advancing or persisting it.
+    ///
+    /// This is the read-only, repeatable counterpart to [`SessionManager::get_next_step`]:
+    /// it serves the snapshot at `session.current_step` and leaves the session state, the
+    /// step counter, and the store untouched. Calling it repeatedly yields the same
+    /// snapshot until an explicit advance ([`SessionManager::get_next_step`]) moves the
+    /// cursor.
+    ///
+    /// The domain walk cache may be populated as a side effect of building the snapshot,
+    /// but no session state ever changes and nothing is written back to the store.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - A `Uuid` identifying the session to peek.
+    ///
+    /// # Returns
+    ///
+    /// A tuple `(Session, OptionChain)` with the unchanged session and its current
+    /// snapshot.
+    ///
+    /// # Errors
+    ///
+    /// This function may return the following errors encapsulated in `ChainError`:
+    /// - [`ChainError::NotFound`] if the session does not exist in the store.
+    /// - [`ChainError::SimulatorError`] if the session has already completed all steps
+    ///   (there is no current step to serve); this maps to HTTP 410 like the
+    ///   exhausted-advance path.
+    /// - Any error surfaced by the simulator while building the current snapshot.
+    pub async fn peek_current_step(&self, id: Uuid) -> Result<(Session, OptionChain), ChainError> {
+        let session = self.store.get(id)?;
+
+        // A completed session has no current step to serve; mirror the exhausted-advance
+        // path (410 Gone) rather than returning stale data.
+        if session.state == SessionState::Completed {
+            return Err(ChainError::SimulatorError(
+                "session completed; no current step".to_string(),
+            ));
+        }
+        // `Error` is the other terminal state (`Session::is_active`); a peek
+        // must reject it like the advance path does instead of serving a
+        // snapshot from a session that can no longer progress.
+        if session.state == SessionState::Error {
+            return Err(ChainError::InvalidState(
+                "Session is in error state".to_string(),
+            ));
+        }
+
+        // Read-only: build/read the walk at the current step. This never advances the
+        // counter and never persists the session.
+        let chain = self
+            .simulator
+            .simulate_next_step(&session)
+            .await
+            .map_err(|e| ChainError::SimulatorError(e.to_string()))?;
 
         Ok((session, chain))
     }
@@ -329,5 +387,114 @@ mod tests {
         let second = manager.create_session(test_parameters()).unwrap();
 
         assert_ne!(first.id, second.id);
+    }
+
+    /// Issue #21: GET is a peek. `peek_current_step` must be repeatable and must not
+    /// mutate the stored session (no cursor advance, no state change, no save).
+    #[tokio::test]
+    async fn test_peek_current_step_is_repeatable_and_read_only() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let session = manager
+            .create_session(test_parameters())
+            .expect("failed to create session");
+        let id = session.id;
+
+        let (first, _) = manager
+            .peek_current_step(id)
+            .await
+            .expect("first peek failed");
+        let (second, _) = manager
+            .peek_current_step(id)
+            .await
+            .expect("second peek failed");
+
+        // Peek is repeatable: the served cursor does not move between calls.
+        assert_eq!(first.current_step, second.current_step);
+        assert_eq!(first.current_step, 0);
+        assert_eq!(first.state, SessionState::Initialized);
+
+        // Peek is read-only: the stored session is untouched.
+        let stored = store.get(id).expect("session missing from store");
+        assert_eq!(stored.current_step, 0);
+        assert_eq!(stored.state, SessionState::Initialized);
+    }
+
+    /// After an explicit advance, peek reflects the new cursor and still does not move it.
+    #[tokio::test]
+    async fn test_advance_then_peek_reflects_new_cursor() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let session = manager
+            .create_session(test_parameters())
+            .expect("failed to create session");
+        let id = session.id;
+
+        // Advance moves the cursor and persists it.
+        let (advanced, _) = manager.get_next_step(id).await.expect("advance failed");
+        assert_eq!(advanced.current_step, 1);
+
+        // Peek now reflects the advanced cursor without moving it further.
+        let (peeked, _) = manager
+            .peek_current_step(id)
+            .await
+            .expect("peek after advance failed");
+        assert_eq!(peeked.current_step, advanced.current_step);
+
+        let stored = store.get(id).expect("session missing from store");
+        assert_eq!(stored.current_step, 1);
+        assert_eq!(stored.state, SessionState::InProgress);
+    }
+
+    /// Peek on a Completed session has no current step to serve and returns a
+    /// `SimulatorError` (mapped to HTTP 410), mirroring the exhausted-advance path.
+    #[tokio::test]
+    async fn test_peek_on_completed_session_returns_simulator_error() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let session = manager
+            .create_session(test_parameters())
+            .expect("failed to create session");
+        let id = session.id;
+
+        // Force the session into the Completed state directly in the store.
+        let mut completed = store.get(id).expect("session missing from store");
+        completed.current_step = completed.total_steps;
+        completed.state = SessionState::Completed;
+        store
+            .save(completed)
+            .expect("failed to persist completed session");
+
+        match manager.peek_current_step(id).await {
+            Err(ChainError::SimulatorError(msg)) => {
+                assert_eq!(msg, "session completed; no current step");
+            }
+            other => panic!("expected SimulatorError for completed peek, got {other:?}"),
+        }
+    }
+
+    /// `Error` is terminal too: a peek must reject it instead of serving a
+    /// snapshot from a session that can no longer progress.
+    #[tokio::test]
+    async fn test_peek_on_error_session_returns_invalid_state() {
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = SessionManager::new(store.clone());
+        let session = manager
+            .create_session(test_parameters())
+            .expect("failed to create session");
+        let id = session.id;
+
+        let mut errored = store.get(id).expect("session missing from store");
+        errored.state = SessionState::Error;
+        store
+            .save(errored)
+            .expect("failed to persist errored session");
+
+        match manager.peek_current_step(id).await {
+            Err(ChainError::InvalidState(msg)) => {
+                assert_eq!(msg, "Session is in error state");
+            }
+            other => panic!("expected InvalidState for errored peek, got {other:?}"),
+        }
     }
 }
