@@ -164,10 +164,13 @@ impl SessionManager {
         }
 
         // Serve the snapshot at the current cursor. The simulator sees the pre-advance
-        // state, so a `Reinitialized` session rebuilds its walk before serving.
+        // state, so a `Reinitialized` session rebuilds its walk before serving. It may
+        // also resolve a `Historical` source in place (issue #12), writing the resolved
+        // symbol + loaded prices back into `session.parameters.method`; the
+        // compare-and-swap save below then persists that resolution.
         let chain = self
             .simulator
-            .simulate_next_step(&session)
+            .simulate_next_step(&mut session)
             .await
             .map_err(|e| ChainError::SimulatorError(e.to_string()))?;
 
@@ -222,7 +225,7 @@ impl SessionManager {
     ///   exhausted-advance path.
     /// - Any error surfaced by the simulator while building the current snapshot.
     pub async fn peek_current_step(&self, id: Uuid) -> Result<(Session, OptionChain), ChainError> {
-        let session = self.store.get(id).await?;
+        let mut session = self.store.get(id).await?;
 
         // A completed session has no current step to serve; mirror the exhausted-advance
         // path (410 Gone) rather than returning stale data.
@@ -240,11 +243,15 @@ impl SessionManager {
             ));
         }
 
-        // Read-only: build/read the walk at the current step. This never advances the
-        // counter and never persists the session.
+        // Read-only with respect to the STORE: build/read the walk at the current step.
+        // This never advances the counter and never persists the session. Building the
+        // walk may resolve a `Historical` source (issue #12), which mutates only this
+        // in-memory copy — the resolution is reflected in the returned session but is
+        // not written back here; a later advance persists it, and reproducibility holds
+        // regardless via the seeded selection stream.
         let chain = self
             .simulator
-            .simulate_next_step(&session)
+            .simulate_next_step(&mut session)
             .await
             .map_err(|e| ChainError::SimulatorError(e.to_string()))?;
 
