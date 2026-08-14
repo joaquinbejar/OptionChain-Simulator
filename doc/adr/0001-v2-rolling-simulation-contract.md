@@ -69,12 +69,22 @@ domain.
 | concern | home | visibility |
 |---|---|---|
 | expiry rules, schedule, planner (§4, §5) | `src/domain/expiry.rs` | `pub(crate)` inside the private `domain` |
+| public representation of a schedule (§4.1) | `src/session/*` | public, converts into the domain types |
 | factor tape (§8) | `src/domain/factors.rs` | `pub(crate)` |
 | snapshot aggregate (§7) | `src/domain/series.rs` | `pub(crate)` |
 | v2 parameters, session, stores (§3, §12.2) | `src/session/*` | public |
 | v2 DTOs, routes, handlers, OpenAPI (§6, §7, §10, §11) | `src/api/rest/*` | public |
 | retention knobs, metrics (§9) | `src/infrastructure/*`, `src/api/rest/limits.rs` pattern | internal |
 | every error (§11) | `src/utils/error.rs` — `ChainError` | public |
+
+The domain expiry types stay `pub(crate)` on purpose. Publishing them would put
+`chrono_tz::Tz`, `chrono::Weekday` and `chrono::NaiveTime` into this crate's
+public API, and a `chrono-tz` major bump would then be a breaking change for
+IronCondor — repeating, voluntarily, the upstream-type leak that §12.1 already
+has to carry an exception for. The session layer therefore owns the public,
+primitive-typed representation (`timezone` as a string, `expiration_time` as
+`"HH:MM:SS"`) and converts into the domain types at the same boundary that
+already does the f64 → typed conversion.
 
 ---
 
@@ -170,21 +180,12 @@ than a silently ignored one:
 
 | field | meaning |
 |---|---|
-| `rule_id` | client-supplied stable identifier, unique within the simulation; becomes the label on every chain the rule produces. 1 to 64 characters matching `[A-Za-z0-9_-]+` |
+| `rule_id` | client-supplied stable identifier, unique within the simulation; becomes the label on every chain the rule produces. Constrained to `[A-Za-z0-9_-]`, 1–64 characters — it is echoed on every chain of every step and joined into a single CSV column with `\|` (§10.2), so a separator or a quote inside an id would corrupt that column |
 | `kind` | `daily` \| `weekly` \| `monthly` \| `yearly` |
 | `target_count` | how many non-expired expirations the rule keeps available at every step (`>= 1`) |
 | `weekdays` | `weekly` only — non-empty set of weekdays |
 | `weekday` | `monthly` / `yearly` only — the weekday whose **last** occurrence in the period expires |
 | `month` | `yearly` only — the month whose last `weekday` expires (default `12`) |
-
-The `rule_id` charset is deliberately narrow. Labels are joined with `|` in the
-CSV export (§10.1), and an identifier free to contain `|`, a comma, a quote, or
-a control character would make two distinct label sets serialise to the same
-cell. Restricting the identifier at the boundary — a `400` naming the offending
-`rule_id`, not a silent rewrite — keeps that encoding unambiguous without an
-escaping scheme the export format would then have to carry. The same constraint
-makes a `rule_id` safe to use as a column name or a file-name fragment
-downstream.
 
 The schedule as a whole carries the timezone, the expiration time of day, and
 the calendar version:
@@ -196,16 +197,10 @@ the calendar version:
 | `calendar` | calendar policy version — `weekdays_v1` is the only accepted value today, and it is persisted so a future version cannot silently change a stored simulation's tape |
 | `tzdb_version` | **resolved, not accepted** — the IANA time zone database the binary was built against (`chrono_tz::IANA_TZDB_VERSION`, e.g. `2025b`), persisted and echoed |
 
-`tzdb_version` is an output. Every expiration instant is a local wall-clock time
-resolved through the IANA database bundled by `chrono-tz`, so a tzdb release
-that moves a zone's offsets or DST transitions moves the instants too — the same
-recorded inputs would produce a different tape after a dependency bump, with
-nothing in the response to show why. Recording the release the run was produced
-under makes that visible: a client replaying against a response whose
-`tzdb_version` differs from the one the service now reports knows the
-identical-tape guarantee does not cover it, before comparing a single row. The
-service does not accept the field on creation and does not attempt to emulate an
-older database.
+`tzdb_version` is the one schedule field a client cannot supply: the timezone
+rules that turn `expiration_time` into an instant come from the database
+compiled into the binary, so the service resolves it, persists it and echoes it
+rather than accepting it. §8 explains why it belongs on the replay-input list.
 
 ### 4.2 `weekdays_v1`
 
@@ -269,7 +264,8 @@ simulation:
 - an unknown or unparseable IANA timezone;
 - an unparseable or out-of-range `expiration_time`;
 - a `calendar` other than `weekdays_v1`;
-- a duplicate `rule_id`;
+- a `rule_id` that is empty, longer than 64 characters, carries a character
+  outside `[A-Za-z0-9_-]`, or is duplicated;
 - `target_count == 0`, or above the configured cap (§9.3);
 - a `weekly` rule with an empty `weekdays` set, or naming Saturday/Sunday;
 - a `monthly` / `yearly` rule naming a weekend `weekday`, or a `month` outside
@@ -420,10 +416,10 @@ Invariants a reviewer can check:
 
 > A v2 simulation's complete tape is reproduced exactly by re-creating it with
 > the same **effective seed**, **effective start**, **step interval**,
-> **time frame**, **timezone**, **calendar version**, **normalised schedules**,
-> **tzdb version**, and market and chain parameters (`symbol`, `steps`, `initial_price`,
-> `volatility`, `risk_free_rate`, `dividend_yield`, `method`, `chain_size`,
-> `strike_interval`, `skew_slope`, `smile_curve`, `spread`).
+> **time frame**, **timezone**, **calendar version**, **IANA tzdb version**,
+> **normalised schedules**, and market and chain parameters (`symbol`, `steps`,
+> `initial_price`, `volatility`, `risk_free_rate`, `dividend_yield`, `method`,
+> `chain_size`, `strike_interval`, `skew_slope`, `smile_curve`, `spread`).
 
 That list is exhaustive and is meant to be checkable. All of it is resolved once
 at creation, persisted, and echoed in the creation and session responses — so a
@@ -431,12 +427,17 @@ client that records the creation response can reproduce the run without having
 recorded the request.  This extends the existing v1 effective-seed contract
 rather than replacing it.
 
-The one input the client cannot supply is `tzdb_version` (§4.1): the timezone
-rules that turn `expiration_time` into an instant come from the database
-compiled into the binary. It is recorded and echoed with the rest, so a replay
-under a different tzdb release is detectable rather than a silent divergence —
-the guarantee above holds for a given `tzdb_version`, and the field is what
-makes that qualifier checkable.
+**Why the tzdb version is on that list.** Every `expires_at` is a function of
+the IANA rules compiled into the binary, and `chrono-tz` ships tzdb updates in
+*patch* releases while the workspace pins `major.minor` and does not commit
+`Cargo.lock`. Two builds of the same commit can therefore embed different data.
+That is theoretical for `America/New_York` and entirely real for zones such as
+`Africa/Cairo` or `Asia/Jerusalem`, which change DST rules on weeks of notice.
+Versioning `weekdays_v1` while leaving the larger source of calendar truth
+unversioned would be a false guarantee, so the effective tzdb release
+(`chrono_tz::IANA_TZDB_VERSION`, e.g. `"2025b"`) is persisted and echoed like
+the seed. A replay against a different tzdb is still a replay — it is just one
+the client can now detect.
 
 Three properties keep the guarantee honest, and each is a test in the issues
 that implement it:
@@ -503,9 +504,14 @@ adds caps so that a single request cannot ask for unbounded work:
 |---|---|
 | `OCS_MAX_SCHEDULES` | rules per simulation |
 | `OCS_MAX_TARGET_COUNT` | `target_count` of one rule |
-| `OCS_MAX_EXPIRATIONS_PER_SNAPSHOT` | deduplicated chains in one snapshot |
+| `OCS_MAX_EXPIRATIONS_PER_SNAPSHOT` | expirations in one snapshot, enforced at schedule validation on the **pre-deduplication** sum of every rule's `target_count` |
 | `OCS_MAX_EXPORT_ROWS` | rows one export may produce |
 | v2 session idle TTL, factor-tape and snapshot cache capacities | §9.1, §9.2 |
+
+The pre-deduplication sum is the tight upper bound on how many chains a snapshot
+can hold, and checking it at construction keeps the rejection deterministic: a
+post-deduplication check would accept or reject the same schedule depending on
+which dates happened to coincide at the instant it was evaluated.
 
 Breaching a request-shaped cap is a `400` naming the offending field; breaching
 `OCS_MAX_EXPORT_ROWS` is a `400` naming the range. Every knob is documented in
