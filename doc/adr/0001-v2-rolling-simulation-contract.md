@@ -68,8 +68,8 @@ domain.
 
 | concern | home | visibility |
 |---|---|---|
-| expiry rules, schedule, planner (§4, §5) | `src/domain/expiry.rs` | `pub(crate)` inside the private `domain` |
-| public representation of a schedule (§4.1) | `src/session/*` | public, converts into the domain types |
+| expiry **configuration** types (§4.1) | `src/domain/expiry.rs` | `pub`, re-exported through `session` |
+| expiry **planner** — projection, dedupe, DST (§4, §5) | `src/domain/expiry.rs` | `pub(crate)`, never leaves the crate |
 | factor tape (§8) | `src/domain/factors.rs` | `pub(crate)` |
 | snapshot aggregate (§7) | `src/domain/series.rs` | `pub(crate)` |
 | v2 parameters, session, stores (§3, §12.2) | `src/session/*` | public |
@@ -77,14 +77,26 @@ domain.
 | retention knobs, metrics (§9) | `src/infrastructure/*`, `src/api/rest/limits.rs` pattern | internal |
 | every error (§11) | `src/utils/error.rs` — `ChainError` | public |
 
-The domain expiry types stay `pub(crate)` on purpose. Publishing them would put
-`chrono_tz::Tz`, `chrono::Weekday` and `chrono::NaiveTime` into this crate's
-public API, and a `chrono-tz` major bump would then be a breaking change for
-IronCondor — repeating, voluntarily, the upstream-type leak that §12.1 already
-has to carry an exception for. The session layer therefore owns the public,
-primitive-typed representation (`timezone` as a string, `expiration_time` as
-`"HH:MM:SS"`) and converts into the domain types at the same boundary that
-already does the f64 → typed conversion.
+The split matters. The **configuration** types — `ExpirationSchedule`,
+`ExpiryRule`, `ExpiryRuleKind`, `CalendarVersion` — are re-exported through
+`session`, because they are fields of the public `SimulationParametersV2` and a
+consumer building parameters in Rust needs to name them. The **planner** —
+`RollingPlanner`, `ActiveExpiry` — stays crate-internal: it is how snapshots get
+built, not part of anyone's contract.
+
+Publishing the configuration types puts `chrono_tz::Tz`, `chrono::Weekday` and
+`chrono::NaiveTime` into this crate's public API, so a `chrono-tz` major bump
+becomes a semver event here. That is accepted rather than overlooked: the crate
+already publishes `optionstratlib::WalkType`, `TimeFrame`, `Positive` and
+`Decimal` in `SimulationParameters`, IronCondor consumes the **REST** contract
+rather than the Rust types, and the alternative — a parallel primitive-typed
+representation in `session` — would mean two shapes, two validation paths, and a
+standing risk that they drift.
+
+What is *not* accepted is a validation bypass. The configuration types keep
+their fields private and route `Deserialize` through their validating
+constructors, so a schedule loaded from Redis is checked exactly like one built
+from a request.
 
 ---
 

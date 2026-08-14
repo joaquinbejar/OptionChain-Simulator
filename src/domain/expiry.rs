@@ -52,18 +52,23 @@
 //! exactly like one built from a request. Without that, a stored
 //! `target_count` of `1e11` would reach the projection loop.
 
-// The planner is the bottom of the v0.2.0 stack and has no in-tree caller yet:
-// issue #44 persists an `ExpirationSchedule` in the v2 session parameters and
-// #46 calls `RollingPlanner::active_at` to build each snapshot. Landing it with
-// its own tests first is what keeps every PR in the stack independently sound.
+// The planner *evaluation* half — `RollingPlanner`, `ActiveExpiry`, and their
+// helpers — has no in-tree caller yet: #46 calls `active_at` to build each
+// snapshot. The *configuration* half is already live, wired into the v2 session
+// parameters by #44.
 //
-// `expect` rather than `allow` on purpose: the moment #44 or #46 wires a caller
-// in, the expectation goes unfulfilled and CI's `-D warnings` turns it into a
-// hard error, so removing this is enforced by the compiler rather than promised
-// in a commit message.
-#![expect(
-    dead_code,
-    reason = "no in-tree caller until #44 persists the schedule and #46 calls active_at"
+// `expect` rather than `allow` on purpose: once #46 exercises the last of these
+// items the expectation goes unfulfilled, and CI's `-D warnings` turns that into
+// a hard error. Removing this line is therefore enforced by the compiler rather
+// than promised in a commit message. It is scoped to non-test builds because the
+// module's own tests already exercise the evaluation path, which would make the
+// expectation unfulfilled under `cargo test` for the wrong reason.
+#![cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the planner evaluation path has no in-tree caller until #46 builds snapshots"
+    )
 )]
 
 use crate::utils::ChainError;
@@ -97,6 +102,10 @@ pub(crate) const MAX_TARGET_COUNT: usize = 256;
 /// A plain constant for now; issue #48 turns it into an `OCS_MAX_*` knob.
 pub(crate) const MAX_EXPIRATIONS_PER_SNAPSHOT: usize = 512;
 
+/// The month a `yearly` rule expires in when the request omits it — December,
+/// the conventional LEAPS expiry month.
+pub(crate) const DEFAULT_YEARLY_MONTH: u32 = 12;
+
 /// Maximum length of a `rule_id`.
 ///
 /// Rule ids are echoed as labels on every chain of every step and are joined
@@ -114,10 +123,6 @@ const DAY_SCAN_SLACK: usize = 32;
 
 /// Upper bound on how many candidate periods a monthly or yearly rule may scan.
 const PERIOD_SCAN_SLACK: usize = 2;
-
-/// The month a `yearly` rule expires in when the request omits it — December,
-/// as ADR 0001 §4.1 specifies.
-const DEFAULT_YEARLY_MONTH: u32 = 12;
 
 /// Seconds in a day, as a `Decimal`, for the fractional days-to-expiration
 /// conversion.
@@ -143,7 +148,7 @@ pub(crate) fn tzdb_version() -> &'static str {
 /// set, so a future policy can be added without silently changing the tape of
 /// a simulation created under an older one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum CalendarVersion {
+pub enum CalendarVersion {
     /// Weekends are the only ineligible days; no exchange-holiday data is
     /// consulted. See [`CalendarVersion::eligible_date`].
     #[serde(rename = "weekdays_v1")]
@@ -165,7 +170,7 @@ impl CalendarVersion {
     /// candidates onto the same date, which is why per-rule projection counts
     /// **distinct instants** (see [`RollingPlanner::project_rule`]).
     #[must_use]
-    pub(crate) fn eligible_date(self, date: NaiveDate) -> Option<NaiveDate> {
+    pub fn eligible_date(self, date: NaiveDate) -> Option<NaiveDate> {
         match self {
             CalendarVersion::WeekdaysV1 => match date.weekday() {
                 Weekday::Sat | Weekday::Sun => None,
@@ -176,7 +181,7 @@ impl CalendarVersion {
 
     /// The stable wire name of this calendar version.
     #[must_use]
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             CalendarVersion::WeekdaysV1 => "weekdays_v1",
         }
@@ -185,13 +190,12 @@ impl CalendarVersion {
 
 /// What a rule expires on, independent of how many expirations it keeps.
 ///
-/// Serialised **internally tagged** under `kind` with `snake_case` variant
-/// names, and flattened into [`ExpiryRule`], so a stored rule reads exactly as
-/// ADR 0001 §14.2 shows it:
+/// The wire form is flat and tagged by `kind` — see [`ExpiryRuleWire`], which
+/// carries the serde derives so that `deny_unknown_fields` and per-kind field
+/// validity both hold. A stored rule reads exactly as ADR 0001 §14.2 shows it:
 /// `{"rule_id": "monthlies", "kind": "monthly", "target_count": 12, "weekday": "Fri"}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum ExpiryRuleKind {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpiryRuleKind {
     /// Every eligible weekday expires — the rolling 0DTE.
     Daily,
     /// Each named weekday expires. The set is non-empty and contains no
@@ -228,7 +232,7 @@ impl ExpiryRuleKind {
     /// [`ExpirationSchedule::validate`], which knows the owning rule id and can
     /// therefore name the offending field.
     #[must_use]
-    pub(crate) fn weekly(weekdays: impl IntoIterator<Item = Weekday>) -> Self {
+    pub fn weekly(weekdays: impl IntoIterator<Item = Weekday>) -> Self {
         // `chrono::Weekday` is not `Ord`, so deduplicate and order through the
         // Monday-based index, which round-trips losslessly.
         let ordered: BTreeSet<u8> = weekdays
@@ -253,26 +257,6 @@ impl ExpiryRuleKind {
         }
     }
 
-    /// The wire tag this kind serialises under.
-    ///
-    /// Nothing calls this at runtime — it exists so that adding a variant to
-    /// [`ExpiryRuleKind`] fails to compile until [`ExpiryRuleKindTag`] gains
-    /// the matching variant. Without it the two lists drift, and a kind that
-    /// serialises fine becomes a stored schedule that cannot be read back.
-    #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "compile-time exhaustiveness link")
-    )]
-    fn tag(&self) -> ExpiryRuleKindTag {
-        match self {
-            ExpiryRuleKind::Daily => ExpiryRuleKindTag::Daily,
-            ExpiryRuleKind::Weekly { .. } => ExpiryRuleKindTag::Weekly,
-            ExpiryRuleKind::Monthly { .. } => ExpiryRuleKindTag::Monthly,
-            ExpiryRuleKind::Yearly { .. } => ExpiryRuleKindTag::Yearly,
-        }
-    }
-
     /// A short, stable description of the rule kind, used in validation
     /// messages.
     #[must_use]
@@ -290,153 +274,127 @@ impl ExpiryRuleKind {
 /// expirations it keeps available at every step.
 ///
 /// Fields are private and the constructor validates, so an out-of-range
-/// `target_count` or a malformed `rule_id` is unrepresentable. `Deserialize`
-/// goes through the same constructor (see [`ExpiryRuleWire`]), which is what
-/// makes a schedule loaded from the session store as safe as one built from a
-/// request.
+/// `target_count` or a malformed `rule_id` is unrepresentable. Both directions
+/// of serde go through [`ExpiryRuleWire`], which is what makes a schedule
+/// loaded from the session store as safe as one built from a request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "ExpiryRuleWire")]
-pub(crate) struct ExpiryRule {
+#[serde(into = "ExpiryRuleWire", try_from = "ExpiryRuleWire")]
+pub struct ExpiryRule {
     rule_id: String,
-    #[serde(flatten)]
     kind: ExpiryRuleKind,
     target_count: NonZeroUsize,
 }
 
-/// Which rule kind a wire rule names, before its kind-specific fields are
-/// checked.
+/// The wire shape of [`ExpiryRule`]: flat, tagged by `kind`, and strict.
 ///
-/// Kept in step with [`ExpiryRuleKind`] by [`ExpiryRuleKind::tag`], whose
-/// exhaustive match is what breaks the build if one list gains a variant and
-/// the other does not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ExpiryRuleKindTag {
-    Daily,
-    Weekly,
-    Monthly,
-    Yearly,
-}
-
-/// The deserialization shape of [`ExpiryRule`], routed through its validating
-/// constructor by `#[serde(try_from = ...)]`.
-///
-/// The kind-specific fields are listed flat and optional rather than reached
-/// through `#[serde(flatten)]` on [`ExpiryRuleKind`], because serde does not
-/// support `deny_unknown_fields` alongside `flatten` — and that rejection is
-/// exactly what ADR 0001 §4.1 specifies. Deserialising through this shape also
-/// makes a field that belongs to *another* kind, such as `weekday` on a `daily`
-/// rule, an error naming the field instead of a silently ignored key.
-///
-/// [`ExpiryRule`] still *serialises* through the flattened, internally-tagged
-/// enum, so the stored shape is untouched. What this type accepts moves in two
-/// directions: it is narrower for a stray or foreign field, and wider for a
-/// `yearly` rule that omits `month`, which now takes the
-/// [`DEFAULT_YEARLY_MONTH`] the ADR specifies instead of failing on a missing
-/// field. An explicit `null` for a foreign field is still accepted and ignored,
-/// which is what serde's own `Option` handling does.
-#[derive(Deserialize)]
+/// The kind-specific fields are declared explicitly rather than through
+/// `#[serde(flatten)]` on an internally-tagged enum. Flattening would give the
+/// same JSON but forfeits `deny_unknown_fields` — serde cannot combine the two
+/// — and with it both guarantees ADR 0001 §4.4 makes: that an unknown field is
+/// rejected, and that a field which is not valid for the rule's `kind`
+/// (`weekdays` on a `daily` rule, `month` on a `weekly` one) is rejected rather
+/// than silently ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExpiryRuleWire {
     rule_id: String,
-    kind: ExpiryRuleKindTag,
+    kind: String,
     target_count: NonZeroUsize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     weekdays: Option<Vec<Weekday>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     weekday: Option<Weekday>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     month: Option<u32>,
+}
+
+impl From<ExpiryRule> for ExpiryRuleWire {
+    fn from(rule: ExpiryRule) -> Self {
+        let kind = rule.kind.kind_name().to_string();
+        let (weekdays, weekday, month) = match rule.kind {
+            ExpiryRuleKind::Daily => (None, None, None),
+            ExpiryRuleKind::Weekly { weekdays } => (Some(weekdays), None, None),
+            ExpiryRuleKind::Monthly { weekday } => (None, Some(weekday), None),
+            ExpiryRuleKind::Yearly { weekday, month } => (None, Some(weekday), Some(month)),
+        };
+
+        Self {
+            rule_id: rule.rule_id,
+            kind,
+            target_count: rule.target_count,
+            weekdays,
+            weekday,
+            month,
+        }
+    }
 }
 
 impl TryFrom<ExpiryRuleWire> for ExpiryRule {
     type Error = ChainError;
 
     fn try_from(wire: ExpiryRuleWire) -> Result<Self, Self::Error> {
-        // Before anything interpolates the id into an error field that a
-        // handler reflects back to the caller.
+        // Before anything interpolates the id into an error field a handler
+        // reflects back to the caller.
         validate_rule_id(&wire.rule_id)?;
-        let kind = wire.kind_from_parts()?;
-        ExpiryRule::from_parts(wire.rule_id, kind, wire.target_count)
-    }
-}
 
-impl ExpiryRuleWire {
-    /// Builds the kind, requiring the fields it owns and rejecting the ones it
-    /// does not.
-    fn kind_from_parts(&self) -> Result<ExpiryRuleKind, ChainError> {
-        let field = |name: &str| format!("schedules.{}.{name}", self.rule_id);
+        let field = |name: &str| format!("schedules.{}.{name}", wire.rule_id);
 
-        match self.kind {
-            ExpiryRuleKindTag::Daily => {
-                self.reject(&[])?;
-                Ok(ExpiryRuleKind::Daily)
-            }
-            ExpiryRuleKindTag::Weekly => {
-                self.reject(&["weekdays"])?;
-                let weekdays = self
-                    .weekdays
-                    .clone()
-                    .ok_or_else(|| ChainError::Validation {
-                        field: field("weekdays"),
-                        reason: "is required for a weekly rule".to_string(),
-                    })?;
-                Ok(ExpiryRuleKind::weekly(weekdays))
-            }
-            ExpiryRuleKindTag::Monthly => {
-                self.reject(&["weekday"])?;
-                Ok(ExpiryRuleKind::Monthly {
-                    weekday: self.require_weekday()?,
-                })
-            }
-            ExpiryRuleKindTag::Yearly => {
-                self.reject(&["weekday", "month"])?;
-                Ok(ExpiryRuleKind::Yearly {
-                    weekday: self.require_weekday()?,
-                    month: self.month.unwrap_or(DEFAULT_YEARLY_MONTH),
-                })
-            }
-        }
-    }
-
-    /// Fails when a kind-specific field outside `allowed` is present.
-    ///
-    /// A stray key is schema drift, and a schedule is persisted and replayed —
-    /// accepting it silently would let a stored simulation mean something
-    /// different from what its author wrote. The check is an allow-list over an
-    /// exhaustive destructure rather than a lookup by name, so a new
-    /// kind-specific field on this type is a compile error here instead of a
-    /// field that silently reports itself absent.
-    fn reject(&self, allowed: &[&str]) -> Result<(), ChainError> {
-        let Self {
-            rule_id: _,
-            kind: _,
-            target_count: _,
-            weekdays,
-            weekday,
-            month,
-        } = self;
-
-        let present = [
-            ("weekdays", weekdays.is_some()),
-            ("weekday", weekday.is_some()),
-            ("month", month.is_some()),
-        ];
-
-        for (name, is_present) in present {
-            if is_present && !allowed.contains(&name) {
+        // Reject a field that does not belong to this kind before building it,
+        // so a `weekdays` list on a `daily` rule is an error the client sees
+        // rather than a silently dropped intent.
+        let reject = |present: bool, name: &str| -> Result<(), ChainError> {
+            if present {
                 return Err(ChainError::Validation {
-                    field: format!("schedules.{}.{name}", self.rule_id),
-                    reason: "does not belong to this rule kind".to_string(),
+                    field: field(name),
+                    reason: format!("is not valid for a {} rule", wire.kind),
                 });
             }
-        }
-        Ok(())
-    }
+            Ok(())
+        };
 
-    /// Requires the `weekday` a monthly or yearly rule expires on.
-    fn require_weekday(&self) -> Result<Weekday, ChainError> {
-        self.weekday.ok_or_else(|| ChainError::Validation {
-            field: format!("schedules.{}.weekday", self.rule_id),
-            reason: "is required for this rule kind".to_string(),
-        })
+        let kind = match wire.kind.as_str() {
+            "daily" => {
+                reject(wire.weekdays.is_some(), "weekdays")?;
+                reject(wire.weekday.is_some(), "weekday")?;
+                reject(wire.month.is_some(), "month")?;
+                ExpiryRuleKind::Daily
+            }
+            "weekly" => {
+                reject(wire.weekday.is_some(), "weekday")?;
+                reject(wire.month.is_some(), "month")?;
+                let weekdays = wire.weekdays.ok_or_else(|| ChainError::Validation {
+                    field: field("weekdays"),
+                    reason: "is required for a weekly rule".to_string(),
+                })?;
+                ExpiryRuleKind::weekly(weekdays)
+            }
+            "monthly" => {
+                reject(wire.weekdays.is_some(), "weekdays")?;
+                reject(wire.month.is_some(), "month")?;
+                let weekday = wire.weekday.ok_or_else(|| ChainError::Validation {
+                    field: field("weekday"),
+                    reason: "is required for a monthly rule".to_string(),
+                })?;
+                ExpiryRuleKind::Monthly { weekday }
+            }
+            "yearly" => {
+                reject(wire.weekdays.is_some(), "weekdays")?;
+                let weekday = wire.weekday.ok_or_else(|| ChainError::Validation {
+                    field: field("weekday"),
+                    reason: "is required for a yearly rule".to_string(),
+                })?;
+                let month = wire.month.unwrap_or(DEFAULT_YEARLY_MONTH);
+                ExpiryRuleKind::Yearly { weekday, month }
+            }
+            other => {
+                return Err(ChainError::Validation {
+                    field: field("kind"),
+                    reason: format!("must be one of daily, weekly, monthly, yearly; got {other:?}"),
+                });
+            }
+        };
+
+        ExpiryRule::from_parts(wire.rule_id, kind, wire.target_count)
     }
 }
 
@@ -454,7 +412,7 @@ impl ExpiryRule {
     /// `schedules.<rule_id>.target_count` when the count is zero or exceeds
     /// [`MAX_TARGET_COUNT`], or `schedules.rule_id` when the id is empty, too
     /// long, or carries a character outside `[A-Za-z0-9_-]`.
-    pub(crate) fn new(
+    pub fn new(
         rule_id: impl Into<String>,
         kind: ExpiryRuleKind,
         target_count: usize,
@@ -506,20 +464,20 @@ impl ExpiryRule {
     /// The rule's stable identifier, which becomes its label on every chain it
     /// produces.
     #[must_use]
-    pub(crate) fn rule_id(&self) -> &str {
+    pub fn rule_id(&self) -> &str {
         &self.rule_id
     }
 
     /// What the rule expires on.
     #[must_use]
-    pub(crate) fn kind(&self) -> &ExpiryRuleKind {
+    pub fn kind(&self) -> &ExpiryRuleKind {
         &self.kind
     }
 
     /// How many non-expired expirations the rule keeps available, evaluated
     /// per rule and before coincident expirations are deduplicated.
     #[must_use]
-    pub(crate) fn target_count(&self) -> NonZeroUsize {
+    pub fn target_count(&self) -> NonZeroUsize {
         self.target_count
     }
 }
@@ -532,7 +490,7 @@ impl ExpiryRule {
 /// the planner can evaluate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ExpirationScheduleWire")]
-pub(crate) struct ExpirationSchedule {
+pub struct ExpirationSchedule {
     calendar: CalendarVersion,
     timezone: Tz,
     expiration_time: NaiveTime,
@@ -577,7 +535,7 @@ impl ExpirationSchedule {
     ///
     /// Returns [`ChainError::Validation`] for the first problem found; see
     /// [`ExpirationSchedule::validate`] for the full list.
-    pub(crate) fn new(
+    pub fn new(
         calendar: CalendarVersion,
         timezone: Tz,
         expiration_time: NaiveTime,
@@ -596,25 +554,25 @@ impl ExpirationSchedule {
 
     /// The calendar policy the rules are evaluated under.
     #[must_use]
-    pub(crate) fn calendar(&self) -> CalendarVersion {
+    pub fn calendar(&self) -> CalendarVersion {
         self.calendar
     }
 
     /// The IANA zone `expiration_time` is expressed in.
     #[must_use]
-    pub(crate) fn timezone(&self) -> Tz {
+    pub fn timezone(&self) -> Tz {
         self.timezone
     }
 
     /// The **local** time of day at which every rule's expirations expire.
     #[must_use]
-    pub(crate) fn expiration_time(&self) -> NaiveTime {
+    pub fn expiration_time(&self) -> NaiveTime {
         self.expiration_time
     }
 
     /// The rules, ordered by `rule_id`.
     #[must_use]
-    pub(crate) fn rules(&self) -> &[ExpiryRule] {
+    pub fn rules(&self) -> &[ExpiryRule] {
         &self.rules
     }
 
@@ -633,7 +591,7 @@ impl ExpirationSchedule {
     /// - a `rule_id` is duplicated;
     /// - the pre-deduplication sum of `target_count` exceeds
     ///   [`MAX_EXPIRATIONS_PER_SNAPSHOT`], or overflows.
-    pub(crate) fn validate(&self) -> Result<(), ChainError> {
+    pub fn validate(&self) -> Result<(), ChainError> {
         if self.rules.is_empty() {
             return Err(ChainError::Validation {
                 field: "schedules".to_string(),
@@ -2372,28 +2330,6 @@ mod tests {
                 Err(error) => panic!("must deserialize {kind:?} from {json}: {error}"),
             }
         }
-    }
-
-    /// The wire tag and the domain kind stay in step, which is what keeps a
-    /// serialised kind readable back.
-    #[test]
-    fn test_every_kind_maps_to_its_wire_tag() {
-        assert_eq!(ExpiryRuleKind::Daily.tag(), ExpiryRuleKindTag::Daily);
-        assert_eq!(
-            ExpiryRuleKind::weekly([Weekday::Mon]).tag(),
-            ExpiryRuleKindTag::Weekly
-        );
-        assert_eq!(
-            ExpiryRuleKind::Monthly {
-                weekday: Weekday::Fri
-            }
-            .tag(),
-            ExpiryRuleKindTag::Monthly
-        );
-        assert_eq!(
-            ExpiryRuleKind::yearly(Weekday::Fri).tag(),
-            ExpiryRuleKindTag::Yearly
-        );
     }
 
     /// Construction normalises the rule order by id, so the stored schedule
