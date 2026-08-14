@@ -162,7 +162,7 @@ deliberately different failure behaviour:
   degrades one request.
 - **v2 operational knobs** — `OCS_V2_RETENTION_SECS`,
   `OCS_V2_CLEANUP_INTERVAL_SECS`, `OCS_MAX_CACHED_TAPES`,
-  `OCS_MAX_CACHED_SNAPSHOTS` — are **validated at startup** and fail the
+  `OCS_MAX_CACHED_SNAPSHOTS`, `OCS_MAX_EXPORT_ROWS` — are **validated at startup** and fail the
   process with a message naming the variable. Silently reverting a
   retention window would expire simulations a client is still walking, and
   silently reverting a cache bound would change the service's memory
@@ -182,6 +182,38 @@ Eviction is never observable in what is served: both rebuild identically
 from the effective parameters, so it costs latency and nothing else. The
 sweep publishes `v2_simulations_expired_total`, and the caches publish
 `v2_tape_cache_size` and `v2_snapshot_cache_size`.
+
+### Exporting a tape
+
+`GET /api/v2/simulations/{id}/export?dataset=…&format=…&from_step=&to_step=`
+replays a simulation and streams it, which is what turns a
+walked-one-request-at-a-time simulation into something a backtester loads in
+one go.
+
+| Parameter | Values |
+|-----------|--------|
+| `dataset` | `underlying` \| `volatility` \| `option_chains` |
+| `format`  | `json` \| `csv` |
+| `from_step`, `to_step` | inclusive bounds; default to the whole tape |
+
+**Read-only in the strong sense.** The export takes an immutable snapshot of
+the effective parameters and replays from those: it never advances the
+cursor, changes the state or version, or alters what the next peek returns.
+A simulation that has never been walked exports its whole tape, a completed
+one still does, and two clients can export the same simulation at once.
+
+**Deterministic.** Repeating an export is byte-identical: every value is a
+function of the effective parameters and the cursor, timestamps render as
+whole-second RFC 3339, and numbers use shortest round-trip formatting with
+no locale. JSON is a single valid array; CSV is RFC 4180 with a header row
+and CRLF endings, and an absent optional is an **empty** field rather than
+`null` or `0`. Chain labels are joined with `|` so a shared expiration stays
+one column.
+
+The rows are produced on a blocking thread and handed over a bounded
+channel, so a long `option_chains` export never occupies an Actix worker and
+a slow client applies backpressure instead of accumulating priced chains in
+memory. `OCS_MAX_EXPORT_ROWS` bounds how many steps one request may cover.
 
 ### Request/Response Models
 

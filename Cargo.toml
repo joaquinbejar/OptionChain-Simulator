@@ -23,6 +23,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 clickhouse = { workspace = true }
+csv = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 actix-web = { workspace = true }
@@ -62,6 +63,9 @@ chrono = { version = "0.4", features = ["serde"] }
 # IANA timezone database for the v2 rolling-expiry calendar: the local
 # expiration cutoff and its DST fold/gap resolution (ADR 0001, issue #43)
 chrono-tz = { version = "0.10", features = ["serde"] }
+# RFC 4180 quoting and escaping for the v2 backtest exports, streaming into a
+# Write sink so a multi-year download stays bounded-memory (ADR 0001, issue #49)
+csv = "1.4"
 clickhouse = "0.15"
 tokio = { version = "1.52", features = ["full"] }
 async-trait = "0.1"
