@@ -104,34 +104,13 @@ pub(crate) const MAX_RULE_ID_LEN: usize = 64;
 /// A weekly rule naming one weekday needs seven days per expiration; the
 /// factor of eight plus a constant leaves room for weekends and for the
 /// starting partial week without ever letting the scan run unbounded.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 const DAY_SCAN_SLACK: usize = 32;
 
 /// Upper bound on how many candidate periods a monthly or yearly rule may scan.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 const PERIOD_SCAN_SLACK: usize = 2;
 
 /// Seconds in a day, as a `Decimal`, for the fractional days-to-expiration
 /// conversion.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 const SECONDS_PER_DAY: Decimal = Decimal::from_parts(86_400, 0, 0, false, 0);
 
 /// The version of the IANA time-zone database this binary resolves local
@@ -745,13 +724,6 @@ fn reject_weekend(field: &str, weekday: Weekday) -> Result<(), ChainError> {
 /// One physical expiration that is alive at a given simulated instant, with
 /// every rule that asked for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 pub(crate) struct ActiveExpiry {
     /// The absolute expiration instant, in UTC.
     pub(crate) expires_at: DateTime<Utc>,
@@ -760,13 +732,6 @@ pub(crate) struct ActiveExpiry {
     pub(crate) labels: Vec<String>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 impl ActiveExpiry {
     /// The fractional days remaining until this expiration at `simulated_at`.
     ///
@@ -821,35 +786,15 @@ impl ActiveExpiry {
 /// Pure: constructing a planner performs no I/O and evaluating it draws no
 /// randomness and reads no clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 pub(crate) struct RollingPlanner<'a> {
     schedule: &'a ExpirationSchedule,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 impl<'a> RollingPlanner<'a> {
     /// Builds a planner over an already-validated schedule.
     #[must_use]
     pub(crate) fn new(schedule: &'a ExpirationSchedule) -> Self {
         Self { schedule }
-    }
-
-    /// The schedule this planner evaluates.
-    #[must_use]
-    pub(crate) fn schedule(&self) -> &ExpirationSchedule {
-        self.schedule
     }
 
     /// Returns every expiration alive at `simulated_at`, in chronological
@@ -1082,13 +1027,6 @@ impl<'a> RollingPlanner<'a> {
 
 /// Builds the error a failed projection reports, naming the rule that failed.
 #[cold]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 fn projection_error(rule: &ExpiryRule, reason: String) -> ChainError {
     ChainError::Validation {
         field: format!("schedules.{}", rule.rule_id),
@@ -1100,13 +1038,6 @@ fn projection_error(rule: &ExpiryRule, reason: String) -> ChainError {
 ///
 /// Returns the failure reason rather than a `ChainError`, so the caller can
 /// attach the rule that was being projected.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 fn add_months(year: i32, month: u32, offset: u32) -> Result<(i32, u32), String> {
     let zero_based = month.checked_sub(1).ok_or("month underflows")?;
     let total = zero_based
@@ -1126,13 +1057,6 @@ fn add_months(year: i32, month: u32, offset: u32) -> Result<(i32, u32), String> 
 ///
 /// Returns the failure reason rather than a `ChainError`, so the caller can
 /// attach the rule that was being projected.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 fn add_years(year: i32, offset: u32) -> Result<i32, String> {
     let offset = i32::try_from(offset).map_err(|_| "year arithmetic overflows")?;
     year.checked_add(offset)
@@ -1144,13 +1068,6 @@ fn add_years(year: i32, offset: u32) -> Result<i32, String> {
 /// Walks back from the last day of the month to the most recent occurrence of
 /// `weekday`, so "last Friday of February 2028" lands on the 25th of a
 /// twenty-nine-day month without any special-casing.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "no in-tree caller until #46 builds snapshots from the planner"
-    )
-)]
 fn last_weekday_of_month(
     rule: &ExpiryRule,
     year: i32,
@@ -2433,9 +2350,6 @@ mod tests {
         assert_eq!(schedule.timezone(), New_York);
         assert_eq!(schedule.expiration_time(), at_1700());
         assert_eq!(schedule.rules().len(), 3);
-
-        let planner = RollingPlanner::new(&schedule);
-        assert_eq!(planner.schedule(), &schedule);
 
         let first = match schedule.rules().first() {
             Some(rule) => rule,

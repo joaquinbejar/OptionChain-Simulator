@@ -43,13 +43,6 @@ pub(crate) const DEFAULT_SKEW_SLOPE: Decimal = dec!(-0.2);
 pub(crate) const DEFAULT_SMILE_CURVE: Decimal = dec!(0.4);
 
 /// Default bid-ask spread factor.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by the v2 factor tape, which has no caller until #46"
-    )
-)]
 pub(crate) const DEFAULT_SPREAD: Decimal = dec!(0.01);
 
 /// Default upper bound on the number of random walks held in the simulation cache.

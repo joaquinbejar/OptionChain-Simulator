@@ -58,13 +58,6 @@ use tracing::{debug, instrument};
 /// One step of the market path: everything a snapshot needs that is not an
 /// option contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the factor tape has no in-tree caller until #46 builds snapshots from it"
-    )
-)]
 pub(crate) struct FactorRow {
     /// The 0-based step index this row describes.
     pub(crate) step: usize,
@@ -85,24 +78,10 @@ pub(crate) struct FactorRow {
 
 /// The ordered market path of a simulation, one row per requested step.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the factor tape has no in-tree caller until #46 builds snapshots from it"
-    )
-)]
 pub(crate) struct FactorTape {
     rows: Vec<FactorRow>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the factor tape has no in-tree caller until #46 builds snapshots from it"
-    )
-)]
 impl FactorTape {
     /// Builds the tape for `parameters`, using `method` as the resolved walk
     /// model.
@@ -229,6 +208,7 @@ impl FactorTape {
 
     /// The rows, in step order.
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by the export in #49"))]
     pub(crate) fn rows(&self) -> &[FactorRow] {
         &self.rows
     }
@@ -243,6 +223,7 @@ impl FactorTape {
     /// validated at the request boundary — but the accessor keeps clippy and
     /// callers honest.
     #[must_use]
+    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by the export in #49"))]
     pub(crate) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
@@ -356,13 +337,6 @@ fn ensure_historical_series_covers_the_horizon(
 ///
 /// Returns [`ChainError::Validation`] naming `volatility` when the two
 /// disagree.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the factor tape has no in-tree caller until #46 builds snapshots from it"
-    )
-)]
 fn resolve_base_volatility(
     parameters: &SimulationParametersV2,
     method: &SimulationMethod,
