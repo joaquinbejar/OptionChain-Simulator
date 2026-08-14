@@ -218,13 +218,14 @@ of a DST transition explicitly, via `chrono::MappedLocalTime`:
 |---|---|---|
 | normal | `Single(t)` | use `t` |
 | **fold** (clock repeats, local time occurs twice) | `Ambiguous(earlier, later)` | use **`earlier`** — the first occurrence |
-| **gap** (clock jumps, local time never occurs) | `None` | advance the **local** time by one minute at a time, up to 24 h, and use the first instant that maps; on an `Ambiguous` mapping during that probe, take `earlier` |
+| **gap** (clock jumps, local time never occurs) | `None` | use the **first instant after the gap**, read from `chrono_tz::GapInfo::new(local, tz).end` |
 
-The one-minute probe is deliberately shift-agnostic: it is correct for the
-common one-hour jump and equally correct for the 30-minute transitions used by
-zones such as `Australia/Lord_Howe`, which a fixed `+1 h` adjustment would get
-wrong. It terminates — no IANA transition exceeds 24 h — and failure to map
-within 24 h is a typed error rather than a silent fallback.
+Resolving the gap from `GapInfo` rather than by adding a fixed offset is
+deliberately shift-agnostic: it is correct for the common one-hour jump and
+equally correct for the 30-minute transitions used by zones such as
+`Australia/Lord_Howe`, which a fixed `+1 h` adjustment would get wrong. When
+`GapInfo` cannot report an end — at the limits of the known timestamp table —
+the conversion fails with a typed error rather than falling back silently.
 
 Both choices are arbitrary in the sense that either would be defensible; what
 matters is that they are fixed, documented, and tested, because the whole
@@ -818,7 +819,7 @@ holds fewer expirations than its `target_count`.
 | year boundary | projection crosses into the next year unchanged: once the 2026-01-30 monthly expires, the twelfth becomes 2027-01-29 |
 | leap year | 2028-02-25 is the last Friday of a 29-day February and is projected as such |
 | DST fold | ambiguous local 17:00 resolves to the **earlier** instant |
-| DST gap | a local time inside the gap resolves to the first mapping instant found by the one-minute probe (§4.3) |
+| DST gap | a local time inside the gap resolves to the first instant after the gap (§4.3) |
 | duplicate expiration | one chain, both labels, both rules counted |
 | invalid schedule | `400` with the offending field (§4.4) |
 
