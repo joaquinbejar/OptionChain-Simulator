@@ -122,8 +122,9 @@ impl FactorTape {
     /// Returns [`ChainError::Validation`] when the parameters are invalid, when
     /// the model's volatility disagrees with the parameters' (see
     /// [`resolve_base_volatility`]), when a `Historical` series is too short
-    /// for the horizon, or when the simulated clock overflows; and
-    /// [`ChainError::Internal`] when the resolved method is not the one the
+    /// for the horizon, when a stochastic-volatility path exceeds the 1.0 an
+    /// option chain can be priced at, or when the simulated clock overflows;
+    /// and [`ChainError::Internal`] when the resolved method is not the one the
     /// parameters name, when the initial chain cannot be built, or when the
     /// walk returns fewer points than requested.
     #[instrument(skip(parameters, method), level = "debug")]
@@ -140,6 +141,7 @@ impl FactorTape {
         ensure_method_matches(parameters, method)?;
         ensure_historical_series_covers_the_horizon(parameters, method)?;
         let base_volatility = resolve_base_volatility(parameters, method)?;
+        reject_unpriceable_volatility(base_volatility, None)?;
         let walker = Walker::new_with_seed(parameters.seed);
 
         // The walk starts from an `OptionChain` because that is the shape v1's
@@ -206,6 +208,8 @@ impl FactorTape {
                 })?,
                 None => base_volatility,
             };
+
+            reject_unpriceable_volatility(row_volatility, Some(step))?;
 
             rows.push(FactorRow {
                 step,
@@ -381,25 +385,75 @@ fn resolve_base_volatility(
     }
 }
 
-/// Builds the single option chain that seeds the walk.
+/// Rejects a volatility no option chain can be priced at.
 ///
-/// Mirrors v1's wiring in [`crate::domain::Simulator`] and the shared defaults,
-/// with one deliberate difference: the expiration is nominal here (see below),
-/// where v1 passes the request's `days_to_expiration`. That changes the strike
-/// ladder when `strike_interval` is `None`, because upstream derives it from
-/// the expiration — but not the walk's starting point, which is the chain's
-/// `underlying_price` and is copied verbatim from the price parameters. So the
-/// price path is the one v1 would produce for the same seed.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the factor tape has no in-tree caller until #46 builds snapshots from it"
-    )
-)]
-fn build_initial_chain(
+/// Upstream refuses anything above 1.0 annualised, so without this a run whose
+/// volatility crosses it fails with an internal error the first time a chain is
+/// built — at creation for a constant model, and halfway through the horizon
+/// for a stochastic one, at whatever step crosses first. Both become one 400
+/// naming the field, at tape build, where the whole path is in hand.
+///
+/// Rejecting rather than clamping: a clamped path is a different tape, and the
+/// seed would no longer reproduce it.
+fn reject_unpriceable_volatility(
+    volatility: Positive,
+    step: Option<usize>,
+) -> Result<(), ChainError> {
+    if volatility <= Positive::ONE {
+        return Ok(());
+    }
+
+    let found = match step {
+        Some(step) => format!("the walk reaches {volatility} at step {step}"),
+        None => format!("{volatility}"),
+    };
+    Err(ChainError::Validation {
+        field: "volatility".to_string(),
+        reason: format!(
+            "{found}, above the 1.0 maximum an option chain can be priced at; \
+             lower the model's volatility or shorten the horizon"
+        ),
+    })
+}
+
+/// Builds one option chain from a simulation's shape and a point in the market
+/// path.
+///
+/// The single place the v2 stack turns parameters into an
+/// [`OptionChainBuildParams`], so the factor tape's seeding chain and every
+/// snapshot chain apply the same defaults, the same decimal precision and the
+/// same volume — and so there is one place to look when a chain does not come
+/// out as expected.
+///
+/// Mirrors v1's wiring in [`crate::domain::Simulator`] field for field, which
+/// is what makes the seeding chain identical to the one v1 would build.
+///
+/// # A field upstream derives from the host clock
+///
+/// The chain is stamped with a `YYYY-MM-DD` expiration string that upstream
+/// computes in `ExpirationDate::get_date_string()`. For the `Days` variant that
+/// goes through `get_date_with_options(true)`, which reads `Utc::now()` and
+/// **ignores** the thread-local reference, so the stamp reflects the host's
+/// calendar rather than the simulated one and there is no upstream hook to
+/// change that.
+///
+/// Everything that reaches a price is unaffected: `get_years()` divides the
+/// `Days` value directly and `get_days()` returns it verbatim, so premiums,
+/// Greeks and the derived strike interval are pure functions of the value
+/// passed here. The stamp is therefore treated as upstream metadata that the
+/// v2 surface does not expose — the authoritative expiration a client sees is
+/// the absolute `expires_at` the planner produced.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Internal`] when the default spread is not a valid
+/// `Positive` — unreachable, it is a compile-time constant — or when upstream
+/// cannot build the chain.
+pub(crate) fn build_chain(
     parameters: &SimulationParametersV2,
-    base_volatility: Positive,
+    spot: Positive,
+    volatility: Positive,
+    expiration: ExpirationDate,
 ) -> Result<OptionChain, ChainError> {
     let chain_size = parameters.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE);
     let skew_slope = parameters.skew_slope.unwrap_or(DEFAULT_SKEW_SLOPE);
@@ -412,10 +466,8 @@ fn build_initial_chain(
     };
 
     let price_params = OptionDataPriceParams::new(
-        Some(Box::new(parameters.initial_price)),
-        // The seeding chain needs *a* expiration; the real ones come from the
-        // planner, per snapshot. One day keeps it well-conditioned.
-        Some(ExpirationDate::Days(Positive::ONE)),
+        Some(Box::new(spot)),
+        Some(expiration),
         Some(parameters.risk_free_rate),
         Some(parameters.dividend_yield),
         Some(parameters.symbol.clone()),
@@ -431,11 +483,31 @@ fn build_initial_chain(
         spread,
         2,
         price_params,
-        base_volatility,
+        volatility,
     );
 
     OptionChain::build_chain(&build_params)
-        .map_err(|e| ChainError::Internal(format!("Failed to build the seeding chain: {e}")))
+        .map_err(|e| ChainError::Internal(format!("Failed to build the option chain: {e}")))
+}
+
+/// Builds the single option chain that seeds the walk.
+///
+/// The seeding chain needs *an* expiration; the real ones come from the
+/// planner, per snapshot. One day keeps it well-conditioned, and the value
+/// never reaches a served price — the walk starts from the chain's
+/// `underlying_price`, which upstream copies verbatim from the price
+/// parameters, so this nominal expiry changes the seeding ladder's shape and
+/// nothing else.
+fn build_initial_chain(
+    parameters: &SimulationParametersV2,
+    base_volatility: Positive,
+) -> Result<OptionChain, ChainError> {
+    build_chain(
+        parameters,
+        parameters.initial_price,
+        base_volatility,
+        ExpirationDate::Days(Positive::ONE),
+    )
 }
 
 #[cfg(test)]
@@ -1025,6 +1097,34 @@ mod tests {
             "a row is a handful of small fields, got {} bytes",
             std::mem::size_of::<FactorRow>()
         );
+    }
+
+    /// A volatility above what a chain can be priced at is a 400 at tape build,
+    /// not a 500 halfway through the run.
+    ///
+    /// Upstream refuses to build a chain above 1.0 annualised, so without this
+    /// the first snapshot at the offending step would fail with an internal
+    /// error, and every later one that also crosses.
+    #[test]
+    fn test_a_volatility_above_one_is_rejected_when_the_tape_is_built() {
+        let mut request = request(30, brownian(1.5), 1.5);
+        request.volatility = 1.5;
+
+        let parameters = match SimulationParametersV2::try_from(request) {
+            Ok(parameters) => parameters,
+            Err(error) => panic!("the request must convert: {error}"),
+        };
+
+        match FactorTape::build(&parameters, &parameters.method) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "volatility");
+                assert!(
+                    reason.contains("1.0"),
+                    "the reason must name the cap, got {reason}"
+                );
+            }
+            other => panic!("a 1.5 volatility must be refused, got {other:?}"),
+        }
     }
 
     /// The step cap is enforced before a tape is ever built, at the request
