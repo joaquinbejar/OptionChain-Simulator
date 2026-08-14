@@ -111,6 +111,27 @@ peeks the snapshot the next advance would serve without moving the cursor.
 > codes as the old GET). Downstream consumers such as IronCondor must switch their
 > step-advancing call from `GET /api/v1/chain` to `POST /api/v1/chain/step`.
 
+### Planned: v2 rolling simulations
+
+The `v0.2.0` milestone adds a second, parallel REST surface,
+`/api/v2/simulations`, for deterministic rolling multi-expiration
+simulations: a simulated clock instead of a wall-clock timestamp, a rolling
+inventory of absolute expirations driven by versioned schedule rules
+(0DTE / weekly / monthly / yearly), and bulk JSON and CSV export of the
+complete tape.
+
+The contract is specified in
+[ADR 0001 — The v2 rolling-simulation contract](https://github.com/joaquinbejar/OptionChain-Simulator/blob/main/doc/adr/0001-v2-rolling-simulation-contract.md):
+deterministic time semantics, the `weekdays_v1` calendar, overlap and
+deduplication rules, the replay guarantee, the export dataset schemas, and
+the typed error mapping.
+
+**`/api/v1/chain` is frozen.** Its routes, DTO fields and types, wall-clock
+`timestamp` behaviour, status codes, and serve-then-advance semantics are
+byte- and behaviour-compatible across the v2 work; v2 ships as a separate
+surface with its own session type and its own stored-session schema, so
+existing clients need no changes.
+
 ### Request/Response Models
 
 #### 1. Create Session (POST /api/v1/chain)
