@@ -122,8 +122,9 @@ impl FactorTape {
     /// Returns [`ChainError::Validation`] when the parameters are invalid, when
     /// the model's volatility disagrees with the parameters' (see
     /// [`resolve_base_volatility`]), when a `Historical` series is too short
-    /// for the horizon, or when the simulated clock overflows; and
-    /// [`ChainError::Internal`] when the resolved method is not the one the
+    /// for the horizon, when a stochastic-volatility path exceeds the 1.0 an
+    /// option chain can be priced at, or when the simulated clock overflows;
+    /// and [`ChainError::Internal`] when the resolved method is not the one the
     /// parameters name, when the initial chain cannot be built, or when the
     /// walk returns fewer points than requested.
     #[instrument(skip(parameters, method), level = "debug")]
@@ -140,6 +141,7 @@ impl FactorTape {
         ensure_method_matches(parameters, method)?;
         ensure_historical_series_covers_the_horizon(parameters, method)?;
         let base_volatility = resolve_base_volatility(parameters, method)?;
+        reject_unpriceable_volatility(base_volatility, None)?;
         let walker = Walker::new_with_seed(parameters.seed);
 
         // The walk starts from an `OptionChain` because that is the shape v1's
@@ -206,6 +208,8 @@ impl FactorTape {
                 })?,
                 None => base_volatility,
             };
+
+            reject_unpriceable_volatility(row_volatility, Some(step))?;
 
             rows.push(FactorRow {
                 step,
@@ -379,6 +383,37 @@ fn resolve_base_volatility(
         }
         None => Ok(parameters.volatility),
     }
+}
+
+/// Rejects a volatility no option chain can be priced at.
+///
+/// Upstream refuses anything above 1.0 annualised, so without this a run whose
+/// volatility crosses it fails with an internal error the first time a chain is
+/// built — at creation for a constant model, and halfway through the horizon
+/// for a stochastic one, at whatever step crosses first. Both become one 400
+/// naming the field, at tape build, where the whole path is in hand.
+///
+/// Rejecting rather than clamping: a clamped path is a different tape, and the
+/// seed would no longer reproduce it.
+fn reject_unpriceable_volatility(
+    volatility: Positive,
+    step: Option<usize>,
+) -> Result<(), ChainError> {
+    if volatility <= Positive::ONE {
+        return Ok(());
+    }
+
+    let found = match step {
+        Some(step) => format!("the walk reaches {volatility} at step {step}"),
+        None => format!("{volatility}"),
+    };
+    Err(ChainError::Validation {
+        field: "volatility".to_string(),
+        reason: format!(
+            "{found}, above the 1.0 maximum an option chain can be priced at; \
+             lower the model's volatility or shorten the horizon"
+        ),
+    })
 }
 
 /// Builds one option chain from a simulation's shape and a point in the market
@@ -1062,6 +1097,34 @@ mod tests {
             "a row is a handful of small fields, got {} bytes",
             std::mem::size_of::<FactorRow>()
         );
+    }
+
+    /// A volatility above what a chain can be priced at is a 400 at tape build,
+    /// not a 500 halfway through the run.
+    ///
+    /// Upstream refuses to build a chain above 1.0 annualised, so without this
+    /// the first snapshot at the offending step would fail with an internal
+    /// error, and every later one that also crosses.
+    #[test]
+    fn test_a_volatility_above_one_is_rejected_when_the_tape_is_built() {
+        let mut request = request(30, brownian(1.5), 1.5);
+        request.volatility = 1.5;
+
+        let parameters = match SimulationParametersV2::try_from(request) {
+            Ok(parameters) => parameters,
+            Err(error) => panic!("the request must convert: {error}"),
+        };
+
+        match FactorTape::build(&parameters, &parameters.method) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "volatility");
+                assert!(
+                    reason.contains("1.0"),
+                    "the reason must name the cap, got {reason}"
+                );
+            }
+            other => panic!("a 1.5 volatility must be refused, got {other:?}"),
+        }
     }
 
     /// The step cap is enforced before a tape is ever built, at the request

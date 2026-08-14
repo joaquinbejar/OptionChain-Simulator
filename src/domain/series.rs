@@ -31,11 +31,23 @@
 //!
 //! Chains are built with `ExpirationDate::Days(fractional_dte)`, computed here
 //! from the same `(simulated_at, expires_at)` pair the planner used — never
-//! with `ExpirationDate::DateTime`. Upstream's `DateTime` variant resolves the
-//! remaining time against a thread-local reference that falls back to the wall
-//! clock, which would make every premium depend on when the request happened to
-//! arrive. Passing `Days` keeps chain building a pure function of the tape and
-//! the planner, which is what the replay guarantee rests on.
+//! with `ExpirationDate::DateTime`. Upstream's `DateTime` variant computes the
+//! remaining time against `Utc::now()` directly, which would make every premium
+//! depend on when the request happened to arrive. Passing `Days` keeps chain
+//! building a pure function of the tape and the planner, which is what the
+//! replay guarantee rests on.
+//!
+//! # The one value upstream stamps from the host clock
+//!
+//! `OptionChain::build_chain` writes a `YYYY-MM-DD` `expiration_date` string
+//! derived from `Utc::now()`, and the field is private with no setter, so it
+//! cannot be normalised here. Nothing priced depends on it — `get_days()` and
+//! `get_years()` read the `Days` value directly — and the authoritative
+//! expiration is the absolute `expires_at` the planner produced, which is what
+//! [`ExpiryChain`] carries and what #47 must put on the wire. The consequence
+//! to keep in mind is narrow but real: two builds of the same snapshot either
+//! side of UTC midnight carry different stamps, so the raw upstream chain must
+//! not be serialised verbatim into a response.
 
 use crate::domain::expiry::{ActiveExpiry, RollingPlanner};
 use crate::domain::factors::{FactorRow, FactorTape, build_chain};
@@ -54,9 +66,16 @@ use uuid::Uuid;
 /// Default number of snapshots held in the per-process cache.
 ///
 /// A snapshot is heavy — every strike of every live expiration — so the bound
-/// is deliberately small compared with the walk cache's. Eviction is never
-/// observable: a rebuilt snapshot is identical, because it is a pure function
-/// of the factor row and the planner.
+/// is deliberately small compared with the walk cache's. Eviction is not
+/// observable in anything served: a rebuilt snapshot prices identically,
+/// because it is a pure function of the factor row and the planner. The one
+/// value that can differ is upstream's host-clock expiration stamp (see the
+/// module docs), which no response carries.
+///
+/// The bound counts entries, not contracts, so the worst case scales with
+/// `chain_size` and the number of live expirations. Issue #62 tracks bounding
+/// it by weight, together with the per-snapshot work cap, before #47 serves
+/// any of this.
 #[cfg_attr(
     not(test),
     expect(
@@ -98,7 +117,13 @@ static MAX_CACHED_SNAPSHOTS: LazyLock<usize> =
 
 /// One live expiration at one step: when it expires, how far away that is,
 /// which rules asked for it, and its priced chain.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `PartialEq` is hand-written rather than derived, because upstream's
+/// `OptionChain: PartialEq` compares only the expiration string and the symbol
+/// — not the strikes, the premiums or the underlying price. Deriving here would
+/// give every reproducibility test a comparison that passes with completely
+/// different chains.
+#[derive(Debug, Clone)]
 #[cfg_attr(
     not(test),
     expect(
@@ -119,6 +144,24 @@ pub(crate) struct ExpiryChain {
     pub(crate) labels: Vec<String>,
     /// The priced chain, built entirely by upstream.
     pub(crate) chain: OptionChain,
+}
+
+impl PartialEq for ExpiryChain {
+    /// Compares what the simulation produced, contract by contract.
+    ///
+    /// The chain's `expiration_date` string is deliberately excluded: upstream
+    /// stamps it from the host calendar via `Utc::now()`, so including it would
+    /// make two otherwise identical snapshots differ across UTC midnight. Every
+    /// value that reaches a client — the strikes, the premiums, the Greeks and
+    /// the underlying price — is compared.
+    fn eq(&self, other: &Self) -> bool {
+        self.expires_at == other.expires_at
+            && self.days_to_expiration == other.days_to_expiration
+            && self.labels == other.labels
+            && self.chain.underlying_price == other.chain.underlying_price
+            && self.chain.symbol == other.chain.symbol
+            && self.chain.options == other.chain.options
+    }
 }
 
 /// The whole simulated market at one step.
@@ -197,17 +240,33 @@ pub(crate) struct SeriesBuilder<'a> {
 )]
 impl<'a> SeriesBuilder<'a> {
     /// Creates a builder over a simulation's parameters and its factor tape.
-    #[must_use]
-    pub(crate) fn new(parameters: &'a SimulationParametersV2, tape: &'a FactorTape) -> Self {
-        Self { parameters, tape }
+    ///
+    /// Validates the parameters, for the same reason [`FactorTape::build`]
+    /// does: `SimulationParametersV2` is public with public fields, so a caller
+    /// can assemble one that never passed a validating constructor. The
+    /// schedule cannot be invalid — its fields are private and `Deserialize`
+    /// routes through the constructor — but `chain_size` is a bare `Option`
+    /// whose cap lives only in `validate`, and it drives how many contracts
+    /// every snapshot prices. Once per builder, not once per step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Validation`] when the parameters are invalid.
+    pub(crate) fn new(
+        parameters: &'a SimulationParametersV2,
+        tape: &'a FactorTape,
+    ) -> Result<Self, ChainError> {
+        parameters.validate()?;
+        Ok(Self { parameters, tape })
     }
 
     /// Builds the snapshot at `step`.
     ///
     /// Pure: the same `(parameters, tape, step)` always produces the same
     /// snapshot, because the factor row is fixed, the planner is deterministic,
-    /// and the chains are built from the two of them with no clock and no
-    /// randomness.
+    /// and the chains are built from the two of them with no randomness and no
+    /// clock read that reaches a priced value — see the module docs for the one
+    /// stamp upstream writes from the host calendar.
     ///
     /// # Errors
     ///
@@ -419,7 +478,12 @@ impl SnapshotCache {
             let victim = self
                 .entries
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_access)
+                // The key breaks an `Instant` tie, so eviction does not depend
+                // on the map's randomised iteration order. Nothing served
+                // depends on which entry goes — a rebuild is identical — but a
+                // deterministic victim keeps the cache's behaviour reproducible
+                // under test.
+                .min_by_key(|(key, entry)| (entry.last_access, **key))
                 .map(|(key, _)| *key);
             match victim {
                 Some(key) => {
@@ -458,6 +522,28 @@ mod tests {
                 12,
             ),
         ]
+    }
+
+    /// Twelve last-Friday monthlies, the rule the isolation test watches.
+    pub(super) fn monthly_rule() -> ExpiryRule {
+        rule(
+            "monthlies",
+            ExpiryRuleKind::Monthly {
+                weekday: Weekday::Fri,
+            },
+            12,
+        )
+    }
+
+    /// One rolling 0DTE — the nearest expiration, so it is priced first.
+    pub(super) fn zero_dte_rule() -> ExpiryRule {
+        rule("zero_dte", ExpiryRuleKind::Daily, 1)
+    }
+
+    /// The reference configuration with a chosen schedule, for tests in sibling
+    /// modules.
+    pub(super) fn parameters_with_rules(schedules: Vec<ExpiryRule>) -> SimulationParametersV2 {
+        parameters(request(2, schedules))
     }
 
     fn rule(id: &str, kind: ExpiryRuleKind, count: usize) -> ExpiryRule {
@@ -526,6 +612,18 @@ mod tests {
         }
     }
 
+    /// Builds a [`SeriesBuilder`], panicking on a validation the tests never
+    /// intend to trip. The production path returns the error instead.
+    pub(super) fn builder<'a>(
+        parameters: &'a SimulationParametersV2,
+        tape: &'a FactorTape,
+    ) -> SeriesBuilder<'a> {
+        match SeriesBuilder::new(parameters, tape) {
+            Ok(builder) => builder,
+            Err(error) => panic!("the reference parameters must validate: {error}"),
+        }
+    }
+
     fn tape(parameters: &SimulationParametersV2) -> FactorTape {
         match FactorTape::build(parameters, &parameters.method) {
             Ok(tape) => tape,
@@ -538,7 +636,7 @@ mod tests {
         tape: &FactorTape,
         step: usize,
     ) -> SeriesSnapshot {
-        match SeriesBuilder::new(parameters, tape).snapshot(step) {
+        match builder(parameters, tape).snapshot(step) {
             Ok(snapshot) => snapshot,
             Err(error) => panic!("the snapshot at step {step} must build: {error}"),
         }
@@ -578,9 +676,15 @@ mod tests {
             }
             // Sixteen rule slots, but the shared dates collapse, so a snapshot
             // never carries more chains than slots and usually fewer.
+            // A bound, not a dedup check: sixteen is the fixed sum of the rule
+            // slots and the planner only ever collapses shared dates, so this
+            // catches a snapshot that grew chains from nowhere. The collapse
+            // itself is asserted at step zero below, where the coincidence is
+            // known.
             assert!(
                 snapshot.chains.len() <= 16,
-                "step {step} priced more chains than there are rule slots"
+                "step {step} priced {} chains, more than the sixteen rule slots",
+                snapshot.chains.len()
             );
         }
     }
@@ -720,7 +824,7 @@ mod tests {
         let parameters = parameters(request(3, reference_schedules()));
         let tape = tape(&parameters);
 
-        match SeriesBuilder::new(&parameters, &tape).snapshot(3) {
+        match builder(&parameters, &tape).snapshot(3) {
             Err(ChainError::NotFound(message)) => assert!(message.contains("past the end")),
             other => panic!("expected NotFound, got {other:?}"),
         }
@@ -832,7 +936,7 @@ mod tests {
     fn test_rebuilding_a_step_yields_an_identical_snapshot() {
         let parameters = parameters(request(4, reference_schedules()));
         let tape = tape(&parameters);
-        let builder = SeriesBuilder::new(&parameters, &tape);
+        let builder = builder(&parameters, &tape);
 
         match (builder.snapshot(2), builder.snapshot(2)) {
             (Ok(first), Ok(second)) => assert_eq!(first, second),
@@ -1051,7 +1155,7 @@ mod reproducibility_tests {
             ));
             for data in chain.chain.iter() {
                 rendered.push_str(&format!(
-                    "\n    k={} iv={} cb={:?} ca={:?} cm={:?} pb={:?} pa={:?} pm={:?} d={:?} g={:?}",
+                    "\n    k={} iv={} cb={:?} ca={:?} cm={:?} pb={:?} pa={:?} pm={:?} dc={:?} dp={:?} g={:?}",
                     data.strike_price,
                     data.implied_volatility,
                     data.call_bid,
@@ -1061,11 +1165,64 @@ mod reproducibility_tests {
                     data.put_ask,
                     data.put_middle,
                     data.delta_call,
+                    data.delta_put,
                     data.gamma,
                 ));
             }
         }
         rendered
+    }
+
+    /// Adding an expiration rule does not disturb the chains of the rules that
+    /// were already there.
+    ///
+    /// This is ADR 0001 §8's isolation property, at the level where it could
+    /// actually break: chain building draws no randomness, so a client may add,
+    /// remove or reorder rules and still compare two runs. The 0DTE rule is
+    /// added deliberately — chains are built in chronological order, so it is
+    /// built **first**, and anything it consumed would shift every monthly
+    /// chain built after it.
+    #[test]
+    fn test_adding_a_rule_leaves_the_other_chains_untouched() {
+        let baseline = parameters_with_rules(vec![monthly_rule()]);
+        let extended = parameters_with_rules(vec![monthly_rule(), zero_dte_rule()]);
+
+        let baseline_tape = test_tape(&baseline);
+        let extended_tape = test_tape(&extended);
+
+        let baseline_snapshot = match builder(&baseline, &baseline_tape).snapshot(1) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("the baseline snapshot must build: {error}"),
+        };
+        let extended_snapshot = match builder(&extended, &extended_tape).snapshot(1) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("the extended snapshot must build: {error}"),
+        };
+
+        assert_eq!(
+            baseline_snapshot.spot, extended_snapshot.spot,
+            "the price path must not depend on the schedule"
+        );
+
+        let monthlies = |snapshot: &SeriesSnapshot| -> Vec<ExpiryChain> {
+            snapshot
+                .chains
+                .iter()
+                .filter(|chain| chain.labels.iter().any(|label| label == "monthlies"))
+                .cloned()
+                .collect()
+        };
+
+        let before = monthlies(&baseline_snapshot);
+        let after = monthlies(&extended_snapshot);
+        assert!(
+            !before.is_empty(),
+            "the baseline must price a monthly chain"
+        );
+        assert_eq!(
+            before, after,
+            "adding a 0DTE rule must not change the monthly chains"
+        );
     }
 
     /// The same seed reproduces every value the v2 surface exposes: timestamps,
@@ -1079,11 +1236,11 @@ mod reproducibility_tests {
         let second_tape = test_tape(&second);
 
         for step in 0..first_tape.len() {
-            let left = match SeriesBuilder::new(&first, &first_tape).snapshot(step) {
+            let left = match builder(&first, &first_tape).snapshot(step) {
                 Ok(snapshot) => snapshot,
                 Err(error) => panic!("the snapshot must build: {error}"),
             };
-            let right = match SeriesBuilder::new(&second, &second_tape).snapshot(step) {
+            let right = match builder(&second, &second_tape).snapshot(step) {
                 Ok(snapshot) => snapshot,
                 Err(error) => panic!("the snapshot must build: {error}"),
             };
@@ -1102,7 +1259,7 @@ mod reproducibility_tests {
     fn test_rebuilding_reproduces_every_surfaced_value() {
         let parameters = test_parameters();
         let tape = test_tape(&parameters);
-        let builder = SeriesBuilder::new(&parameters, &tape);
+        let builder = builder(&parameters, &tape);
 
         match (builder.snapshot(1), builder.snapshot(1)) {
             (Ok(first), Ok(second)) => {
@@ -1121,11 +1278,11 @@ mod reproducibility_tests {
         let baseline_tape = test_tape(&baseline);
         let other_tape = test_tape(&other);
 
-        let left = match SeriesBuilder::new(&baseline, &baseline_tape).snapshot(1) {
+        let left = match builder(&baseline, &baseline_tape).snapshot(1) {
             Ok(snapshot) => snapshot,
             Err(error) => panic!("the snapshot must build: {error}"),
         };
-        let right = match SeriesBuilder::new(&other, &other_tape).snapshot(1) {
+        let right = match builder(&other, &other_tape).snapshot(1) {
             Ok(snapshot) => snapshot,
             Err(error) => panic!("the snapshot must build: {error}"),
         };
