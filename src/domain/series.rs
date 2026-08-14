@@ -76,13 +76,6 @@ use uuid::Uuid;
 /// `chain_size` and the number of live expirations. Issue #62 tracks bounding
 /// it by weight, together with the per-snapshot work cap, before #47 serves
 /// any of this.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots have no in-tree caller until #47 serves them over the v2 API"
-    )
-)]
 const DEFAULT_MAX_CACHED_SNAPSHOTS: usize = 256;
 
 /// Hard bound on the number of snapshots the cache may hold
@@ -92,13 +85,6 @@ const DEFAULT_MAX_CACHED_SNAPSHOTS: usize = 256;
 /// [`crate::domain::simulator`]; an unset or invalid value falls back to the
 /// default and emits a `tracing::warn!`, so a misconfiguration never aborts
 /// startup. Issue #48 folds this into the typed v2 configuration.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots have no in-tree caller until #47 serves them over the v2 API"
-    )
-)]
 static MAX_CACHED_SNAPSHOTS: LazyLock<usize> =
     LazyLock::new(|| match std::env::var("OCS_MAX_CACHED_SNAPSHOTS").ok() {
         None => DEFAULT_MAX_CACHED_SNAPSHOTS,
@@ -124,13 +110,6 @@ static MAX_CACHED_SNAPSHOTS: LazyLock<usize> =
 /// give every reproducibility test a comparison that passes with completely
 /// different chains.
 #[derive(Debug, Clone)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots have no in-tree caller until #47 serves them over the v2 API"
-    )
-)]
 pub(crate) struct ExpiryChain {
     /// The absolute expiration instant, in UTC.
     pub(crate) expires_at: DateTime<Utc>,
@@ -166,13 +145,6 @@ impl PartialEq for ExpiryChain {
 
 /// The whole simulated market at one step.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots have no in-tree caller until #47 serves them over the v2 API"
-    )
-)]
 pub(crate) struct SeriesSnapshot {
     /// The 0-based step this snapshot describes.
     pub(crate) step: usize,
@@ -187,16 +159,16 @@ pub(crate) struct SeriesSnapshot {
     pub(crate) chains: Vec<ExpiryChain>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots have no in-tree caller until #47 serves them over the v2 API"
-    )
-)]
 impl SeriesSnapshot {
     /// The chain expiring at `expires_at`, if the snapshot carries one.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the export in #49 and the cache metrics in #48"
+        )
+    )]
     pub(crate) fn chain_at(&self, expires_at: DateTime<Utc>) -> Option<&ExpiryChain> {
         self.chains
             .iter()
@@ -207,6 +179,13 @@ impl SeriesSnapshot {
     ///
     /// A rule's count is satisfied by the chains carrying its label, which is
     /// not the same as the number of chains: coincident expirations are shared.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the export in #49 and the cache metrics in #48"
+        )
+    )]
     pub(crate) fn chains_for(&self, rule_id: &str) -> impl Iterator<Item = &ExpiryChain> {
         self.chains
             .iter()
@@ -219,25 +198,11 @@ impl SeriesSnapshot {
 /// Borrows its inputs, so a caller that keeps the parameters and the tape in a
 /// session can build a snapshot per request without cloning either.
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots have no in-tree caller until #47 serves them over the v2 API"
-    )
-)]
 pub(crate) struct SeriesBuilder<'a> {
     parameters: &'a SimulationParametersV2,
     tape: &'a FactorTape,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots have no in-tree caller until #47 serves them over the v2 API"
-    )
-)]
 impl<'a> SeriesBuilder<'a> {
     /// Creates a builder over a simulation's parameters and its factor tape.
     ///
@@ -343,13 +308,6 @@ impl<'a> SeriesBuilder<'a> {
 }
 
 /// One cached snapshot together with the last time it was served.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots have no in-tree caller until #47 serves them over the v2 API"
-    )
-)]
 struct CacheEntry {
     snapshot: SeriesSnapshot,
     last_access: Instant,
@@ -365,13 +323,6 @@ struct CacheEntry {
 /// Keyed by `(simulation, step)` so one simulation's working set cannot evict
 /// another's wholesale, and so #48 can drop every entry belonging to a
 /// simulation that has gone away.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots have no in-tree caller until #47 serves them over the v2 API"
-    )
-)]
 pub(crate) struct SnapshotCache {
     entries: HashMap<(Uuid, usize), CacheEntry>,
     capacity: usize,
@@ -383,13 +334,6 @@ impl Default for SnapshotCache {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "snapshots have no in-tree caller until #47 serves them over the v2 API"
-    )
-)]
 impl SnapshotCache {
     /// Creates a cache bounded by `OCS_MAX_CACHED_SNAPSHOTS`.
     #[must_use]
@@ -412,18 +356,39 @@ impl SnapshotCache {
 
     /// The number of snapshots currently held.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the export in #49 and the cache metrics in #48"
+        )
+    )]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Whether the cache holds nothing.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the export in #49 and the cache metrics in #48"
+        )
+    )]
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// The bound this cache enforces.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the export in #49 and the cache metrics in #48"
+        )
+    )]
     pub(crate) fn capacity(&self) -> usize {
         self.capacity
     }

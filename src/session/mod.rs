@@ -18,6 +18,10 @@
 /// Ensure that all submodules or functionalities added to this module are well-documented
 /// and adhere to the established coding conventions.
 mod manager;
+/// The `manager_v2` module owns the lifecycle of v2 rolling simulations:
+/// the simulation store, the per-simulation factor tapes, and the bounded
+/// snapshot cache. It is the only thing the api layer talks to for v2.
+mod manager_v2;
 /// The `model` module is typically used to define and manage the core
 /// data structures and associated logic used by the application.
 ///
@@ -69,6 +73,7 @@ mod store;
 
 pub use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, ExpiryRule, ExpiryRuleKind};
 pub use manager::SessionManager;
+pub use manager_v2::SimulationManager;
 pub use model::{Session, SessionState, SimulationMethod, SimulationParameters};
 pub use model_v2::{SESSION_V2_SCHEMA_VERSION, SessionV2, SimulationParametersV2};
 pub use store::{

@@ -61,7 +61,9 @@ use optionchain_simulator::api::{ListenOn, start_server};
 use optionchain_simulator::infrastructure::{
     MetricsCollector, RedisClient, RedisConfig, init_mongodb,
 };
-use optionchain_simulator::session::{InRedisSessionStore, SessionManager};
+use optionchain_simulator::session::{
+    InRedisSessionStore, InRedisSimulationStore, SessionManager, SimulationManager,
+};
 use optionstratlib::utils::setup_logger_with_level;
 use std::sync::Arc;
 use tracing::info;
@@ -116,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let redis_config = RedisConfig::default();
     info!("Connecting to Redis at {}", redis_config);
     let redis_client = Arc::new(RedisClient::new(redis_config).await?);
+    let redis_client_v2 = Arc::clone(&redis_client);
     let store = Arc::new(InRedisSessionStore::new(
         redis_client,
         Some("optionchain:session:".to_string()), // Custom key prefix
@@ -129,12 +132,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a session manager
     let session_manager = Arc::new(SessionManager::new(store.clone()));
+
+    // The v2 rolling simulations live in their own Redis key space, so a v2 id
+    // can never resolve a v1 session and a v1 document is never read back as
+    // rolling configuration (ADR 0001 section 12.2).
+    let simulation_store = Arc::new(InRedisSimulationStore::new(
+        redis_client_v2,
+        None, // the documented v2 prefix
+        None, // the shared v2 retention window
+    ));
+    let simulation_manager = Arc::new(SimulationManager::new(simulation_store));
     let listen_on = ListenOn::All;
     let port = 7070;
     // Start HTTP server
     info!("Starting HTTP server at http://{}:{}", listen_on, port);
     match start_server(
         session_manager,
+        simulation_manager,
         metrics_collector,
         mongodb_repository,
         listen_on,

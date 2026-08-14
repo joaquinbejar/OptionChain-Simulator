@@ -1,6 +1,6 @@
 use crate::api::rest::models::ListenOn;
 
-use crate::session::SessionManager;
+use crate::session::{SessionManager, SimulationManager};
 use actix_web::{App, HttpServer};
 use std::sync::Arc;
 use tracing::info;
@@ -41,6 +41,7 @@ use crate::infrastructure::{MetricsCollector, MetricsMiddleware, MongoDBReposito
 /// - An error occurs while attempting to run the server.
 pub async fn start_server(
     session_manager: Arc<SessionManager>,
+    simulation_manager: Arc<SimulationManager>,
     metrics_collector: Arc<MetricsCollector>,
     mongodb_repo: Arc<MongoDBRepository>,
     listen_on: ListenOn,
@@ -57,6 +58,7 @@ pub async fn start_server(
                 configure_routes(
                     cfg,
                     session_manager.clone(),
+                    simulation_manager.clone(),
                     metrics_collector.clone(),
                     mongodb_repo.clone(),
                 )

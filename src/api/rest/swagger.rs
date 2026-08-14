@@ -9,6 +9,11 @@ use utoipa::OpenApi;
         crate::api::rest::handlers::replace_session,
         crate::api::rest::handlers::update_session,
         crate::api::rest::handlers::delete_session,
+        crate::api::rest::handlers_v2::create_simulation,
+        crate::api::rest::handlers_v2::get_simulation,
+        crate::api::rest::handlers_v2::peek_snapshot,
+        crate::api::rest::handlers_v2::advance_simulation,
+        crate::api::rest::handlers_v2::delete_simulation,
     ),
     components(
         schemas(
@@ -19,6 +24,16 @@ use utoipa::OpenApi;
             crate::api::rest::requests::UpdateSessionRequest,
             crate::api::rest::models::SessionId,
             crate::api::rest::responses::ValidationErrorResponse,
+            crate::api::rest::requests_v2::CreateSimulationRequest,
+            crate::api::rest::responses_v2::SimulationResponse,
+            crate::api::rest::responses_v2::SimulationParametersResponse,
+            crate::api::rest::responses_v2::ScheduleRuleResponse,
+            crate::api::rest::responses_v2::SnapshotResponse,
+            crate::api::rest::responses_v2::ExpiryChainResponse,
+            crate::api::rest::responses_v2::ContractResponse,
+            crate::api::rest::responses_v2::OptionQuoteResponse,
+            crate::api::rest::responses_v2::UnderlyingResponse,
+            crate::api::rest::responses_v2::CursorResponse,
         )
     ),
     tags(
@@ -185,5 +200,93 @@ mod tests {
                 "OpenAPI version should be 3.x"
             );
         }
+    }
+
+    /// The v1 OpenAPI paths and their operations are unchanged.
+    ///
+    /// ADR §12.1 freezes "every status code and OpenAPI example". #47 adds five v2
+    /// paths to the same document, so this asserts the v1 half of it: the exact set
+    /// of v1 paths, and the exact set of methods on each. A v2 addition that
+    /// accidentally renamed or dropped a v1 operation fails here.
+    #[test]
+    fn test_v1_openapi_paths_are_unchanged() {
+        let spec = match ApiDoc::openapi().to_json() {
+            Ok(json) => json,
+            Err(error) => panic!("the OpenAPI document must render: {error}"),
+        };
+        let parsed: Value = match serde_json::from_str(&spec) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("the OpenAPI document must parse: {error}"),
+        };
+        let paths = match parsed.get("paths").and_then(Value::as_object) {
+            Some(paths) => paths,
+            None => panic!("the document must carry paths"),
+        };
+
+        let mut v1_paths: Vec<&str> = paths
+            .keys()
+            .map(String::as_str)
+            .filter(|path| path.starts_with("/api/v1/"))
+            .collect();
+        v1_paths.sort_unstable();
+        assert_eq!(v1_paths, vec!["/api/v1/chain", "/api/v1/chain/step"]);
+
+        let mut chain_methods: Vec<&str> =
+            match paths.get("/api/v1/chain").and_then(Value::as_object) {
+                Some(operations) => operations.keys().map(String::as_str).collect(),
+                None => panic!("/api/v1/chain must be documented"),
+            };
+        chain_methods.sort_unstable();
+        assert_eq!(chain_methods, vec!["delete", "get", "patch", "post", "put"]);
+
+        let step_methods: Vec<&str> =
+            match paths.get("/api/v1/chain/step").and_then(Value::as_object) {
+                Some(operations) => operations.keys().map(String::as_str).collect(),
+                None => panic!("/api/v1/chain/step must be documented"),
+            };
+        assert_eq!(step_methods, vec!["post"]);
+    }
+
+    /// The v1 operations keep their documented status codes.
+    ///
+    /// The other half of §12.1's OpenAPI freeze: a cleanup that dropped the `412`
+    /// from the advance, or the `410` from either serving path, would be a silent
+    /// contract change.
+    #[test]
+    fn test_v1_openapi_status_codes_are_unchanged() {
+        let spec = match ApiDoc::openapi().to_json() {
+            Ok(json) => json,
+            Err(error) => panic!("the OpenAPI document must render: {error}"),
+        };
+        let parsed: Value = match serde_json::from_str(&spec) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("the OpenAPI document must parse: {error}"),
+        };
+
+        let codes = |path: &str, method: &str| -> Vec<String> {
+            let responses = parsed
+                .get("paths")
+                .and_then(|paths| paths.get(path))
+                .and_then(|operations| operations.get(method))
+                .and_then(|operation| operation.get("responses"))
+                .and_then(Value::as_object);
+            match responses {
+                Some(responses) => {
+                    let mut codes: Vec<String> = responses.keys().cloned().collect();
+                    codes.sort_unstable();
+                    codes
+                }
+                None => panic!("{method} {path} must document its responses"),
+            }
+        };
+
+        assert_eq!(
+            codes("/api/v1/chain/step", "post"),
+            vec!["200", "404", "409", "410", "412", "500"]
+        );
+        assert_eq!(
+            codes("/api/v1/chain", "get"),
+            vec!["200", "404", "410", "500"]
+        );
     }
 }

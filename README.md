@@ -111,26 +111,44 @@ peeks the snapshot the next advance would serve without moving the cursor.
 > codes as the old GET). Downstream consumers such as IronCondor must switch their
 > step-advancing call from `GET /api/v1/chain` to `POST /api/v1/chain/step`.
 
-### Planned: v2 rolling simulations
+### v2 rolling simulations
 
-The `v0.2.0` milestone adds a second, parallel REST surface,
-`/api/v2/simulations`, for deterministic rolling multi-expiration
-simulations: a simulated clock instead of a wall-clock timestamp, a rolling
-inventory of absolute expirations driven by versioned schedule rules
-(0DTE / weekly / monthly / yearly), and bulk JSON and CSV export of the
-complete tape.
+`/api/v2/simulations` is a second, parallel REST surface for deterministic
+rolling multi-expiration simulations: a simulated clock instead of a
+wall-clock timestamp, a rolling inventory of absolute expirations driven by
+versioned schedule rules (0DTE / weekly / monthly / yearly), and one
+snapshot per cursor position.
 
-The contract is specified in
-[ADR 0001 — The v2 rolling-simulation contract](https://github.com/joaquinbejar/OptionChain-Simulator/blob/main/doc/adr/0001-v2-rolling-simulation-contract.md):
-deterministic time semantics, the `weekdays_v1` calendar, overlap and
-deduplication rules, the replay guarantee, the export dataset schemas, and
-the typed error mapping.
+| Method | Endpoint | Action |
+|--------|----------|--------|
+| POST   | /api/v2/simulations              | Create a simulation and receive every replay input |
+| GET    | /api/v2/simulations/{id}         | Read its metadata and effective parameters |
+| GET    | /api/v2/simulations/{id}/snapshot| Peek the current snapshot (safe, repeatable) |
+| POST   | /api/v2/simulations/{id}/step    | Serve the current snapshot, then advance once |
+| DELETE | /api/v2/simulations/{id}         | Delete it and evict its cached state |
+
+**Serve-then-advance**, as in v1: a simulation with `steps = N` serves
+indices `0..N-1` over `N` calls to `/step`, and any call after that returns
+`410 Gone`. `expected_step` on the advance is a precondition — a mismatch is
+`412` with the actual cursor and consumes nothing, which is what makes a
+retry after a lost response safe. It is deliberately distinct from `409`,
+which means another writer committed first.
+
+**A v2 simulation is immutable after creation.** There is no PATCH or PUT:
+changing the seed, the start, the schedules or the chain shape changes the
+tape, so it creates a new simulation instead of mutating one.
+
+**Replay.** The creation response echoes the effective seed, effective
+start, step interval, time frame, timezone, calendar version, IANA tzdb
+release and normalised schedules — everything needed to reproduce the run
+without having kept the request. The full contract is in
+[ADR 0001](https://github.com/joaquinbejar/OptionChain-Simulator/blob/main/doc/adr/0001-v2-rolling-simulation-contract.md).
 
 **`/api/v1/chain` is frozen.** Its routes, DTO fields and types, wall-clock
-`timestamp` behaviour, status codes, and serve-then-advance semantics are
-byte- and behaviour-compatible across the v2 work; v2 ships as a separate
-surface with its own session type and its own stored-session schema, so
-existing clients need no changes.
+`timestamp` behaviour, rendered values, status codes and OpenAPI operations
+are byte- and behaviour-compatible; v2 ships as a separate surface with its
+own session type and its own stored-session schema, so existing clients
+need no changes.
 
 ### Request/Response Models
 
