@@ -25,11 +25,16 @@ docker-push: docker-build
 	docker push $(IMAGE_NAME):latest
 	@echo "pushed $(IMAGE_NAME):$(VERSION) and :latest"
 
+# Local stack: the deployable services plus the dev override (admin UIs and
+# host-published infrastructure ports).
 .PHONY: deploy
 deploy:
-	OPTIONCHAIN_VERSION=$(VERSION) docker compose -p $(PROJECT_NAME) -f Docker/docker-compose.yml up --pull always --force-recreate -d
+	OPTIONCHAIN_VERSION=$(VERSION) docker compose -p $(PROJECT_NAME) \
+		-f Docker/docker-compose.yml -f Docker/docker-compose.dev.yml \
+		up --pull always --force-recreate -d
 
-# Same stack on a swarm manager: overlay network, no build context.
+# Same stack on a swarm manager: overlay network, no build context, and never
+# the dev override (admin UIs with default credentials, published infra ports).
 .PHONY: deploy-swarm
 deploy-swarm:
 	OPTIONCHAIN_VERSION=$(VERSION) OPTIONCHAIN_NETWORK_DRIVER=overlay \
