@@ -1,0 +1,14 @@
+# The build context is the repository root (see Docker/docker-compose.yml and
+# .github/workflows/docker-publish.yml). Keep it small: the image build only
+# needs the sources, the manifests and the Makefile.
+.git
+.github
+target
+**/target
+Docker/docker-compose.yml
+*.md
+!README.md
+.idea
+.run
+.env
+.local

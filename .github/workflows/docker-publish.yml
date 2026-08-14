@@ -1,0 +1,118 @@
+name: Docker image
+
+# Publishes the service image to GitHub Packages (GHCR) exactly when the
+# `[package] version` in Cargo.toml changes on main - i.e. on the release
+# "chore: bump version" commit, not on every push. The path filter is only a
+# cheap pre-filter; the authoritative check compares the version at HEAD with
+# the version at the first parent.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+  # Manual escape hatch: republish the current Cargo.toml version (e.g. after a
+  # failed run) without touching the version.
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  version:
+    name: Detect version bump
+    runs-on: ubuntu-latest
+    outputs:
+      bumped: ${{ steps.check.outputs.bumped }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # HEAD and its first parent: enough to diff the manifest version.
+          fetch-depth: 2
+
+      - name: Compare [package] version with the previous commit
+        id: check
+        run: |
+          set -euo pipefail
+
+          # Reads `version` from the [package] table only, ignoring the
+          # versions declared in [workspace.dependencies].
+          package_version() {
+            awk '
+              /^\[package\]/ { in_pkg = 1; next }
+              /^\[/          { in_pkg = 0 }
+              in_pkg && /^version[[:space:]]*=/ {
+                gsub(/[",]/, "", $3); print $3; exit
+              }
+            ' "$1"
+          }
+
+          new="$(package_version Cargo.toml)"
+          if [ -z "$new" ]; then
+            echo "::error::could not read [package] version from Cargo.toml"
+            exit 1
+          fi
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch: publishing version ${new}"
+            bumped=true
+          elif git rev-parse --verify --quiet HEAD^ >/dev/null; then
+            git show HEAD^:Cargo.toml > /tmp/previous-Cargo.toml
+            old="$(package_version /tmp/previous-Cargo.toml)"
+            echo "previous=${old:-<none>} current=${new}"
+            if [ "$old" = "$new" ]; then
+              bumped=false
+            else
+              bumped=true
+            fi
+          else
+            # No parent commit to compare against (initial commit): treat the
+            # version as new.
+            echo "no parent commit; treating ${new} as a bump"
+            bumped=true
+          fi
+
+          echo "bumped=${bumped}" >> "$GITHUB_OUTPUT"
+          echo "version=${new}" >> "$GITHUB_OUTPUT"
+          echo "### Version ${new} (bumped: ${bumped})" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Build and push image
+    needs: version
+    if: needs.version.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # metadata-action lowercases the image name, which GHCR requires
+          # (the repository is OptionChain-Simulator).
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ needs.version.outputs.version }}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
