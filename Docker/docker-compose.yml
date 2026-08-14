@@ -49,7 +49,7 @@ version: '3.8'
 services:
   # Redis service configuration
   redis:
-    image: redis:7.4@sha256:b2b95679e3b46fb51864949ed25ea976fc3a6bcc00a40a1bc00d568cb2822e50
+    image: redis:8.10.0@sha256:344e3945a0b431c8ff1eecd58c5573538126bd756f02fc7e218ddf1fc2546366
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-password}
     volumes:
       - redis-data:/data
@@ -70,7 +70,7 @@ services:
 
   # MongoDB service configuration
   mongodb:
-    image: mongo:7.0@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703
+    image: mongo:8.0.29@sha256:de267922bc1153d923f5c9dc429f21c11faf18299080c1ce04d6d6007097fb06
     volumes:
       - mongodb-data:/data/db
       - mongodb-config:/data/configdb

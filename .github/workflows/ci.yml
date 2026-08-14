@@ -52,14 +52,14 @@ jobs:
       # so the ignored live tests authenticate successfully and can ASSERT
       # success instead of tolerating connection failures.
       mongodb:
-        image: mongo:7
+        image: mongo:8.0.29
         env:
           MONGO_INITDB_ROOT_USERNAME: admin
           MONGO_INITDB_ROOT_PASSWORD: password
         ports:
           - 27017:27017
       redis:
-        image: redis:7.4
+        image: redis:8.10.0
         ports:
           - 6379:6379
       clickhouse:
