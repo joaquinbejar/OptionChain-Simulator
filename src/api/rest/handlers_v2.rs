@@ -344,9 +344,10 @@ mod tests {
     /// Mounts the real v2 routes over an in-memory store.
     macro_rules! v2_service {
         () => {{
-            let manager = Arc::new(crate::session::SimulationManager::new(Arc::new(
-                InMemorySimulationStore::new(),
-            )));
+            let manager = Arc::new(crate::session::SimulationManager::new(
+                Arc::new(InMemorySimulationStore::new()),
+                crate::infrastructure::SimulationV2Config::default(),
+            ));
             actix_test::init_service(
                 App::new().configure(|cfg| configure_v2_routes(cfg, manager.clone())),
             )

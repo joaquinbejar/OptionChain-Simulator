@@ -24,44 +24,17 @@
 
 use crate::domain::factors::FactorTape;
 use crate::domain::series::{SeriesBuilder, SeriesSnapshot, SnapshotCache};
+use crate::infrastructure::SimulationV2Config;
 use crate::session::manager::DEFAULT_NAMESPACE;
 use crate::session::model::SessionState;
 use crate::session::store::SimulationStore;
 use crate::session::{SessionV2, SimulationParametersV2};
 use crate::utils::{ChainError, UuidGenerator};
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, info, instrument};
 use uuid::Uuid;
-
-/// Default number of factor tapes held in memory.
-///
-/// A tape is `O(steps)` four-field rows, so this bound is generous compared
-/// with the snapshot cache's. Issue #48 folds it into the typed v2
-/// configuration.
-const DEFAULT_MAX_CACHED_TAPES: usize = 64;
-
-/// Hard bound on cached factor tapes (`OCS_MAX_CACHED_TAPES`).
-///
-/// Read once via [`LazyLock`], mirroring `OCS_MAX_CACHED_WALKS`; an unset or
-/// invalid value falls back to the default and warns rather than aborting
-/// startup.
-static MAX_CACHED_TAPES: LazyLock<usize> =
-    LazyLock::new(|| match std::env::var("OCS_MAX_CACHED_TAPES").ok() {
-        None => DEFAULT_MAX_CACHED_TAPES,
-        Some(value) => match value.trim().parse::<usize>() {
-            Ok(parsed) if parsed >= 1 => parsed,
-            _ => {
-                warn!(
-                    raw = %value,
-                    default = DEFAULT_MAX_CACHED_TAPES,
-                    "invalid OCS_MAX_CACHED_TAPES; falling back to default"
-                );
-                DEFAULT_MAX_CACHED_TAPES
-            }
-        },
-    });
 
 /// The UUID v5 namespace simulations are generated under.
 ///
@@ -86,6 +59,7 @@ struct TapeEntry {
 pub struct SimulationManager {
     store: Arc<dyn SimulationStore>,
     uuid_generator: UuidGenerator,
+    config: SimulationV2Config,
     tapes: Mutex<HashMap<Uuid, TapeEntry>>,
     snapshots: Mutex<SnapshotCache>,
 }
@@ -97,13 +71,20 @@ impl SimulationManager {
     /// because it deals in `domain` types that are not part of this crate's
     /// public API. The v2 REST surface is the contract, not these signatures.
     #[must_use]
-    pub fn new(store: Arc<dyn SimulationStore>) -> Self {
+    pub fn new(store: Arc<dyn SimulationStore>, config: SimulationV2Config) -> Self {
         Self {
             store,
             uuid_generator: UuidGenerator::new(default_namespace()),
+            config,
             tapes: Mutex::new(HashMap::new()),
-            snapshots: Mutex::new(SnapshotCache::new()),
+            snapshots: Mutex::new(SnapshotCache::with_capacity(config.max_cached_snapshots)),
         }
+    }
+
+    /// The operational configuration this manager applies.
+    #[must_use]
+    pub fn config(&self) -> SimulationV2Config {
+        self.config
     }
 
     /// Creates a simulation from resolved parameters.
@@ -239,11 +220,7 @@ impl SimulationManager {
     ///
     /// Returns any storage failure.
     #[instrument(skip(self), level = "debug")]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the cleanup loop is wired by #48")
-    )]
-    pub(crate) async fn cleanup(&self) -> Result<Vec<Uuid>, ChainError> {
+    pub async fn cleanup(&self) -> Result<Vec<Uuid>, ChainError> {
         let expired = self.store.cleanup().await?;
         for id in &expired {
             self.evict(*id);
@@ -253,11 +230,7 @@ impl SimulationManager {
 
     /// The number of factor tapes currently cached.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the v2 cache metrics in #48")
-    )]
-    pub(crate) fn cached_tapes(&self) -> usize {
+    pub fn cached_tapes(&self) -> usize {
         match self.tapes.lock() {
             Ok(tapes) => tapes.len(),
             Err(poisoned) => poisoned.into_inner().len(),
@@ -266,11 +239,7 @@ impl SimulationManager {
 
     /// The number of snapshots currently cached.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the v2 cache metrics in #48")
-    )]
-    pub(crate) fn cached_snapshots(&self) -> usize {
+    pub fn cached_snapshots(&self) -> usize {
         match self.snapshots.lock() {
             Ok(snapshots) => snapshots.len(),
             Err(poisoned) => poisoned.into_inner().len(),
@@ -368,11 +337,14 @@ impl SimulationManager {
         };
 
         tapes.remove(&id);
-        // `MAX_CACHED_TAPES` is validated `>= 1` at parse time, so `- 1` cannot
-        // underflow. Evicting before the insert keeps the id being inserted out
-        // of the running for victim.
-        let max = *MAX_CACHED_TAPES;
-        debug_assert!(max >= 1, "MAX_CACHED_TAPES is validated >= 1 at parse time");
+        // The capacity is validated `>= 1` when the configuration loads, so
+        // `- 1` cannot underflow. Evicting before the insert keeps the id being
+        // inserted out of the running for victim.
+        let max = self.config.max_cached_tapes;
+        debug_assert!(
+            max >= 1,
+            "the configured capacity is validated >= 1 at load"
+        );
         while tapes.len() > max - 1 {
             let victim = tapes
                 .iter()
@@ -481,7 +453,10 @@ mod tests {
     }
 
     fn manager() -> SimulationManager {
-        SimulationManager::new(Arc::new(InMemorySimulationStore::new()))
+        SimulationManager::new(
+            Arc::new(InMemorySimulationStore::new()),
+            SimulationV2Config::default(),
+        )
     }
 
     async fn created(manager: &SimulationManager, steps: usize) -> SessionV2 {
@@ -621,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_lost_race_is_a_conflict() {
         let store = Arc::new(InMemorySimulationStore::new());
-        let manager = SimulationManager::new(store.clone());
+        let manager = SimulationManager::new(store.clone(), SimulationV2Config::default());
         let created = created(&manager, 5).await;
 
         // Advance once through the manager, then replay an advance built from
@@ -706,7 +681,7 @@ mod tests {
         let store = Arc::new(InMemorySimulationStore::with_idle_retention(
             std::time::Duration::from_secs(1),
         ));
-        let manager = SimulationManager::new(store);
+        let manager = SimulationManager::new(store, SimulationV2Config::default());
         let created = created(&manager, 5).await;
         match manager.peek(created.id).await {
             Ok(_) => {}

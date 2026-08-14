@@ -51,6 +51,7 @@
 
 use crate::domain::expiry::{ActiveExpiry, RollingPlanner};
 use crate::domain::factors::{FactorRow, FactorTape, build_chain};
+use crate::infrastructure::DEFAULT_MAX_CACHED_SNAPSHOTS;
 use crate::session::SimulationParametersV2;
 use crate::utils::ChainError;
 use chrono::{DateTime, Utc};
@@ -58,48 +59,9 @@ use optionstratlib::ExpirationDate;
 use optionstratlib::chains::chain::OptionChain;
 use positive::Positive;
 use std::collections::HashMap;
-use std::sync::LazyLock;
 use std::time::Instant;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, instrument};
 use uuid::Uuid;
-
-/// Default number of snapshots held in the per-process cache.
-///
-/// A snapshot is heavy — every strike of every live expiration — so the bound
-/// is deliberately small compared with the walk cache's. Eviction is not
-/// observable in anything served: a rebuilt snapshot prices identically,
-/// because it is a pure function of the factor row and the planner. The one
-/// value that can differ is upstream's host-clock expiration stamp (see the
-/// module docs), which no response carries.
-///
-/// The bound counts entries, not contracts, so the worst case scales with
-/// `chain_size` and the number of live expirations. Issue #62 tracks bounding
-/// it by weight, together with the per-snapshot work cap, before #47 serves
-/// any of this.
-const DEFAULT_MAX_CACHED_SNAPSHOTS: usize = 256;
-
-/// Hard bound on the number of snapshots the cache may hold
-/// (`OCS_MAX_CACHED_SNAPSHOTS`).
-///
-/// Read once via [`LazyLock`], mirroring `OCS_MAX_CACHED_WALKS` in
-/// [`crate::domain::simulator`]; an unset or invalid value falls back to the
-/// default and emits a `tracing::warn!`, so a misconfiguration never aborts
-/// startup. Issue #48 folds this into the typed v2 configuration.
-static MAX_CACHED_SNAPSHOTS: LazyLock<usize> =
-    LazyLock::new(|| match std::env::var("OCS_MAX_CACHED_SNAPSHOTS").ok() {
-        None => DEFAULT_MAX_CACHED_SNAPSHOTS,
-        Some(value) => match value.trim().parse::<usize>() {
-            Ok(parsed) if parsed >= 1 => parsed,
-            _ => {
-                warn!(
-                    raw = %value,
-                    default = DEFAULT_MAX_CACHED_SNAPSHOTS,
-                    "invalid OCS_MAX_CACHED_SNAPSHOTS; falling back to default"
-                );
-                DEFAULT_MAX_CACHED_SNAPSHOTS
-            }
-        },
-    });
 
 /// One live expiration at one step: when it expires, how far away that is,
 /// which rules asked for it, and its priced chain.
@@ -335,10 +297,15 @@ impl Default for SnapshotCache {
 }
 
 impl SnapshotCache {
-    /// Creates a cache bounded by `OCS_MAX_CACHED_SNAPSHOTS`.
+    /// Creates a cache bounded by the documented default.
+    ///
+    /// The bound is configuration, not a constant of the domain: the service
+    /// passes the operator's value through [`SnapshotCache::with_capacity`].
+    /// This constructor exists for tests and for a caller with nothing to say
+    /// about it.
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self::with_capacity(*MAX_CACHED_SNAPSHOTS)
+        Self::with_capacity(DEFAULT_MAX_CACHED_SNAPSHOTS)
     }
 
     /// Creates a cache with an explicit bound.
@@ -356,13 +323,6 @@ impl SnapshotCache {
 
     /// The number of snapshots currently held.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed by the export in #49 and the cache metrics in #48"
-        )
-    )]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
