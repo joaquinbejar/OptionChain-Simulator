@@ -37,7 +37,7 @@ deploy:
 # the dev override (admin UIs with default credentials, published infra ports).
 .PHONY: deploy-swarm
 deploy-swarm:
-	OPTIONCHAIN_VERSION=$(VERSION) OPTIONCHAIN_NETWORK_DRIVER=overlay \
+	OPTIONCHAIN_VERSION=$(VERSION) \
 		docker stack deploy --with-registry-auth -c Docker/docker-compose.yml $(PROJECT_NAME)
 
 # Default target

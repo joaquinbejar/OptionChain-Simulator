@@ -4,31 +4,55 @@ version: '3.8'
 #
 #   docker compose -f Docker/docker-compose.yml -f Docker/docker-compose.dev.yml up -d
 #
-# which is what `make deploy` runs. It adds the two admin UIs and publishes the
-# infrastructure ports on the host so the integration tests
-# (`cargo test --workspace -- --ignored`) and a psql/redis-cli/mongosh session
-# can reach them.
+# which is what `make deploy` runs. It restores everything the base file leaves
+# out because swarm rejects or ignores it:
+#
+#   - the network driver: `bridge`, since `overlay` needs a swarm manager;
+#   - `container_name`, `restart` and `depends_on`, which `docker stack deploy`
+#     drops with an "Ignoring unsupported options" warning;
+#   - the ClickHouse `ulimits` (a swarm sets nofile through the daemon's
+#     default-ulimits, not through the stack file);
+#   - the two admin UIs and the infrastructure ports on the host, so the
+#     integration tests (`cargo test --workspace -- --ignored`) and a
+#     redis-cli/mongosh session can reach them.
 #
 # NEVER include this file in `docker stack deploy` (make deploy-swarm): compose
-# profiles are not supported there, the UIs ship default admin/password
-# credentials, and under the routing mesh every published port answers on every
-# node of the cluster.
+# profiles are not supported there, and the UIs ship default admin/password
+# credentials.
 #
 # Images are pinned by immutable digest, same policy as the base file (#22).
 
 services:
   redis:
+    container_name: redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
 
   mongodb:
+    container_name: mongodb
+    restart: unless-stopped
     ports:
       - "27017:27017"
 
   clickhouse:
+    container_name: clickhouse
+    restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     ports:
       - "8123:8123"   # HTTP interface
       - "9000:9000"   # Native client (TCP)
+
+  backend:
+    container_name: backend
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - mongodb
+      - clickhouse
 
   # MongoDB Express for web-based MongoDB management (optional)
   mongo-express:
@@ -63,3 +87,8 @@ services:
       - optionchain-network
     depends_on:
       - redis
+
+networks:
+  optionchain-network:
+    # Overrides the base file's overlay: a local engine is not a swarm manager.
+    driver: bridge
