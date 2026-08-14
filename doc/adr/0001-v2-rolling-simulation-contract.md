@@ -170,12 +170,21 @@ than a silently ignored one:
 
 | field | meaning |
 |---|---|
-| `rule_id` | client-supplied stable identifier, unique within the simulation; becomes the label on every chain the rule produces |
+| `rule_id` | client-supplied stable identifier, unique within the simulation; becomes the label on every chain the rule produces. 1 to 64 characters matching `[A-Za-z0-9_-]+` |
 | `kind` | `daily` \| `weekly` \| `monthly` \| `yearly` |
 | `target_count` | how many non-expired expirations the rule keeps available at every step (`>= 1`) |
 | `weekdays` | `weekly` only — non-empty set of weekdays |
 | `weekday` | `monthly` / `yearly` only — the weekday whose **last** occurrence in the period expires |
 | `month` | `yearly` only — the month whose last `weekday` expires (default `12`) |
+
+The `rule_id` charset is deliberately narrow. Labels are joined with `|` in the
+CSV export (§10.1), and an identifier free to contain `|`, a comma, a quote, or
+a control character would make two distinct label sets serialise to the same
+cell. Restricting the identifier at the boundary — a `400` naming the offending
+`rule_id`, not a silent rewrite — keeps that encoding unambiguous without an
+escaping scheme the export format would then have to carry. The same constraint
+makes a `rule_id` safe to use as a column name or a file-name fragment
+downstream.
 
 The schedule as a whole carries the timezone, the expiration time of day, and
 the calendar version:
@@ -185,6 +194,18 @@ the calendar version:
 | `timezone` | IANA zone name (e.g. `America/New_York`), applied to every rule |
 | `expiration_time` | local time of day, `HH:MM` or `HH:MM:SS` |
 | `calendar` | calendar policy version — `weekdays_v1` is the only accepted value today, and it is persisted so a future version cannot silently change a stored simulation's tape |
+| `tzdb_version` | **resolved, not accepted** — the IANA time zone database the binary was built against (`chrono_tz::IANA_TZDB_VERSION`, e.g. `2025b`), persisted and echoed |
+
+`tzdb_version` is an output. Every expiration instant is a local wall-clock time
+resolved through the IANA database bundled by `chrono-tz`, so a tzdb release
+that moves a zone's offsets or DST transitions moves the instants too — the same
+recorded inputs would produce a different tape after a dependency bump, with
+nothing in the response to show why. Recording the release the run was produced
+under makes that visible: a client replaying against a response whose
+`tzdb_version` differs from the one the service now reports knows the
+identical-tape guarantee does not cover it, before comparing a single row. The
+service does not accept the field on creation and does not attempt to emulate an
+older database.
 
 ### 4.2 `weekdays_v1`
 
@@ -400,7 +421,7 @@ Invariants a reviewer can check:
 > A v2 simulation's complete tape is reproduced exactly by re-creating it with
 > the same **effective seed**, **effective start**, **step interval**,
 > **time frame**, **timezone**, **calendar version**, **normalised schedules**,
-> and market and chain parameters (`symbol`, `steps`, `initial_price`,
+> **tzdb version**, and market and chain parameters (`symbol`, `steps`, `initial_price`,
 > `volatility`, `risk_free_rate`, `dividend_yield`, `method`, `chain_size`,
 > `strike_interval`, `skew_slope`, `smile_curve`, `spread`).
 
@@ -409,6 +430,13 @@ at creation, persisted, and echoed in the creation and session responses — so 
 client that records the creation response can reproduce the run without having
 recorded the request.  This extends the existing v1 effective-seed contract
 rather than replacing it.
+
+The one input the client cannot supply is `tzdb_version` (§4.1): the timezone
+rules that turn `expiration_time` into an instant come from the database
+compiled into the binary. It is recorded and echoed with the rest, so a replay
+under a different tzdb release is detectable rather than a silent divergence —
+the guarantee above holds for a given `tzdb_version`, and the field is what
+makes that qualifier checkable.
 
 Three properties keep the guarantee honest, and each is a test in the issues
 that implement it:
@@ -745,6 +773,7 @@ last-Friday monthlies, all expiring at 17:00 America/New_York.
     "time_frame": "Day",
     "timezone": "America/New_York",
     "calendar": "weekdays_v1",
+    "tzdb_version": "2025b",
     "expiration_time": "17:00:00",
     "schedules": [
       { "rule_id": "monthlies","kind": "monthly", "target_count": 12, "weekday": "Fri" },
