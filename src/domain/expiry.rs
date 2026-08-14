@@ -115,6 +115,10 @@ const DAY_SCAN_SLACK: usize = 32;
 /// Upper bound on how many candidate periods a monthly or yearly rule may scan.
 const PERIOD_SCAN_SLACK: usize = 2;
 
+/// The month a `yearly` rule expires in when the request omits it — December,
+/// as ADR 0001 §4.1 specifies.
+const DEFAULT_YEARLY_MONTH: u32 = 12;
+
 /// Seconds in a day, as a `Decimal`, for the fractional days-to-expiration
 /// conversion.
 const SECONDS_PER_DAY: Decimal = Decimal::from_parts(86_400, 0, 0, false, 0);
@@ -238,6 +242,37 @@ impl ExpiryRuleKind {
         ExpiryRuleKind::Weekly { weekdays }
     }
 
+    /// Builds an [`ExpiryRuleKind::Yearly`] in the default month, so the
+    /// constructor and the `Deserialize` path agree on what "yearly without a
+    /// month" means.
+    #[must_use]
+    pub(crate) fn yearly(weekday: Weekday) -> Self {
+        ExpiryRuleKind::Yearly {
+            weekday,
+            month: DEFAULT_YEARLY_MONTH,
+        }
+    }
+
+    /// The wire tag this kind serialises under.
+    ///
+    /// Nothing calls this at runtime — it exists so that adding a variant to
+    /// [`ExpiryRuleKind`] fails to compile until [`ExpiryRuleKindTag`] gains
+    /// the matching variant. Without it the two lists drift, and a kind that
+    /// serialises fine becomes a stored schedule that cannot be read back.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "compile-time exhaustiveness link")
+    )]
+    fn tag(&self) -> ExpiryRuleKindTag {
+        match self {
+            ExpiryRuleKind::Daily => ExpiryRuleKindTag::Daily,
+            ExpiryRuleKind::Weekly { .. } => ExpiryRuleKindTag::Weekly,
+            ExpiryRuleKind::Monthly { .. } => ExpiryRuleKindTag::Monthly,
+            ExpiryRuleKind::Yearly { .. } => ExpiryRuleKindTag::Yearly,
+        }
+    }
+
     /// A short, stable description of the rule kind, used in validation
     /// messages.
     #[must_use]
@@ -268,21 +303,140 @@ pub(crate) struct ExpiryRule {
     target_count: NonZeroUsize,
 }
 
+/// Which rule kind a wire rule names, before its kind-specific fields are
+/// checked.
+///
+/// Kept in step with [`ExpiryRuleKind`] by [`ExpiryRuleKind::tag`], whose
+/// exhaustive match is what breaks the build if one list gains a variant and
+/// the other does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExpiryRuleKindTag {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
 /// The deserialization shape of [`ExpiryRule`], routed through its validating
 /// constructor by `#[serde(try_from = ...)]`.
+///
+/// The kind-specific fields are listed flat and optional rather than reached
+/// through `#[serde(flatten)]` on [`ExpiryRuleKind`], because serde does not
+/// support `deny_unknown_fields` alongside `flatten` — and that rejection is
+/// exactly what ADR 0001 §4.1 specifies. Deserialising through this shape also
+/// makes a field that belongs to *another* kind, such as `weekday` on a `daily`
+/// rule, an error naming the field instead of a silently ignored key.
+///
+/// [`ExpiryRule`] still *serialises* through the flattened, internally-tagged
+/// enum, so the stored shape is untouched. What this type accepts moves in two
+/// directions: it is narrower for a stray or foreign field, and wider for a
+/// `yearly` rule that omits `month`, which now takes the
+/// [`DEFAULT_YEARLY_MONTH`] the ADR specifies instead of failing on a missing
+/// field. An explicit `null` for a foreign field is still accepted and ignored,
+/// which is what serde's own `Option` handling does.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExpiryRuleWire {
     rule_id: String,
-    #[serde(flatten)]
-    kind: ExpiryRuleKind,
+    kind: ExpiryRuleKindTag,
     target_count: NonZeroUsize,
+    weekdays: Option<Vec<Weekday>>,
+    weekday: Option<Weekday>,
+    month: Option<u32>,
 }
 
 impl TryFrom<ExpiryRuleWire> for ExpiryRule {
     type Error = ChainError;
 
     fn try_from(wire: ExpiryRuleWire) -> Result<Self, Self::Error> {
-        ExpiryRule::from_parts(wire.rule_id, wire.kind, wire.target_count)
+        // Before anything interpolates the id into an error field that a
+        // handler reflects back to the caller.
+        validate_rule_id(&wire.rule_id)?;
+        let kind = wire.kind_from_parts()?;
+        ExpiryRule::from_parts(wire.rule_id, kind, wire.target_count)
+    }
+}
+
+impl ExpiryRuleWire {
+    /// Builds the kind, requiring the fields it owns and rejecting the ones it
+    /// does not.
+    fn kind_from_parts(&self) -> Result<ExpiryRuleKind, ChainError> {
+        let field = |name: &str| format!("schedules.{}.{name}", self.rule_id);
+
+        match self.kind {
+            ExpiryRuleKindTag::Daily => {
+                self.reject(&[])?;
+                Ok(ExpiryRuleKind::Daily)
+            }
+            ExpiryRuleKindTag::Weekly => {
+                self.reject(&["weekdays"])?;
+                let weekdays = self
+                    .weekdays
+                    .clone()
+                    .ok_or_else(|| ChainError::Validation {
+                        field: field("weekdays"),
+                        reason: "is required for a weekly rule".to_string(),
+                    })?;
+                Ok(ExpiryRuleKind::weekly(weekdays))
+            }
+            ExpiryRuleKindTag::Monthly => {
+                self.reject(&["weekday"])?;
+                Ok(ExpiryRuleKind::Monthly {
+                    weekday: self.require_weekday()?,
+                })
+            }
+            ExpiryRuleKindTag::Yearly => {
+                self.reject(&["weekday", "month"])?;
+                Ok(ExpiryRuleKind::Yearly {
+                    weekday: self.require_weekday()?,
+                    month: self.month.unwrap_or(DEFAULT_YEARLY_MONTH),
+                })
+            }
+        }
+    }
+
+    /// Fails when a kind-specific field outside `allowed` is present.
+    ///
+    /// A stray key is schema drift, and a schedule is persisted and replayed —
+    /// accepting it silently would let a stored simulation mean something
+    /// different from what its author wrote. The check is an allow-list over an
+    /// exhaustive destructure rather than a lookup by name, so a new
+    /// kind-specific field on this type is a compile error here instead of a
+    /// field that silently reports itself absent.
+    fn reject(&self, allowed: &[&str]) -> Result<(), ChainError> {
+        let Self {
+            rule_id: _,
+            kind: _,
+            target_count: _,
+            weekdays,
+            weekday,
+            month,
+        } = self;
+
+        let present = [
+            ("weekdays", weekdays.is_some()),
+            ("weekday", weekday.is_some()),
+            ("month", month.is_some()),
+        ];
+
+        for (name, is_present) in present {
+            if is_present && !allowed.contains(&name) {
+                return Err(ChainError::Validation {
+                    field: format!("schedules.{}.{name}", self.rule_id),
+                    reason: "does not belong to this rule kind".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Requires the `weekday` a monthly or yearly rule expires on.
+    fn require_weekday(&self) -> Result<Weekday, ChainError> {
+        self.weekday.ok_or_else(|| ChainError::Validation {
+            field: format!("schedules.{}.weekday", self.rule_id),
+            reason: "is required for this rule kind".to_string(),
+        })
     }
 }
 
@@ -321,6 +475,15 @@ impl ExpiryRule {
         kind: ExpiryRuleKind,
         target_count: NonZeroUsize,
     ) -> Result<Self, ChainError> {
+        // Normalise here rather than only in `ExpiryRuleKind::weekly`, so the
+        // `Deserialize` path converges on the same form: the normalised set is
+        // what gets persisted and echoed (ADR 0001 §8), and a schedule loaded
+        // from the store must not keep duplicates or an arbitrary order.
+        let kind = match kind {
+            ExpiryRuleKind::Weekly { weekdays } => ExpiryRuleKind::weekly(weekdays),
+            other => other,
+        };
+
         validate_rule_id(&rule_id)?;
         if target_count.get() > MAX_TARGET_COUNT {
             return Err(ChainError::Validation {
@@ -378,7 +541,11 @@ pub(crate) struct ExpirationSchedule {
 
 /// The deserialization shape of [`ExpirationSchedule`], routed through its
 /// validating constructor by `#[serde(try_from = ...)]`.
+///
+/// Nothing is flattened here, so the rejection ADR 0001 §4.1 specifies is the
+/// serde attribute itself.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExpirationScheduleWire {
     calendar: CalendarVersion,
     timezone: Tz,
@@ -2082,6 +2249,151 @@ mod tests {
             }
             Err(error) => panic!("must deserialize: {error}"),
         }
+    }
+
+    /// A weekday set written with duplicates and out of order loads normalised,
+    /// so the `Deserialize` path cannot smuggle a form the constructor would
+    /// never produce into the store.
+    #[test]
+    fn test_deserialization_normalises_weekly_weekdays() {
+        let json = r#"{
+            "calendar": "weekdays_v1",
+            "timezone": "America/New_York",
+            "expiration_time": "17:00:00",
+            "rules": [
+                { "rule_id": "weeklies", "kind": "weekly", "target_count": 1,
+                  "weekdays": ["Fri", "Mon", "Fri", "Wed"] }
+            ]
+        }"#;
+
+        match serde_json::from_str::<ExpirationSchedule>(json) {
+            Ok(schedule) => match schedule.rules().first().map(ExpiryRule::kind) {
+                Some(ExpiryRuleKind::Weekly { weekdays }) => assert_eq!(
+                    *weekdays,
+                    vec![Weekday::Mon, Weekday::Wed, Weekday::Fri],
+                    "the stored set must be deduplicated and Monday-first"
+                ),
+                other => panic!("must load a weekly rule, got {other:?}"),
+            },
+            Err(error) => panic!("must deserialize: {error}"),
+        }
+    }
+
+    /// An unknown key inside a rule is schema drift and is rejected by name,
+    /// as ADR 0001 §4.1 requires, rather than silently dropped.
+    #[test]
+    fn test_deserialization_rejects_an_unknown_rule_field() {
+        let json = r#"{
+            "calendar": "weekdays_v1",
+            "timezone": "America/New_York",
+            "expiration_time": "17:00:00",
+            "rules": [
+                { "rule_id": "zero_dte", "kind": "daily", "target_count": 1,
+                  "weekday": "Fri" }
+            ]
+        }"#;
+
+        match serde_json::from_str::<ExpirationSchedule>(json) {
+            Ok(schedule) => panic!("must reject the stray field, got {schedule:?}"),
+            Err(error) => assert!(
+                error.to_string().contains("weekday"),
+                "the error must name the offending field, got {error}"
+            ),
+        }
+    }
+
+    /// The same rejection at the schedule level, where nothing is flattened and
+    /// serde's own `deny_unknown_fields` does the work.
+    #[test]
+    fn test_deserialization_rejects_an_unknown_schedule_field() {
+        let json = r#"{
+            "calendar": "weekdays_v1",
+            "timezone": "America/New_York",
+            "expiration_time": "17:00:00",
+            "not_a_schedule_field": true,
+            "rules": [
+                { "rule_id": "zero_dte", "kind": "daily", "target_count": 1 }
+            ]
+        }"#;
+
+        assert!(serde_json::from_str::<ExpirationSchedule>(json).is_err());
+    }
+
+    /// A `yearly` rule may omit `month`, and it loads as December — the default
+    /// ADR 0001 §4.1 specifies, and the one
+    /// [`ExpiryRuleKind::yearly`] applies on the construction path.
+    #[test]
+    fn test_deserialization_defaults_the_yearly_month() {
+        let json = r#"{
+            "calendar": "weekdays_v1",
+            "timezone": "America/New_York",
+            "expiration_time": "17:00:00",
+            "rules": [
+                { "rule_id": "leaps", "kind": "yearly", "target_count": 1, "weekday": "Fri" }
+            ]
+        }"#;
+
+        match serde_json::from_str::<ExpirationSchedule>(json) {
+            Ok(schedule) => assert_eq!(
+                schedule.rules().first().map(ExpiryRule::kind),
+                Some(&ExpiryRuleKind::yearly(Weekday::Fri)),
+                "an omitted month must default to December on both paths"
+            ),
+            Err(error) => panic!("must deserialize: {error}"),
+        }
+    }
+
+    /// Every kind survives serialize then deserialize unchanged.
+    ///
+    /// The two directions are separate code paths — Serialize goes through the
+    /// flattened internally-tagged enum, Deserialize through
+    /// [`ExpiryRuleWire`] — so a field-name drift between them would make a
+    /// stored schedule unreadable rather than merely odd.
+    #[test]
+    fn test_every_rule_kind_survives_a_round_trip() {
+        let kinds = vec![
+            ExpiryRuleKind::Daily,
+            ExpiryRuleKind::weekly([Weekday::Mon, Weekday::Wed, Weekday::Fri]),
+            ExpiryRuleKind::Monthly {
+                weekday: Weekday::Fri,
+            },
+            ExpiryRuleKind::yearly(Weekday::Fri),
+        ];
+
+        for kind in kinds {
+            let schedule = ny_schedule(vec![rule("only", kind.clone(), 1)]);
+            let json = match serde_json::to_string(&schedule) {
+                Ok(json) => json,
+                Err(error) => panic!("must serialize {kind:?}: {error}"),
+            };
+
+            match serde_json::from_str::<ExpirationSchedule>(&json) {
+                Ok(loaded) => assert_eq!(loaded, schedule, "{kind:?} must round-trip"),
+                Err(error) => panic!("must deserialize {kind:?} from {json}: {error}"),
+            }
+        }
+    }
+
+    /// The wire tag and the domain kind stay in step, which is what keeps a
+    /// serialised kind readable back.
+    #[test]
+    fn test_every_kind_maps_to_its_wire_tag() {
+        assert_eq!(ExpiryRuleKind::Daily.tag(), ExpiryRuleKindTag::Daily);
+        assert_eq!(
+            ExpiryRuleKind::weekly([Weekday::Mon]).tag(),
+            ExpiryRuleKindTag::Weekly
+        );
+        assert_eq!(
+            ExpiryRuleKind::Monthly {
+                weekday: Weekday::Fri
+            }
+            .tag(),
+            ExpiryRuleKindTag::Monthly
+        );
+        assert_eq!(
+            ExpiryRuleKind::yearly(Weekday::Fri).tag(),
+            ExpiryRuleKindTag::Yearly
+        );
     }
 
     /// Construction normalises the rule order by id, so the stored schedule
