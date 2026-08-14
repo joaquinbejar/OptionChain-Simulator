@@ -256,7 +256,7 @@ impl ExpiryRuleKind {
     /// constructor and the `Deserialize` path agree on what "yearly without a
     /// month" means.
     #[must_use]
-    pub(crate) fn yearly(weekday: Weekday) -> Self {
+    pub fn yearly(weekday: Weekday) -> Self {
         ExpiryRuleKind::Yearly {
             weekday,
             month: DEFAULT_YEARLY_MONTH,

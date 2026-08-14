@@ -299,6 +299,10 @@ impl SimulationStore for InRedisSimulationStore {
         let id = simulation.id;
         debug!(simulation_id = %id, "Creating simulation in Redis");
 
+        // Redis only rechecks on the way out, so without this a document
+        // written invalid stays readable-but-rejected until its TTL expires.
+        simulation.validate()?;
+
         let json = Self::serialize(&simulation)?;
         let mut conn = self.client.connection_manager();
         let created: i64 = redis::Script::new(CREATE_SCRIPT)
@@ -331,6 +335,8 @@ impl SimulationStore for InRedisSimulationStore {
     ) -> Result<(), ChainError> {
         let id = simulation.id;
         debug!(simulation_id = %id, expected_version, "CAS-saving simulation to Redis");
+
+        simulation.validate()?;
 
         let json = Self::serialize(&simulation)?;
         let mut conn = self.client.connection_manager();

@@ -88,6 +88,11 @@ impl SimulationStore for InMemorySimulationStore {
     }
 
     async fn create(&self, simulation: SessionV2) -> Result<(), ChainError> {
+        // The in-memory backend serves what it was handed, so an unvalidated
+        // document would be served for the rest of the process's life without
+        // a round trip through serde ever catching it.
+        simulation.validate()?;
+
         let mut simulations = self.lock()?;
 
         if simulations.contains_key(&simulation.id) {
@@ -106,6 +111,8 @@ impl SimulationStore for InMemorySimulationStore {
         simulation: SessionV2,
         expected_version: u64,
     ) -> Result<(), ChainError> {
+        simulation.validate()?;
+
         // The whole compare-and-swap runs under the map lock, held only for
         // this synchronous section (no `.await` inside), so the read of the
         // stored revision and the conditional write are one atomic step.
@@ -165,6 +172,7 @@ mod tests {
     use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
     use crate::api::rest::requests_v2::CreateSimulationRequest;
     use crate::domain::expiry::{ExpiryRule, ExpiryRuleKind};
+    use crate::session::model::SessionState;
     use crate::session::model_v2::SimulationParametersV2;
     use crate::utils::UuidGenerator;
     use chrono::{TimeZone, Utc, Weekday};
@@ -227,6 +235,48 @@ mod tests {
         SessionV2::new(parameters, &UuidGenerator::new(namespace))
     }
 
+    /// An invalid simulation is refused on the way in.
+    ///
+    /// `SessionV2` has public, mutable fields, so a crate caller can hand the
+    /// store a document no constructor would produce. This backend never
+    /// round-trips through serde, so without the check it would keep serving
+    /// that document for the life of the process.
+    #[tokio::test]
+    async fn test_create_rejects_an_invalid_simulation() {
+        let store = InMemorySimulationStore::new();
+        let mut invalid = simulation();
+        invalid.current_step = invalid.total_steps + 1;
+
+        match store.create(invalid.clone()).await {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "current_step"),
+            other => panic!("must reject the invalid cursor, got {other:?}"),
+        }
+
+        match store.get(invalid.id).await {
+            Err(ChainError::NotFound(_)) => {}
+            other => panic!("nothing must have been stored, got {other:?}"),
+        }
+    }
+
+    /// The same refusal on the compare-and-swap path.
+    #[tokio::test]
+    async fn test_save_cas_rejects_an_invalid_simulation() {
+        let store = InMemorySimulationStore::new();
+        let original = simulation();
+        match store.create(original.clone()).await {
+            Ok(()) => {}
+            Err(error) => panic!("must create: {error}"),
+        }
+
+        let mut invalid = original.clone();
+        invalid.state = SessionState::Completed;
+
+        match store.save_cas(invalid, original.version).await {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "state"),
+            other => panic!("must reject the contradictory state, got {other:?}"),
+        }
+    }
+
     /// The reference configuration round-trips through the store unchanged.
     #[tokio::test]
     async fn test_create_then_get_round_trips_the_simulation() {
@@ -281,7 +331,10 @@ mod tests {
             Err(error) => panic!("must create: {error}"),
         }
 
+        // Advancing the cursor moves the lifecycle with it — the pair is
+        // validated on every write now.
         sim.current_step = 1;
+        sim.state = SessionState::InProgress;
         let expected = match sim.bump_version() {
             Ok(expected) => expected,
             Err(error) => panic!("must bump: {error}"),
@@ -313,6 +366,7 @@ mod tests {
 
         let mut first = sim.clone();
         first.current_step = 1;
+        first.state = SessionState::InProgress;
         let first_expected = match first.bump_version() {
             Ok(expected) => expected,
             Err(error) => panic!("must bump: {error}"),
@@ -320,6 +374,7 @@ mod tests {
 
         let mut second = sim;
         second.current_step = 1;
+        second.state = SessionState::InProgress;
         let second_expected = match second.bump_version() {
             Ok(expected) => expected,
             Err(error) => panic!("must bump: {error}"),

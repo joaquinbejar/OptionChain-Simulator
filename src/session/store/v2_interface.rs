@@ -31,9 +31,16 @@ pub trait SimulationStore: Send + Sync {
     /// clobbering a live simulation, which is what makes a fresh manager safe
     /// after a restart or on a second replica.
     ///
+    /// Implementations **must** call [`SessionV2::validate`] before writing.
+    /// `SessionV2` has public, mutable fields, so a crate caller can hand this
+    /// method a document no constructor would produce; validating on the way in
+    /// keeps the store from being the one place an invalid simulation becomes
+    /// durable.
+    ///
     /// # Errors
     ///
-    /// Returns [`ChainError::AlreadyExists`] on an id collision, or another
+    /// Returns [`ChainError::Validation`] when the simulation is invalid,
+    /// [`ChainError::AlreadyExists`] on an id collision, or another
     /// [`ChainError`] on a storage or serialization failure.
     async fn create(&self, simulation: SessionV2) -> Result<(), ChainError>;
 
@@ -45,9 +52,13 @@ pub trait SimulationStore: Send + Sync {
     /// simulation is immutable after creation and the sole mutation is the
     /// cursor advance, which must not lose a concurrent writer's work.
     ///
+    /// Implementations **must** call [`SessionV2::validate`] before writing,
+    /// for the same reason as `create`.
+    ///
     /// # Errors
     ///
-    /// Returns [`ChainError::NotFound`] when the id is absent,
+    /// Returns [`ChainError::Validation`] when the simulation is invalid,
+    /// [`ChainError::NotFound`] when the id is absent,
     /// [`ChainError::Conflict`] when the stored revision differs (the store is
     /// left untouched), or another [`ChainError`] on a backend failure.
     async fn save_cas(

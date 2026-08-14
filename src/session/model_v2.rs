@@ -19,6 +19,7 @@
 //!   simulation instead of mutating one.
 
 use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS};
+use crate::api::rest::models::validate_walk_type;
 use crate::api::rest::requests_v2::CreateSimulationRequest;
 use crate::api::rest::validation::{
     decimal_field, positive_field, strictly_positive_field, symbol_field, time_frame_field,
@@ -125,6 +126,21 @@ fn derive_step_interval_seconds(time_frame: TimeFrame) -> Result<u64, ChainError
     };
 
     Ok(seconds)
+}
+
+/// Rejects a `Positive` that is zero, naming the field.
+///
+/// `Positive` guarantees non-negative, not strictly positive, so the request
+/// path's `strictly_positive_field` check has no type-level counterpart on a
+/// value read back from the store.
+fn reject_zero(field: &str, value: Positive) -> Result<(), ChainError> {
+    if value == Positive::ZERO {
+        return Err(ChainError::Validation {
+            field: field.to_string(),
+            reason: "must be strictly positive, got 0".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Validates an explicitly-supplied step interval.
@@ -342,6 +358,22 @@ impl SimulationParametersV2 {
         }
         symbol_field("symbol", &self.symbol)?;
         validate_step_interval_seconds(self.step_interval_seconds)?;
+
+        // `Positive` admits zero, so the strict-positive constraints the
+        // request path enforces have to be rechecked here: a stored price or
+        // volatility of zero is a chain of zero-value options, and a stored
+        // `strike_interval` of zero collapses every strike onto one.
+        for (field, value) in [
+            ("initial_price", self.initial_price),
+            ("volatility", self.volatility),
+        ] {
+            reject_zero(field, value)?;
+        }
+        if let Some(strike_interval) = self.strike_interval {
+            reject_zero("strike_interval", strike_interval)?;
+        }
+        validate_walk_type(&self.method)?;
+
         if self.effective_start.nanosecond() != 0 {
             return Err(ChainError::Validation {
                 field: "effective_start".to_string(),
@@ -655,14 +687,48 @@ impl SessionV2 {
                 ),
             });
         }
+        self.validate_state()
+    }
+
+    /// Checks the lifecycle state against the cursor.
+    ///
+    /// A v2 simulation walks `Initialized` at cursor 0, `InProgress` while it
+    /// has snapshots left, and `Completed` once the cursor reaches the horizon.
+    /// Every other combination — `Completed` at step 0, `Initialized` halfway
+    /// through — is a document no code path can write, so accepting one would
+    /// let a corrupted or hand-edited simulation into the manager and serve
+    /// snapshots from a state the rest of the code assumes away.
+    fn validate_state(&self) -> Result<(), ChainError> {
+        let unreachable = |reason: String| ChainError::Validation {
+            field: "state".to_string(),
+            reason,
+        };
+
         match self.state {
-            SessionState::Modified | SessionState::Reinitialized => Err(ChainError::Validation {
-                field: "state".to_string(),
-                reason: format!(
+            SessionState::Modified | SessionState::Reinitialized | SessionState::Error => {
+                Err(unreachable(format!(
                     "{} is unreachable for a v2 simulation, which is immutable after creation",
                     self.state
-                ),
-            }),
+                )))
+            }
+            SessionState::Initialized if self.current_step != 0 => Err(unreachable(format!(
+                "{} requires a cursor of 0, got {}",
+                self.state, self.current_step
+            ))),
+            SessionState::Completed if self.current_step != self.total_steps => {
+                Err(unreachable(format!(
+                    "{} requires the cursor to have reached total_steps ({}), got {}",
+                    self.state, self.total_steps, self.current_step
+                )))
+            }
+            SessionState::InProgress
+                if self.current_step == 0 || self.current_step >= self.total_steps =>
+            {
+                Err(unreachable(format!(
+                    "{} requires a cursor between 1 and total_steps ({}) exclusive, got {}",
+                    self.state, self.total_steps, self.current_step
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -840,8 +906,7 @@ mod tests {
         let parameters = parameters(request);
 
         assert_eq!(parameters.effective_start.nanosecond(), 0);
-        // Reading it again yields the same value: it is stored, not recomputed.
-        assert_eq!(parameters.effective_start, parameters.effective_start);
+        // The start is stored, not recomputed: cursor 0 resolves back to it.
         match parameters.simulated_at(0) {
             Ok(at) => assert_eq!(at, parameters.effective_start),
             Err(error) => panic!("cursor 0 must resolve: {error}"),
@@ -1237,6 +1302,29 @@ mod tests {
             (r#""symbol":"SPX""#, r#""symbol":"SPX,\"x\"|y""#, "symbol"),
             // A chain size above the cap drives an unbounded strike ladder.
             (r#""chain_size":15"#, r#""chain_size":100000"#, "chain_size"),
+            // `Positive` admits zero, so these three survive the type and have
+            // to be rejected by the validator: a zero price or volatility is a
+            // chain of worthless options, and a zero interval collapses every
+            // strike onto one.
+            (
+                r#""initial_price":5000"#,
+                r#""initial_price":0"#,
+                "initial_price",
+            ),
+            (
+                r#""tzdb_version":"2025b","initial_price":5000,"volatility":0.18"#,
+                r#""tzdb_version":"2025b","initial_price":5000,"volatility":0"#,
+                "volatility",
+            ),
+            (
+                r#""strike_interval":25"#,
+                r#""strike_interval":0"#,
+                "strike_interval",
+            ),
+            // The walk's own invariants are not re-derived here: the stored
+            // method round-trips through the same mirror the request path
+            // validates with, so a `dt` of zero is caught by that check.
+            (r#""dt":0.004"#, r#""dt":0.0"#, "dt"),
         ];
 
         for (from, to, field) in tampers {
@@ -1302,7 +1390,7 @@ mod tests {
             Err(error) => panic!("must serialize: {error}"),
         };
 
-        for state in ["Modified", "Reinitialized"] {
+        for state in ["Modified", "Reinitialized", "Error"] {
             let tampered =
                 json.replace(r#""state":"Initialized""#, &format!(r#""state":"{state}""#));
             assert_ne!(tampered, json, "the tamper for {state} must have applied");
@@ -1312,6 +1400,58 @@ mod tests {
                 Err(error) => error.to_string(),
             };
             assert!(error.contains("state"), "got {error}");
+        }
+    }
+
+    /// A state that contradicts the cursor is refused.
+    ///
+    /// `Completed` at step 0 and `Initialized` halfway through are documents no
+    /// code path writes, so accepting one would let a corrupted simulation
+    /// serve snapshots from a state the rest of the code assumes away.
+    #[test]
+    fn test_stored_simulation_rejects_a_state_the_cursor_contradicts() {
+        let mut request = reference_request();
+        request.steps = 4;
+        let simulation = SessionV2::new(parameters(request), &generator());
+        let json = match serde_json::to_string(&simulation) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+
+        let contradictions = [
+            (
+                r#""current_step":0,"total_steps":4,"state":"Completed""#,
+                "Completed at step 0",
+            ),
+            (
+                r#""current_step":2,"total_steps":4,"state":"Initialized""#,
+                "Initialized mid-run",
+            ),
+            (
+                r#""current_step":0,"total_steps":4,"state":"InProgress""#,
+                "InProgress at step 0",
+            ),
+            (
+                r#""current_step":4,"total_steps":4,"state":"InProgress""#,
+                "InProgress at the horizon",
+            ),
+        ];
+
+        for (replacement, what) in contradictions {
+            let tampered = json.replace(
+                r#""current_step":0,"total_steps":4,"state":"Initialized""#,
+                replacement,
+            );
+            assert_ne!(tampered, json, "the tamper for {what} must have applied");
+
+            let error = match serde_json::from_str::<SessionV2>(&tampered) {
+                Ok(_) => panic!("{what} must be rejected"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("state"),
+                "{what} must name state, got {error}"
+            );
         }
     }
 
