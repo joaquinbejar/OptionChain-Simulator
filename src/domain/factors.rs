@@ -21,12 +21,19 @@
 //! Three properties, each of them tested:
 //!
 //! - **The tape is a pure function of the effective parameters.** Same seed,
-//!   same start, same model ⇒ the same rows, on any machine.
-//! - **Expiration schedules cannot perturb it.** The planner draws no
-//!   randomness and lazy chain building consumes none, so adding, removing or
-//!   reordering rules leaves every row byte-identical. This is the property
-//!   that lets a client change its expiration inventory and still compare two
-//!   runs' underlying paths.
+//!   same start, same model ⇒ the same rows, on any machine. One caveat, stated
+//!   because it is real: building the seeding chain reaches upstream code that
+//!   reads `Utc::now()` while stamping a calendar date. That value cannot reach
+//!   a row — only the chain's `underlying_price` flows into the walk, and it is
+//!   `initial_price` verbatim — so the rows stay clock-free even though the
+//!   call is not.
+//! - **Expiration schedules cannot perturb it.** `build` never reads the
+//!   schedule at all, so adding, removing or reordering rules leaves every row
+//!   byte-identical — which is what lets a client change its expiration
+//!   inventory and still compare two runs' underlying paths. The tests here
+//!   guard that cheaply; the *load-bearing* version of the property, that
+//!   building snapshots' chains cannot consume the walker's stream either,
+//!   belongs where those chains are built (#46).
 //! - **The walk kernels are the ones v1 already uses.** The tape asks the same
 //!   seeded [`Walker`] for the same `WalkParams` v1 builds, and reads the price
 //!   path from `generate_with_vol`. It does not reimplement the mathematics, so
@@ -119,6 +126,8 @@ impl FactorTape {
         parameters: &SimulationParametersV2,
         method: &SimulationMethod,
     ) -> Result<Self, ChainError> {
+        ensure_method_matches(parameters, method)?;
+        ensure_historical_series_covers_the_horizon(parameters, method)?;
         let base_volatility = resolve_base_volatility(parameters, method)?;
         let walker = Walker::new_with_seed(parameters.seed);
 
@@ -154,10 +163,13 @@ impl FactorTape {
             ChainError::Internal(format!("Failed to generate the factor tape: {e}"))
         })?;
 
-        // Upstream's first element duplicates the walk's initial value, so the
-        // path holds `steps + 1` points and row 0 is the simulation's starting
-        // state. Take exactly `steps` rows: a simulation with `steps = N` has
-        // cursors `0..N-1`.
+        // Every kernel — upstream and mirrored — pushes the initial value and
+        // then loops `1..size`, so the path holds **exactly** `size` points,
+        // element 0 duplicating the walk's initial value. Row 0 is therefore
+        // the simulation's starting state and `prices[0..steps]` consumes the
+        // whole path with no slack. The guard below is the exact bound: there
+        // is no spare element to shift into, and a `prices[1..=steps]` "fix"
+        // would truncate the tape or fail outright.
         if path.prices.len() < parameters.steps {
             return Err(ChainError::Internal(format!(
                 "the walk produced {} points but {} steps were requested",
@@ -224,6 +236,73 @@ impl FactorTape {
     }
 }
 
+/// Rejects a resolved method that is not the one the stored parameters name.
+///
+/// `build` takes the method separately so a `Historical` walk can be resolved
+/// against the database first, but that flexibility would otherwise let a
+/// caller build a `Brownian` tape for parameters that say `Heston` — a tape
+/// nothing could reproduce from the persisted replay inputs, which is precisely
+/// what ADR 0001 §8 promises. A `Historical` method is compared by variant
+/// rather than by value, because resolution is exactly what fills in its
+/// symbol and prices.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Internal`] naming both methods when they disagree.
+/// Internal rather than validation: no request can produce this, only a
+/// mis-wired caller.
+fn ensure_method_matches(
+    parameters: &SimulationParametersV2,
+    method: &SimulationMethod,
+) -> Result<(), ChainError> {
+    let agrees = match (&parameters.method, method) {
+        (SimulationMethod::Historical { .. }, SimulationMethod::Historical { .. }) => true,
+        (stored, resolved) => stored == resolved,
+    };
+
+    if agrees {
+        Ok(())
+    } else {
+        Err(ChainError::Internal(format!(
+            "the resolved walk method does not match the simulation's parameters: \
+             parameters say {:?}, the caller passed {method:?}",
+            parameters.method
+        )))
+    }
+}
+
+/// Rejects a historical series too short to cover the requested horizon.
+///
+/// Upstream's `historical` kernel errors when the embedded series is shorter
+/// than the walk, and that error would surface as a `500`. It is a client
+/// mistake — a request embedding five prices and asking for a hundred steps —
+/// so it is caught here and named, the way v1 avoids the problem entirely by
+/// refetching from the database.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Validation`] naming `method.prices`.
+fn ensure_historical_series_covers_the_horizon(
+    parameters: &SimulationParametersV2,
+    method: &SimulationMethod,
+) -> Result<(), ChainError> {
+    let SimulationMethod::Historical { prices, .. } = method else {
+        return Ok(());
+    };
+
+    if prices.len() < parameters.steps {
+        return Err(ChainError::Validation {
+            field: "method.prices".to_string(),
+            reason: format!(
+                "must carry at least one price per step: {} supplied for {} steps",
+                prices.len(),
+                parameters.steps
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Determines the one authoritative base volatility for a simulation, and
 /// rejects a request that specifies two different ones.
 ///
@@ -233,13 +312,27 @@ impl FactorTape {
 /// accepted and silently produces a chain priced at one number and a path
 /// driven by another. #45 exists partly to remove that.
 ///
+/// The agreement itself is enforced at the boundary, by
+/// `SimulationParametersV2::validate`, which runs on both the request and the
+/// stored-document path. The check is repeated here because this function is
+/// what would silently pick a winner otherwise, and a domain type that depends
+/// on an invariant should say so rather than assume it.
+///
 /// The rule: for the nine synthetic walk types the model's volatility is
 /// authoritative, and the parameters' must agree with it. For `Historical`
-/// there is no model volatility — upstream returns `None`, since it would have
-/// to be estimated from the price history — so the parameters' value is used as
-/// a constant. Estimating it per step from the series is deliberately not done
-/// here: a trailing estimate that includes step `i` is look-ahead, and a proper
-/// causal estimator is its own decision, not a side effect of building a tape.
+/// there is no model volatility — `WalkType::volatility()` returns `None` — so
+/// the parameters' value is used as a constant.
+///
+/// **That is a deliberate simplification, and it changes behaviour relative to
+/// v1.** Upstream ships a causal estimator, `expanding_window_vols`, whose
+/// estimate at index `i` uses only the returns of `prices[..=i]`, and v1 prices
+/// its historical chains with it through `walk_steps_par`. v2 does not walk
+/// through that driver — the whole point of the factor tape is to stop
+/// materialising chains per step — and the estimator is private to it, so
+/// adopting it means either duplicating the mathematics here, which is exactly
+/// what this module exists to avoid, or a change upstream. Until then a
+/// historical v2 simulation prices every step at the requested constant
+/// volatility. Worth knowing before comparing a v1 and a v2 historical run.
 ///
 /// # Errors
 ///
@@ -699,6 +792,95 @@ mod tests {
             Err(ChainError::Validation { field, reason }) => {
                 assert_eq!(field, "volatility");
                 assert!(reason.contains("exactly one base volatility"), "{reason}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    /// The agreement is enforced at the request boundary, not only when a tape
+    /// is built — so a contradictory request never reaches the domain.
+    #[test]
+    fn test_disagreeing_volatilities_are_rejected_at_the_boundary() {
+        let mut contradictory = request(10, brownian(0.35), 0.35);
+        contradictory.volatility = 0.18;
+
+        match SimulationParametersV2::try_from(contradictory) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "volatility");
+                assert!(reason.contains("exactly one base volatility"), "{reason}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    /// Building a tape with a method the parameters do not name is refused.
+    ///
+    /// `build` takes the method separately so a historical walk can be resolved
+    /// first; without this guard that flexibility would let a caller produce a
+    /// tape nothing could reproduce from the persisted replay inputs.
+    #[test]
+    fn test_a_method_the_parameters_do_not_name_is_refused() {
+        let parameters = parameters(request(10, brownian(0.18), 0.18));
+        let mismatched = match SimulationParametersV2::try_from(request(10, garch(0.18), 0.18)) {
+            Ok(other) => other.method,
+            Err(error) => panic!("the request must convert: {error}"),
+        };
+
+        match FactorTape::build(&parameters, &mismatched) {
+            Err(ChainError::Internal(reason)) => {
+                assert!(reason.contains("does not match"), "{reason}");
+            }
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+    }
+
+    /// A resolved historical method is accepted even though its prices and
+    /// symbol differ from the stored ones — resolution is what fills those in.
+    #[test]
+    fn test_a_resolved_historical_method_is_accepted() {
+        let prices: Vec<f64> = (0..30).map(|i| 5000.0 + f64::from(i)).collect();
+        let mut historical = request(15, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices: Vec::new(),
+            symbol: None,
+        };
+        let parameters = parameters(historical);
+
+        let resolved = SimulationMethod::Historical {
+            timeframe: optionstratlib::utils::TimeFrame::Day,
+            prices: prices
+                .iter()
+                .map(|price| match Positive::new(*price) {
+                    Ok(value) => value,
+                    Err(error) => panic!("the test price must be valid: {error}"),
+                })
+                .collect(),
+            symbol: Some("SPX".to_string()),
+        };
+
+        match FactorTape::build(&parameters, &resolved) {
+            Ok(tape) => assert_eq!(tape.len(), 15),
+            Err(error) => panic!("a resolved historical method must build: {error}"),
+        }
+    }
+
+    /// A historical series too short for the horizon is a client error naming
+    /// the field, not an internal failure.
+    #[test]
+    fn test_a_short_historical_series_is_a_client_error() {
+        let mut historical = request(50, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices: vec![5000.0, 5001.0, 5002.0],
+            symbol: Some("SPX".to_string()),
+        };
+        let parameters = parameters(historical);
+
+        match FactorTape::build(&parameters, &parameters.method) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "method.prices");
+                assert!(reason.contains("3 supplied for 50 steps"), "{reason}");
             }
             other => panic!("expected a validation error, got {other:?}"),
         }

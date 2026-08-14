@@ -385,6 +385,25 @@ impl SimulationParametersV2 {
         }
         self.schedule.validate()?;
 
+        // A simulation has exactly one base volatility. v1 accepts a top-level
+        // value and a walk model carrying a different one, and silently prices
+        // step zero at the first while walking on the second; v2 refuses the
+        // contradiction at the boundary rather than letting the domain pick a
+        // winner later. `Historical` carries no model volatility, so there is
+        // nothing to disagree with.
+        if let Some(model_volatility) = self.method.volatility()
+            && model_volatility != self.volatility
+        {
+            return Err(ChainError::Validation {
+                field: "volatility".to_string(),
+                reason: format!(
+                    "must match the walk model's volatility ({model_volatility}), got {}; \
+                     a simulation has exactly one base volatility",
+                    self.volatility
+                ),
+            });
+        }
+
         let running = tzdb_version();
         if self.tzdb_version != running {
             warn!(
@@ -509,7 +528,7 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
             request.schedules,
         )?;
 
-        Ok(Self {
+        let parameters = Self {
             symbol: request.symbol,
             steps: request.steps,
             effective_start,
@@ -540,7 +559,14 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
                 .map(|value| positive_field("spread", value))
                 .transpose()?,
             seed: request.seed.unwrap_or_else(|| rand::rng().random()),
-        })
+        };
+
+        // Run the same checks the stored-document path runs, so a request and a
+        // reloaded document are held to one standard and there is one place to
+        // add the next invariant. The field-specific checks above stay where
+        // they are: they can name the *request* field, which `validate` cannot.
+        parameters.validate()?;
+        Ok(parameters)
     }
 }
 
