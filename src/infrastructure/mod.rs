@@ -11,6 +11,10 @@ pub use clickhouse::model::{OHLCVData, PriceType};
 pub(crate) use clickhouse::{calculate_required_duration, select_random_date, validate_symbol};
 pub use config::clickhouse::ClickHouseConfig;
 pub use config::redis::RedisConfig;
+pub use config::simulation_v2::{
+    DEFAULT_CLEANUP_INTERVAL_SECS, DEFAULT_MAX_CACHED_SNAPSHOTS, DEFAULT_MAX_CACHED_TAPES,
+    DEFAULT_RETENTION_SECS, SimulationV2Config,
+};
 pub use redis::RedisClient;
 pub use repositories::historical_repo::ClickHouseHistoricalRepository;
 pub use repositories::mongo_repo::{MongoDBRepository, init_mongodb};

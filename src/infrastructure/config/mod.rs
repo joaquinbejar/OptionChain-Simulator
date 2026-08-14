@@ -1,6 +1,9 @@
 pub mod clickhouse;
 pub mod mongo;
 pub mod redis;
+/// Operational configuration for v2 rolling simulations: retention, the
+/// cleanup cadence, and the domain-cache capacities.
+pub mod simulation_v2;
 
 /// Redacts URL userinfo (credentials) from every URL-like substring inside a
 /// larger text (log lines, driver error messages).

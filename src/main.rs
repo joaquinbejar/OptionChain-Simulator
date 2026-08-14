@@ -59,14 +59,14 @@
 
 use optionchain_simulator::api::{ListenOn, start_server};
 use optionchain_simulator::infrastructure::{
-    MetricsCollector, RedisClient, RedisConfig, init_mongodb,
+    MetricsCollector, RedisClient, RedisConfig, SimulationV2Config, init_mongodb,
 };
 use optionchain_simulator::session::{
     InRedisSessionStore, InRedisSimulationStore, SessionManager, SimulationManager,
 };
 use optionstratlib::utils::setup_logger_with_level;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 /// The `main` function is the entry point of the application using the Actix Web server framework.
 /// It initializes the logger, sets up the session management with Redis as the backend, and starts the HTTP server.
@@ -136,12 +136,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The v2 rolling simulations live in their own Redis key space, so a v2 id
     // can never resolve a v1 session and a v1 document is never read back as
     // rolling configuration (ADR 0001 section 12.2).
+    //
+    // Their operational limits are loaded and validated here, before anything
+    // binds: an invalid knob fails startup with a message naming the variable
+    // rather than silently reverting to a default that would change how long
+    // simulations live.
+    let v2_config = SimulationV2Config::from_env()?;
     let simulation_store = Arc::new(InRedisSimulationStore::new(
         redis_client_v2,
         None, // the documented v2 prefix
-        None, // the shared v2 retention window
+        Some(v2_config.retention_secs()),
     ));
-    let simulation_manager = Arc::new(SimulationManager::new(simulation_store));
+    let simulation_manager = Arc::new(SimulationManager::new(simulation_store, v2_config));
+
+    // Reap idle simulations and evict what they left cached. Detached, because
+    // the sweep is independent of any request; it stops when the process does.
+    let sweeper = Arc::clone(&simulation_manager);
+    let sweeper_metrics = Arc::clone(&metrics_collector);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(v2_config.cleanup_interval);
+        loop {
+            ticker.tick().await;
+            match sweeper.cleanup().await {
+                Ok(expired) => {
+                    sweeper_metrics.record_v2_simulations_expired(expired.len());
+                    sweeper_metrics.set_v2_cache_sizes(
+                        sweeper.cached_tapes() as i64,
+                        sweeper.cached_snapshots() as i64,
+                    );
+                }
+                // A failed sweep is worth knowing about but must not stop the
+                // loop: the next tick retries, and Redis expiring keys on its
+                // own means nothing leaks in the meantime except the cache
+                // entries this pass would have dropped.
+                Err(error) => warn!(%error, "the v2 retention sweep failed"),
+            }
+        }
+    });
     let listen_on = ListenOn::All;
     let port = 7070;
     // Start HTTP server

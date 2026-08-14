@@ -15,23 +15,19 @@ use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
 /// Default retention for a v2 simulation, in seconds — shared by **both**
-/// backends.
+/// backends and by the configuration.
 ///
-/// One constant rather than one per store, because ADR 0001 §9.1 requires the
-/// in-memory and Redis stores to agree on expiry, and two independently-named
-/// defaults are exactly how that agreement drifts.
+/// Re-exported from [`crate::infrastructure::DEFAULT_RETENTION_SECS`] rather
+/// than restated, because ADR 0001 §9.1 requires the in-memory and Redis stores
+/// to agree on expiry and a second literal is exactly how that agreement
+/// drifts. An operator changes it through `OCS_V2_RETENTION_SECS`; this is only
+/// the value a store built without one applies.
 ///
-/// Deliberately longer than v1's 30 minutes: a simulation whose *simulated*
-/// clock spans years is still walked one request at a time, and a client
-/// pausing between steps must not lose it. Issue #48 makes it configurable;
-/// v1's retention is untouched either way.
-///
-/// The window is measured from the **last write**, not from the last access:
-/// ADR 0001 §6 defines the snapshot endpoint as a safe peek that persists
-/// nothing, so a client that only peeks does not refresh it. Both backends
-/// behave the same way, which is the property that matters here; whether
-/// peeking should refresh is #48's call.
-pub const DEFAULT_V2_RETENTION_SECS: u64 = 3_600;
+/// The window is measured from the **last write**, not the last access: ADR
+/// 0001 §6 defines the snapshot endpoint as a safe peek that persists nothing,
+/// so a client that only peeks does not refresh it. Both backends behave the
+/// same way.
+pub use crate::infrastructure::DEFAULT_RETENTION_SECS as DEFAULT_V2_RETENTION_SECS;
 
 /// In-memory store for v2 rolling simulations.
 pub struct InMemorySimulationStore {

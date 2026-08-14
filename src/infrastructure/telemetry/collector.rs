@@ -29,6 +29,12 @@ pub struct MetricsCollector {
     cache_hit_counter: IntCounter,
     cache_miss_counter: IntCounter,
     simulation_cache_size: IntGauge,
+    /// Factor tapes currently resident for v2 rolling simulations.
+    v2_tape_cache_size: IntGauge,
+    /// Snapshots currently resident for v2 rolling simulations.
+    v2_snapshot_cache_size: IntGauge,
+    /// v2 simulations reaped by the retention sweep since startup.
+    v2_simulations_expired: IntCounter,
 
     // Resource metrics
     memory_usage: Gauge,
@@ -103,6 +109,21 @@ impl MetricsCollector {
         let simulation_cache_size =
             IntGauge::new("simulation_cache_size", "Number of cached random walks")?;
 
+        // v2 keeps two caches rather than one, and they behave very
+        // differently: a tape is O(steps) small rows, a snapshot holds every
+        // strike of every live expiration. Reporting them separately is what
+        // makes it possible to tell which bound needs moving.
+        let v2_tape_cache_size =
+            IntGauge::new("v2_tape_cache_size", "Number of cached v2 factor tapes")?;
+
+        let v2_snapshot_cache_size =
+            IntGauge::new("v2_snapshot_cache_size", "Number of cached v2 snapshots")?;
+
+        let v2_simulations_expired = IntCounter::new(
+            "v2_simulations_expired_total",
+            "Total number of v2 simulations reaped by the retention sweep",
+        )?;
+
         // Create resource metrics
         let memory_usage = Gauge::new("memory_usage_bytes", "Current memory usage in bytes")?;
 
@@ -136,6 +157,9 @@ impl MetricsCollector {
         registry.register(Box::new(cache_hit_counter.clone()))?;
         registry.register(Box::new(cache_miss_counter.clone()))?;
         registry.register(Box::new(simulation_cache_size.clone()))?;
+        registry.register(Box::new(v2_tape_cache_size.clone()))?;
+        registry.register(Box::new(v2_snapshot_cache_size.clone()))?;
+        registry.register(Box::new(v2_simulations_expired.clone()))?;
         registry.register(Box::new(memory_usage.clone()))?;
 
         // Register MongoDB metrics
@@ -156,6 +180,9 @@ impl MetricsCollector {
             cache_hit_counter,
             cache_miss_counter,
             simulation_cache_size,
+            v2_tape_cache_size,
+            v2_snapshot_cache_size,
+            v2_simulations_expired,
             memory_usage,
             mongodb_insert_counter,
             mongodb_insert_duration,
@@ -255,6 +282,27 @@ impl MetricsCollector {
     }
 
     /// Records the current memory usage
+    /// Publishes how much v2 derived state is resident.
+    ///
+    /// Both caches at once, because they are only meaningful together: a full
+    /// snapshot cache with an empty tape cache means something quite different
+    /// from the reverse.
+    pub fn set_v2_cache_sizes(&self, tapes: i64, snapshots: i64) {
+        self.v2_tape_cache_size.set(tapes);
+        self.v2_snapshot_cache_size.set(snapshots);
+    }
+
+    /// Records simulations reaped by the retention sweep.
+    ///
+    /// Counted rather than gauged: the interesting question is how many are
+    /// being expired over time, not how many were expired in the last pass.
+    pub fn record_v2_simulations_expired(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.v2_simulations_expired.inc_by(count as u64);
+    }
+
     pub fn record_memory_usage(&self, bytes: f64) {
         self.memory_usage.set(bytes);
     }

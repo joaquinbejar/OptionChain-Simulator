@@ -150,6 +150,39 @@ are byte- and behaviour-compatible; v2 ships as a separate surface with its
 own session type and its own stored-session schema, so existing clients
 need no changes.
 
+### Configuration
+
+Every environment variable the service reads is documented in
+`.env.example` with its default and accepted range. Two families, with
+deliberately different failure behaviour:
+
+- **Request caps** — `OCS_MAX_STEPS`, `OCS_MAX_CHAIN_SIZE`,
+  `OCS_MAX_HISTORICAL_PRICES`, `OCS_MAX_CACHED_WALKS` — warn and fall back
+  to their defaults when set to something invalid. A bad value there
+  degrades one request.
+- **v2 operational knobs** — `OCS_V2_RETENTION_SECS`,
+  `OCS_V2_CLEANUP_INTERVAL_SECS`, `OCS_MAX_CACHED_TAPES`,
+  `OCS_MAX_CACHED_SNAPSHOTS` — are **validated at startup** and fail the
+  process with a message naming the variable. Silently reverting a
+  retention window would expire simulations a client is still walking, and
+  silently reverting a cache bound would change the service's memory
+  profile with nothing to show for it.
+
+**v2 retention is real time, not simulated time.** A simulation whose
+simulated clock spans three years is still walked one request at a time, so
+its idle window is an operational choice independent of the horizon. It
+defaults to an hour — longer than v1's thirty minutes — and is measured from
+the last **write**: peeking a snapshot persists nothing, so a client that
+only peeks does not refresh it. The in-memory and Redis backends apply the
+same window from the same constant.
+
+A retention sweep runs every `OCS_V2_CLEANUP_INTERVAL_SECS`, reaping expired
+simulations and evicting the factor tapes and snapshots they left behind.
+Eviction is never observable in what is served: both rebuild identically
+from the effective parameters, so it costs latency and nothing else. The
+sweep publishes `v2_simulations_expired_total`, and the caches publish
+`v2_tape_cache_size` and `v2_snapshot_cache_size`.
+
 ### Request/Response Models
 
 #### 1. Create Session (POST /api/v1/chain)
