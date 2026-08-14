@@ -29,8 +29,11 @@ version: '3.8'
 #     `make deploy` / `make deploy-swarm` pass OPTIONCHAIN_VERSION so the
 #     deployed tag always matches the manifest. `docker stack deploy` does NOT
 #     read .env, so export the overrides in the shell.
-#   - The network is `overlay`, the only scope swarm accepts for services. The
-#     dev override swaps it for `bridge` on a non-swarm engine.
+#   - The network is EXTERNAL and shared: create it once per environment
+#     (`make network` locally, `make network-swarm` on a manager) so other
+#     stacks can attach to it and resolve these services by name. Swarm needs
+#     it to be an attachable overlay - a bridge network is node-scoped and
+#     rejected for services.
 #   - Nothing swarm ignores is declared here: `container_name`, `restart`,
 #     `depends_on` and `ulimits` live in the dev override, and the `deploy`
 #     blocks carry the equivalent restart policy. Keeping them out is what
@@ -145,14 +148,13 @@ services:
 
 networks:
   optionchain-network:
-    # overlay is MANDATORY under swarm: a bridge network is node-scoped and
-    # `docker stack deploy` refuses it with "cannot be used with services. Only
-    # networks scoped to the swarm can be used". The default therefore targets
-    # swarm - including deploys driven by Portainer, which passes no
-    # environment - and docker-compose.dev.yml overrides it back to bridge for
-    # a local, non-swarm engine.
-    driver: overlay
-    attachable: true
+    # EXTERNAL so other stacks can join the same network and reach this service
+    # by name. It is NOT created by this file and NOT stack-prefixed: create it
+    # once per environment before the first deploy (make network), as an
+    # attachable overlay on a swarm - the only scope swarm accepts for services
+    # - or as a bridge on a local engine.
+    external: true
+    name: ${OPTIONCHAIN_NETWORK:-optionchain-network}
 
 volumes:
   redis-data:

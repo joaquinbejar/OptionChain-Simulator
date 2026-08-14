@@ -7,7 +7,9 @@ version: '3.8'
 # which is what `make deploy` runs. It restores everything the base file leaves
 # out because swarm rejects or ignores it:
 #
-#   - the network driver: `bridge`, since `overlay` needs a swarm manager;
+#   - nothing about the network: it is external in both files, and `make
+#     network` creates it locally with the bridge driver (overlay needs a
+#     swarm manager);
 #   - `container_name`, `restart` and `depends_on`, which `docker stack deploy`
 #     drops with an "Ignoring unsupported options" warning;
 #   - the ClickHouse `ulimits` (a swarm sets nofile through the daemon's
@@ -90,5 +92,7 @@ services:
 
 networks:
   optionchain-network:
-    # Overrides the base file's overlay: a local engine is not a swarm manager.
-    driver: bridge
+    # Same external network as the base file - a local engine just creates it
+    # with the bridge driver instead of overlay (`make network`).
+    external: true
+    name: ${OPTIONCHAIN_NETWORK:-optionchain-network}
