@@ -1,28 +1,34 @@
-FROM rust:1.96.1-bookworm as builder
+# Base images are pinned by IMMUTABLE digest (issue #22), same policy as
+# Docker/docker-compose.yml: the tag is a readable prefix, the digest is what
+# the engine actually resolves. Re-resolve with
+# `docker buildx imagetools inspect <image:tag>` when bumping, and bump the
+# tag and the digest together.
+FROM rust:1.97.1-alpine3.24@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900 AS builder
 
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    pkg-config \
-    curl \
-    libfontconfig1-dev \
-    libfreetype6-dev \
-    libexpat1-dev \
-    libpng-dev \
-    libjpeg-dev \
-    && rm -rf /var/lib/apt/lists/*
+# build-base pulls gcc + musl-dev (the `ring` C sources need them) and make,
+# which drives the `make release` target below. curl is REQUIRED: the
+# utoipa-swagger-ui build script shells out to it to download the Swagger UI
+# bundle, and panics with "`curl` command not found" otherwise. No
+# fontconfig/freetype stack: the dependency tree carries no native image or
+# font libraries.
+RUN apk add --no-cache build-base curl
 
 WORKDIR /app
 
 COPY . .
 
+# The rust:alpine host target is x86_64-unknown-linux-musl, which links
+# statically by default, so the release binary is self-contained.
 RUN make release
 
-FROM debian:bookworm-slim
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
+# Root certificates for the outbound TLS connections (ClickHouse, MongoDB,
+# Redis when configured over TLS).
+RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 
-COPY --from=builder /usr/lib /usr/lib
-COPY --from=builder /lib /lib
 COPY --from=builder /app/target/release/optionchain_simulator /app/
 
 EXPOSE 7070

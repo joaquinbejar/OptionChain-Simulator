@@ -1,5 +1,16 @@
 version: '3.8'
 
+# Deployable stack: the four services the binary actually needs. Redis and
+# MongoDB are HARD requirements (src/main.rs propagates their connection errors
+# with `?`, so the process exits without them); ClickHouse is optional
+# (src/domain/simulator.rs logs the failure and runs with database_repo: None,
+# which only degrades the Historical source).
+#
+# The admin UIs (mongo-express, redis-commander) and the host-published
+# infrastructure ports live in docker-compose.dev.yml, NOT here: `docker stack
+# deploy` does not support compose profiles, so anything present in this file
+# reaches the swarm, and those UIs ship default admin/password credentials.
+#
 # Service images are pinned by IMMUTABLE digest (image: name:tag@sha256:...)
 # so a redeploy can never silently pull a different build (issue #22). The
 # tag is kept as a readable prefix only; the digest is what the engine
@@ -10,6 +21,24 @@ version: '3.8'
 # its digest with imagetools inspect, update tag and digest together, run
 # the stack locally (make deploy) against the health checks, and record the
 # tested combination in the PR. Never drop the digest or use :latest.
+#
+# SWARM: this file deploys unchanged with `docker stack deploy` (make
+# deploy-swarm). Consequences of that:
+#   - `backend` pulls the PUBLISHED image, it is never built here. The tag is
+#     the crate version, defaulting to the current Cargo.toml version;
+#     `make deploy` / `make deploy-swarm` pass OPTIONCHAIN_VERSION so the
+#     deployed tag always matches the manifest. `docker stack deploy` does NOT
+#     read .env, so export the overrides in the shell.
+#   - The network driver defaults to `bridge` for local compose runs and must
+#     be `overlay` under swarm (make deploy-swarm sets it).
+#   - Swarm ignores `container_name`, `depends_on` and `restart`; the `deploy`
+#     blocks carry the equivalent policy and compose ignores those instead.
+#   - Only `backend` publishes a port. The infrastructure services are reachable
+#     over the stack network alone; under the routing mesh a published port
+#     would answer on EVERY node of the cluster.
+#   - The infrastructure services keep node-local volumes, so a multi-node
+#     swarm must either constrain them to one node or point the backend at
+#     managed Redis/MongoDB/ClickHouse instances via the env vars below.
 
 services:
   # Redis service configuration
@@ -17,8 +46,6 @@ services:
     image: redis:7.4@sha256:b2b95679e3b46fb51864949ed25ea976fc3a6bcc00a40a1bc00d568cb2822e50
     container_name: redis
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-password}
-    ports:
-      - "6379:6379"
     volumes:
       - redis-data:/data
     networks:
@@ -31,13 +58,16 @@ services:
     environment:
       - TZ=UTC
     restart: unless-stopped
-  
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+
   # MongoDB service configuration
   mongodb:
     image: mongo:7.0@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703
     container_name: mongodb
-    ports:
-      - "27017:27017"
     volumes:
       - mongodb-data:/data/db
       - mongodb-config:/data/configdb
@@ -53,47 +83,15 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
 
-  # MongoDB Express for web-based MongoDB management (optional)
-  mongo-express:
-    image: mongo-express:1.0.2@sha256:1b23d7976f0210dbec74045c209e52fbb26d29b2e873d6c6fa3d3f0ae32c2a64
-    container_name: mongo-express
-    restart: unless-stopped
-    ports:
-      - "8081:8081"
-    environment:
-      - ME_CONFIG_MONGODB_ADMINUSERNAME=${MONGO_USERNAME:-admin}
-      - ME_CONFIG_MONGODB_ADMINPASSWORD=${MONGO_PASSWORD:-password}
-      - ME_CONFIG_MONGODB_SERVER=mongodb
-      - ME_CONFIG_BASICAUTH_USERNAME=${MONGOEXPRESS_USERNAME:-admin}
-      - ME_CONFIG_BASICAUTH_PASSWORD=${MONGOEXPRESS_PASSWORD:-password}
-    networks:
-      - optionchain-network
-    depends_on:
-      - mongodb
-
-  # Redis Commander for web-based Redis management (optional)
-  redis-commander:
-    image: rediscommander/redis-commander:redis-commander-210@sha256:25f93c06111f8614e3ecc8df5c563272bb465459a2e08e7f5364b5fe4c14f87f
-    container_name: redis-commander
-    restart: unless-stopped
-    ports:
-      - "8082:8081"
-    environment:
-      - REDIS_HOSTS=local:redis:6379:0:${REDIS_PASSWORD:-password}
-      - HTTP_USER=${REDIS_COMMANDER_USER:-admin}
-      - HTTP_PASSWORD=${REDIS_COMMANDER_PASSWORD:-password}
-    networks:
-      - optionchain-network
-    depends_on:
-      - redis
-        
   clickhouse:
     image: clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
     container_name: clickhouse
-    ports:
-      - "8123:8123"   # HTTP interface
-      - "9000:9000"   # Native client (TCP)
     environment:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
@@ -107,13 +105,27 @@ services:
     restart: unless-stopped
     networks:
       - optionchain-network
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
 
   backend:
-    build:
-      context: ..
-      dockerfile: Docker/Dockerfile
+    # Published by .github/workflows/docker-publish.yml on every Cargo.toml
+    # version bump, or by `make docker-push` from a workstation. Bump the
+    # default tag in the same PR that bumps the crate version.
+    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.1.0}
     container_name: backend
     restart: unless-stopped
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 5s
+      update_config:
+        order: start-first
+        failure_action: rollback
     environment:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
@@ -138,10 +150,11 @@ services:
       - "7070:7070"
     networks:
       - optionchain-network
-      
+
 networks:
   optionchain-network:
-    driver: bridge
+    # bridge for a local compose run, overlay under swarm (make deploy-swarm).
+    driver: ${OPTIONCHAIN_NETWORK_DRIVER:-bridge}
 
 volumes:
   redis-data:

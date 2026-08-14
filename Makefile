@@ -4,9 +4,41 @@ CURRENT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD)
 ZIP_NAME = OptionChain-Simulator.zip
 PROJECT_NAME := optionchain-simulator
 
+# Container image coordinates. VERSION is read from the [package] table of
+# Cargo.toml (the versions in [workspace.dependencies] are skipped), so the
+# published tag can never drift from the crate version.
+REGISTRY ?= ghcr.io
+IMAGE_NAME ?= $(REGISTRY)/joaquinbejar/optionchain-simulator
+VERSION := $(shell awk '/^\[package\]/ { in_pkg = 1; next } /^\[/ { in_pkg = 0 } in_pkg && /^version[[:space:]]*=/ { gsub(/[",]/, "", $$3); print $$3; exit }' Cargo.toml)
+
+# Build the release image for the version in Cargo.toml.
+.PHONY: docker-build
+docker-build:
+	@test -n "$(VERSION)" || (echo "could not read [package] version from Cargo.toml"; exit 1)
+	docker build -f Docker/Dockerfile -t $(IMAGE_NAME):$(VERSION) -t $(IMAGE_NAME):latest .
+
+# Build and push that image to the registry. Requires a prior
+# `docker login $(REGISTRY)` with a token carrying write:packages.
+.PHONY: docker-push
+docker-push: docker-build
+	docker push $(IMAGE_NAME):$(VERSION)
+	docker push $(IMAGE_NAME):latest
+	@echo "pushed $(IMAGE_NAME):$(VERSION) and :latest"
+
+# Local stack: the deployable services plus the dev override (admin UIs and
+# host-published infrastructure ports).
 .PHONY: deploy
 deploy:
-	docker compose -p $(PROJECT_NAME) -f Docker/docker-compose.yml up --build  --force-recreate -d
+	OPTIONCHAIN_VERSION=$(VERSION) docker compose -p $(PROJECT_NAME) \
+		-f Docker/docker-compose.yml -f Docker/docker-compose.dev.yml \
+		up --pull always --force-recreate -d
+
+# Same stack on a swarm manager: overlay network, no build context, and never
+# the dev override (admin UIs with default credentials, published infra ports).
+.PHONY: deploy-swarm
+deploy-swarm:
+	OPTIONCHAIN_VERSION=$(VERSION) OPTIONCHAIN_NETWORK_DRIVER=overlay \
+		docker stack deploy --with-registry-auth -c Docker/docker-compose.yml $(PROJECT_NAME)
 
 # Default target
 .PHONY: all

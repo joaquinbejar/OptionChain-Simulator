@@ -1,0 +1,65 @@
+version: '3.8'
+
+# Workstation-only override for Docker/docker-compose.yml:
+#
+#   docker compose -f Docker/docker-compose.yml -f Docker/docker-compose.dev.yml up -d
+#
+# which is what `make deploy` runs. It adds the two admin UIs and publishes the
+# infrastructure ports on the host so the integration tests
+# (`cargo test --workspace -- --ignored`) and a psql/redis-cli/mongosh session
+# can reach them.
+#
+# NEVER include this file in `docker stack deploy` (make deploy-swarm): compose
+# profiles are not supported there, the UIs ship default admin/password
+# credentials, and under the routing mesh every published port answers on every
+# node of the cluster.
+#
+# Images are pinned by immutable digest, same policy as the base file (#22).
+
+services:
+  redis:
+    ports:
+      - "6379:6379"
+
+  mongodb:
+    ports:
+      - "27017:27017"
+
+  clickhouse:
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # Native client (TCP)
+
+  # MongoDB Express for web-based MongoDB management (optional)
+  mongo-express:
+    image: mongo-express:1.0.2@sha256:1b23d7976f0210dbec74045c209e52fbb26d29b2e873d6c6fa3d3f0ae32c2a64
+    container_name: mongo-express
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      - ME_CONFIG_MONGODB_ADMINUSERNAME=${MONGO_USERNAME:-admin}
+      - ME_CONFIG_MONGODB_ADMINPASSWORD=${MONGO_PASSWORD:-password}
+      - ME_CONFIG_MONGODB_SERVER=mongodb
+      - ME_CONFIG_BASICAUTH_USERNAME=${MONGOEXPRESS_USERNAME:-admin}
+      - ME_CONFIG_BASICAUTH_PASSWORD=${MONGOEXPRESS_PASSWORD:-password}
+    networks:
+      - optionchain-network
+    depends_on:
+      - mongodb
+
+  # Redis Commander for web-based Redis management (optional)
+  redis-commander:
+    image: rediscommander/redis-commander:redis-commander-210@sha256:25f93c06111f8614e3ecc8df5c563272bb465459a2e08e7f5364b5fe4c14f87f
+    container_name: redis-commander
+    restart: unless-stopped
+    ports:
+      - "8082:8081"
+    environment:
+      - REDIS_HOSTS=local:redis:6379:0:${REDIS_PASSWORD:-password}
+      - HTTP_USER=${REDIS_COMMANDER_USER:-admin}
+      - HTTP_PASSWORD=${REDIS_COMMANDER_PASSWORD:-password}
+    networks:
+      - optionchain-network
+    depends_on:
+      - redis
