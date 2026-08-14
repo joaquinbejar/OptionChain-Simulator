@@ -37,6 +37,22 @@ mod in_redis;
 /// shareable implementations (i.e., satisfy `Send` and `Sync`).
 mod interface;
 
+/// The v2 persistence contract for rolling simulations.
+///
+/// Deliberately separate from [`interface`]: the two store different documents
+/// under different key spaces, and keeping the traits apart is what makes the
+/// isolation structural rather than conventional.
+mod v2_interface;
+
+/// In-memory implementation of the v2 simulation store.
+mod v2_memory;
+
+/// Redis implementation of the v2 simulation store.
+mod v2_redis;
+
 pub use in_memory::InMemorySessionStore;
 pub use in_redis::InRedisSessionStore;
 pub use interface::SessionStore;
+pub use v2_interface::SimulationStore;
+pub use v2_memory::{DEFAULT_V2_RETENTION_SECS, InMemorySimulationStore};
+pub use v2_redis::{DEFAULT_V2_KEY_PREFIX, InRedisSimulationStore};

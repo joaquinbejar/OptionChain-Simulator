@@ -29,6 +29,11 @@ mod manager;
 /// and is used effectively for encapsulating the core business data.
 ///
 mod model;
+/// The `model_v2` module defines the v2 rolling-simulation session types:
+/// the resolved simulation parameters, the simulation document, and the
+/// conversion from the v2 request DTO. Kept apart from `model` because
+/// `/api/v1/chain` and its stored shape are frozen (ADR 0001 section 12).
+mod model_v2;
 ///
 /// The `state_handler` module is responsible for managing and encapsulating all
 /// logic related to the application state. It defines functionality to manipulate,
@@ -62,6 +67,12 @@ mod state_handler;
 /// Users of this module should refer to its public items to utilize its functionality effectively.
 mod store;
 
+pub use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, ExpiryRule, ExpiryRuleKind};
 pub use manager::SessionManager;
 pub use model::{Session, SessionState, SimulationMethod, SimulationParameters};
-pub use store::{InMemorySessionStore, InRedisSessionStore, SessionStore};
+pub use model_v2::{SESSION_V2_SCHEMA_VERSION, SessionV2, SimulationParametersV2};
+pub use store::{
+    DEFAULT_V2_KEY_PREFIX, DEFAULT_V2_RETENTION_SECS, InMemorySessionStore,
+    InMemorySimulationStore, InRedisSessionStore, InRedisSimulationStore, SessionStore,
+    SimulationStore,
+};

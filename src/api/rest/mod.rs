@@ -7,6 +7,7 @@ mod middleware;
 pub(crate) mod models;
 pub(crate) mod patch;
 pub(crate) mod requests;
+pub(crate) mod requests_v2;
 pub(crate) mod responses;
 mod routes;
 pub mod swagger;

@@ -1,4 +1,4 @@
-mod expiry;
+pub(crate) mod expiry;
 mod simulator;
 mod walker;
 

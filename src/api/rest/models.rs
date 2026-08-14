@@ -392,6 +392,23 @@ impl From<WalkType> for ApiWalkType {
     }
 }
 
+/// Rechecks a [`WalkType`] that did not arrive through the request path.
+///
+/// A stored simulation is an outer-layer input: the document in Redis may have
+/// been hand-edited, or written by a build whose validation differed, so a
+/// `dt` of zero can reach the walk without ever passing
+/// [`TryFrom<ApiWalkType>`]. Rather than mirror those invariants a second time
+/// in the session layer — a second exhaustive match to keep in step with
+/// upstream — this round-trips through the mirror that already exists, so the
+/// stored document is held to exactly the checks a request is.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Validation`] naming the offending field.
+pub(crate) fn validate_walk_type(walk: &WalkType) -> Result<(), ChainError> {
+    WalkType::try_from(ApiWalkType::from(walk.clone())).map(|_| ())
+}
+
 impl TryFrom<ApiWalkType> for WalkType {
     type Error = ChainError;
 

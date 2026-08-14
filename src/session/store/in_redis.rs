@@ -41,7 +41,11 @@ pub struct InRedisSessionStore {
 ///
 /// Return codes: `-1` = key missing (NotFound); `-2` = version mismatch
 /// (Conflict); `1` = written.
-const SAVE_CAS_SCRIPT: &str = r#"
+///
+/// Shared with the v2 simulation store (`super::v2_redis`): the script is
+/// parameterised entirely by its keys and arguments, so both key spaces run the
+/// same, already-reviewed compare-and-swap rather than two copies of it.
+pub(super) const SAVE_CAS_SCRIPT: &str = r#"
 local cur = redis.call('GET', KEYS[1])
 if not cur then
     return -1
