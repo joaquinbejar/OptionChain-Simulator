@@ -29,10 +29,13 @@ version: '3.8'
 #     `make deploy` / `make deploy-swarm` pass OPTIONCHAIN_VERSION so the
 #     deployed tag always matches the manifest. `docker stack deploy` does NOT
 #     read .env, so export the overrides in the shell.
-#   - The network driver defaults to `bridge` for local compose runs and must
-#     be `overlay` under swarm (make deploy-swarm sets it).
-#   - Swarm ignores `container_name`, `depends_on` and `restart`; the `deploy`
-#     blocks carry the equivalent policy and compose ignores those instead.
+#   - The network is `overlay`, the only scope swarm accepts for services. The
+#     dev override swaps it for `bridge` on a non-swarm engine.
+#   - Nothing swarm ignores is declared here: `container_name`, `restart`,
+#     `depends_on` and `ulimits` live in the dev override, and the `deploy`
+#     blocks carry the equivalent restart policy. Keeping them out is what
+#     stops `docker stack deploy` (and Portainer) from printing "Ignoring
+#     unsupported options" on every deploy.
 #   - Only `backend` publishes a port. The infrastructure services are reachable
 #     over the stack network alone; under the routing mesh a published port
 #     would answer on EVERY node of the cluster.
@@ -44,7 +47,6 @@ services:
   # Redis service configuration
   redis:
     image: redis:7.4@sha256:b2b95679e3b46fb51864949ed25ea976fc3a6bcc00a40a1bc00d568cb2822e50
-    container_name: redis
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-password}
     volumes:
       - redis-data:/data
@@ -57,7 +59,6 @@ services:
       retries: 5
     environment:
       - TZ=UTC
-    restart: unless-stopped
     deploy:
       replicas: 1
       restart_policy:
@@ -67,7 +68,6 @@ services:
   # MongoDB service configuration
   mongodb:
     image: mongo:7.0@sha256:d5b3ca8c3f3cdce78d44870dc0871b76d5235e9b2ad4ea6bea5d1fbff8027703
-    container_name: mongodb
     volumes:
       - mongodb-data:/data/db
       - mongodb-config:/data/configdb
@@ -82,7 +82,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
     deploy:
       replicas: 1
       restart_policy:
@@ -91,18 +90,12 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8@sha256:1ffa82edee000a42c09313bd9f1293d94c570aee74babc1b3ca9983a35fa597b
-    container_name: clickhouse
     environment:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
     volumes:
       - clickhouse_data:/var/lib/clickhouse
-    ulimits:
-      nofile:
-        soft: 262144
-        hard: 262144
-    restart: unless-stopped
     networks:
       - optionchain-network
     deploy:
@@ -116,8 +109,6 @@ services:
     # version bump, or by `make docker-push` from a workstation. Bump the
     # default tag in the same PR that bumps the crate version.
     image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.1.0}
-    container_name: backend
-    restart: unless-stopped
     deploy:
       replicas: 1
       restart_policy:
@@ -142,10 +133,6 @@ services:
       REDIS_USER: ${REDIS_USER}
       REDIS_PASSWORD: ${REDIS_PASSWORD-password}
       REDIS_HOST: ${REDIS_HOST-redis}
-    depends_on:
-      - redis
-      - mongodb
-      - clickhouse
     ports:
       - "7070:7070"
     networks:
@@ -153,8 +140,14 @@ services:
 
 networks:
   optionchain-network:
-    # bridge for a local compose run, overlay under swarm (make deploy-swarm).
-    driver: ${OPTIONCHAIN_NETWORK_DRIVER:-bridge}
+    # overlay is MANDATORY under swarm: a bridge network is node-scoped and
+    # `docker stack deploy` refuses it with "cannot be used with services. Only
+    # networks scoped to the swarm can be used". The default therefore targets
+    # swarm - including deploys driven by Portainer, which passes no
+    # environment - and docker-compose.dev.yml overrides it back to bridge for
+    # a local, non-swarm engine.
+    driver: overlay
+    attachable: true
 
 volumes:
   redis-data:
