@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use std::time::SystemTime;
+use tracing::warn;
 use uuid::Uuid;
 
 /// Schema version stamped on every stored v2 session.
@@ -46,10 +47,17 @@ use uuid::Uuid;
 pub const SESSION_V2_SCHEMA_VERSION: u32 = 1;
 
 /// Shortest simulated step interval, in seconds.
-pub const MIN_STEP_INTERVAL_SECONDS: u64 = 1;
+///
+/// Crate-internal on purpose: issue #48 turns the v2 bounds into validated
+/// `OCS_MAX_*` environment knobs following the `LazyLock` pattern in
+/// `api::rest::limits`, and publishing them as `const u64` first would make
+/// that conversion a breaking change to a released item.
+pub(crate) const MIN_STEP_INTERVAL_SECONDS: u64 = 1;
 
 /// Longest simulated step interval, in seconds — one 365-day year.
-pub const MAX_STEP_INTERVAL_SECONDS: u64 = 31_536_000;
+///
+/// Crate-internal for the same reason as [`MIN_STEP_INTERVAL_SECONDS`].
+pub(crate) const MAX_STEP_INTERVAL_SECONDS: u64 = 31_536_000;
 
 /// Seconds in a 365-day year, used to derive an interval from a `Custom`
 /// time frame expressed in periods per year.
@@ -181,6 +189,7 @@ fn to_whole_second_utc(instant: DateTime<Utc>) -> Result<DateTime<Utc>, ChainErr
 /// set of fields is exactly the replay input list of ADR 0001 §8, which is what
 /// lets a client reproduce a run from the creation response alone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SimulationParametersV2Wire")]
 pub struct SimulationParametersV2 {
     /// Ticker symbol of the underlying.
     pub symbol: String,
@@ -223,7 +232,139 @@ pub struct SimulationParametersV2 {
     pub seed: u64,
 }
 
+/// The deserialization shape of [`SimulationParametersV2`].
+///
+/// Exists so that a stored document is validated exactly like a request. The
+/// fields are public and the type derives `Deserialize`, so without this a
+/// hand-edited or corrupted document in Redis would sail past every check the
+/// request path performs: a `step_interval_seconds` of `0` freezes the
+/// simulated clock, a `steps` above the cap drives an unbounded factor tape, a
+/// sub-second `effective_start` breaks the whole-second rendering that makes
+/// exports byte-comparable. Redis is an outer layer, and
+/// `rules/global_rules.md` is explicit that domain types must not trust one.
+///
+/// It also carries `deny_unknown_fields`, which turns the rolling-deploy
+/// hazard into a loud one: an old binary reading a document written by a newer
+/// one fails instead of silently dropping the new fields and writing the
+/// truncated document back.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SimulationParametersV2Wire {
+    symbol: String,
+    steps: usize,
+    effective_start: DateTime<Utc>,
+    step_interval_seconds: u64,
+    time_frame: TimeFrame,
+    schedule: ExpirationSchedule,
+    tzdb_version: String,
+    initial_price: Positive,
+    volatility: Positive,
+    risk_free_rate: Decimal,
+    dividend_yield: Positive,
+    method: SimulationMethod,
+    chain_size: Option<usize>,
+    strike_interval: Option<Positive>,
+    skew_slope: Option<Decimal>,
+    smile_curve: Option<Decimal>,
+    spread: Option<Positive>,
+    seed: u64,
+}
+
+impl TryFrom<SimulationParametersV2Wire> for SimulationParametersV2 {
+    type Error = ChainError;
+
+    fn try_from(wire: SimulationParametersV2Wire) -> Result<Self, Self::Error> {
+        let parameters = Self {
+            symbol: wire.symbol,
+            steps: wire.steps,
+            effective_start: wire.effective_start,
+            step_interval_seconds: wire.step_interval_seconds,
+            time_frame: wire.time_frame,
+            schedule: wire.schedule,
+            tzdb_version: wire.tzdb_version,
+            initial_price: wire.initial_price,
+            volatility: wire.volatility,
+            risk_free_rate: wire.risk_free_rate,
+            dividend_yield: wire.dividend_yield,
+            method: wire.method,
+            chain_size: wire.chain_size,
+            strike_interval: wire.strike_interval,
+            skew_slope: wire.skew_slope,
+            smile_curve: wire.smile_curve,
+            spread: wire.spread,
+            seed: wire.seed,
+        };
+        parameters.validate()?;
+        Ok(parameters)
+    }
+}
+
 impl SimulationParametersV2 {
+    /// Re-checks every invariant the request path establishes.
+    ///
+    /// Called from the `Deserialize` path, so a stored document is held to the
+    /// same standard as a request. Cheap: a handful of comparisons and one
+    /// symbol check, run once per load.
+    ///
+    /// A `tzdb_version` that differs from the running binary's is a **warning**,
+    /// not a rejection: the simulation is still coherent, it was simply resolved
+    /// against a different IANA release, and refusing to load it would turn a
+    /// dependency bump into an outage. Issue #46 decides whether a mid-tape
+    /// divergence should be escalated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Validation`] naming the offending field when
+    /// `steps` is outside `1..=MAX_STEPS`, `chain_size` exceeds
+    /// `MAX_CHAIN_SIZE`, the symbol violates the identifier format,
+    /// `step_interval_seconds` is outside its documented range, or
+    /// `effective_start` is not on a whole second.
+    pub fn validate(&self) -> Result<(), ChainError> {
+        if self.steps < 1 {
+            return Err(ChainError::Validation {
+                field: "steps".to_string(),
+                reason: "must be at least 1".to_string(),
+            });
+        }
+        if self.steps > *MAX_STEPS {
+            return Err(ChainError::Validation {
+                field: "steps".to_string(),
+                reason: format!("must not exceed {}, got {}", *MAX_STEPS, self.steps),
+            });
+        }
+        if let Some(chain_size) = self.chain_size
+            && chain_size > *MAX_CHAIN_SIZE
+        {
+            return Err(ChainError::Validation {
+                field: "chain_size".to_string(),
+                reason: format!("must not exceed {}, got {chain_size}", *MAX_CHAIN_SIZE),
+            });
+        }
+        symbol_field("symbol", &self.symbol)?;
+        validate_step_interval_seconds(self.step_interval_seconds)?;
+        if self.effective_start.nanosecond() != 0 {
+            return Err(ChainError::Validation {
+                field: "effective_start".to_string(),
+                reason: format!(
+                    "must be on a whole second, got {}",
+                    self.effective_start.to_rfc3339()
+                ),
+            });
+        }
+        self.schedule.validate()?;
+
+        let running = tzdb_version();
+        if self.tzdb_version != running {
+            warn!(
+                stored = %self.tzdb_version,
+                running = %running,
+                "simulation was resolved against a different IANA tzdb release"
+            );
+        }
+
+        Ok(())
+    }
+
     /// The simulated instant at `cursor`.
     ///
     /// `effective_start + cursor × step_interval`, with checked arithmetic
@@ -322,8 +463,11 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
             None => derive_step_interval_seconds(time_frame)?,
         };
 
-        // The one wall-clock read in a v2 simulation's life. Everything
-        // downstream is a function of this value and the cursor.
+        // The only wall-clock read that reaches simulation OUTPUT. Everything
+        // downstream — every simulated_at, expires_at and days_to_expiration —
+        // is a function of this value and the cursor. (`created_at` and
+        // `updated_at` also read the clock, but they are operational metadata
+        // and never enter the tape.)
         let effective_start = to_whole_second_utc(request.start_at.unwrap_or_else(Utc::now))?;
 
         let schedule = ExpirationSchedule::new(
@@ -375,6 +519,7 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
 /// immutable after creation, so `Modified` and `Reinitialized` — the PATCH and
 /// PUT branches — cannot occur.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SessionV2Wire")]
 pub struct SessionV2 {
     /// Unique identifier.
     pub id: Uuid,
@@ -399,6 +544,50 @@ pub struct SessionV2 {
     pub version: u64,
 }
 
+/// The deserialization shape of [`SessionV2`], validated on the way in.
+///
+/// Mirrors the parameters' wire type for the same reason: a stored document is
+/// an outer-layer input. It additionally rejects the two states a v2 simulation
+/// can never legitimately be in, a cursor past its own horizon, and — the one
+/// that matters most operationally — a `schema_version` from the future, which
+/// during a rolling deploy would otherwise let an old replica read a newer
+/// document, drop what it does not understand, and write the truncated version
+/// back with an intact revision so the compare-and-swap succeeds.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionV2Wire {
+    id: Uuid,
+    #[serde(default = "default_schema_version")]
+    schema_version: u32,
+    created_at: SystemTime,
+    updated_at: SystemTime,
+    parameters: SimulationParametersV2,
+    current_step: usize,
+    total_steps: usize,
+    state: SessionState,
+    version: u64,
+}
+
+impl TryFrom<SessionV2Wire> for SessionV2 {
+    type Error = ChainError;
+
+    fn try_from(wire: SessionV2Wire) -> Result<Self, Self::Error> {
+        let simulation = Self {
+            id: wire.id,
+            schema_version: wire.schema_version,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+            parameters: wire.parameters,
+            current_step: wire.current_step,
+            total_steps: wire.total_steps,
+            state: wire.state,
+            version: wire.version,
+        };
+        simulation.validate()?;
+        Ok(simulation)
+    }
+}
+
 /// The schema version assumed for a stored document written before the field
 /// existed. There is no such document today — v2 has shipped with the field
 /// from its first release — but defaulting keeps a future reader honest.
@@ -421,6 +610,60 @@ impl SessionV2 {
             parameters,
             state: SessionState::Initialized,
             version: 0,
+        }
+    }
+
+    /// Re-checks every invariant a freshly-created simulation satisfies.
+    ///
+    /// Called from the `Deserialize` path, so a stored document cannot present
+    /// a state the lifecycle forbids.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Validation`] when the document carries a
+    /// `schema_version` this binary does not understand, a `total_steps` that
+    /// disagrees with its parameters, a cursor past its own horizon, or a state
+    /// unreachable for a v2 simulation (`Modified` and `Reinitialized` are the
+    /// PATCH and PUT branches, and a v2 simulation is immutable). Also
+    /// propagates the parameters' own validation.
+    pub fn validate(&self) -> Result<(), ChainError> {
+        if self.schema_version > SESSION_V2_SCHEMA_VERSION {
+            return Err(ChainError::Validation {
+                field: "schema_version".to_string(),
+                reason: format!(
+                    "document was written under schema {} but this binary understands at most {SESSION_V2_SCHEMA_VERSION}",
+                    self.schema_version
+                ),
+            });
+        }
+        self.parameters.validate()?;
+        if self.total_steps != self.parameters.steps {
+            return Err(ChainError::Validation {
+                field: "total_steps".to_string(),
+                reason: format!(
+                    "must equal the parameters' steps ({}), got {}",
+                    self.parameters.steps, self.total_steps
+                ),
+            });
+        }
+        if self.current_step > self.total_steps {
+            return Err(ChainError::Validation {
+                field: "current_step".to_string(),
+                reason: format!(
+                    "must not exceed total_steps ({}), got {}",
+                    self.total_steps, self.current_step
+                ),
+            });
+        }
+        match self.state {
+            SessionState::Modified | SessionState::Reinitialized => Err(ChainError::Validation {
+                field: "state".to_string(),
+                reason: format!(
+                    "{} is unreachable for a v2 simulation, which is immutable after creation",
+                    self.state
+                ),
+            }),
+            _ => Ok(()),
         }
     }
 
@@ -920,7 +1163,12 @@ mod tests {
         );
     }
 
-    /// The stored schedule keeps the wire shape ADR 0001 §14.2 specifies.
+    /// The stored schedule keeps its documented wire shape.
+    ///
+    /// This is the *storage* form: the schedule nests under `schedule` with its
+    /// rules under `rules`. ADR 0001 §14.2 shows the *response* form, which is
+    /// flat inside `parameters` with the array named `schedules`; #47 owns that
+    /// mapping.
     #[test]
     fn test_stored_schedule_keeps_the_documented_shape() {
         let parameters = parameters(reference_request());
@@ -947,6 +1195,177 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("17:00:00")
         );
+    }
+
+    // ---- stored input is not trusted -------------------------------------
+
+    /// Deserialization runs the same validation as the request path.
+    ///
+    /// Without it a hand-edited or corrupted document in Redis sails past every
+    /// check: `rules/global_rules.md` is explicit that a domain type must not
+    /// trust an outer layer, and Redis is one.
+    #[test]
+    fn test_stored_parameters_are_validated_on_load() {
+        let parameters = parameters(reference_request());
+        let json = match serde_json::to_string(&parameters) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+
+        // Each tamper is a field the request path checks and a stored document
+        // could otherwise smuggle past.
+        let tampers = [
+            // A zero interval freezes the simulated clock: every snapshot would
+            // carry the same instant, the cutoff would never advance, and the
+            // rolling inventory would never roll.
+            (
+                r#""step_interval_seconds":86400"#,
+                r#""step_interval_seconds":0"#,
+                "step_interval_seconds",
+            ),
+            // A steps count above the cap drives an unbounded factor tape.
+            (r#""steps":500"#, r#""steps":100000000"#, "steps"),
+            // A sub-second start breaks the whole-second rendering that makes
+            // exports byte-comparable.
+            (
+                r#""effective_start":"2026-01-05T14:30:00Z""#,
+                r#""effective_start":"2026-01-05T14:30:00.5Z""#,
+                "effective_start",
+            ),
+            // A symbol carrying the CSV separators would corrupt the export
+            // column the rule-id charset was narrowed to protect.
+            (r#""symbol":"SPX""#, r#""symbol":"SPX,\"x\"|y""#, "symbol"),
+            // A chain size above the cap drives an unbounded strike ladder.
+            (r#""chain_size":15"#, r#""chain_size":100000"#, "chain_size"),
+        ];
+
+        for (from, to, field) in tampers {
+            let tampered = json.replace(from, to);
+            assert_ne!(tampered, json, "the tamper for {field} must have applied");
+
+            let error = match serde_json::from_str::<SimulationParametersV2>(&tampered) {
+                Ok(_) => panic!("a tampered {field} must be rejected on load"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(field),
+                "the error must name {field}, got {error}"
+            );
+        }
+    }
+
+    /// An unknown field in a stored document is an error, not a silent drop.
+    ///
+    /// During a rolling deploy an old replica would otherwise read a newer
+    /// document, discard what it does not understand, and write the truncated
+    /// version back with an intact revision — so the compare-and-swap succeeds
+    /// and the data is simply gone.
+    #[test]
+    fn test_stored_parameters_reject_an_unknown_field() {
+        let parameters = parameters(reference_request());
+        let json = match serde_json::to_string(&parameters) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+        let tampered = json.replace(r#""symbol":"SPX""#, r#""symbol":"SPX","a_future_field":1"#);
+
+        assert!(serde_json::from_str::<SimulationParametersV2>(&tampered).is_err());
+    }
+
+    /// A stored simulation from a newer schema is refused rather than silently
+    /// downgraded.
+    #[test]
+    fn test_stored_simulation_rejects_a_future_schema_version() {
+        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let json = match serde_json::to_string(&simulation) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+        let tampered = json.replace(
+            &format!(r#""schema_version":{SESSION_V2_SCHEMA_VERSION}"#),
+            r#""schema_version":99"#,
+        );
+
+        let error = match serde_json::from_str::<SessionV2>(&tampered) {
+            Ok(_) => panic!("a future schema version must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("schema_version"), "got {error}");
+    }
+
+    /// A stored simulation in a state the v2 lifecycle cannot reach is refused.
+    #[test]
+    fn test_stored_simulation_rejects_an_unreachable_state() {
+        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let json = match serde_json::to_string(&simulation) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+
+        for state in ["Modified", "Reinitialized"] {
+            let tampered =
+                json.replace(r#""state":"Initialized""#, &format!(r#""state":"{state}""#));
+            assert_ne!(tampered, json, "the tamper for {state} must have applied");
+
+            let error = match serde_json::from_str::<SessionV2>(&tampered) {
+                Ok(_) => panic!("{state} must be rejected for a v2 simulation"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("state"), "got {error}");
+        }
+    }
+
+    /// A cursor past its own horizon is refused, so no caller has to defend
+    /// against one.
+    #[test]
+    fn test_stored_simulation_rejects_a_cursor_past_the_horizon() {
+        let mut request = reference_request();
+        request.steps = 2;
+        let simulation = SessionV2::new(parameters(request), &generator());
+        let json = match serde_json::to_string(&simulation) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+        let tampered = json.replace(r#""current_step":0"#, r#""current_step":9999"#);
+
+        let error = match serde_json::from_str::<SessionV2>(&tampered) {
+            Ok(_) => panic!("a cursor past the horizon must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("current_step"), "got {error}");
+    }
+
+    /// A `total_steps` that disagrees with the parameters is refused.
+    #[test]
+    fn test_stored_simulation_rejects_a_mismatched_total_steps() {
+        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let json = match serde_json::to_string(&simulation) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+        let tampered = json.replace(r#""total_steps":500"#, r#""total_steps":7"#);
+
+        let error = match serde_json::from_str::<SessionV2>(&tampered) {
+            Ok(_) => panic!("a mismatched total_steps must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("total_steps"), "got {error}");
+    }
+
+    /// A valid stored document still loads, so the validation does not reject
+    /// what it should accept.
+    #[test]
+    fn test_a_valid_stored_simulation_still_loads() {
+        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let json = match serde_json::to_string(&simulation) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+
+        match serde_json::from_str::<SessionV2>(&json) {
+            Ok(loaded) => assert_eq!(loaded, simulation),
+            Err(error) => panic!("a valid document must load: {error}"),
+        }
     }
 
     // ---- lifecycle -------------------------------------------------------

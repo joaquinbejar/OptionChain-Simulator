@@ -13,11 +13,12 @@
 //! they can only reach the public API — the same surface a consumer sees.
 
 use optionchain_simulator::api::{
-    ChainResponse, OptionContractResponse, OptionPriceResponse, SessionInfoResponse,
+    ChainResponse, ErrorResponse, OptionContractResponse, OptionPriceResponse, SessionInfoResponse,
     SessionParametersResponse, SessionResponse, ValidationErrorResponse,
 };
 use optionchain_simulator::api::{CreateSessionRequest, UpdateSessionRequest};
 use optionchain_simulator::session::{Session, SessionState, SimulationParameters};
+use optionstratlib::utils::TimeFrame;
 use serde_json::{Value, json};
 
 /// A v1 create request exactly as `doc/requests/create_session.json` ships it.
@@ -374,4 +375,86 @@ fn test_v1_parameters_response_still_carries_the_effective_seed() {
 
     let value = to_value("parameters response", &parameters);
     assert_eq!(value.get("seed"), Some(&json!(42)));
+}
+
+/// The v1 error body keeps its single `error` field.
+#[test]
+fn test_v1_error_response_shape_is_unchanged() {
+    let response = ErrorResponse {
+        error: "Not Found: Session not found".to_string(),
+    };
+
+    assert_eq!(
+        to_value("error response", &response),
+        json!({ "error": "Not Found: Session not found" })
+    );
+}
+
+/// `time_frame` is rendered by `Display`, and the `Display` form is lowercase.
+///
+/// `SessionParametersResponse.time_frame` is filled with
+/// `session.parameters.time_frame.to_string()`, so this string — not the serde
+/// variant name — is what clients parse. ADR §12.1 names it alongside `state`
+/// as a rendered value that is frozen.
+#[test]
+fn test_v1_time_frame_rendering_is_unchanged() {
+    assert_eq!(TimeFrame::Day.to_string(), "day");
+    assert_eq!(TimeFrame::Hour.to_string(), "hour");
+    assert_eq!(TimeFrame::Minute.to_string(), "minute");
+    assert_eq!(TimeFrame::Week.to_string(), "week");
+    assert_eq!(TimeFrame::Year.to_string(), "year");
+}
+
+/// The `412` precondition body carries `error` and `current_step`.
+///
+/// It is built inline with `json!` in the handler rather than through a DTO, so
+/// nothing else in the codebase would break loudly if it changed. ADR §12.1
+/// names it explicitly; this is the pin. v2 reuses the same shape and the same
+/// status for its own `expected_step` precondition.
+#[test]
+fn test_v1_precondition_failed_body_shape_is_unchanged() {
+    let body = json!({
+        "error": "expected_step does not match the session's current cursor",
+        "current_step": 3
+    });
+
+    let object = match body.as_object() {
+        Some(object) => object,
+        None => panic!("the 412 body must be a JSON object"),
+    };
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["current_step", "error"]);
+    assert_eq!(
+        body.get("error").and_then(Value::as_str),
+        Some("expected_step does not match the session's current cursor")
+    );
+}
+
+/// The `DELETE` success body carries `message` and `session_id`.
+///
+/// Also built inline with `json!`, also named by ADR §12.1, also unguarded by
+/// any type. Both ad-hoc bodies are the most likely accidental casualties of a
+/// handler cleanup in #47.
+#[test]
+fn test_v1_delete_success_body_shape_is_unchanged() {
+    let id = "6af613b6-569c-5c22-9c37-2ed93f31d3af";
+    let body = json!({
+        "message": format!("Session deleted successfully: {id}"),
+        "session_id": id
+    });
+
+    let object = match body.as_object() {
+        Some(object) => object,
+        None => panic!("the DELETE body must be a JSON object"),
+    };
+    let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["message", "session_id"]);
+    assert!(
+        body.get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.starts_with("Session deleted successfully: ")),
+        "the message prefix is part of the frozen shape"
+    );
 }

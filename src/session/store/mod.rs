@@ -54,5 +54,5 @@ pub use in_memory::InMemorySessionStore;
 pub use in_redis::InRedisSessionStore;
 pub use interface::SessionStore;
 pub use v2_interface::SimulationStore;
-pub use v2_memory::{DEFAULT_V2_IDLE_RETENTION_SECS, InMemorySimulationStore};
-pub use v2_redis::{DEFAULT_V2_KEY_PREFIX, DEFAULT_V2_SESSION_TTL_SECS, InRedisSimulationStore};
+pub use v2_memory::{DEFAULT_V2_RETENTION_SECS, InMemorySimulationStore};
+pub use v2_redis::{DEFAULT_V2_KEY_PREFIX, InRedisSimulationStore};

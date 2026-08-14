@@ -93,10 +93,23 @@ rather than the Rust types, and the alternative — a parallel primitive-typed
 representation in `session` — would mean two shapes, two validation paths, and a
 standing risk that they drift.
 
-What is *not* accepted is a validation bypass. The configuration types keep
-their fields private and route `Deserialize` through their validating
-constructors, so a schedule loaded from Redis is checked exactly like one built
-from a request.
+What is *not* accepted is a validation bypass. **Every** stored v2 type — the
+schedule and its rules, the simulation parameters, the simulation document —
+routes `Deserialize` through a validating constructor, so a document loaded
+from Redis is checked exactly like a request. This is not defensive
+programming for its own sake: without it a `step_interval_seconds` of `0`
+freezes the simulated clock and every snapshot silently carries the same
+instant, a `steps` past the cap drives an unbounded factor tape, and a
+sub-second `effective_start` breaks the whole-second rendering §10.2 relies on
+for byte-comparable exports. Redis is an outer layer, and a domain type does
+not trust one.
+
+The stored shapes additionally reject unknown fields. That turns the
+rolling-deploy hazard into a loud one: an old replica reading a document
+written by a newer binary fails, rather than dropping the fields it does not
+understand and writing the truncated document back with an intact revision so
+the compare-and-swap succeeds. For the same reason a `schema_version` from the
+future is refused on load.
 
 ---
 
@@ -185,10 +198,14 @@ its `target_count` expirations.
 
 ### 4.1 Schedule shape
 
-A simulation carries a `schedules` array. Each entry is one rule, serialised as
-an **internally-tagged enum on `kind`** carrying `#[serde(deny_unknown_fields)]`,
-so a field that does not belong to a rule's `kind` is a rejected request rather
-than a silently ignored one:
+A simulation carries a `schedules` array. Each entry is one **flat object
+tagged by `kind`**, with the kind-specific fields as siblings of `rule_id`.
+
+The tag and those fields are declared explicitly rather than through an
+internally-tagged enum: serde cannot combine that with `deny_unknown_fields`,
+and giving up `deny_unknown_fields` would give up both guarantees §4.4 makes —
+that an unknown field is rejected, and that a field which does not belong to
+the rule's `kind` is rejected rather than silently ignored.
 
 | field | meaning |
 |---|---|
@@ -481,11 +498,19 @@ real minutes, and must not pin three years of option contracts in memory.
 
 ### 9.1 Session retention
 
-The **idle** lifetime of a v2 session is operational and completely independent
-of the months or years its simulated clock spans. It is configurable, validated
-at startup, and applied consistently by the in-memory and Redis stores, which
-must agree on expiry and renewal semantics. v1's hard-coded one-hour Redis TTL
+The retention lifetime of a v2 session is operational and completely
+independent of the months or years its simulated clock spans. It is
+configurable, validated at startup, and applied consistently by the in-memory
+and Redis stores, which must agree on expiry and renewal semantics — one shared
+default constant rather than one per backend, because two independently-named
+defaults are how that agreement drifts. v1's hard-coded one-hour Redis TTL
 (`src/main.rs`) is unchanged; only v2 gets the knob.
+
+The window is measured from the **last write**, not the last access. §6 defines
+the snapshot endpoint as a safe peek that persists nothing, so a client that
+only ever peeks does not refresh its retention. Both backends behave the same
+way, which is the property that matters for correctness; whether a peek *should*
+refresh is a product decision for #48.
 
 ### 9.2 Cache eviction
 
@@ -636,6 +661,16 @@ the offending `field` — so a client can point a user at one input. The `412`
 body matches v1's precondition body exactly
 (`src/api/rest/handlers.rs:374-377`). Error messages never contain credentials,
 connection strings, or environment values.
+
+**One implementation note that is easy to get wrong.** A schedule rule is
+validated during deserialization, not after it, because the rule type owns its
+own invariants (§4.4). Its `ChainError::Validation` is therefore flattened into
+a serde error before any handler sees it, and actix's default JSON extractor
+would render that as a plaintext `400` with no `field`. The v2 routes must
+register a `web::JsonConfig` error handler that recovers the message into a
+`ValidationErrorResponse`; without it, the whole rule-level class of §4.4
+failures silently loses the structured `field` this section promises. That
+handler is #47's to add, and is a required part of its acceptance.
 
 ---
 

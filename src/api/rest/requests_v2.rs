@@ -10,7 +10,7 @@
 //! (`crate::session::model_v2`).
 
 use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
-use crate::domain::expiry::ExpiryRule;
+use crate::session::ExpiryRule;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;

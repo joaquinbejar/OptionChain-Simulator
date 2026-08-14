@@ -35,14 +35,18 @@
 //!
 //! # Visibility
 //!
-//! Every type here is `pub(crate)` and stays inside the private `domain`
-//! module. It is deliberately **not** part of the published crate's API: doing
-//! so would put `chrono_tz::Tz`, `chrono::Weekday` and `chrono::NaiveTime` into
-//! the public surface, and a `chrono-tz` major bump would then be a breaking
-//! change for downstream consumers such as IronCondor. Issue #44 owns the
-//! public representation — primitive-typed schedule fields on the v2 session
-//! parameters — and converts into these types at the one boundary that already
-//! does f64 → typed conversion.
+//! The module splits in two. The **configuration** types —
+//! [`ExpirationSchedule`], [`ExpiryRule`], [`ExpiryRuleKind`],
+//! [`CalendarVersion`] — are `pub` and re-exported through `session`, because
+//! they are fields of the public v2 simulation parameters and a caller building
+//! those in Rust has to name them. The **planner** — [`RollingPlanner`],
+//! [`ActiveExpiry`] — stays `pub(crate)`: it is how snapshots get built, not
+//! part of anyone's contract.
+//!
+//! Publishing the configuration types puts `chrono_tz::Tz`, `chrono::Weekday`
+//! and `chrono::NaiveTime` on the crate's public surface, so a `chrono-tz`
+//! major bump is a semver event here. ADR 0001 §2.1 records why that is
+//! accepted rather than overlooked.
 //!
 //! # Validation
 //!
@@ -51,25 +55,6 @@
 //! `#[serde(try_from = ...)]` so a schedule loaded from Redis is checked
 //! exactly like one built from a request. Without that, a stored
 //! `target_count` of `1e11` would reach the projection loop.
-
-// The planner *evaluation* half — `RollingPlanner`, `ActiveExpiry`, and their
-// helpers — has no in-tree caller yet: #46 calls `active_at` to build each
-// snapshot. The *configuration* half is already live, wired into the v2 session
-// parameters by #44.
-//
-// `expect` rather than `allow` on purpose: once #46 exercises the last of these
-// items the expectation goes unfulfilled, and CI's `-D warnings` turns that into
-// a hard error. Removing this line is therefore enforced by the compiler rather
-// than promised in a commit message. It is scoped to non-test builds because the
-// module's own tests already exercise the evaluation path, which would make the
-// expectation unfulfilled under `cargo test` for the wrong reason.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the planner evaluation path has no in-tree caller until #46 builds snapshots"
-    )
-)]
 
 use crate::utils::ChainError;
 use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
@@ -119,13 +104,34 @@ pub(crate) const MAX_RULE_ID_LEN: usize = 64;
 /// A weekly rule naming one weekday needs seven days per expiration; the
 /// factor of eight plus a constant leaves room for weekends and for the
 /// starting partial week without ever letting the scan run unbounded.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 const DAY_SCAN_SLACK: usize = 32;
 
 /// Upper bound on how many candidate periods a monthly or yearly rule may scan.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 const PERIOD_SCAN_SLACK: usize = 2;
 
 /// Seconds in a day, as a `Decimal`, for the fractional days-to-expiration
 /// conversion.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 const SECONDS_PER_DAY: Decimal = Decimal::from_parts(86_400, 0, 0, false, 0);
 
 /// The version of the IANA time-zone database this binary resolves local
@@ -454,6 +460,17 @@ impl ExpiryRule {
         }
         validate_rule_kind(&rule_id, &kind)?;
 
+        // Rebuild a weekly set through the normalising constructor. The REST
+        // and stored paths already go through it, but `ExpiryRuleKind` has
+        // public variants, so a Rust caller can hand us
+        // `Weekly { weekdays: vec![Fri, Mon, Mon] }` directly — and ADR 0001
+        // §14.2 makes the normalised form the replay input, so persisting an
+        // un-normalised one would be a quiet contract break.
+        let kind = match kind {
+            ExpiryRuleKind::Weekly { weekdays } => ExpiryRuleKind::weekly(weekdays),
+            other => other,
+        };
+
         Ok(Self {
             rule_id,
             kind,
@@ -728,6 +745,13 @@ fn reject_weekend(field: &str, weekday: Weekday) -> Result<(), ChainError> {
 /// One physical expiration that is alive at a given simulated instant, with
 /// every rule that asked for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 pub(crate) struct ActiveExpiry {
     /// The absolute expiration instant, in UTC.
     pub(crate) expires_at: DateTime<Utc>,
@@ -736,6 +760,13 @@ pub(crate) struct ActiveExpiry {
     pub(crate) labels: Vec<String>,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 impl ActiveExpiry {
     /// The fractional days remaining until this expiration at `simulated_at`.
     ///
@@ -790,10 +821,24 @@ impl ActiveExpiry {
 /// Pure: constructing a planner performs no I/O and evaluating it draws no
 /// randomness and reads no clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 pub(crate) struct RollingPlanner<'a> {
     schedule: &'a ExpirationSchedule,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 impl<'a> RollingPlanner<'a> {
     /// Builds a planner over an already-validated schedule.
     #[must_use]
@@ -1037,6 +1082,13 @@ impl<'a> RollingPlanner<'a> {
 
 /// Builds the error a failed projection reports, naming the rule that failed.
 #[cold]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 fn projection_error(rule: &ExpiryRule, reason: String) -> ChainError {
     ChainError::Validation {
         field: format!("schedules.{}", rule.rule_id),
@@ -1048,6 +1100,13 @@ fn projection_error(rule: &ExpiryRule, reason: String) -> ChainError {
 ///
 /// Returns the failure reason rather than a `ChainError`, so the caller can
 /// attach the rule that was being projected.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 fn add_months(year: i32, month: u32, offset: u32) -> Result<(i32, u32), String> {
     let zero_based = month.checked_sub(1).ok_or("month underflows")?;
     let total = zero_based
@@ -1067,6 +1126,13 @@ fn add_months(year: i32, month: u32, offset: u32) -> Result<(i32, u32), String> 
 ///
 /// Returns the failure reason rather than a `ChainError`, so the caller can
 /// attach the rule that was being projected.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 fn add_years(year: i32, offset: u32) -> Result<i32, String> {
     let offset = i32::try_from(offset).map_err(|_| "year arithmetic overflows")?;
     year.checked_add(offset)
@@ -1078,6 +1144,13 @@ fn add_years(year: i32, offset: u32) -> Result<i32, String> {
 /// Walks back from the last day of the month to the most recent occurrence of
 /// `weekday`, so "last Friday of February 2028" lands on the 25th of a
 /// twenty-nine-day month without any special-casing.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "no in-tree caller until #46 builds snapshots from the planner"
+    )
+)]
 fn last_weekday_of_month(
     rule: &ExpiryRule,
     year: i32,

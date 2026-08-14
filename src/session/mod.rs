@@ -33,7 +33,7 @@ mod model;
 /// the resolved simulation parameters, the simulation document, and the
 /// conversion from the v2 request DTO. Kept apart from `model` because
 /// `/api/v1/chain` and its stored shape are frozen (ADR 0001 section 12).
-pub mod model_v2;
+mod model_v2;
 ///
 /// The `state_handler` module is responsible for managing and encapsulating all
 /// logic related to the application state. It defines functionality to manipulate,
@@ -70,12 +70,9 @@ mod store;
 pub use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, ExpiryRule, ExpiryRuleKind};
 pub use manager::SessionManager;
 pub use model::{Session, SessionState, SimulationMethod, SimulationParameters};
-pub use model_v2::{
-    MAX_STEP_INTERVAL_SECONDS, MIN_STEP_INTERVAL_SECONDS, SESSION_V2_SCHEMA_VERSION, SessionV2,
-    SimulationParametersV2,
-};
+pub use model_v2::{SESSION_V2_SCHEMA_VERSION, SessionV2, SimulationParametersV2};
 pub use store::{
-    DEFAULT_V2_IDLE_RETENTION_SECS, DEFAULT_V2_KEY_PREFIX, DEFAULT_V2_SESSION_TTL_SECS,
-    InMemorySessionStore, InMemorySimulationStore, InRedisSessionStore, InRedisSimulationStore,
-    SessionStore, SimulationStore,
+    DEFAULT_V2_KEY_PREFIX, DEFAULT_V2_RETENTION_SECS, InMemorySessionStore,
+    InMemorySimulationStore, InRedisSessionStore, InRedisSimulationStore, SessionStore,
+    SimulationStore,
 };
