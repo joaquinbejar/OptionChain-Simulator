@@ -57,6 +57,11 @@ pub struct CreateSimulationRequest {
     /// Initial price of the underlying.
     pub initial_price: f64,
     /// Initial (and, for constant-volatility models, the only) volatility.
+    ///
+    /// Must equal the walk model's own `volatility` where the model carries
+    /// one: a simulation has exactly one base volatility, and a disagreement is
+    /// a `400` naming this field rather than a silent choice made later
+    /// (ADR 0001 §4.4). `Historical` carries none, so nothing has to match.
     pub volatility: f64,
     /// Annualised risk-free rate, as a decimal fraction.
     pub risk_free_rate: f64,

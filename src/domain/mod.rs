@@ -1,5 +1,6 @@
 pub(crate) mod expiry;
-mod simulator;
+pub(crate) mod factors;
+pub(crate) mod simulator;
 mod walker;
 
 pub use simulator::Simulator;

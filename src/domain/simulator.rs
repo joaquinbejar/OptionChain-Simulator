@@ -30,10 +30,27 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-const DEFAULT_CHAIN_SIZE: usize = 30;
+/// Number of strikes a chain carries when the request does not say.
+///
+/// `pub(crate)` so the v2 factor tape and snapshot builder apply exactly the
+/// same defaults as v1 rather than a second set that could drift.
+pub(crate) const DEFAULT_CHAIN_SIZE: usize = 30;
 
-const DEFAULT_SKEW_SLOPE: Decimal = dec!(-0.2);
-const DEFAULT_SMILE_CURVE: Decimal = dec!(0.4);
+/// Default slope of the volatility skew.
+pub(crate) const DEFAULT_SKEW_SLOPE: Decimal = dec!(-0.2);
+
+/// Default curvature of the volatility smile.
+pub(crate) const DEFAULT_SMILE_CURVE: Decimal = dec!(0.4);
+
+/// Default bid-ask spread factor.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the v2 factor tape, which has no caller until #46"
+    )
+)]
+pub(crate) const DEFAULT_SPREAD: Decimal = dec!(0.01);
 
 /// Default upper bound on the number of random walks held in the simulation cache.
 const DEFAULT_MAX_CACHED_WALKS: usize = 1000;
@@ -668,6 +685,118 @@ mod tests {
         let tape_b = collect_tape(&simulator, &mut session_b).await;
 
         assert_eq!(tape_a, tape_b);
+    }
+
+    /// The v2 factor tape reproduces v1's price path for the same seed and
+    /// parameters.
+    ///
+    /// This pins the claim that justifies the factor tape reusing v1's
+    /// `WalkParams` rather than building its own: the tape reads the same
+    /// seeded stream through the same kernels, so the two paths agree.
+    ///
+    /// It rests on an upstream detail — no walk kernel reads `init_step.x` —
+    /// that v2 deliberately diverges on, passing a nominal one-day expiration
+    /// where v1 passes the session's `days_to_expiration`. Every other
+    /// reproducibility test in this crate compares v2 against v2, so an
+    /// upstream kernel that became time-aware would split the two tapes with
+    /// all of them still green. This is the one that would fail.
+    ///
+    /// Compared over the steps v1 actually serves: its walk truncates when its
+    /// single expiry reaches zero, which is the limitation the factor tape
+    /// exists to remove.
+    #[tokio::test]
+    async fn test_the_v2_factor_tape_reproduces_the_v1_price_path() {
+        use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
+        use crate::api::rest::requests_v2::CreateSimulationRequest;
+        use crate::domain::factors::FactorTape;
+        use crate::session::{ExpiryRule, ExpiryRuleKind, SimulationParametersV2};
+        use chrono::{TimeZone, Utc};
+
+        const SEED: u64 = 20260713;
+        const STEPS: usize = 12;
+        const INITIAL_PRICE: f64 = 100.0;
+        const VOLATILITY: f64 = 0.2;
+        const DT: f64 = 0.004;
+
+        // v1: a session walking a seeded geometric Brownian path.
+        let mut session = create_test_session(Some(Uuid::new_v4()));
+        session.parameters.seed = Some(SEED);
+        session.parameters.steps = STEPS;
+        session.parameters.method = SimulationMethod::GeometricBrownian {
+            dt: pos_or_panic!(DT),
+            drift: dec!(0.0),
+            volatility: pos_or_panic!(VOLATILITY),
+        };
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+        let (walk, _resolved) = match simulator.create_random_walk(&session).await {
+            Ok(walk) => walk,
+            Err(error) => panic!("the v1 walk must build: {error}"),
+        };
+
+        // v2: the same market, expressed as a rolling simulation.
+        let rule = match ExpiryRule::new("zero_dte", ExpiryRuleKind::Daily, 1) {
+            Ok(rule) => rule,
+            Err(error) => panic!("the test rule must be valid: {error}"),
+        };
+        let start_at = match Utc.with_ymd_and_hms(2026, 1, 5, 14, 30, 0).single() {
+            Some(instant) => instant,
+            None => panic!("the test instant must be valid"),
+        };
+        let request = CreateSimulationRequest {
+            symbol: "TEST".to_string(),
+            steps: STEPS,
+            start_at: Some(start_at),
+            step_interval_seconds: Some(86_400),
+            timezone: "America/New_York".to_string(),
+            calendar: None,
+            expiration_time: "17:00".to_string(),
+            schedules: vec![rule],
+            initial_price: INITIAL_PRICE,
+            volatility: VOLATILITY,
+            risk_free_rate: 0.0,
+            dividend_yield: 0.0,
+            method: ApiWalkType::GeometricBrownian {
+                dt: DT,
+                drift: 0.0,
+                volatility: VOLATILITY,
+            },
+            time_frame: ApiTimeFrame::Day,
+            chain_size: Some(10),
+            strike_interval: Some(5.0),
+            skew_slope: Some(-0.2),
+            smile_curve: Some(0.5),
+            spread: Some(0.01),
+            seed: Some(SEED),
+        };
+        let parameters = match SimulationParametersV2::try_from(request) {
+            Ok(parameters) => parameters,
+            Err(error) => panic!("the v2 request must convert: {error}"),
+        };
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the v2 tape must build: {error}"),
+        };
+
+        let shared = walk.len().min(tape.len());
+        assert!(
+            shared > 1,
+            "the comparison needs more than the shared starting point"
+        );
+        for step in 0..shared {
+            let v1_spot = walk[step].y.value().underlying_price;
+            let v2_spot = match tape.row(step) {
+                Some(row) => row.spot,
+                None => panic!("the tape must have a row at step {step}"),
+            };
+            assert_eq!(
+                v1_spot, v2_spot,
+                "step {step} diverged between the v1 walk and the v2 factor tape"
+            );
+        }
     }
 
     #[tokio::test]

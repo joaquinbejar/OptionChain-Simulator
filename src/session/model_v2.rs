@@ -333,8 +333,11 @@ impl SimulationParametersV2 {
     /// Returns [`ChainError::Validation`] naming the offending field when
     /// `steps` is outside `1..=MAX_STEPS`, `chain_size` exceeds
     /// `MAX_CHAIN_SIZE`, the symbol violates the identifier format,
-    /// `step_interval_seconds` is outside its documented range, or
-    /// `effective_start` is not on a whole second.
+    /// `step_interval_seconds` is outside its documented range,
+    /// `effective_start` is not on a whole second, `initial_price`,
+    /// `volatility` or `strike_interval` is not strictly positive, the walk
+    /// model fails its own invariants, `volatility` disagrees with the walk
+    /// model's own volatility, or the schedule is invalid.
     pub fn validate(&self) -> Result<(), ChainError> {
         if self.steps < 1 {
             return Err(ChainError::Validation {
@@ -384,6 +387,25 @@ impl SimulationParametersV2 {
             });
         }
         self.schedule.validate()?;
+
+        // A simulation has exactly one base volatility. v1 accepts a top-level
+        // value and a walk model carrying a different one, and silently prices
+        // step zero at the first while walking on the second; v2 refuses the
+        // contradiction at the boundary rather than letting the domain pick a
+        // winner later. `Historical` carries no model volatility, so there is
+        // nothing to disagree with.
+        if let Some(model_volatility) = self.method.volatility()
+            && model_volatility != self.volatility
+        {
+            return Err(ChainError::Validation {
+                field: "volatility".to_string(),
+                reason: format!(
+                    "must match the walk model's volatility ({model_volatility}), got {}; \
+                     a simulation has exactly one base volatility",
+                    self.volatility
+                ),
+            });
+        }
 
         let running = tzdb_version();
         if self.tzdb_version != running {
@@ -509,7 +531,7 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
             request.schedules,
         )?;
 
-        Ok(Self {
+        let parameters = Self {
             symbol: request.symbol,
             steps: request.steps,
             effective_start,
@@ -540,7 +562,14 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
                 .map(|value| positive_field("spread", value))
                 .transpose()?,
             seed: request.seed.unwrap_or_else(|| rand::rng().random()),
-        })
+        };
+
+        // Run the same checks the stored-document path runs, so a request and a
+        // reloaded document are held to one standard and there is one place to
+        // add the next invariant. The field-specific checks above stay where
+        // they are: they can name the *request* field, which `validate` cannot.
+        parameters.validate()?;
+        Ok(parameters)
     }
 }
 
@@ -1325,6 +1354,15 @@ mod tests {
             // method round-trips through the same mirror the request path
             // validates with, so a `dt` of zero is caught by that check.
             (r#""dt":0.004"#, r#""dt":0.0"#, "dt"),
+            // A simulation has exactly one base volatility, and the check that
+            // enforces it has to hold on the stored path too — otherwise a
+            // document can carry a top-level value the walk never uses. The
+            // anchor is needed because "volatility":0.18 appears twice.
+            (
+                r#""tzdb_version":"2025b","initial_price":5000,"volatility":0.18"#,
+                r#""tzdb_version":"2025b","initial_price":5000,"volatility":0.25"#,
+                "volatility",
+            ),
         ];
 
         for (from, to, field) in tampers {
