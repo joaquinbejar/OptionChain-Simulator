@@ -438,6 +438,15 @@ Invariants a reviewer can check:
   the ladder, not a copy of it.
 - All numeric fields are `f64` **at the REST boundary only**; the domain works
   in `Positive`/`Decimal`.
+- `expires_at` is the **only** expiration a client sees. Upstream's
+  `OptionChain` also carries a `YYYY-MM-DD` string that it stamps from the host
+  clock — `get_date_string()` reads `Utc::now()` for a relative expiration and
+  ignores the thread-local reference, and there is no hook to change that. It is
+  upstream metadata, it is not part of this contract, and the v2 DTOs must not
+  surface it. Nothing that reaches a price depends on it: premiums, Greeks and
+  the derived strike interval all come from the fractional days value directly,
+  so the snapshot's *surfaced* content stays a pure function of the effective
+  inputs.
 - The identifier field is `id` and the resource is a *simulation*; "session" is
   v1 vocabulary and is not used on the v2 wire.
 - `state` is serialised **`snake_case`** — `initialized`, `in_progress`,
