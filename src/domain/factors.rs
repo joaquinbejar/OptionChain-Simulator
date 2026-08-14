@@ -111,21 +111,32 @@ impl FactorTape {
     /// `Historical` walk has to be resolved against the database first — a
     /// seeded symbol-and-date selection that already lives in
     /// [`crate::domain::Simulator`]. Keeping the resolution outside leaves this
-    /// function pure and synchronous: no I/O, no wall clock, and therefore
-    /// directly testable for the reproducibility properties that matter. A
-    /// caller with nothing to resolve passes `&parameters.method`.
+    /// function synchronous and free of I/O, and therefore directly testable
+    /// for the reproducibility properties that matter. It is not clock-free:
+    /// the seeding chain stamps an expiration date through `Utc::now()`, as the
+    /// module docs explain, but that value reaches no row. A caller with
+    /// nothing to resolve passes `&parameters.method`.
     ///
     /// # Errors
     ///
-    /// Returns [`ChainError::Validation`] when the model's volatility disagrees
-    /// with the parameters' (see [`resolve_base_volatility`]) or when the
-    /// simulated clock overflows, and [`ChainError::Internal`] when the initial
-    /// chain cannot be built or the walk returns fewer points than requested.
+    /// Returns [`ChainError::Validation`] when the parameters are invalid, when
+    /// the model's volatility disagrees with the parameters' (see
+    /// [`resolve_base_volatility`]), when a `Historical` series is too short
+    /// for the horizon, or when the simulated clock overflows; and
+    /// [`ChainError::Internal`] when the resolved method is not the one the
+    /// parameters name, when the initial chain cannot be built, or when the
+    /// walk returns fewer points than requested.
     #[instrument(skip(parameters, method), level = "debug")]
     pub(crate) fn build(
         parameters: &SimulationParametersV2,
         method: &SimulationMethod,
     ) -> Result<Self, ChainError> {
+        // `SimulationParametersV2` is public with public fields, so a crate
+        // caller can hand this a struct literal that never passed a validating
+        // constructor. `steps: 0` is the one that bites: two of the mirrored
+        // kernels compute `size - 1`, which panics in debug and wraps to an
+        // unbounded loop in release.
+        parameters.validate()?;
         ensure_method_matches(parameters, method)?;
         ensure_historical_series_covers_the_horizon(parameters, method)?;
         let base_volatility = resolve_base_volatility(parameters, method)?;
@@ -147,7 +158,10 @@ impl FactorTape {
                     // A nominal relative expiration for the seeding step only.
                     // The tape carries no expiration of its own — every real
                     // one comes from the planner — and this value never reaches
-                    // a price.
+                    // a price. It is safe only because the generation below is
+                    // called directly: never route this `WalkParams` through a
+                    // `walk_steps` driver, which advances the expiry per step
+                    // and would truncate the walk at the first one.
                     ExpirationDate::Days(Positive::ONE),
                 ),
                 y: Ystep::new(0, initial_chain),
@@ -369,9 +383,13 @@ fn resolve_base_volatility(
 
 /// Builds the single option chain that seeds the walk.
 ///
-/// Mirrors v1's wiring in [`crate::domain::Simulator`] field for field, using
-/// the shared defaults, so the walk's starting point is identical to the one v1
-/// would produce for the same parameters.
+/// Mirrors v1's wiring in [`crate::domain::Simulator`] and the shared defaults,
+/// with one deliberate difference: the expiration is nominal here (see below),
+/// where v1 passes the request's `days_to_expiration`. That changes the strike
+/// ladder when `strike_interval` is `None`, because upstream derives it from
+/// the expiration — but not the walk's starting point, which is the chain's
+/// `underlying_price` and is copied verbatim from the price parameters. So the
+/// price path is the one v1 would produce for the same seed.
 #[cfg_attr(
     not(test),
     expect(
@@ -633,8 +651,10 @@ mod tests {
     ///
     /// This is the load-bearing isolation property: the planner draws no
     /// randomness, so a client can add, remove or reorder expiration rules and
-    /// still compare two runs' underlying paths. If chain building ever started
-    /// consuming the walker's RNG, this test is what would catch it.
+    /// still compare two runs' underlying paths. What this test catches is
+    /// `build` starting to read `parameters.schedule` at all; the version that
+    /// covers snapshot building consuming the walker's RNG belongs with the
+    /// snapshots themselves, in #46.
     #[test]
     fn test_the_schedule_cannot_perturb_the_tape() {
         let baseline = tape(&parameters(request(40, brownian(0.18), 0.18)));
@@ -730,14 +750,28 @@ mod tests {
         let tape = tape(&parameters);
 
         assert_eq!(tape.len(), 60);
-        let distinct: std::collections::BTreeSet<String> = tape
-            .rows()
-            .iter()
-            .map(|row| row.base_volatility.to_string())
-            .collect();
+
+        let series: Vec<Positive> = tape.rows().iter().map(|row| row.base_volatility).collect();
+        let distinct: std::collections::BTreeSet<String> =
+            series.iter().map(ToString::to_string).collect();
         assert!(
             distinct.len() > 1,
             "a GARCH tape must not have a constant volatility"
+        );
+
+        // Alignment, not just variation: row 0 carries the model's own
+        // volatility, which is where upstream starts the series, and the series
+        // is not its own mirror image — so a reversed or shifted column fails
+        // here rather than passing on variation alone.
+        assert_eq!(
+            series.first(),
+            Some(&parameters.volatility),
+            "row 0 must carry the model's starting volatility"
+        );
+        let reversed: Vec<Positive> = series.iter().rev().copied().collect();
+        assert_ne!(
+            series, reversed,
+            "a symmetric series would hide a reversed column"
         );
     }
 
@@ -749,14 +783,28 @@ mod tests {
         let tape = tape(&parameters);
 
         assert_eq!(tape.len(), 60);
-        let distinct: std::collections::BTreeSet<String> = tape
-            .rows()
-            .iter()
-            .map(|row| row.base_volatility.to_string())
-            .collect();
+
+        let series: Vec<Positive> = tape.rows().iter().map(|row| row.base_volatility).collect();
+        let distinct: std::collections::BTreeSet<String> =
+            series.iter().map(ToString::to_string).collect();
         assert!(
             distinct.len() > 1,
             "a Heston tape must not have a constant volatility"
+        );
+
+        // Alignment, not just variation: row 0 carries the model's own
+        // volatility, which is where upstream starts the series, and the series
+        // is not its own mirror image — so a reversed or shifted column fails
+        // here rather than passing on variation alone.
+        assert_eq!(
+            series.first(),
+            Some(&parameters.volatility),
+            "row 0 must carry the model's starting volatility"
+        );
+        let reversed: Vec<Positive> = series.iter().rev().copied().collect();
+        assert_ne!(
+            series, reversed,
+            "a symmetric series would hide a reversed column"
         );
     }
 
@@ -954,11 +1002,14 @@ mod tests {
 
     // ---- bounds -----------------------------------------------------------
 
-    /// The tape stores rows, not contracts: its memory is `O(steps)` and does
-    /// not grow with the chain size.
+    /// The tape stores rows, not contracts: its memory is `O(steps)`, and the
+    /// chain shape reaches neither its size nor its contents.
     ///
-    /// Asserted structurally — a row is four small fields — rather than by
-    /// measuring an allocator, which would be flaky.
+    /// The second assertion is the load-bearing one. Only the seeding chain's
+    /// `underlying_price` enters the walk, and upstream copies that verbatim
+    /// from the price parameters, so a 200-strike ladder and a default one must
+    /// produce the same rows for the same seed. If that ever stops holding, the
+    /// chain shape has started perturbing the tape.
     #[test]
     fn test_memory_is_o_steps_and_independent_of_chain_size() {
         let mut wide = request(30, brownian(0.18), 0.18);
@@ -968,11 +1019,11 @@ mod tests {
         let wide_tape = tape(&parameters(wide));
         let narrow_tape = tape(&parameters(narrow));
 
-        assert_eq!(wide_tape.len(), narrow_tape.len());
-        assert_eq!(
-            wide_tape.len() * std::mem::size_of::<FactorRow>(),
-            narrow_tape.len() * std::mem::size_of::<FactorRow>(),
-            "a row's size must not depend on the chain shape"
+        assert_eq!(wide_tape.rows(), narrow_tape.rows());
+        assert!(
+            std::mem::size_of::<FactorRow>() <= 128,
+            "a row is a handful of small fields, got {} bytes",
+            std::mem::size_of::<FactorRow>()
         );
     }
 

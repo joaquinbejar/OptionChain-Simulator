@@ -301,7 +301,14 @@ simulation:
   `1..=12`;
 - an empty `schedules` array, or more rules than the configured cap (§9.3);
 - a projected inventory larger than the configured per-snapshot cap (§9.3);
-- any date arithmetic that would overflow while projecting the requested count.
+- any date arithmetic that would overflow while projecting the requested count;
+- a top-level `volatility` that disagrees with the walk model's own
+  `volatility`. A simulation has exactly one base volatility: v1 accepts the
+  pair and silently prices step zero at one while walking on the other, and v2
+  refuses the contradiction at the boundary rather than letting the domain pick
+  a winner. `Historical` carries no model volatility, so there is nothing to
+  disagree with. The check runs on the stored document too, so a hand-edited
+  simulation cannot smuggle the contradiction back in.
 
 ---
 

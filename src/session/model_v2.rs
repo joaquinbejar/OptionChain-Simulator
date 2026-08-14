@@ -333,8 +333,11 @@ impl SimulationParametersV2 {
     /// Returns [`ChainError::Validation`] naming the offending field when
     /// `steps` is outside `1..=MAX_STEPS`, `chain_size` exceeds
     /// `MAX_CHAIN_SIZE`, the symbol violates the identifier format,
-    /// `step_interval_seconds` is outside its documented range, or
-    /// `effective_start` is not on a whole second.
+    /// `step_interval_seconds` is outside its documented range,
+    /// `effective_start` is not on a whole second, `initial_price`,
+    /// `volatility` or `strike_interval` is not strictly positive, the walk
+    /// model fails its own invariants, `volatility` disagrees with the walk
+    /// model's own volatility, or the schedule is invalid.
     pub fn validate(&self) -> Result<(), ChainError> {
         if self.steps < 1 {
             return Err(ChainError::Validation {
@@ -1351,6 +1354,15 @@ mod tests {
             // method round-trips through the same mirror the request path
             // validates with, so a `dt` of zero is caught by that check.
             (r#""dt":0.004"#, r#""dt":0.0"#, "dt"),
+            // A simulation has exactly one base volatility, and the check that
+            // enforces it has to hold on the stored path too — otherwise a
+            // document can carry a top-level value the walk never uses. The
+            // anchor is needed because "volatility":0.18 appears twice.
+            (
+                r#""tzdb_version":"2025b","initial_price":5000,"volatility":0.18"#,
+                r#""tzdb_version":"2025b","initial_price":5000,"volatility":0.25"#,
+                "volatility",
+            ),
         ];
 
         for (from, to, field) in tampers {
