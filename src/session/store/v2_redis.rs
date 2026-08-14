@@ -493,6 +493,7 @@ mod live_tests {
     use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
     use crate::api::rest::requests_v2::CreateSimulationRequest;
     use crate::infrastructure::RedisConfig;
+    use crate::session::model::SessionState;
     use crate::session::model_v2::SimulationParametersV2;
     use crate::session::{ExpiryRule, ExpiryRuleKind};
     use crate::utils::UuidGenerator;
@@ -647,10 +648,12 @@ mod live_tests {
 
         let mut winner = sim.clone();
         winner.current_step = 1;
+        winner.state = SessionState::InProgress;
         let winner_expected = winner.bump_version().expect("must bump");
 
         let mut loser = sim.clone();
         loser.current_step = 1;
+        loser.state = SessionState::InProgress;
         let loser_expected = loser.bump_version().expect("must bump");
 
         store
