@@ -65,6 +65,17 @@ const MAX_CLEANUP_INTERVAL_SECS: u64 = 3_600;
 /// The largest cache bound that can be configured.
 const MAX_CACHE_CAPACITY: usize = 1_000_000;
 
+/// Default cap on the steps one export request may cover.
+///
+/// Bounds the *work*, not the memory: streaming already keeps the response
+/// bounded, but an `option_chains` export is `steps × expirations × strikes`
+/// priced contracts, so an unbounded range is minutes of CPU on a blocking
+/// thread. A client wanting more pages the range.
+pub const DEFAULT_MAX_EXPORT_ROWS: usize = 100_000;
+
+/// The largest export range that can be configured.
+const MAX_EXPORT_ROWS_CEILING: usize = 10_000_000;
+
 /// Operational limits for the v2 rolling-simulation surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SimulationV2Config {
@@ -80,6 +91,8 @@ pub struct SimulationV2Config {
     pub max_cached_tapes: usize,
     /// How many snapshots stay resident.
     pub max_cached_snapshots: usize,
+    /// How many steps one export request may cover.
+    pub max_export_rows: usize,
 }
 
 impl Default for SimulationV2Config {
@@ -89,6 +102,7 @@ impl Default for SimulationV2Config {
             cleanup_interval: Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS),
             max_cached_tapes: DEFAULT_MAX_CACHED_TAPES,
             max_cached_snapshots: DEFAULT_MAX_CACHED_SNAPSHOTS,
+            max_export_rows: DEFAULT_MAX_EXPORT_ROWS,
         }
     }
 }
@@ -127,6 +141,12 @@ impl SimulationV2Config {
                 read("OCS_MAX_CACHED_SNAPSHOTS").as_deref(),
                 DEFAULT_MAX_CACHED_SNAPSHOTS,
             )?,
+            max_export_rows: parse_bounded(
+                "OCS_MAX_EXPORT_ROWS",
+                read("OCS_MAX_EXPORT_ROWS").as_deref(),
+                DEFAULT_MAX_EXPORT_ROWS,
+                MAX_EXPORT_ROWS_CEILING,
+            )?,
         };
 
         info!(
@@ -134,6 +154,7 @@ impl SimulationV2Config {
             cleanup_interval_secs = config.cleanup_interval.as_secs(),
             max_cached_tapes = config.max_cached_tapes,
             max_cached_snapshots = config.max_cached_snapshots,
+            max_export_rows = config.max_export_rows,
             "Loaded the v2 simulation configuration"
         );
         Ok(config)
@@ -181,24 +202,36 @@ fn parse_secs(
 ///
 /// Takes the raw value for the same reason as [`parse_secs`].
 fn parse_capacity(variable: &str, raw: Option<&str>, default: usize) -> Result<usize, ChainError> {
+    parse_bounded(variable, raw, default, MAX_CACHE_CAPACITY)
+}
+
+/// Parses a positive count with an explicit ceiling.
+///
+/// Takes the raw value for the same reason as [`parse_secs`].
+fn parse_bounded(
+    variable: &str,
+    raw: Option<&str>,
+    default: usize,
+    max: usize,
+) -> Result<usize, ChainError> {
     let Some(raw) = raw else {
         return Ok(default);
     };
 
-    let capacity = raw.parse::<usize>().map_err(|_| invalid(variable, raw))?;
-    if capacity == 0 {
+    let value = raw.parse::<usize>().map_err(|_| invalid(variable, raw))?;
+    if value == 0 {
         return Err(ChainError::Validation {
             field: variable.to_string(),
             reason: "must be at least 1".to_string(),
         });
     }
-    if capacity > MAX_CACHE_CAPACITY {
+    if value > max {
         return Err(ChainError::Validation {
             field: variable.to_string(),
-            reason: format!("must not exceed {MAX_CACHE_CAPACITY}, got {capacity}"),
+            reason: format!("must not exceed {max}, got {value}"),
         });
     }
-    Ok(capacity)
+    Ok(value)
 }
 
 /// Reads a variable, treating an empty or whitespace-only value as unset.

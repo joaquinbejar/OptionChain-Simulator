@@ -1,3 +1,4 @@
+use crate::api::rest::export::export_simulation;
 use crate::api::rest::get_favicon;
 use crate::api::rest::handlers::{
     advance_step, create_session, delete_session, get_current_step, replace_session, update_session,
@@ -103,6 +104,8 @@ pub fn configure_routes(
 /// - **POST** `/api/v2/simulations/{id}/step` — serve the current snapshot and
 ///   advance once, with an optional `expected_step` precondition.
 /// - **DELETE** `/api/v2/simulations/{id}` — delete it and evict its caches.
+/// - **GET** `/api/v2/simulations/{id}/export` — stream the complete tape, or a
+///   step range of it, as JSON or CSV.
 pub(crate) fn configure_v2_routes(
     cfg: &mut web::ServiceConfig,
     simulation_manager: Arc<SimulationManager>,
@@ -125,5 +128,9 @@ pub(crate) fn configure_v2_routes(
         .service(
             web::resource("/api/v2/simulations/{id}/step")
                 .route(web::post().to(advance_simulation)),
+        )
+        .service(
+            web::resource("/api/v2/simulations/{id}/export")
+                .route(web::get().to(export_simulation)),
         );
 }

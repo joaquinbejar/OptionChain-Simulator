@@ -14,6 +14,7 @@ use utoipa::OpenApi;
         crate::api::rest::handlers_v2::peek_snapshot,
         crate::api::rest::handlers_v2::advance_simulation,
         crate::api::rest::handlers_v2::delete_simulation,
+        crate::api::rest::export::export_simulation,
     ),
     components(
         schemas(
