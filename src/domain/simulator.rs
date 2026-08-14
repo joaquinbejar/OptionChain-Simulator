@@ -30,10 +30,27 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-const DEFAULT_CHAIN_SIZE: usize = 30;
+/// Number of strikes a chain carries when the request does not say.
+///
+/// `pub(crate)` so the v2 factor tape and snapshot builder apply exactly the
+/// same defaults as v1 rather than a second set that could drift.
+pub(crate) const DEFAULT_CHAIN_SIZE: usize = 30;
 
-const DEFAULT_SKEW_SLOPE: Decimal = dec!(-0.2);
-const DEFAULT_SMILE_CURVE: Decimal = dec!(0.4);
+/// Default slope of the volatility skew.
+pub(crate) const DEFAULT_SKEW_SLOPE: Decimal = dec!(-0.2);
+
+/// Default curvature of the volatility smile.
+pub(crate) const DEFAULT_SMILE_CURVE: Decimal = dec!(0.4);
+
+/// Default bid-ask spread factor.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by the v2 factor tape, which has no caller until #46"
+    )
+)]
+pub(crate) const DEFAULT_SPREAD: Decimal = dec!(0.01);
 
 /// Default upper bound on the number of random walks held in the simulation cache.
 const DEFAULT_MAX_CACHED_WALKS: usize = 1000;
