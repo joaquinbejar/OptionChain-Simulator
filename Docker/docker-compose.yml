@@ -133,6 +133,11 @@ services:
       REDIS_USER: ${REDIS_USER}
       REDIS_PASSWORD: ${REDIS_PASSWORD-password}
       REDIS_HOST: ${REDIS_HOST-redis}
+      # Whole seconds, must parse as an integer >= 1: src/infrastructure/config
+      # /redis.rs falls back to these same defaults (30 / 5) on 0, on a
+      # non-numeric value, or when unset, warning as it does so.
+      REDIS_TIMEOUT: ${REDIS_TIMEOUT-30}
+      REDIS_CONNECT_TIMEOUT: ${REDIS_CONNECT_TIMEOUT-5}
     ports:
       - "7070:7070"
     networks:
