@@ -63,7 +63,7 @@ jobs:
         ports:
           - 6379:6379
       clickhouse:
-        image: clickhouse/clickhouse-server:24.8
+        image: clickhouse/clickhouse-server:26.3.17.110
         env:
           CLICKHOUSE_USER: admin
           CLICKHOUSE_PASSWORD: password
