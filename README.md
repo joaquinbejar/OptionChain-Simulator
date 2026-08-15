@@ -146,6 +146,23 @@ uses a rolling causal estimate for the same series, so the two produce the
 same price path and different premiums. It is a stated difference, tracked
 in issue #63 and asked for upstream in optionstratlib#423.
 
+**Advanced steps can be filed in ClickHouse.** With
+`OCS_SNAPSHOT_PERSISTENCE_ENABLED` on, every step an advance serves is
+written as one metadata row plus one flattened row per expiration and
+strike, so a client can query one contract across time instead of unwinding
+whole documents. A peek and an export replay and persist nothing — only the
+advance, which is the call that moves the cursor, files anything.
+
+Filing happens **after** the cursor commits and off the request's clock, so
+a degraded warehouse can neither fail a response nor delay one. Row identity
+is derived from `(simulation, tape generation, step)`, which makes a retry
+replace a row rather than duplicate it, and a reader never sees a snapshot
+whose quote rows are missing — the metadata row carries the expected count
+and a mismatch reads as absent. Turning the knob on makes ClickHouse a hard
+startup dependency: the tables are created at boot, so a schema or
+connectivity problem fails the boot rather than surfacing later. MongoDB
+stays event and audit only.
+
 **Replay.** The creation response echoes the effective seed, effective
 start, step interval, time frame, timezone, calendar version, IANA tzdb
 release and normalised schedules — everything needed to reproduce the run
@@ -171,8 +188,8 @@ deliberately different failure behaviour:
 - **v2 operational knobs** — `OCS_V2_RETENTION_SECS`,
   `OCS_V2_CLEANUP_INTERVAL_SECS`, `OCS_MAX_CACHED_TAPES`,
   `OCS_MAX_CACHED_SNAPSHOTS`, `OCS_MAX_CACHED_SNAPSHOT_CONTRACTS`,
-  `OCS_MAX_EXPORT_ROWS` — are **validated at startup** and fail the
-  process with a message naming the variable. Silently reverting a
+  `OCS_MAX_EXPORT_ROWS`, `OCS_SNAPSHOT_*` — are **validated at startup** and
+  fail the process with a message naming the variable. Silently reverting a
   retention window would expire simulations a client is still walking, and
   silently reverting a cache bound would change the service's memory
   profile with nothing to show for it.

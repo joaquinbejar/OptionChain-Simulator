@@ -28,7 +28,7 @@ use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, tzdb_version};
 use crate::domain::simulator::DEFAULT_CHAIN_SIZE;
 use crate::infrastructure::max_snapshot_contracts;
 use crate::session::model::{SessionState, SimulationMethod};
-use crate::utils::{ChainError, UuidGenerator};
+use crate::utils::ChainError;
 use chrono::{DateTime, NaiveTime, TimeDelta, Timelike, Utc};
 use chrono_tz::Tz;
 use optionstratlib::utils::TimeFrame;
@@ -724,11 +724,24 @@ fn default_schema_version() -> u32 {
 
 impl SessionV2 {
     /// Creates a simulation from resolved parameters.
+    ///
+    /// The id is **random** (`Uuid::new_v4`), for the reason v1 already
+    /// documents: [`UuidGenerator`] derives from a process-local counter that
+    /// starts at zero, so a restarted service or a second replica would reissue
+    /// the same id sequence. That was survivable while an id only had to be
+    /// unique among live sessions; it is not now that persisted snapshots are
+    /// filed under `(simulation, generation, step)` for as long as the retention
+    /// window, where a repeated id means one run's tape silently replacing
+    /// another's.
+    ///
+    /// The id is not an input to anything seeded — the tape and the snapshots
+    /// are functions of the parameters alone — so randomising it leaves the
+    /// reproducibility contract exactly where it was.
     #[must_use]
-    pub fn new(parameters: SimulationParametersV2, uuid_generator: &UuidGenerator) -> Self {
+    pub fn new(parameters: SimulationParametersV2) -> Self {
         let now = SystemTime::now();
         Self {
-            id: uuid_generator.next(),
+            id: Uuid::new_v4(),
             schema_version: SESSION_V2_SCHEMA_VERSION,
             created_at: now,
             updated_at: now,
@@ -959,13 +972,6 @@ mod tests {
         match SimulationParametersV2::try_from(request) {
             Ok(parameters) => parameters,
             Err(error) => panic!("the request must convert: {error}"),
-        }
-    }
-
-    fn generator() -> UuidGenerator {
-        match Uuid::parse_str(crate::session::manager::DEFAULT_NAMESPACE) {
-            Ok(namespace) => UuidGenerator::new(namespace),
-            Err(error) => panic!("the default namespace must parse: {error}"),
         }
     }
 
@@ -1303,7 +1309,7 @@ mod tests {
     /// revision.
     #[test]
     fn test_simulation_round_trips_through_serde() {
-        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let simulation = SessionV2::new(parameters(reference_request()));
 
         let json = match serde_json::to_string(&simulation) {
             Ok(json) => json,
@@ -1322,7 +1328,7 @@ mod tests {
     /// migration can tell documents apart without inferring from their shape.
     #[test]
     fn test_stored_document_carries_an_explicit_schema_version() {
-        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let simulation = SessionV2::new(parameters(reference_request()));
 
         let value = match serde_json::to_value(&simulation) {
             Ok(value) => value,
@@ -1518,7 +1524,7 @@ mod tests {
     /// downgraded.
     #[test]
     fn test_stored_simulation_rejects_a_future_schema_version() {
-        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let simulation = SessionV2::new(parameters(reference_request()));
         let json = match serde_json::to_string(&simulation) {
             Ok(json) => json,
             Err(error) => panic!("must serialize: {error}"),
@@ -1538,7 +1544,7 @@ mod tests {
     /// A stored simulation in a state the v2 lifecycle cannot reach is refused.
     #[test]
     fn test_stored_simulation_rejects_an_unreachable_state() {
-        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let simulation = SessionV2::new(parameters(reference_request()));
         let json = match serde_json::to_string(&simulation) {
             Ok(json) => json,
             Err(error) => panic!("must serialize: {error}"),
@@ -1566,7 +1572,7 @@ mod tests {
     fn test_stored_simulation_rejects_a_state_the_cursor_contradicts() {
         let mut request = reference_request();
         request.steps = 4;
-        let simulation = SessionV2::new(parameters(request), &generator());
+        let simulation = SessionV2::new(parameters(request));
         let json = match serde_json::to_string(&simulation) {
             Ok(json) => json,
             Err(error) => panic!("must serialize: {error}"),
@@ -1615,7 +1621,7 @@ mod tests {
     fn test_stored_simulation_rejects_a_cursor_past_the_horizon() {
         let mut request = reference_request();
         request.steps = 2;
-        let simulation = SessionV2::new(parameters(request), &generator());
+        let simulation = SessionV2::new(parameters(request));
         let json = match serde_json::to_string(&simulation) {
             Ok(json) => json,
             Err(error) => panic!("must serialize: {error}"),
@@ -1632,7 +1638,7 @@ mod tests {
     /// A `total_steps` that disagrees with the parameters is refused.
     #[test]
     fn test_stored_simulation_rejects_a_mismatched_total_steps() {
-        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let simulation = SessionV2::new(parameters(reference_request()));
         let json = match serde_json::to_string(&simulation) {
             Ok(json) => json,
             Err(error) => panic!("must serialize: {error}"),
@@ -1650,7 +1656,7 @@ mod tests {
     /// what it should accept.
     #[test]
     fn test_a_valid_stored_simulation_still_loads() {
-        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let simulation = SessionV2::new(parameters(reference_request()));
         let json = match serde_json::to_string(&simulation) {
             Ok(json) => json,
             Err(error) => panic!("must serialize: {error}"),
@@ -1667,7 +1673,7 @@ mod tests {
     /// A new simulation starts at cursor zero, revision zero, Initialized.
     #[test]
     fn test_new_simulation_starts_initialized_at_cursor_zero() {
-        let simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let simulation = SessionV2::new(parameters(reference_request()));
 
         assert_eq!(simulation.current_step, 0);
         assert_eq!(simulation.total_steps, 500);
@@ -1679,7 +1685,7 @@ mod tests {
     /// Bumping the revision returns the value a compare-and-swap must expect.
     #[test]
     fn test_bump_version_returns_the_expected_revision() {
-        let mut simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let mut simulation = SessionV2::new(parameters(reference_request()));
 
         match simulation.bump_version() {
             Ok(expected) => {
@@ -1694,7 +1700,7 @@ mod tests {
     /// would let a stale writer pass the compare-and-swap.
     #[test]
     fn test_bump_version_overflow_is_a_typed_error() {
-        let mut simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let mut simulation = SessionV2::new(parameters(reference_request()));
         simulation.version = u64::MAX;
 
         match simulation.bump_version() {
@@ -1708,7 +1714,7 @@ mod tests {
     fn test_is_complete_tracks_the_cursor() {
         let mut request = reference_request();
         request.steps = 2;
-        let mut simulation = SessionV2::new(parameters(request), &generator());
+        let mut simulation = SessionV2::new(parameters(request));
 
         assert!(!simulation.is_complete());
         simulation.current_step = 2;
@@ -1718,7 +1724,7 @@ mod tests {
     /// The simulation's own `simulated_at` follows its cursor.
     #[test]
     fn test_simulation_simulated_at_follows_the_cursor() {
-        let mut simulation = SessionV2::new(parameters(reference_request()), &generator());
+        let mut simulation = SessionV2::new(parameters(reference_request()));
         simulation.current_step = 2;
 
         match simulation.simulated_at() {

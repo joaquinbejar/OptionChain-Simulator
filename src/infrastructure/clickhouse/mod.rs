@@ -1,6 +1,7 @@
 mod client;
 pub(crate) mod interface;
 pub(crate) mod model;
+pub(crate) mod snapshots;
 pub(crate) mod utils;
 
 pub use client::ClickHouseClient;

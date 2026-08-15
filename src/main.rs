@@ -59,7 +59,8 @@
 
 use optionchain_simulator::api::{ListenOn, start_server};
 use optionchain_simulator::infrastructure::{
-    MetricsCollector, RedisClient, RedisConfig, SimulationV2Config, init_mongodb,
+    ClickHouseSnapshotRepository, MetricsCollector, RedisClient, RedisConfig, SimulationV2Config,
+    init_mongodb,
 };
 use optionchain_simulator::session::{
     InRedisSessionStore, InRedisSimulationStore, SessionManager, SimulationManager,
@@ -147,7 +148,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None, // the documented v2 prefix
         Some(v2_config.retention_secs()),
     ));
-    let simulation_manager = Arc::new(SimulationManager::new(simulation_store, v2_config));
+    // Snapshot persistence is opt-in (`OCS_SNAPSHOT_PERSISTENCE_ENABLED`). When
+    // it is off the manager never learns the feature exists; when it is on, the
+    // tables are created here rather than on the first advance, so a schema
+    // problem is a startup failure with a message rather than a warning buried
+    // in the serving path.
+    //
+    // The manager owns the one repository: it writes through it, and the v2
+    // export reads back through the same handle — the routes take it off the
+    // manager rather than being passed a second one, because two handles could
+    // be configured differently and there is only ever one warehouse.
+    let mut simulation_manager = SimulationManager::new(simulation_store, v2_config);
+    match ClickHouseSnapshotRepository::from_env()? {
+        Some(warehouse) => {
+            warehouse.ensure_schema().await?;
+            info!("v2 snapshot persistence is enabled");
+            simulation_manager = simulation_manager.with_warehouse(Arc::new(warehouse));
+        }
+        None => {
+            info!("v2 snapshot persistence is disabled; snapshots are served from replay only");
+        }
+    }
+    let simulation_manager = Arc::new(simulation_manager);
 
     // Reap idle simulations and evict what they left cached. Detached, because
     // the sweep is independent of any request; it stops when the process does.

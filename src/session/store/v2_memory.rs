@@ -170,7 +170,6 @@ mod tests {
     use crate::domain::expiry::{ExpiryRule, ExpiryRuleKind};
     use crate::session::model::SessionState;
     use crate::session::model_v2::SimulationParametersV2;
-    use crate::utils::UuidGenerator;
     use chrono::{TimeZone, Utc, Weekday};
 
     fn request() -> CreateSimulationRequest {
@@ -224,11 +223,7 @@ mod tests {
             Ok(parameters) => parameters,
             Err(error) => panic!("the request must convert: {error}"),
         };
-        let namespace = match uuid::Uuid::parse_str(crate::session::manager::DEFAULT_NAMESPACE) {
-            Ok(namespace) => namespace,
-            Err(error) => panic!("the default namespace must parse: {error}"),
-        };
-        SessionV2::new(parameters, &UuidGenerator::new(namespace))
+        SessionV2::new(parameters)
     }
 
     /// An invalid simulation is refused on the way in.
@@ -425,11 +420,8 @@ mod tests {
         let store = InMemorySimulationStore::with_idle_retention(Duration::from_secs(1));
         let mut stale = simulation();
         stale.updated_at = SystemTime::now() - Duration::from_secs(3_600);
+        // `simulation()` mints a random id, so the two are already distinct.
         let fresh = simulation();
-        let fresh = SessionV2 {
-            id: Uuid::new_v4(),
-            ..fresh
-        };
 
         match store.create(stale.clone()).await {
             Ok(()) => {}

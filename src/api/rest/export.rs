@@ -26,6 +26,21 @@
 //! receiver so the producer's next send fails and the task ends. Cancellation
 //! costs one row of wasted work.
 //!
+//! # Where the chains come from
+//!
+//! When snapshot persistence is on, an `option_chains` export prefers the
+//! **persisted** snapshot of a step and replays only the steps the warehouse
+//! does not have. The decision is per step, never per export: a warehouse that
+//! is missing a step, or missing entirely, or down, costs the export nothing
+//! but the pricing it would have done anyway. That is the whole point of a
+//! deterministic replay — a gap in the tape is not an incident, so the fallback
+//! logs at `DEBUG`.
+//!
+//! Both sources go through one adapter ([`StepChains`]) that yields the same
+//! per-quote view, so a row is byte-identical whichever side produced it. The
+//! factor row still comes from the tape either way: the underlying and
+//! volatility datasets are built from it, and it is cheap next to a chain.
+//!
 //! # Determinism
 //!
 //! Two exports of the same simulation are byte-identical. Every value is a
@@ -37,17 +52,24 @@
 use crate::api::rest::error::map_error;
 use crate::domain::factors::FactorTape;
 use crate::domain::series::{SeriesBuilder, SeriesSnapshot};
+use crate::infrastructure::{
+    CURRENT_SNAPSHOT_GENERATION, QuoteRow, SimulationSnapshotRepository, SnapshotRecord,
+};
 use crate::session::{SimulationManager, SimulationParametersV2};
 use crate::utils::ChainError;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures::stream::Stream;
+use optionstratlib::chains::OptionData;
+use optionstratlib::chains::chain::OptionChain;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -57,6 +79,21 @@ use uuid::Uuid;
 /// producer blocks on the next send, and no unbounded queue of priced chains
 /// accumulates in memory.
 const CHANNEL_CAPACITY: usize = 16;
+
+/// How many steps one warehouse round trip asks for.
+///
+/// Neither extreme is acceptable. One read per step turns a hundred-thousand
+/// step export into a hundred thousand round trips; one read of the whole range
+/// materialises the entire tape in memory, which is exactly what the streaming
+/// producer exists to avoid — a snapshot can hold two hundred thousand
+/// contracts.
+///
+/// Sixty-four amortises the round trip over a window whose memory cost is
+/// bounded by sixty-four snapshots, and it is the *starting* width: a window
+/// that a deployment's `OCS_SNAPSHOT_MAX_READ_ROWS` refuses is halved and
+/// retried, so a service with very large chains narrows to a width that works
+/// instead of silently replaying everything.
+const SNAPSHOT_WINDOW_STEPS: usize = 64;
 
 /// Which dataset an export request asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -252,6 +289,304 @@ fn render_optional(value: Option<f64>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 
+/// One strike of one expiration, flattened to exactly what a row carries.
+///
+/// The common view both sources are reduced to. Every conversion from a source
+/// value to the wire's `f64` happens here and only here, which is what makes a
+/// persisted row and a replayed row byte-identical rather than merely similar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct QuoteView {
+    strike: f64,
+    implied_volatility: f64,
+    call_bid: Option<f64>,
+    call_ask: Option<f64>,
+    call_mid: Option<f64>,
+    call_delta: Option<f64>,
+    put_bid: Option<f64>,
+    put_ask: Option<f64>,
+    put_mid: Option<f64>,
+    put_delta: Option<f64>,
+    gamma: Option<f64>,
+}
+
+impl QuoteView {
+    /// Views a strike that was just priced.
+    #[must_use]
+    fn replayed(data: &OptionData) -> Self {
+        Self {
+            strike: data.strike_price.to_f64(),
+            implied_volatility: data.implied_volatility.to_f64(),
+            call_bid: data.call_bid.map(|value| value.to_f64()),
+            call_ask: data.call_ask.map(|value| value.to_f64()),
+            call_mid: data.call_middle.map(|value| value.to_f64()),
+            call_delta: data.delta_call.and_then(decimal_to_f64),
+            put_bid: data.put_bid.map(|value| value.to_f64()),
+            put_ask: data.put_ask.map(|value| value.to_f64()),
+            put_mid: data.put_middle.map(|value| value.to_f64()),
+            put_delta: data.delta_put.and_then(decimal_to_f64),
+            gamma: data.gamma.and_then(decimal_to_f64),
+        }
+    }
+
+    /// Views a strike that was read back from the warehouse.
+    #[must_use]
+    fn stored(row: &QuoteRow) -> Self {
+        Self {
+            strike: row.strike.to_f64(),
+            implied_volatility: row.implied_volatility.to_f64(),
+            call_bid: row.call_bid.map(|value| value.to_f64()),
+            call_ask: row.call_ask.map(|value| value.to_f64()),
+            call_mid: row.call_mid.map(|value| value.to_f64()),
+            call_delta: row.delta_call.and_then(decimal_to_f64),
+            put_bid: row.put_bid.map(|value| value.to_f64()),
+            put_ask: row.put_ask.map(|value| value.to_f64()),
+            put_mid: row.put_mid.map(|value| value.to_f64()),
+            put_delta: row.delta_put.and_then(decimal_to_f64),
+            gamma: row.gamma.and_then(decimal_to_f64),
+        }
+    }
+}
+
+/// The strikes of one expiration, from whichever source produced them.
+#[derive(Debug, Clone, Copy)]
+enum QuoteSource<'a> {
+    /// Upstream's priced chain, iterated by ascending strike.
+    Replayed(&'a OptionChain),
+    /// The stored rows, which the repository returns by ascending strike.
+    Stored(&'a [QuoteRow]),
+}
+
+impl<'a> QuoteSource<'a> {
+    /// The strikes, ascending.
+    ///
+    /// Exactly one of the two options is `Some`, so concatenating them with
+    /// [`Iterator::chain`] *is* the branch — one concrete iterator type, no
+    /// boxing on a path that runs once per contract.
+    fn quotes(self) -> impl Iterator<Item = QuoteView> + 'a {
+        let replayed = match self {
+            QuoteSource::Replayed(chain) => Some(chain.iter()),
+            QuoteSource::Stored(_) => None,
+        };
+        let stored = match self {
+            QuoteSource::Replayed(_) => None,
+            QuoteSource::Stored(quotes) => Some(quotes.iter()),
+        };
+
+        replayed
+            .into_iter()
+            .flatten()
+            .map(QuoteView::replayed)
+            .chain(stored.into_iter().flatten().map(QuoteView::stored))
+    }
+}
+
+/// One expiration of one step, from whichever source produced it.
+#[derive(Debug, Clone, Copy)]
+struct ExpirationView<'a> {
+    expires_at: DateTime<Utc>,
+    days_to_expiration: f64,
+    labels: &'a [String],
+    quotes: QuoteSource<'a>,
+}
+
+/// The chains of one step, from whichever source produced them.
+///
+/// The adapter the whole preference rests on: a stored snapshot and a replayed
+/// one are the same simulated market, so they must render the same rows. Giving
+/// the two sources one view — instead of two row builders that happen to agree
+/// today — is what makes preferring the warehouse safe.
+#[derive(Debug, Clone, Copy)]
+enum StepChains<'a> {
+    /// Priced here and now, from the effective parameters.
+    Replayed(&'a SeriesSnapshot),
+    /// Read back from the warehouse exactly as it was served.
+    Stored(&'a SnapshotRecord),
+}
+
+impl<'a> StepChains<'a> {
+    /// The live expirations, ascending — the order both sources guarantee.
+    fn expirations(self) -> impl Iterator<Item = ExpirationView<'a>> {
+        let replayed = match self {
+            StepChains::Replayed(snapshot) => Some(snapshot.chains.iter()),
+            StepChains::Stored(_) => None,
+        };
+        let stored = match self {
+            StepChains::Replayed(_) => None,
+            StepChains::Stored(record) => Some(record.expirations.iter()),
+        };
+
+        replayed
+            .into_iter()
+            .flatten()
+            .map(|chain| ExpirationView {
+                expires_at: chain.expires_at,
+                days_to_expiration: chain.days_to_expiration.to_f64(),
+                labels: &chain.labels,
+                quotes: QuoteSource::Replayed(&chain.chain),
+            })
+            .chain(
+                stored
+                    .into_iter()
+                    .flatten()
+                    .map(|expiration| ExpirationView {
+                        expires_at: expiration.expires_at,
+                        days_to_expiration: expiration.days_to_expiration.to_f64(),
+                        labels: &expiration.labels,
+                        quotes: QuoteSource::Stored(&expiration.quotes),
+                    }),
+            )
+    }
+}
+
+/// The last step a window starting at `from` covers.
+///
+/// Clamped to `last` so a window never asks for steps past the range, and
+/// checked so a `from` near `usize::MAX` cannot wrap into a reversed range.
+#[must_use]
+#[inline]
+fn window_end(from: usize, window: usize, last: usize) -> usize {
+    match window
+        .checked_sub(1)
+        .and_then(|span| from.checked_add(span))
+    {
+        Some(end) => end.min(last),
+        None => last,
+    }
+}
+
+/// Reads persisted snapshots ahead of the producer, a window of steps at a time.
+///
+/// Lives on the blocking thread that produces the rows, so its reads have to
+/// cross back onto the runtime — hence the [`Handle`]. Blocking on a future from
+/// a `spawn_blocking` thread is sound (it is not an async context); doing it
+/// from an Actix worker would not be, which is exactly why the whole producer
+/// runs off the runtime.
+struct StoredSteps {
+    repository: Arc<dyn SimulationSnapshotRepository>,
+    runtime: Handle,
+    simulation: Uuid,
+    /// What the current window found, ascending by step and consumed in order.
+    loaded: VecDeque<SnapshotRecord>,
+    /// The last step the current window covered; `None` before the first read.
+    window_end: Option<usize>,
+    /// How many steps a window asks for. Narrows on a refused read.
+    window: usize,
+    /// Set once a read fails for a reason a narrower window cannot fix.
+    ///
+    /// After that the export replays everything. A warehouse that is down will
+    /// be down for the next window too, and a failed round trip per window
+    /// would add latency to an export that is already producing correct rows
+    /// without it.
+    degraded: bool,
+}
+
+impl StoredSteps {
+    /// Prepares to read one simulation's persisted tape.
+    #[must_use]
+    fn new(
+        repository: Arc<dyn SimulationSnapshotRepository>,
+        simulation: Uuid,
+        runtime: Handle,
+    ) -> Self {
+        Self {
+            repository,
+            runtime,
+            simulation,
+            loaded: VecDeque::new(),
+            window_end: None,
+            window: SNAPSHOT_WINDOW_STEPS,
+            degraded: false,
+        }
+    }
+
+    /// The persisted snapshot of `step`, when the warehouse has a complete one.
+    ///
+    /// `last` bounds the prefetch, so a window never reads past the export's
+    /// range. Steps are requested in ascending order, which is what lets the
+    /// window be consumed from the front instead of indexed.
+    fn take(&mut self, step: usize, last: usize) -> Option<SnapshotRecord> {
+        if self.degraded {
+            return None;
+        }
+        if self.window_end.is_none_or(|end| step > end) {
+            self.load(step, last);
+        }
+
+        // Anything below `step` belongs to a step already produced: the
+        // repository skips what was never completed, so a gap is normal.
+        while self.loaded.front().is_some_and(|record| record.step < step) {
+            self.loaded.pop_front();
+        }
+        match self.loaded.front() {
+            Some(record) if record.step == step => self.loaded.pop_front(),
+            _ => None,
+        }
+    }
+
+    /// Fills the window that starts at `from`.
+    ///
+    /// A window refused as too wide is halved and retried: that failure is a
+    /// property of this deployment's snapshot size against
+    /// `OCS_SNAPSHOT_MAX_READ_ROWS`, so a narrower window keeps working for the
+    /// rest of the export. Every other failure degrades to replay. The loop
+    /// terminates because the width strictly decreases and stops at one.
+    fn load(&mut self, from: usize, last: usize) {
+        self.loaded.clear();
+        loop {
+            let to = window_end(from, self.window, last);
+            match self.read(from, to) {
+                Ok(records) => {
+                    debug!(
+                        simulation_id = %self.simulation,
+                        from_step = from,
+                        to_step = to,
+                        found = records.len(),
+                        "Prefetched persisted snapshots for an export window"
+                    );
+                    self.loaded = VecDeque::from(records);
+                    self.window_end = Some(to);
+                    return;
+                }
+                Err(ChainError::Validation { field, reason }) if self.window > 1 => {
+                    // Integer division by a non-zero constant, bottoming out at
+                    // one: no saturation, no zero-width window.
+                    self.window /= 2;
+                    debug!(
+                        simulation_id = %self.simulation,
+                        window = self.window,
+                        field = %field,
+                        reason = %reason,
+                        "Narrowed the snapshot read window and retried"
+                    );
+                }
+                Err(error) => {
+                    // DEBUG, not WARN: a cold or absent warehouse is the default
+                    // configuration, and replay produces the same rows.
+                    debug!(
+                        simulation_id = %self.simulation,
+                        from_step = from,
+                        error = %error,
+                        "Could not read persisted snapshots; the export replays instead"
+                    );
+                    self.degraded = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Runs one range read on the runtime and waits for it.
+    fn read(&self, from: usize, to: usize) -> Result<Vec<SnapshotRecord>, ChainError> {
+        let repository = Arc::clone(&self.repository);
+        let simulation = self.simulation;
+        self.runtime.block_on(async move {
+            repository
+                .read_range(simulation, CURRENT_SNAPSHOT_GENERATION, from, to)
+                .await
+        })
+    }
+}
+
 /// Streams rows from a bounded channel as an HTTP body.
 ///
 /// Dropping this — which is what actix does when the client disconnects —
@@ -287,9 +622,11 @@ impl Stream for RowStream {
     description = "Export a simulation's complete tape, or a step range of it, as JSON or CSV. \
         Read-only: it replays from an immutable snapshot of the effective parameters and never \
         advances the cursor, changes the state or version, or alters what the next peek returns. \
-        A simulation that has not been walked at all exports its whole tape. JSON is a single \
-        array of row objects; CSV is RFC 4180 with a header row and CRLF line endings. Repeating \
-        the same export yields byte-identical output.",
+        A simulation that has not been walked at all exports its whole tape. Where snapshot \
+        persistence is enabled, an option_chains export serves the steps the warehouse holds from \
+        it and replays the rest; the rows are identical either way. JSON is a single array of row \
+        objects; CSV is RFC 4180 with a header row and CRLF line endings. Repeating the same \
+        export yields byte-identical output.",
     params(
         ("id" = String, Path, description = "The simulation's identifier"),
         ("dataset" = String, Query, description = "underlying | volatility | option_chains"),
@@ -304,10 +641,14 @@ impl Stream for RowStream {
         (status = 500, description = "Internal server error")
     )
 )]
-#[instrument(skip(manager, query), level = "debug")]
+#[instrument(skip(manager, snapshots, query), level = "debug")]
 pub(crate) async fn export_simulation(
     req: HttpRequest,
     manager: web::Data<Arc<SimulationManager>>,
+    // Absent unless the operator turned snapshot persistence on, which is why
+    // this is an `Option` rather than a required dependency: a deployment
+    // without ClickHouse must not have to register anything to not use it.
+    snapshots: Option<web::Data<Arc<dyn SimulationSnapshotRepository>>>,
     path: web::Path<super::handlers_v2::SimulationPath>,
     query: web::Query<ExportQuery>,
 ) -> impl Responder {
@@ -342,10 +683,19 @@ pub(crate) async fn export_simulation(
     let format = query.format;
     let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
 
+    // Only the chains dataset can be served from storage; the other two read the
+    // factor tape and would pay a round trip for nothing. The handle is taken
+    // here, on the runtime, because the producer that uses it will not be on one.
+    let stored = snapshots
+        .filter(|_| dataset.needs_chains())
+        .map(|repository| {
+            StoredSteps::new(Arc::clone(repository.get_ref()), id, Handle::current())
+        });
+
     // Priced chains are minutes of CPU for a long horizon. Producing them on an
     // Actix worker would block every other request on that thread.
     tokio::task::spawn_blocking(move || {
-        if let Err(error) = produce(&parameters, dataset, format, range, &sender) {
+        if let Err(error) = produce(&parameters, dataset, format, range, stored, &sender) {
             // A send failure means the client went away, which is not an error
             // worth reporting to anyone.
             let _ = sender.blocking_send(Err(error));
@@ -369,15 +719,20 @@ pub(crate) async fn export_simulation(
         .streaming(RowStream { receiver })
 }
 
-/// Replays the range and sends every chunk.
+/// Produces the range and sends every chunk.
 ///
 /// Runs on a blocking thread. Returns as soon as a send fails, which is how a
 /// disconnected client stops the work.
+///
+/// Each step takes its chains from the warehouse when `stored` has them and
+/// replays them otherwise, so a partially persisted tape costs exactly the
+/// pricing of its gaps.
 fn produce(
     parameters: &SimulationParametersV2,
     dataset: Dataset,
     format: Format,
     range: StepRange,
+    mut stored: Option<StoredSteps>,
     sender: &mpsc::Sender<Result<Vec<u8>, ChainError>>,
 ) -> Result<(), ChainError> {
     let tape = FactorTape::build(parameters, &parameters.method)?;
@@ -394,16 +749,34 @@ fn produce(
         return Ok(());
     }
 
+    let mut served_from_storage: usize = 0;
     for step in range.steps() {
         let row = tape
             .row(step)
             .ok_or_else(|| ChainError::Internal(format!("the tape has no row at step {step}")))?;
-        let snapshot = match &builder {
-            Some(builder) => Some(builder.snapshot(step)?),
+
+        // A persisted step is the same snapshot, already priced: prefer it, and
+        // price only what the warehouse does not have.
+        let record = match &mut stored {
+            Some(stored) => stored.take(step, range.to),
             None => None,
         };
+        let replayed = match (&record, &builder) {
+            (None, Some(builder)) => Some(builder.snapshot(step)?),
+            _ => None,
+        };
+        let chains = match (&record, &replayed) {
+            (Some(record), _) => Some(StepChains::Stored(record)),
+            (None, Some(snapshot)) => Some(StepChains::Replayed(snapshot)),
+            (None, None) => None,
+        };
+        if record.is_some() {
+            served_from_storage = served_from_storage
+                .checked_add(1)
+                .ok_or_else(|| ChainError::Internal("the step counter overflowed".to_string()))?;
+        }
 
-        let chunk = writer.rows(parameters, row.step, row, snapshot.as_ref())?;
+        let chunk = writer.rows(parameters, row.step, row, chains)?;
         if !chunk.is_empty() && sender.blocking_send(Ok(chunk)).is_err() {
             return Ok(());
         }
@@ -413,6 +786,15 @@ fn produce(
         && sender.blocking_send(Ok(chunk)).is_err()
     {
         return Ok(());
+    }
+
+    if stored.is_some() {
+        debug!(
+            from_step = range.from,
+            to_step = range.to,
+            served_from_storage,
+            "Finished a v2 export"
+        );
     }
     Ok(())
 }
@@ -460,19 +842,24 @@ impl Writer {
     }
 
     /// Encodes every row one step contributes.
+    ///
+    /// `simulated_at` comes from the factor row whichever source produced the
+    /// chains: it is the tape's instant, the same one a stored record was
+    /// written from, and taking it from one place keeps the two sources
+    /// rendering identically by construction.
     fn rows(
         &mut self,
         parameters: &SimulationParametersV2,
         step: usize,
         row: &crate::domain::factors::FactorRow,
-        snapshot: Option<&SeriesSnapshot>,
+        chains: Option<StepChains<'_>>,
     ) -> Result<Vec<u8>, ChainError> {
         let simulated_at = render_instant(row.simulated_at);
         let symbol = parameters.symbol.as_str();
 
         match self {
             Writer::Json { dataset, first } => {
-                let values = json_rows(*dataset, step, &simulated_at, symbol, row, snapshot);
+                let values = json_rows(*dataset, step, &simulated_at, symbol, row, chains);
                 let mut chunk = Vec::new();
                 for value in values {
                     if !*first {
@@ -487,7 +874,7 @@ impl Writer {
                 Ok(chunk)
             }
             Writer::Csv { dataset } => {
-                let records = csv_rows(*dataset, step, &simulated_at, symbol, row, snapshot);
+                let records = csv_rows(*dataset, step, &simulated_at, symbol, row, chains);
                 encode_csv(&records)
             }
         }
@@ -524,7 +911,7 @@ fn json_rows(
     simulated_at: &str,
     symbol: &str,
     row: &crate::domain::factors::FactorRow,
-    snapshot: Option<&SeriesSnapshot>,
+    chains: Option<StepChains<'_>>,
 ) -> Vec<serde_json::Value> {
     match dataset {
         Dataset::Underlying => vec![serde_json::json!({
@@ -540,32 +927,32 @@ fn json_rows(
             "base_volatility": row.base_volatility.to_f64(),
         })],
         Dataset::OptionChains => {
-            let Some(snapshot) = snapshot else {
+            let Some(chains) = chains else {
                 return Vec::new();
             };
             let mut rows = Vec::new();
-            for chain in &snapshot.chains {
-                let expires_at = render_instant(chain.expires_at);
-                let labels = chain.labels.join("|");
-                for data in chain.chain.iter() {
+            for expiration in chains.expirations() {
+                let expires_at = render_instant(expiration.expires_at);
+                let labels = expiration.labels.join("|");
+                for quote in expiration.quotes.quotes() {
                     rows.push(serde_json::json!({
                         "step": step,
                         "simulated_at": simulated_at,
                         "symbol": symbol,
                         "expires_at": expires_at,
                         "labels": labels,
-                        "days_to_expiration": chain.days_to_expiration.to_f64(),
-                        "strike": data.strike_price.to_f64(),
-                        "implied_volatility": data.implied_volatility.to_f64(),
-                        "call_bid": data.call_bid.map(|v| v.to_f64()),
-                        "call_ask": data.call_ask.map(|v| v.to_f64()),
-                        "call_mid": data.call_middle.map(|v| v.to_f64()),
-                        "call_delta": data.delta_call.and_then(decimal_to_f64),
-                        "put_bid": data.put_bid.map(|v| v.to_f64()),
-                        "put_ask": data.put_ask.map(|v| v.to_f64()),
-                        "put_mid": data.put_middle.map(|v| v.to_f64()),
-                        "put_delta": data.delta_put.and_then(decimal_to_f64),
-                        "gamma": data.gamma.and_then(decimal_to_f64),
+                        "days_to_expiration": expiration.days_to_expiration,
+                        "strike": quote.strike,
+                        "implied_volatility": quote.implied_volatility,
+                        "call_bid": quote.call_bid,
+                        "call_ask": quote.call_ask,
+                        "call_mid": quote.call_mid,
+                        "call_delta": quote.call_delta,
+                        "put_bid": quote.put_bid,
+                        "put_ask": quote.put_ask,
+                        "put_mid": quote.put_mid,
+                        "put_delta": quote.put_delta,
+                        "gamma": quote.gamma,
                     }));
                 }
             }
@@ -581,7 +968,7 @@ fn csv_rows(
     simulated_at: &str,
     symbol: &str,
     row: &crate::domain::factors::FactorRow,
-    snapshot: Option<&SeriesSnapshot>,
+    chains: Option<StepChains<'_>>,
 ) -> Vec<Vec<String>> {
     match dataset {
         Dataset::Underlying => vec![vec![
@@ -597,34 +984,34 @@ fn csv_rows(
             row.base_volatility.to_f64().to_string(),
         ]],
         Dataset::OptionChains => {
-            let Some(snapshot) = snapshot else {
+            let Some(chains) = chains else {
                 return Vec::new();
             };
             let mut records = Vec::new();
-            for chain in &snapshot.chains {
-                let expires_at = render_instant(chain.expires_at);
+            for expiration in chains.expirations() {
+                let expires_at = render_instant(expiration.expires_at);
                 // Joined with `|` rather than `,` so a multi-label chain stays
                 // one column without depending on quoting to do it.
-                let labels = chain.labels.join("|");
-                for data in chain.chain.iter() {
+                let labels = expiration.labels.join("|");
+                for quote in expiration.quotes.quotes() {
                     records.push(vec![
                         step.to_string(),
                         simulated_at.to_string(),
                         symbol.to_string(),
                         expires_at.clone(),
                         labels.clone(),
-                        chain.days_to_expiration.to_f64().to_string(),
-                        data.strike_price.to_f64().to_string(),
-                        data.implied_volatility.to_f64().to_string(),
-                        render_optional(data.call_bid.map(|v| v.to_f64())),
-                        render_optional(data.call_ask.map(|v| v.to_f64())),
-                        render_optional(data.call_middle.map(|v| v.to_f64())),
-                        render_optional(data.delta_call.and_then(decimal_to_f64)),
-                        render_optional(data.put_bid.map(|v| v.to_f64())),
-                        render_optional(data.put_ask.map(|v| v.to_f64())),
-                        render_optional(data.put_middle.map(|v| v.to_f64())),
-                        render_optional(data.delta_put.and_then(decimal_to_f64)),
-                        render_optional(data.gamma.and_then(decimal_to_f64)),
+                        expiration.days_to_expiration.to_string(),
+                        quote.strike.to_string(),
+                        quote.implied_volatility.to_string(),
+                        render_optional(quote.call_bid),
+                        render_optional(quote.call_ask),
+                        render_optional(quote.call_mid),
+                        render_optional(quote.call_delta),
+                        render_optional(quote.put_bid),
+                        render_optional(quote.put_ask),
+                        render_optional(quote.put_mid),
+                        render_optional(quote.put_delta),
+                        render_optional(quote.gamma),
                     ]);
                 }
             }
@@ -680,14 +1067,23 @@ mod tests {
         })
     }
 
+    /// Mounts the real v2 routes over an in-memory store, with no warehouse.
+    ///
+    /// The argument form mounts one, which is how the tests below exercise the
+    /// stored path over the very same route registration production uses.
     macro_rules! v2_service {
-        () => {{
+        () => {
+            v2_service!(None)
+        };
+        ($snapshots:expr) => {{
             let manager = Arc::new(crate::session::SimulationManager::new(
                 Arc::new(InMemorySimulationStore::new()),
                 SimulationV2Config::default(),
             ));
+            let snapshots: Option<Arc<dyn SimulationSnapshotRepository>> = $snapshots;
             actix_test::init_service(
-                App::new().configure(|cfg| configure_v2_routes(cfg, manager.clone())),
+                App::new()
+                    .configure(|cfg| configure_v2_routes(cfg, manager.clone(), snapshots.clone())),
             )
             .await
         }};
@@ -1200,6 +1596,395 @@ mod tests {
                 "{symbol:?} must be rejected at the boundary"
             );
         }
+    }
+
+    // ---- the persisted source --------------------------------------------
+
+    /// A warehouse that answers from memory, standing in for ClickHouse.
+    ///
+    /// Hermetic on purpose: what these tests are about is the *export's*
+    /// decision between the two sources and the adapter that renders them, not
+    /// the SQL — a live warehouse would test the driver and hide the branch.
+    #[derive(Default)]
+    struct FakeWarehouse {
+        stored: std::sync::Mutex<std::collections::BTreeMap<usize, SnapshotRecord>>,
+        /// When set, every read fails the way an unreachable warehouse does.
+        failing: bool,
+        /// How many range reads the export asked for — the windowing evidence.
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeWarehouse {
+        /// A warehouse that is down.
+        fn failing() -> Self {
+            Self {
+                failing: true,
+                ..Self::default()
+            }
+        }
+
+        /// How many range reads it has answered.
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Files records after the fact.
+        ///
+        /// Lets a test create the simulation first and persist its real id
+        /// afterwards, which is the order production works in.
+        fn fill(&self, records: Vec<SnapshotRecord>) {
+            let mut stored = match self.stored.lock() {
+                Ok(stored) => stored,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for record in records {
+                stored.insert(record.step, record);
+            }
+        }
+
+        /// The records it holds, ascending by step.
+        fn range(&self, from: usize, to: usize) -> Vec<SnapshotRecord> {
+            match self.stored.lock() {
+                Ok(stored) => stored
+                    .range(from..=to)
+                    .map(|(_, record)| record.clone())
+                    .collect(),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .range(from..=to)
+                    .map(|(_, record)| record.clone())
+                    .collect(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SimulationSnapshotRepository for FakeWarehouse {
+        async fn persist(&self, record: SnapshotRecord) -> Result<(), ChainError> {
+            match self.stored.lock() {
+                Ok(mut stored) => {
+                    stored.insert(record.step, record);
+                }
+                Err(poisoned) => {
+                    poisoned.into_inner().insert(record.step, record);
+                }
+            }
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _simulation: Uuid,
+            _generation: u64,
+            step: usize,
+        ) -> Result<Option<SnapshotRecord>, ChainError> {
+            Ok(self.range(step, step).into_iter().next())
+        }
+
+        async fn read_range(
+            &self,
+            _simulation: Uuid,
+            _generation: u64,
+            from_step: usize,
+            to_step: usize,
+        ) -> Result<Vec<SnapshotRecord>, ChainError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.failing {
+                return Err(ChainError::ClickHouseError(
+                    "the warehouse is unreachable".to_string(),
+                ));
+            }
+            Ok(self.range(from_step, to_step))
+        }
+
+        async fn contract_series(
+            &self,
+            _query: crate::infrastructure::ContractSeriesQuery,
+        ) -> Result<Vec<crate::infrastructure::ContractQuote>, ChainError> {
+            // The export never projects a single contract; an empty history is
+            // an honest answer rather than a panic waiting to be reached.
+            Ok(Vec::new())
+        }
+    }
+
+    /// The effective parameters of [`reference_body`].
+    ///
+    /// Parsed from the very same JSON the tests create with, so the replayed
+    /// tape here cannot drift from the simulation under test.
+    fn reference_parameters() -> SimulationParametersV2 {
+        let request: crate::api::rest::requests_v2::CreateSimulationRequest =
+            match serde_json::from_value(reference_body()) {
+                Ok(request) => request,
+                Err(error) => panic!("the reference body must deserialize: {error}"),
+            };
+        match SimulationParametersV2::try_from(request) {
+            Ok(parameters) => parameters,
+            Err(error) => panic!("the reference body must convert: {error}"),
+        }
+    }
+
+    /// The snapshot record of `step`, as the session layer would have filed it.
+    ///
+    /// The conversion is re-stated here rather than reused because
+    /// `session::snapshot_record` is a private module: the api layer cannot name
+    /// it. That is a feature for this test — the fixture is built from the
+    /// domain snapshot independently of the writer, so the assertion below is
+    /// about the reader, not about a shared helper agreeing with itself.
+    fn stored_record(simulation: Uuid, step: usize) -> SnapshotRecord {
+        let parameters = reference_parameters();
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
+        let builder = match SeriesBuilder::new(&parameters, &tape) {
+            Ok(builder) => builder,
+            Err(error) => panic!("the builder must accept the parameters: {error}"),
+        };
+        let snapshot = match builder.snapshot(step) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("the snapshot must build: {error}"),
+        };
+
+        SnapshotRecord::new(
+            simulation,
+            CURRENT_SNAPSHOT_GENERATION,
+            snapshot.step,
+            snapshot.simulated_at,
+            parameters.symbol.clone(),
+            snapshot.spot,
+            snapshot.base_volatility,
+            snapshot
+                .chains
+                .iter()
+                .map(|chain| {
+                    crate::infrastructure::ExpirationRecord::new(
+                        chain.expires_at,
+                        chain.days_to_expiration,
+                        chain.labels.clone(),
+                        chain
+                            .chain
+                            .iter()
+                            .map(|data| QuoteRow {
+                                strike: data.strike_price,
+                                implied_volatility: data.implied_volatility,
+                                call_bid: data.call_bid,
+                                call_ask: data.call_ask,
+                                call_mid: data.call_middle,
+                                put_bid: data.put_bid,
+                                put_ask: data.put_ask,
+                                put_mid: data.put_middle,
+                                delta_call: data.delta_call,
+                                delta_put: data.delta_put,
+                                gamma: data.gamma,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Every step of the reference simulation, as persisted records.
+    fn stored_tape(simulation: Uuid) -> Vec<SnapshotRecord> {
+        (0..3).map(|step| stored_record(simulation, step)).collect()
+    }
+
+    /// The id the export will use, parsed back from the create response.
+    fn parse_id(id: &str) -> Uuid {
+        match Uuid::parse_str(id) {
+            Ok(id) => id,
+            Err(error) => panic!("the created id must be a UUID: {error}"),
+        }
+    }
+
+    /// A step served from the warehouse renders exactly like one replayed —
+    /// byte for byte, in both encodings.
+    ///
+    /// This is what makes preferring the warehouse safe at all: the two sources
+    /// go through one adapter, so a client cannot tell which produced its rows.
+    #[actix_web::test]
+    async fn test_a_persisted_step_renders_exactly_like_a_replayed_one() {
+        let warehouse = Arc::new(FakeWarehouse::default());
+        let app = v2_service!(Some(
+            Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>
+        ));
+        let id = create!(app);
+
+        // The same app, the same simulation, exported either side of the moment
+        // the warehouse learns the tape: the only thing that changes is which
+        // source answers.
+        let mut replayed = Vec::new();
+        for format in ["json", "csv"] {
+            let (status, body) = export!(app, id, format!("dataset=option_chains&format={format}"));
+            assert_eq!(status, StatusCode::OK, "{format}");
+            replayed.push(body);
+        }
+
+        warehouse.fill(stored_tape(parse_id(&id)));
+
+        for (format, replayed) in ["json", "csv"].iter().zip(replayed) {
+            let (status, stored) =
+                export!(app, id, format!("dataset=option_chains&format={format}"));
+
+            assert_eq!(status, StatusCode::OK, "{format}");
+            assert_eq!(
+                replayed, stored,
+                "{format}: a persisted step must render identically to a replayed one"
+            );
+        }
+        assert!(
+            warehouse.reads() >= 4,
+            "every chains export must have consulted the warehouse"
+        );
+    }
+
+    /// The persisted snapshot is what the export serves, not a replay of it.
+    ///
+    /// Without this the test above would pass on an export that ignored the
+    /// warehouse entirely, since both sources agree by construction. A stored
+    /// row carrying a value replay could never produce is the only way to see
+    /// which side answered.
+    #[actix_web::test]
+    async fn test_the_export_prefers_the_persisted_snapshot() {
+        let warehouse = Arc::new(FakeWarehouse::default());
+        let app = v2_service!(Some(
+            Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>
+        ));
+        let id = create!(app);
+
+        let (_, replayed) = export!(app, id, "dataset=option_chains&format=json");
+        assert!(
+            !replayed.contains("1234.5"),
+            "the marker must be impossible to reach by replay"
+        );
+
+        let mut records = stored_tape(parse_id(&id));
+        for record in &mut records {
+            for expiration in &mut record.expirations {
+                for quote in &mut expiration.quotes {
+                    quote.call_bid = Some(positive::pos_or_panic!(1_234.5));
+                }
+            }
+        }
+        warehouse.fill(records);
+
+        let (status, stored) = export!(app, id, "dataset=option_chains&format=json");
+
+        assert_eq!(status, StatusCode::OK);
+        let rows = json_rows_of(&stored);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert_eq!(
+                row.get("call_bid"),
+                Some(&json!(1234.5)),
+                "every chains row must come from the warehouse: {row}"
+            );
+        }
+    }
+
+    /// A step the warehouse does not hold is replayed, and the export is
+    /// indistinguishable from a full replay.
+    #[actix_web::test]
+    async fn test_a_missing_step_falls_back_to_replay() {
+        let warehouse = Arc::new(FakeWarehouse::default());
+        let app = v2_service!(Some(
+            Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>
+        ));
+        let id = create!(app);
+
+        let mut replayed = Vec::new();
+        for format in ["json", "csv"] {
+            let (_, body) = export!(app, id, format!("dataset=option_chains&format={format}"));
+            replayed.push(body);
+        }
+
+        // Only the middle step is persisted; the ends are gaps.
+        warehouse.fill(vec![stored_record(parse_id(&id), 1)]);
+
+        for (format, replayed) in ["json", "csv"].iter().zip(replayed) {
+            let (status, mixed) =
+                export!(app, id, format!("dataset=option_chains&format={format}"));
+
+            assert_eq!(status, StatusCode::OK, "{format}");
+            assert_eq!(
+                replayed, mixed,
+                "{format}: a partially persisted tape must export the whole range"
+            );
+        }
+    }
+
+    /// A warehouse that is down does not fail the export, and does not change
+    /// what it produces.
+    #[actix_web::test]
+    async fn test_a_failing_warehouse_does_not_fail_the_export() {
+        let replaying = v2_service!();
+        let id = create!(replaying);
+
+        // A different app, hence a different simulation id — but the same
+        // parameters and the same seed, which is all a tape depends on.
+        let warehouse = Arc::new(FakeWarehouse::failing());
+        let storing = v2_service!(Some(
+            Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>
+        ));
+        let stored_id = create!(storing);
+
+        let (_, replayed) = export!(replaying, id, "dataset=option_chains&format=csv");
+        let (status, degraded) = export!(storing, stored_id, "dataset=option_chains&format=csv");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replayed, degraded, "a failed read must fall back to replay");
+        assert_eq!(
+            warehouse.reads(),
+            1,
+            "a warehouse that failed once must not be asked again for this export"
+        );
+    }
+
+    /// Only the chains dataset consults the warehouse, and it consults it once
+    /// per window rather than once per step.
+    #[actix_web::test]
+    async fn test_only_the_chains_dataset_reads_the_warehouse() {
+        let warehouse = Arc::new(FakeWarehouse::default());
+        let app = v2_service!(Some(
+            Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>
+        ));
+        let id = create!(app);
+
+        for dataset in ["underlying", "volatility"] {
+            let (status, _) = export!(app, id, format!("dataset={dataset}&format=json"));
+            assert_eq!(status, StatusCode::OK);
+        }
+        assert_eq!(
+            warehouse.reads(),
+            0,
+            "the tape-only datasets must not pay for a warehouse lookup"
+        );
+
+        let (status, _) = export!(app, id, "dataset=option_chains&format=json");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            warehouse.reads(),
+            1,
+            "three steps fit in one window, so one read serves them all"
+        );
+    }
+
+    /// A window covers at most its width, and never reaches past the range.
+    #[test]
+    fn test_a_window_is_bounded_by_its_width_and_by_the_range() {
+        assert_eq!(window_end(0, SNAPSHOT_WINDOW_STEPS, 1_000), 63);
+        assert_eq!(window_end(64, SNAPSHOT_WINDOW_STEPS, 1_000), 127);
+        assert_eq!(
+            window_end(0, SNAPSHOT_WINDOW_STEPS, 10),
+            10,
+            "a short range must not be read past its end"
+        );
+        assert_eq!(window_end(7, 1, 1_000), 7, "a narrowed window is one step");
+        assert_eq!(
+            window_end(usize::MAX, SNAPSHOT_WINDOW_STEPS, usize::MAX),
+            usize::MAX,
+            "the arithmetic must not wrap into a reversed range"
+        );
     }
 
     // ---- ranges and bounds, unit level -----------------------------------

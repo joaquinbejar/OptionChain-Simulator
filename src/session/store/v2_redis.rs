@@ -496,7 +496,6 @@ mod live_tests {
     use crate::session::model::SessionState;
     use crate::session::model_v2::SimulationParametersV2;
     use crate::session::{ExpiryRule, ExpiryRuleKind};
-    use crate::utils::UuidGenerator;
     use chrono::{TimeZone, Utc, Weekday};
     use tokio::test;
 
@@ -555,13 +554,8 @@ mod live_tests {
 
         let parameters =
             SimulationParametersV2::try_from(request).expect("the reference request must convert");
-        let namespace = Uuid::parse_str(crate::session::manager::DEFAULT_NAMESPACE)
-            .expect("the default namespace must parse");
-        let mut simulation = SessionV2::new(parameters, &UuidGenerator::new(namespace));
-        // The uuid generator is a deterministic counter, so give each test its
-        // own id rather than letting parallel tests share one.
-        simulation.id = Uuid::new_v4();
-        simulation
+        // Ids are random now, so each test already gets its own.
+        SessionV2::new(parameters)
     }
 
     /// A created simulation round-trips through Redis unchanged, and its
