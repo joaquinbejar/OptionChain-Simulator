@@ -22,6 +22,7 @@
 
 use crate::utils::ChainError;
 use std::env;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::info;
 
@@ -51,6 +52,16 @@ pub const DEFAULT_MAX_CACHED_TAPES: usize = 64;
 /// [`DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS`], which does.
 pub const DEFAULT_MAX_CACHED_SNAPSHOTS: usize = 256;
 
+/// Default cap on the contracts one snapshot may price.
+///
+/// A snapshot prices every strike of every live expiration, so its cost is the
+/// product of two caps that each look reasonable alone: a chain size of 500 is
+/// 1 001 strikes, and a schedule may keep 512 expirations alive, for half a
+/// million contracts in one request. The default admits any realistic
+/// configuration — ADR 0001's reference schedule prices about 500 contracts a
+/// snapshot — while refusing the shapes that exist only to exhaust the service.
+pub const DEFAULT_MAX_SNAPSHOT_CONTRACTS: usize = 200_000;
+
 /// Default number of contracts held resident across every cached snapshot.
 ///
 /// The honest unit for a memory bound: one entry is a few hundred contracts in
@@ -74,6 +85,12 @@ const MAX_CLEANUP_INTERVAL_SECS: u64 = 3_600;
 
 /// The largest cache bound that can be configured.
 const MAX_CACHE_CAPACITY: usize = 1_000_000;
+
+/// The largest per-snapshot contract cap that can be configured.
+///
+/// Above the product of the two caps it bounds, so it can never be the binding
+/// constraint by accident — a value this high is a typo.
+const MAX_SNAPSHOT_CONTRACTS_CEILING: usize = 10_000_000;
 
 /// The largest contract budget that can be configured.
 ///
@@ -107,6 +124,8 @@ pub struct SimulationV2Config {
     pub max_cached_tapes: usize,
     /// How many snapshots stay resident.
     pub max_cached_snapshots: usize,
+    /// How many contracts one snapshot may price.
+    pub max_snapshot_contracts: usize,
     /// How many contracts stay resident across every cached snapshot.
     pub max_cached_snapshot_contracts: usize,
     /// How many steps one export request may cover.
@@ -120,6 +139,7 @@ impl Default for SimulationV2Config {
             cleanup_interval: Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS),
             max_cached_tapes: DEFAULT_MAX_CACHED_TAPES,
             max_cached_snapshots: DEFAULT_MAX_CACHED_SNAPSHOTS,
+            max_snapshot_contracts: DEFAULT_MAX_SNAPSHOT_CONTRACTS,
             max_cached_snapshot_contracts: DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS,
             max_export_rows: DEFAULT_MAX_EXPORT_ROWS,
         }
@@ -160,6 +180,12 @@ impl SimulationV2Config {
                 read("OCS_MAX_CACHED_SNAPSHOTS").as_deref(),
                 DEFAULT_MAX_CACHED_SNAPSHOTS,
             )?,
+            max_snapshot_contracts: parse_bounded(
+                "OCS_MAX_SNAPSHOT_CONTRACTS",
+                read("OCS_MAX_SNAPSHOT_CONTRACTS").as_deref(),
+                DEFAULT_MAX_SNAPSHOT_CONTRACTS,
+                MAX_SNAPSHOT_CONTRACTS_CEILING,
+            )?,
             max_cached_snapshot_contracts: parse_bounded(
                 "OCS_MAX_CACHED_SNAPSHOT_CONTRACTS",
                 read("OCS_MAX_CACHED_SNAPSHOT_CONTRACTS").as_deref(),
@@ -179,10 +205,16 @@ impl SimulationV2Config {
             cleanup_interval_secs = config.cleanup_interval.as_secs(),
             max_cached_tapes = config.max_cached_tapes,
             max_cached_snapshots = config.max_cached_snapshots,
+            max_snapshot_contracts = config.max_snapshot_contracts,
             max_cached_snapshot_contracts = config.max_cached_snapshot_contracts,
             max_export_rows = config.max_export_rows,
             "Loaded the v2 simulation configuration"
         );
+        // Publish the parsed cap for the validator, which has no config handle.
+        // A second call is a no-op: the first configuration a process loads is
+        // the one it runs with.
+        let _ = SNAPSHOT_CONTRACT_CAP.set(config.max_snapshot_contracts);
+
         Ok(config)
     }
 
@@ -282,6 +314,27 @@ fn invalid(variable: &str, raw: &str) -> ChainError {
         field: variable.to_string(),
         reason: format!("must be a whole number, got {raw:?}"),
     }
+}
+
+/// The per-snapshot contract cap the running service applies.
+///
+/// [`SimulationParametersV2::validate`] is a method on a value, not a service
+/// with a config handle, so the parsed cap reaches it through here.
+/// [`SimulationV2Config::from_env`] publishes it once at startup, which keeps
+/// the parsing — and the failure that names the variable — in exactly one
+/// place: a malformed `OCS_MAX_SNAPSHOT_CONTRACTS` fails the boot rather than
+/// quietly deploying a different bound than the operator asked for.
+///
+/// Before startup publishes it, and in tests and library use where no service
+/// exists, the documented default applies.
+static SNAPSHOT_CONTRACT_CAP: OnceLock<usize> = OnceLock::new();
+
+/// The cap to validate against.
+#[must_use]
+pub fn max_snapshot_contracts() -> usize {
+    *SNAPSHOT_CONTRACT_CAP
+        .get()
+        .unwrap_or(&DEFAULT_MAX_SNAPSHOT_CONTRACTS)
 }
 
 #[cfg(test)]

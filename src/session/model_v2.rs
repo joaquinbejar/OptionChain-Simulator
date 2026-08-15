@@ -18,9 +18,7 @@
 //!   simulation: changing any parameter changes the tape, so it creates a new
 //!   simulation instead of mutating one.
 
-use crate::api::rest::limits::{
-    MAX_CHAIN_SIZE, MAX_SNAPSHOT_CONTRACTS, MAX_STEPS, strikes_per_chain,
-};
+use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS, strikes_per_chain};
 use crate::api::rest::models::validate_walk_type;
 use crate::api::rest::requests_v2::CreateSimulationRequest;
 use crate::api::rest::validation::{
@@ -28,6 +26,7 @@ use crate::api::rest::validation::{
 };
 use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, tzdb_version};
 use crate::domain::simulator::DEFAULT_CHAIN_SIZE;
+use crate::infrastructure::max_snapshot_contracts;
 use crate::session::model::{SessionState, SimulationMethod};
 use crate::utils::{ChainError, UuidGenerator};
 use chrono::{DateTime, NaiveTime, TimeDelta, Timelike, Utc};
@@ -444,7 +443,11 @@ impl SimulationParametersV2 {
     /// Returns [`ChainError::Validation`] naming `chain_size`, which is the
     /// field a client can lower without changing what the simulation means.
     fn validate_snapshot_work(&self) -> Result<(), ChainError> {
-        let strikes = strikes_per_chain(self.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE));
+        let requested = self.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE);
+        let strikes = strikes_per_chain(requested).ok_or_else(|| ChainError::Validation {
+            field: "chain_size".to_string(),
+            reason: format!("a chain of {requested} does not have a representable strike count"),
+        })?;
         let expirations = self
             .schedule
             .rules()
@@ -467,14 +470,14 @@ impl SimulationParametersV2 {
                 ),
             })?;
 
-        if contracts > *MAX_SNAPSHOT_CONTRACTS {
+        let cap = max_snapshot_contracts();
+        if contracts > cap {
             return Err(ChainError::Validation {
                 field: "chain_size".to_string(),
                 reason: format!(
                     "every snapshot would price {contracts} contracts ({strikes} strikes \
-                     across up to {expirations} expirations), above the {} maximum; lower \
-                     chain_size or the schedules' target_count",
-                    *MAX_SNAPSHOT_CONTRACTS
+                     across up to {expirations} expirations), above the {cap} maximum; lower \
+                     chain_size or the schedules' target_count"
                 ),
             });
         }
