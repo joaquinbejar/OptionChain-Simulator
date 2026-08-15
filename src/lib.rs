@@ -121,6 +121,14 @@
 //! changing the seed, the start, the schedules or the chain shape changes the
 //! tape, so it creates a new simulation instead of mutating one.
 //!
+//! **A historical v2 walk is priced at the volatility you send.** A
+//! `Historical` method carries no volatility of its own, and v2 does not enter
+//! the upstream walk driver that estimates one per step, so every step of a
+//! historical v2 simulation prices at the request's constant `volatility`. v1
+//! uses a rolling causal estimate for the same series, so the two produce the
+//! same price path and different premiums. It is a stated difference, tracked
+//! in issue #63 and asked for upstream in optionstratlib#423.
+//!
 //! **Replay.** The creation response echoes the effective seed, effective
 //! start, step interval, time frame, timezone, calendar version, IANA tzdb
 //! release and normalised schedules — everything needed to reproduce the run
