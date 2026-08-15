@@ -50,7 +50,18 @@ use uuid::Uuid;
 /// this build wrote is this one. It lives here, next to the records, so an
 /// external consumer of the `pub` read API has a name to pass instead of a
 /// hardcoded literal.
-pub const CURRENT_SNAPSHOT_GENERATION: u64 = 1;
+///
+/// # History
+///
+/// - `1` — the shape 0.2.0 shipped. A historical walk priced every step at the
+///   constant `volatility` the request supplied.
+/// - `2` — a historical walk prices each step at a causal realized-volatility
+///   estimate over the observations up to it. The price path is unchanged and
+///   every other walk type is unaffected, but the premiums of a historical
+///   simulation are not, so its rows are a different tape under the same
+///   coordinates. Generation 1 rows stay in place until their retention expires
+///   and are simply not read by this build.
+pub const CURRENT_SNAPSHOT_GENERATION: u64 = 2;
 
 /// The namespace every deterministic `snapshot_id` is derived under.
 ///
@@ -524,10 +535,35 @@ mod tests {
     fn test_the_current_generation_is_addressable() {
         let simulation = Uuid::from_u128(7);
 
-        assert_eq!(CURRENT_SNAPSHOT_GENERATION, 1);
+        assert_eq!(CURRENT_SNAPSHOT_GENERATION, 2);
         assert_eq!(
             record(simulation, CURRENT_SNAPSHOT_GENERATION, 0).snapshot_id(),
             snapshot_id(simulation, CURRENT_SNAPSHOT_GENERATION, 0)
+        );
+    }
+
+    /// One step of one simulation is a different row in each generation.
+    ///
+    /// This is what a generation is for. The tables collapse on
+    /// `(simulation, generation, step)`, so if two builds that price a step
+    /// differently shared a generation, the later one would not sit beside the
+    /// earlier tape — it would replace it, and a client replaying against
+    /// either would get whichever landed last.
+    #[test]
+    fn test_a_generation_bump_addresses_a_different_row() {
+        let simulation = Uuid::from_u128(7);
+
+        let previous = snapshot_id(simulation, CURRENT_SNAPSHOT_GENERATION - 1, 3);
+        let current = snapshot_id(simulation, CURRENT_SNAPSHOT_GENERATION, 3);
+
+        assert_ne!(
+            previous, current,
+            "the same step under two generations must be two rows"
+        );
+        assert_eq!(
+            current,
+            snapshot_id(simulation, CURRENT_SNAPSHOT_GENERATION, 3),
+            "and the current one must still be reproducible"
         );
     }
 

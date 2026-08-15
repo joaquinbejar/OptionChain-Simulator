@@ -121,13 +121,16 @@
 //! changing the seed, the start, the schedules or the chain shape changes the
 //! tape, so it creates a new simulation instead of mutating one.
 //!
-//! **A historical v2 walk is priced at the volatility you send.** A
-//! `Historical` method carries no volatility of its own, and v2 does not enter
-//! the upstream walk driver that estimates one per step, so every step of a
-//! historical v2 simulation prices at the request's constant `volatility`. v1
-//! uses a rolling causal estimate for the same series, so the two produce the
-//! same price path and different premiums. It is a stated difference, tracked
-//! in issue #63 and asked for upstream in optionstratlib#423.
+//! **A historical v2 walk prices itself.** A `Historical` method carries no
+//! volatility of its own, so each step is priced by the realized volatility of
+//! everything observed up to that step and nothing later — the same expanding
+//! window v1 uses, so from step 1 on the two agree on the volatility path as
+//! well as the price path. (Step 0 differs by construction: v1 prices its first
+//! chain at the request's constant.) The `volatility` you send prices none of
+//! its steps; the values that did are the per-step ones every snapshot and the
+//! `volatility` export report. A series too turbulent to price a chain at, or
+//! one whose first three prices are equal, is refused when the simulation is
+//! first served.
 //!
 //! **Advanced steps can be filed in ClickHouse.** With
 //! `OCS_SNAPSHOT_PERSISTENCE_ENABLED` on, every step an advance serves is

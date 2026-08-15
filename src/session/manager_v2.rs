@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -48,7 +48,16 @@ struct TapeEntry {
 pub struct SimulationManager {
     store: Arc<dyn SimulationStore>,
     config: SimulationV2Config,
-    tapes: Mutex<HashMap<Uuid, TapeEntry>>,
+    tapes: Arc<Mutex<HashMap<Uuid, TapeEntry>>>,
+    /// Tape builds currently running, one entry per simulation.
+    ///
+    /// Without it, N concurrent first reads of one simulation start N identical
+    /// builds — and a build is the one place a v2 request does seconds of CPU,
+    /// so the duplicates are not a wasted allocation, they are the machine.
+    /// `spawn_blocking` does not bound that: its pool grows to hundreds of
+    /// threads, so the cache would still be cold while every core was busy
+    /// filling it with the same answer.
+    builds: Mutex<HashMap<Uuid, broadcast::Sender<Result<FactorTape, String>>>>,
     snapshots: Mutex<SnapshotCache>,
     /// Where served snapshots are queued for filing, when the operator turned
     /// persistence on. `None` is the default and the whole feature is then
@@ -101,7 +110,8 @@ impl SimulationManager {
         Self {
             store,
             config,
-            tapes: Mutex::new(HashMap::new()),
+            tapes: Arc::new(Mutex::new(HashMap::new())),
+            builds: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(SnapshotCache::with_bounds(
                 config.max_cached_snapshots,
                 config.max_cached_snapshot_contracts,
@@ -228,7 +238,9 @@ impl SimulationManager {
         let simulation = self.store.get(id).await?;
         Self::reject_terminal(&simulation, "no current step")?;
 
-        let snapshot = self.snapshot_at(&simulation, simulation.current_step)?;
+        let snapshot = self
+            .snapshot_at(&simulation, simulation.current_step)
+            .await?;
         Ok((simulation, snapshot))
     }
 
@@ -258,7 +270,9 @@ impl SimulationManager {
         let expected_version = simulation.version;
         Self::reject_terminal(&simulation, "no further steps")?;
 
-        let snapshot = self.snapshot_at(&simulation, simulation.current_step)?;
+        let snapshot = self
+            .snapshot_at(&simulation, simulation.current_step)
+            .await?;
 
         simulation.current_step = simulation
             .current_step
@@ -427,7 +441,7 @@ impl SimulationManager {
     /// Locks are held only for the map operations, never across a build: the
     /// tape and the snapshot are produced outside any critical section, so a
     /// slow build cannot stall another simulation's request.
-    fn snapshot_at(
+    async fn snapshot_at(
         &self,
         simulation: &SessionV2,
         step: usize,
@@ -436,7 +450,7 @@ impl SimulationManager {
             return Ok(cached);
         }
 
-        let tape = self.tape_for(simulation)?;
+        let tape = self.tape_for(simulation).await?;
         let snapshot = SeriesBuilder::new(&simulation.parameters, &tape)?.snapshot(step)?;
 
         self.cache_snapshot(simulation.id, snapshot.clone());
@@ -462,18 +476,112 @@ impl SimulationManager {
     }
 
     /// Returns the simulation's factor tape, building it on a miss.
-    fn tape_for(&self, simulation: &SessionV2) -> Result<FactorTape, ChainError> {
+    ///
+    /// Built outside the lock — holding the map while it runs would serialise
+    /// every other simulation behind it — and off the runtime. `FactorTape::build`
+    /// is pure and synchronous, and it is the one place a v2 request does real
+    /// CPU work up front: a historical walk estimates a volatility per step,
+    /// which at the 10 000-step cap measures over three seconds. Left on a
+    /// worker that would stall every other request the worker holds, so it goes
+    /// to the blocking pool, exactly as the export path already does with the
+    /// same call.
+    ///
+    /// The result is filed **inside** the blocking task rather than after the
+    /// await. A `spawn_blocking` task cannot be cancelled, but awaiting it can:
+    /// a client that disconnects or times out mid-build drops this future, and
+    /// filing afterwards would throw away a build that ran to completion
+    /// anyway. At three seconds a caller retrying under a shorter timeout would
+    /// then never warm the cache and would pin a blocking thread on every
+    /// attempt.
+    async fn tape_for(&self, simulation: &SessionV2) -> Result<FactorTape, ChainError> {
         if let Some(tape) = self.cached_tape(simulation.id) {
             return Ok(tape);
         }
 
-        // Built outside the lock. `FactorTape::build` is pure and synchronous —
-        // it is the one place a v2 request does real CPU work up front — and
-        // holding the map while it runs would serialise every other simulation
-        // behind it.
-        let tape = FactorTape::build(&simulation.parameters, &simulation.parameters.method)?;
-        self.cache_tape(simulation.id, tape.clone());
-        Ok(tape)
+        let id = simulation.id;
+
+        // Either this call owns the build or it waits on the one already
+        // running. Decided under the lock, so two callers cannot both decide
+        // they are the owner.
+        let subscription = {
+            let mut builds = match self.builds.lock() {
+                Ok(builds) => builds,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            match builds.get(&id) {
+                Some(running) => Some(running.subscribe()),
+                None => {
+                    let (sender, _) = broadcast::channel(1);
+                    builds.insert(id, sender);
+                    None
+                }
+            }
+        };
+
+        if let Some(mut waiting) = subscription {
+            return match waiting.recv().await {
+                Ok(Ok(tape)) => Ok(tape),
+                // The owner failed; report what it reported rather than
+                // starting a second build that would fail the same way.
+                Ok(Err(reason)) => Err(ChainError::Internal(reason)),
+                // The owner's task died without publishing. Rare, and the
+                // honest answer is to build it here rather than hang.
+                Err(_) => self.build_tape(simulation).await,
+            };
+        }
+
+        let result = self.build_tape(simulation).await;
+
+        // Publish to whoever is waiting and stop being the owner, in that
+        // order: a caller that subscribes after the removal misses the
+        // broadcast, retries, and finds the tape in the cache.
+        let sender = {
+            let mut builds = match self.builds.lock() {
+                Ok(builds) => builds,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            builds.remove(&id)
+        };
+        if let Some(sender) = sender {
+            let published = match &result {
+                Ok(tape) => Ok(tape.clone()),
+                Err(error) => Err(error.to_string()),
+            };
+            // An error means nobody was waiting, which is the common case.
+            let _ = sender.send(published);
+        }
+
+        result
+    }
+
+    /// Builds a tape off the runtime and files it.
+    ///
+    /// `FactorTape::build` is pure and synchronous, and it is the one place a
+    /// v2 request does real CPU work up front: a historical walk estimates a
+    /// volatility per step, which at the 10 000-step cap measures over three
+    /// seconds. Left on a worker it would stall every other request that worker
+    /// holds, so it goes to the blocking pool, exactly as the export path
+    /// already does with the same call.
+    ///
+    /// The result is filed **inside** the blocking task rather than after the
+    /// await. A `spawn_blocking` task cannot be cancelled, but awaiting it can:
+    /// a client that disconnects or times out mid-build drops that future, and
+    /// filing afterwards would throw away a build that ran to completion
+    /// anyway.
+    async fn build_tape(&self, simulation: &SessionV2) -> Result<FactorTape, ChainError> {
+        let parameters = simulation.parameters.clone();
+        let id = simulation.id;
+        let tapes = Arc::clone(&self.tapes);
+        let max_cached_tapes = self.config.max_cached_tapes;
+
+        tokio::task::spawn_blocking(move || {
+            let tape = FactorTape::build(&parameters, &parameters.method)?;
+            Self::cache_tape(&tapes, max_cached_tapes, id, tape.clone());
+            Ok(tape)
+        })
+        .await
+        .map_err(|e| ChainError::Internal(format!("the factor tape build did not finish: {e}")))?
     }
 
     /// Reads a cached tape, refreshing its recency.
@@ -488,8 +596,25 @@ impl SimulationManager {
     }
 
     /// Stores a built tape, evicting the least recently used first.
-    fn cache_tape(&self, id: Uuid, tape: FactorTape) {
-        let mut tapes = match self.tapes.lock() {
+    ///
+    /// Takes the map rather than `&self` so the builder can file its result
+    /// from inside the blocking task, where no caller can drop it.
+    ///
+    /// One race that follows from filing there, recorded because it is benign
+    /// only under the current routes: a build already running when the
+    /// simulation is deleted, completed or reaped will file afterwards, leaving
+    /// a tape for an id the store no longer knows. Nothing can serve it — every
+    /// path reads the store before the cache — so it costs memory until the LRU
+    /// pushes it out. It would stop being benign the day v2 gains a route that
+    /// changes a simulation's parameters in place, because the stale tape would
+    /// then be a tape of the *old* parameters under a live id.
+    fn cache_tape(
+        tapes: &Mutex<HashMap<Uuid, TapeEntry>>,
+        max_cached_tapes: usize,
+        id: Uuid,
+        tape: FactorTape,
+    ) {
+        let mut tapes = match tapes.lock() {
             Ok(tapes) => tapes,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -498,7 +623,7 @@ impl SimulationManager {
         // The capacity is validated `>= 1` when the configuration loads, so
         // `- 1` cannot underflow. Evicting before the insert keeps the id being
         // inserted out of the running for victim.
-        let max = self.config.max_cached_tapes;
+        let max = max_cached_tapes;
         debug_assert!(
             max >= 1,
             "the configured capacity is validated >= 1 at load"
@@ -776,6 +901,47 @@ mod tests {
         }
     }
 
+    /// Concurrent first reads of one simulation share a single build.
+    ///
+    /// The build is the one place a v2 request does seconds of CPU, so N
+    /// concurrent peeks starting N identical builds is not wasted allocation,
+    /// it is the machine. What proves the sharing is the snapshots: every
+    /// caller gets the same tape, and only one entry is cached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_first_reads_share_one_build() {
+        let manager = Arc::new(manager());
+        let simulation = created(&manager, 3).await;
+
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let manager = Arc::clone(&manager);
+            let id = simulation.id;
+            readers.push(tokio::spawn(async move { manager.peek(id).await }));
+        }
+
+        let mut snapshots = Vec::new();
+        for reader in readers {
+            match reader.await {
+                Ok(Ok((_, snapshot))) => snapshots.push(snapshot),
+                Ok(Err(error)) => panic!("every reader must be served: {error}"),
+                Err(error) => panic!("a reader panicked: {error}"),
+            }
+        }
+
+        assert_eq!(snapshots.len(), 8);
+        for snapshot in &snapshots {
+            assert_eq!(
+                snapshot, &snapshots[0],
+                "every reader must see the same tape"
+            );
+        }
+        assert_eq!(
+            manager.cached_tapes(),
+            1,
+            "eight readers of one simulation must leave one tape"
+        );
+    }
+
     /// An advance files exactly the step it served.
     #[tokio::test]
     async fn test_an_advance_files_the_step_it_served() {
@@ -927,6 +1093,31 @@ mod tests {
             Ok(_) => assert_eq!(manager.cached_tapes(), 1),
             Err(error) => panic!("the peek must succeed: {error}"),
         }
+    }
+
+    /// The tape cache still honours the configured capacity now that the build
+    /// files its own result from inside the blocking task and the cap travels
+    /// as a parameter rather than through `&self`.
+    #[tokio::test]
+    async fn test_the_tape_cache_still_honours_its_capacity() {
+        let config = SimulationV2Config {
+            max_cached_tapes: 2,
+            ..SimulationV2Config::default()
+        };
+        let manager = SimulationManager::new(Arc::new(InMemorySimulationStore::new()), config);
+
+        for _ in 0..4 {
+            let created = created(&manager, 5).await;
+            if let Err(error) = manager.peek(created.id).await {
+                panic!("the peek must succeed: {error}");
+            }
+        }
+
+        assert_eq!(
+            manager.cached_tapes(),
+            2,
+            "four tapes were built under a cap of two"
+        );
     }
 
     /// A peek is repeatable and changes nothing.

@@ -318,7 +318,7 @@ fn invalid(variable: &str, raw: &str) -> ChainError {
 
 /// The per-snapshot contract cap the running service applies.
 ///
-/// [`SimulationParametersV2::validate`] is a method on a value, not a service
+/// [`crate::session::SimulationParametersV2::validate`] is a method on a value, not a service
 /// with a config handle, so the parsed cap reaches it through here.
 /// [`SimulationV2Config::from_env`] publishes it once at startup, which keeps
 /// the parsing — and the failure that names the variable — in exactly one

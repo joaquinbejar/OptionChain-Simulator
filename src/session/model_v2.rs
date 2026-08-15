@@ -726,7 +726,7 @@ impl SessionV2 {
     /// Creates a simulation from resolved parameters.
     ///
     /// The id is **random** (`Uuid::new_v4`), for the reason v1 already
-    /// documents: [`UuidGenerator`] derives from a process-local counter that
+    /// documents: [`crate::utils::UuidGenerator`] derives from a process-local counter that
     /// starts at zero, so a restarted service or a second replica would reissue
     /// the same id sequence. That was survivable while an id only had to be
     /// unique among live sessions; it is not now that persisted snapshots are

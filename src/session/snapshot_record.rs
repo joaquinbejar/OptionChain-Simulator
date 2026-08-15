@@ -1,7 +1,7 @@
 //! The domain snapshot, in the shape the warehouse stores.
 //!
 //! The conversion lives here rather than in `infrastructure` because
-//! [`SeriesSnapshot`] is `pub(crate)` inside the private `domain` module: the
+//! `SeriesSnapshot` is `pub(crate)` inside the private `domain` module: the
 //! persistence layer cannot name it, and must not, or the layering would run
 //! backwards. The session layer sees both sides, so it owns the translation —
 //! the same place the f64 ↔ typed conversion already happens for the REST
