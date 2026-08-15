@@ -1058,9 +1058,12 @@ mod tests {
     /// would break it.
     #[test]
     fn test_a_longer_series_leaves_earlier_steps_untouched() {
-        let build = |steps: usize, observations: usize| {
+        // The observation count is a `u32` so the index converts to `f64`
+        // losslessly and infallibly — no conversion to swallow, which is what a
+        // fallback of zero would have done, quietly flattening the series.
+        let build = |steps: usize, observations: u32| {
             let prices: Vec<f64> = (0..observations)
-                .map(|i| 5000.0 + (f64::from(u32::try_from(i).unwrap_or(0)) * 7.0).sin() * 250.0)
+                .map(|i| 5000.0 + (f64::from(i) * 7.0).sin() * 250.0)
                 .collect();
             let mut historical = request(steps, brownian(0.18), 0.18);
             historical.method = ApiWalkType::Historical {
