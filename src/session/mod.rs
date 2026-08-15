@@ -38,6 +38,9 @@ mod model;
 /// conversion from the v2 request DTO. Kept apart from `model` because
 /// `/api/v1/chain` and its stored shape are frozen (ADR 0001 section 12).
 mod model_v2;
+/// The domain snapshot in the shape the ClickHouse warehouse stores, and the
+/// tape generation it is filed under.
+mod snapshot_record;
 ///
 /// The `state_handler` module is responsible for managing and encapsulating all
 /// logic related to the application state. It defines functionality to manipulate,

@@ -781,6 +781,42 @@ v1 JSON is never reinterpreted as rolling configuration, and a v1 session
 written by an older binary keeps loading unchanged. Breaking either stored shape
 remains a semver event.
 
+### 12.2b Persisted snapshots (amends the warehouse decision)
+
+Served snapshots may additionally be **filed in ClickHouse**, opt-in via
+`OCS_SNAPSHOT_PERSISTENCE_ENABLED`. This amends what §10 assumed — that
+deterministic replay is the only way to obtain a past step — without weakening
+it: replay stays canonical, and the warehouse is a materialisation of what
+replay would produce.
+
+Two tables, because the two query patterns are different shapes. One metadata
+row per step in `simulation_snapshots`, and one flattened row per
+`(step, expiration, strike)` in `simulation_option_quotes` — which is what makes
+"this contract's premium across time" a range scan rather than an unwind of
+nested documents. Both are `ReplacingMergeTree`, ordered by the coordinate that
+identifies a row, and partitioned by `toYYYYMM(simulated_at)`: a **content**
+key, not an ingestion one, because the engine only deduplicates within a
+partition and a backfilled step written a month later would otherwise survive as
+a permanent duplicate. Retention is a row-level TTL anchored on the ingestion
+timestamp, so a backfill keeps its full window.
+
+Four properties make it safe to read:
+
+- **Identity is derived, not generated.** A row's id is a v5 UUID over
+  `(simulation, tape generation, step)`, so retrying a step replaces its rows
+  instead of adding a second copy. The generation is the *tape's*, not the
+  session's compare-and-swap revision — that changes on every advance, and
+  filing under it would scatter one simulation across as many generations as it
+  has steps.
+- **A partial write never reads as complete.** Quote rows go first, in one
+  insert; the metadata row carrying the expected count goes last. Every read
+  compares what it got against that count and treats a mismatch as absent.
+- **Filing cannot fail an advance.** It happens after the cursor commits, and a
+  failure is logged with the step rather than returned: the client already holds
+  its snapshot, and the missing row is exactly what replay can rewrite.
+- **Nothing about v1 moves.** MongoDB stays event and audit only; no v2 chain is
+  written as a nested document.
+
 ### 12.3 OpenAPI
 
 `actix_extras` remains unavailable — optionstratlib enables

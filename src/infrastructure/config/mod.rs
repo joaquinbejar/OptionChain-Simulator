@@ -4,6 +4,10 @@ pub mod redis;
 /// Operational configuration for v2 rolling simulations: retention, the
 /// cleanup cadence, and the domain-cache capacities.
 pub mod simulation_v2;
+/// Operational configuration for persisting v2 snapshots: whether it happens,
+/// how large a batch may be, how long an insert may take, and how long the rows
+/// are kept.
+pub mod snapshot;
 
 /// Redacts URL userinfo (credentials) from every URL-like substring inside a
 /// larger text (log lines, driver error messages).

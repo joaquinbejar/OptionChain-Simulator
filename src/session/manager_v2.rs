@@ -24,30 +24,18 @@
 
 use crate::domain::factors::FactorTape;
 use crate::domain::series::{SeriesBuilder, SeriesSnapshot, SnapshotCache};
-use crate::infrastructure::SimulationV2Config;
-use crate::session::manager::DEFAULT_NAMESPACE;
+use crate::infrastructure::{SimulationSnapshotRepository, SimulationV2Config, SnapshotRecord};
 use crate::session::model::SessionState;
+use crate::session::snapshot_record::snapshot_record;
 use crate::session::store::SimulationStore;
 use crate::session::{SessionV2, SimulationParametersV2};
-use crate::utils::{ChainError, UuidGenerator};
+use crate::utils::ChainError;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::{debug, info, instrument};
+use tokio::sync::mpsc;
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
-
-/// The UUID v5 namespace simulations are generated under.
-///
-/// The same namespace v1 uses, parsed once. It is a compile-time constant that
-/// has been valid since the crate's first release; a parse failure here would
-/// mean the constant itself was edited to something malformed, so falling back
-/// to the nil namespace keeps the service up rather than aborting a request
-/// path — ids stay unique either way, since the generator counts within the
-/// namespace.
-#[must_use]
-fn default_namespace() -> Uuid {
-    Uuid::parse_str(DEFAULT_NAMESPACE).unwrap_or(Uuid::nil())
-}
 
 /// One cached factor tape and the last time it was used.
 struct TapeEntry {
@@ -58,11 +46,28 @@ struct TapeEntry {
 /// Owns the lifecycle of v2 rolling simulations.
 pub struct SimulationManager {
     store: Arc<dyn SimulationStore>,
-    uuid_generator: UuidGenerator,
     config: SimulationV2Config,
     tapes: Mutex<HashMap<Uuid, TapeEntry>>,
     snapshots: Mutex<SnapshotCache>,
+    /// Where served snapshots are queued for filing, when the operator turned
+    /// persistence on. `None` is the default and the whole feature is then
+    /// absent from the serving path — no connection, no latency, no failure
+    /// mode.
+    warehouse: Option<mpsc::Sender<SnapshotRecord>>,
 }
+
+/// How many snapshots may be waiting to be filed before the oldest is dropped.
+///
+/// The queue is what keeps a degraded warehouse from becoming a memory leak. An
+/// unbounded spawn-per-advance cannot delay a response, but at a sustained
+/// advance rate against a warehouse that is timing out it accumulates records
+/// until the process dies — which fails every request, not just the write.
+///
+/// The depth is generous relative to the reference configuration (a record is
+/// on the order of a few hundred quotes) and deliberately not a knob: a
+/// deployment that needs to tune it is a deployment whose warehouse cannot keep
+/// up, and the answer there is the warehouse, not a bigger buffer.
+const SNAPSHOT_QUEUE_DEPTH: usize = 1_024;
 
 impl SimulationManager {
     /// Creates a manager over a simulation store.
@@ -74,14 +79,46 @@ impl SimulationManager {
     pub fn new(store: Arc<dyn SimulationStore>, config: SimulationV2Config) -> Self {
         Self {
             store,
-            uuid_generator: UuidGenerator::new(default_namespace()),
             config,
             tapes: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(SnapshotCache::with_bounds(
                 config.max_cached_snapshots,
                 config.max_cached_snapshot_contracts,
             )),
+            warehouse: None,
         }
+    }
+
+    /// Files every served snapshot in `warehouse`.
+    ///
+    /// Opt-in, and deliberately a separate constructor rather than an argument
+    /// to [`SimulationManager::new`]: a deployment without ClickHouse should not
+    /// have to name the feature to not use it, and the serving path should not
+    /// branch on a config flag it can express as a missing dependency.
+    #[must_use]
+    pub fn with_warehouse(mut self, warehouse: Arc<dyn SimulationSnapshotRepository>) -> Self {
+        let (sender, mut receiver) = mpsc::channel::<SnapshotRecord>(SNAPSHOT_QUEUE_DEPTH);
+
+        // One writer, not one task per advance: the queue bounds what a slow
+        // warehouse can accumulate, and serialising the writes means two steps
+        // of one simulation reach the warehouse in the order they were served.
+        tokio::spawn(async move {
+            while let Some(record) = receiver.recv().await {
+                let simulation = record.simulation;
+                let step = record.step;
+                if let Err(error) = warehouse.persist(record).await {
+                    warn!(
+                        simulation_id = %simulation,
+                        step,
+                        error = %error,
+                        "Could not file the snapshot; the step can be replayed and rewritten"
+                    );
+                }
+            }
+        });
+
+        self.warehouse = Some(sender);
+        self
     }
 
     /// The operational configuration this manager applies.
@@ -105,7 +142,7 @@ impl SimulationManager {
         &self,
         parameters: SimulationParametersV2,
     ) -> Result<SessionV2, ChainError> {
-        let simulation = SessionV2::new(parameters, &self.uuid_generator);
+        let simulation = SessionV2::new(parameters);
         self.store.create(simulation.clone()).await?;
 
         info!(
@@ -192,12 +229,58 @@ impl SimulationManager {
             .save_cas(simulation.clone(), expected_version)
             .await?;
 
+        // After the commit, never before: a snapshot is only real once the
+        // cursor that served it is durable, and persisting first would leave a
+        // row for a step a losing writer never served.
+        self.file_snapshot(&simulation, &snapshot);
+
         if simulation.state == SessionState::Completed {
             self.evict(id);
             debug!(simulation_id = %id, "Simulation completed; cached state evicted");
         }
 
         Ok((simulation, snapshot))
+    }
+
+    /// Queues a served snapshot for filing, if a warehouse is configured.
+    ///
+    /// **Off the request's clock.** A failure cannot fail the advance — the
+    /// cursor has already committed and the client already has its snapshot —
+    /// and neither can a slow one delay it: the record goes into a bounded
+    /// queue that one writer task drains.
+    ///
+    /// A full queue **drops** the record with a `WARN` naming the step. That is
+    /// the same trade as a failed write, made explicit: the step stays
+    /// reproducible, replay rebuilds it, and a retry writes the same rows. What
+    /// it costs is a gap, and the honest way to find one is to compare a
+    /// simulation's cursor against what `read_range` returns — a log line can be
+    /// lost with the process, a missing row cannot.
+    ///
+    /// Filing is idempotent because both tables sort on
+    /// `(simulation, generation, step, …)` and their `ReplacingMergeTree` engine
+    /// collapses on that sorting key, so a retry of a step that did land
+    /// replaces its rows rather than adding a second copy. The derived
+    /// `snapshot_id` rides along as a payload column and is verified on read; it
+    /// is not what does the replacing.
+    ///
+    /// The trade this accepts: a snapshot filed after the response means a
+    /// client that advances and immediately queries the warehouse may not find
+    /// the step yet. Deterministic replay is the read path that is always
+    /// current; the warehouse is the one that is durable.
+    fn file_snapshot(&self, simulation: &SessionV2, snapshot: &SeriesSnapshot) {
+        let Some(warehouse) = &self.warehouse else {
+            return;
+        };
+
+        let record = snapshot_record(simulation.id, &simulation.parameters.symbol, snapshot);
+        if let Err(error) = warehouse.try_send(record) {
+            warn!(
+                simulation_id = %simulation.id,
+                step = snapshot.step,
+                error = %error,
+                "The snapshot queue is full; the step was not filed and can be replayed"
+            );
+        }
     }
 
     /// Deletes a simulation and everything cached for it.
@@ -396,6 +479,7 @@ mod tests {
     use super::*;
     use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
     use crate::api::rest::requests_v2::CreateSimulationRequest;
+    use crate::infrastructure::{ContractQuote, ContractSeriesQuery, SnapshotRecord};
     use crate::session::store::InMemorySimulationStore;
     use crate::session::{ExpiryRule, ExpiryRuleKind};
     use chrono::{TimeZone, Utc, Weekday};
@@ -460,6 +544,197 @@ mod tests {
             Arc::new(InMemorySimulationStore::new()),
             SimulationV2Config::default(),
         )
+    }
+
+    /// A warehouse that records what it was asked to file, and can be told to
+    /// fail — the two behaviours the wiring promises something about.
+    #[derive(Default)]
+    struct RecordingWarehouse {
+        filed: Mutex<Vec<(Uuid, usize)>>,
+        fail: bool,
+    }
+
+    impl RecordingWarehouse {
+        fn failing() -> Self {
+            Self {
+                filed: Mutex::new(Vec::new()),
+                fail: true,
+            }
+        }
+
+        fn filed(&self) -> Vec<(Uuid, usize)> {
+            match self.filed.lock() {
+                Ok(filed) => filed.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SimulationSnapshotRepository for RecordingWarehouse {
+        async fn persist(&self, record: SnapshotRecord) -> Result<(), ChainError> {
+            if self.fail {
+                return Err(ChainError::Internal("the warehouse is down".to_string()));
+            }
+            match self.filed.lock() {
+                Ok(mut filed) => filed.push((record.simulation, record.step)),
+                Err(poisoned) => poisoned.into_inner().push((record.simulation, record.step)),
+            }
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _simulation: Uuid,
+            _generation: u64,
+            _step: usize,
+        ) -> Result<Option<SnapshotRecord>, ChainError> {
+            Ok(None)
+        }
+
+        async fn read_range(
+            &self,
+            _simulation: Uuid,
+            _generation: u64,
+            _from_step: usize,
+            _to_step: usize,
+        ) -> Result<Vec<SnapshotRecord>, ChainError> {
+            Ok(Vec::new())
+        }
+
+        async fn contract_series(
+            &self,
+            _query: ContractSeriesQuery,
+        ) -> Result<Vec<ContractQuote>, ChainError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Filing is detached, so a test has to let the spawned write run before it
+    /// can observe it. One yield is enough on the current-thread runtime the
+    /// tests use; the loop keeps it from being a race on a busier one.
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The simulation id is not an input to anything seeded.
+    ///
+    /// This is what the switch to random ids rests on. Two simulations built
+    /// from one set of parameters have different ids and must still produce the
+    /// same snapshots, strike for strike — `SeriesSnapshot`'s equality compares
+    /// premiums, Greeks and the underlying price, not lengths. If the id ever
+    /// leaked into the tape, the planner or the chain build, this fails.
+    #[tokio::test]
+    async fn test_the_simulation_id_does_not_reach_the_tape() {
+        let manager = manager();
+
+        let first = created(&manager, 3).await;
+        let second = created(&manager, 3).await;
+        assert_ne!(first.id, second.id, "ids are random, so two differ");
+        assert_eq!(
+            first.parameters.seed, second.parameters.seed,
+            "the fixture must pin the seed, or this proves nothing"
+        );
+
+        for _ in 0..3 {
+            let left = match manager.advance(first.id).await {
+                Ok((_, snapshot)) => snapshot,
+                Err(error) => panic!("the first simulation must advance: {error}"),
+            };
+            let right = match manager.advance(second.id).await {
+                Ok((_, snapshot)) => snapshot,
+                Err(error) => panic!("the second simulation must advance: {error}"),
+            };
+
+            assert_eq!(
+                left, right,
+                "step {} differs between two simulations that share every parameter",
+                left.step
+            );
+        }
+    }
+
+    /// An advance files exactly the step it served.
+    #[tokio::test]
+    async fn test_an_advance_files_the_step_it_served() {
+        let warehouse = Arc::new(RecordingWarehouse::default());
+        let manager = SimulationManager::new(
+            Arc::new(InMemorySimulationStore::new()),
+            SimulationV2Config::default(),
+        )
+        .with_warehouse(Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>);
+
+        let simulation = created(&manager, 3).await;
+        match manager.advance(simulation.id).await {
+            Ok(_) => {}
+            Err(error) => panic!("the advance must serve: {error}"),
+        }
+        settle().await;
+
+        assert_eq!(
+            warehouse.filed(),
+            vec![(simulation.id, 0)],
+            "the step the advance served is the step that is filed"
+        );
+    }
+
+    /// A warehouse that is down does not fail the advance. This is the whole
+    /// point of filing after the commit and off the request's clock.
+    #[tokio::test]
+    async fn test_a_failing_warehouse_does_not_fail_the_advance() {
+        let warehouse = Arc::new(RecordingWarehouse::failing());
+        let manager = SimulationManager::new(
+            Arc::new(InMemorySimulationStore::new()),
+            SimulationV2Config::default(),
+        )
+        .with_warehouse(warehouse as Arc<dyn SimulationSnapshotRepository>);
+
+        let simulation = created(&manager, 3).await;
+
+        match manager.advance(simulation.id).await {
+            Ok((advanced, _)) => assert_eq!(advanced.current_step, 1, "the cursor still moved"),
+            Err(error) => panic!("a warehouse failure must not fail the advance: {error}"),
+        }
+        settle().await;
+    }
+
+    /// A peek serves a snapshot and files nothing: it moves no cursor, so there
+    /// is no step to file.
+    #[tokio::test]
+    async fn test_a_peek_files_nothing() {
+        let warehouse = Arc::new(RecordingWarehouse::default());
+        let manager = SimulationManager::new(
+            Arc::new(InMemorySimulationStore::new()),
+            SimulationV2Config::default(),
+        )
+        .with_warehouse(Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>);
+
+        let simulation = created(&manager, 3).await;
+        match manager.peek(simulation.id).await {
+            Ok(_) => {}
+            Err(error) => panic!("the peek must serve: {error}"),
+        }
+        settle().await;
+
+        assert!(warehouse.filed().is_empty(), "a peek persists nothing");
+    }
+
+    /// Without a warehouse the serving path is unchanged — there is nothing to
+    /// call and nothing to fail.
+    #[tokio::test]
+    async fn test_a_manager_without_a_warehouse_serves_normally() {
+        let manager = manager();
+        let simulation = created(&manager, 2).await;
+
+        match manager.advance(simulation.id).await {
+            Ok((advanced, snapshot)) => {
+                assert_eq!(advanced.current_step, 1);
+                assert_eq!(snapshot.step, 0);
+            }
+            Err(error) => panic!("the advance must serve: {error}"),
+        }
     }
 
     async fn created(manager: &SimulationManager, steps: usize) -> SessionV2 {
