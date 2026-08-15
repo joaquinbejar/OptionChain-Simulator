@@ -47,9 +47,19 @@ pub const DEFAULT_MAX_CACHED_TAPES: usize = 64;
 /// Default number of snapshots held resident.
 ///
 /// A snapshot holds every strike of every live expiration, so the bound is
-/// deliberately small. Issue #62 tracks bounding it by weight rather than by
-/// entry count.
+/// deliberately small. It bounds the *map*, not the memory — see
+/// [`DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS`], which does.
 pub const DEFAULT_MAX_CACHED_SNAPSHOTS: usize = 256;
+
+/// Default number of contracts held resident across every cached snapshot.
+///
+/// The honest unit for a memory bound: one entry is a few hundred contracts in
+/// ADR 0001's reference configuration and up to the per-snapshot cap in a large
+/// one, so an entry count says nothing about how much is resident. Four million
+/// contracts is roughly a gigabyte of `OptionData`, and it lets the reference
+/// configuration keep its entry bound's worth of snapshots without ever
+/// reaching this one.
+pub const DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS: usize = 4_000_000;
 
 /// The longest retention window that can be configured, in seconds — thirty
 /// days.
@@ -64,6 +74,12 @@ const MAX_CLEANUP_INTERVAL_SECS: u64 = 3_600;
 
 /// The largest cache bound that can be configured.
 const MAX_CACHE_CAPACITY: usize = 1_000_000;
+
+/// The largest contract budget that can be configured.
+///
+/// A hundred million `OptionData` is far past any machine this runs on, so a
+/// value above it is a typo rather than an intent.
+const MAX_CACHE_CONTRACTS: usize = 100_000_000;
 
 /// Default cap on the steps one export request may cover.
 ///
@@ -91,6 +107,8 @@ pub struct SimulationV2Config {
     pub max_cached_tapes: usize,
     /// How many snapshots stay resident.
     pub max_cached_snapshots: usize,
+    /// How many contracts stay resident across every cached snapshot.
+    pub max_cached_snapshot_contracts: usize,
     /// How many steps one export request may cover.
     pub max_export_rows: usize,
 }
@@ -102,6 +120,7 @@ impl Default for SimulationV2Config {
             cleanup_interval: Duration::from_secs(DEFAULT_CLEANUP_INTERVAL_SECS),
             max_cached_tapes: DEFAULT_MAX_CACHED_TAPES,
             max_cached_snapshots: DEFAULT_MAX_CACHED_SNAPSHOTS,
+            max_cached_snapshot_contracts: DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS,
             max_export_rows: DEFAULT_MAX_EXPORT_ROWS,
         }
     }
@@ -141,6 +160,12 @@ impl SimulationV2Config {
                 read("OCS_MAX_CACHED_SNAPSHOTS").as_deref(),
                 DEFAULT_MAX_CACHED_SNAPSHOTS,
             )?,
+            max_cached_snapshot_contracts: parse_bounded(
+                "OCS_MAX_CACHED_SNAPSHOT_CONTRACTS",
+                read("OCS_MAX_CACHED_SNAPSHOT_CONTRACTS").as_deref(),
+                DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS,
+                MAX_CACHE_CONTRACTS,
+            )?,
             max_export_rows: parse_bounded(
                 "OCS_MAX_EXPORT_ROWS",
                 read("OCS_MAX_EXPORT_ROWS").as_deref(),
@@ -154,6 +179,7 @@ impl SimulationV2Config {
             cleanup_interval_secs = config.cleanup_interval.as_secs(),
             max_cached_tapes = config.max_cached_tapes,
             max_cached_snapshots = config.max_cached_snapshots,
+            max_cached_snapshot_contracts = config.max_cached_snapshot_contracts,
             max_export_rows = config.max_export_rows,
             "Loaded the v2 simulation configuration"
         );

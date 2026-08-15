@@ -170,7 +170,8 @@ deliberately different failure behaviour:
   degrades one request.
 - **v2 operational knobs** — `OCS_V2_RETENTION_SECS`,
   `OCS_V2_CLEANUP_INTERVAL_SECS`, `OCS_MAX_CACHED_TAPES`,
-  `OCS_MAX_CACHED_SNAPSHOTS`, `OCS_MAX_EXPORT_ROWS` — are **validated at startup** and fail the
+  `OCS_MAX_CACHED_SNAPSHOTS`, `OCS_MAX_CACHED_SNAPSHOT_CONTRACTS`,
+  `OCS_MAX_EXPORT_ROWS` — are **validated at startup** and fail the
   process with a message naming the variable. Silently reverting a
   retention window would expire simulations a client is still walking, and
   silently reverting a cache bound would change the service's memory

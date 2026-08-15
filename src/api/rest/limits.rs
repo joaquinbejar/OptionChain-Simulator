@@ -11,6 +11,7 @@
 //! | `OCS_MAX_STEPS`            | `10_000`  | Max simulation steps per session         |
 //! | `OCS_MAX_CHAIN_SIZE`       | `500`     | Max option-chain size per request        |
 //! | `OCS_MAX_HISTORICAL_PRICES`| `100_000` | Max historical prices in a walk request  |
+//! | `OCS_MAX_SNAPSHOT_CONTRACTS`| `200_000`| Max contracts one v2 snapshot may price |
 
 use std::sync::LazyLock;
 use tracing::warn;
@@ -21,6 +22,16 @@ pub(crate) const DEFAULT_MAX_STEPS: usize = 10_000;
 pub(crate) const DEFAULT_MAX_CHAIN_SIZE: usize = 500;
 /// Default cap on the number of historical prices in a `Historical` walk request.
 pub(crate) const DEFAULT_MAX_HISTORICAL_PRICES: usize = 100_000;
+/// Default cap on the contracts one v2 snapshot may price.
+///
+/// A snapshot prices every strike of every live expiration, so its cost is the
+/// product of two caps that each look reasonable alone: `OCS_MAX_CHAIN_SIZE`
+/// of 500 is 1 001 strikes, and a schedule may keep 512 expirations alive, for
+/// half a million contracts in one request. The default admits any realistic
+/// configuration — ADR 0001's reference schedule prices about 500 contracts a
+/// snapshot, and 200 000 still allows 200 expirations at 1 001 strikes — while
+/// refusing the shapes that exist only to exhaust the service.
+pub(crate) const DEFAULT_MAX_SNAPSHOT_CONTRACTS: usize = 200_000;
 
 /// Maximum number of simulation steps a session may request (`OCS_MAX_STEPS`).
 pub(crate) static MAX_STEPS: LazyLock<usize> =
@@ -42,6 +53,26 @@ pub(crate) static MAX_HISTORICAL_PRICES: LazyLock<usize> = LazyLock::new(|| {
         DEFAULT_MAX_HISTORICAL_PRICES,
     )
 });
+
+/// Maximum number of contracts one v2 snapshot may price
+/// (`OCS_MAX_SNAPSHOT_CONTRACTS`).
+pub(crate) static MAX_SNAPSHOT_CONTRACTS: LazyLock<usize> = LazyLock::new(|| {
+    parse_limit(
+        std::env::var("OCS_MAX_SNAPSHOT_CONTRACTS").ok(),
+        DEFAULT_MAX_SNAPSHOT_CONTRACTS,
+    )
+});
+
+/// The number of strikes a chain of `chain_size` carries.
+///
+/// `chain_size` is upstream's per-side half-width — it counts strikes above
+/// *and* below the money — so the ladder is `2n + 1` wide. Saturating, because
+/// the caller may be validating a value that has not been range-checked yet and
+/// an overflow here would be the wrong error to report.
+#[must_use]
+pub(crate) fn strikes_per_chain(chain_size: usize) -> usize {
+    chain_size.saturating_mul(2).saturating_add(1)
+}
 
 /// Parses a raw environment value into a positive `usize` limit.
 ///

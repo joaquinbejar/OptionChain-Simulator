@@ -578,12 +578,31 @@ adds caps so that a single request cannot ask for unbounded work:
 | `OCS_MAX_TARGET_COUNT` | `target_count` of one rule |
 | `OCS_MAX_EXPIRATIONS_PER_SNAPSHOT` | expirations in one snapshot, enforced at schedule validation on the **pre-deduplication** sum of every rule's `target_count` |
 | `OCS_MAX_EXPORT_ROWS` | rows one export may produce |
+| `OCS_MAX_SNAPSHOT_CONTRACTS` | contracts one snapshot may price — `strikes × Σ target_count`, default 200 000 |
+| `OCS_MAX_CACHED_SNAPSHOT_CONTRACTS` | contracts resident across the snapshot cache, default 4 000 000 |
 | v2 session idle TTL, factor-tape and snapshot cache capacities | §9.1, §9.2 |
 
 The pre-deduplication sum is the tight upper bound on how many chains a snapshot
 can hold, and checking it at construction keeps the rejection deterministic: a
 post-deduplication check would accept or reject the same schedule depending on
 which dates happened to coincide at the instant it was evaluated.
+
+**Two caps that are each reasonable can multiply into one that is not.** A chain
+size of 500 is 1 001 strikes; a schedule may keep 512 expirations alive; the
+product is half a million priced contracts for a single `/snapshot` call, from a
+request that violates neither bound. `OCS_MAX_SNAPSHOT_CONTRACTS` bounds the
+product, checked once at creation and reported against `chain_size` — the field
+a client can lower without changing what the simulation means. The default is
+deliberately generous: the reference configuration in §14 prices about 500
+contracts a snapshot.
+
+The snapshot cache is bounded the same way. An entry count says nothing about
+memory when one entry is a few hundred contracts in one configuration and
+hundreds of thousands in another, so `OCS_MAX_CACHED_SNAPSHOT_CONTRACTS` bounds
+what is resident and the entry cap of §9.2 bounds the map. A snapshot heavier
+than the whole budget is still cached — refusing to hold anything would turn a
+large-but-legal configuration into a permanently cold cache, and the per-snapshot
+cap is what bounds that case.
 
 Breaching a request-shaped cap is a `400` naming the offending field; breaching
 `OCS_MAX_EXPORT_ROWS` is a `400` naming the range. Every knob is documented in
