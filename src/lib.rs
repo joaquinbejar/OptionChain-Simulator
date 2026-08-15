@@ -2,18 +2,60 @@
 //!
 //! ## System Architecture
 //!
+//! Two REST surfaces over one set of layers. v1 serves a single expiration per
+//! request and stamps it with the wall clock; v2 serves a rolling inventory of
+//! absolute expirations on a simulated clock. They share the seeded walk and
+//! the error boundary, and nothing else — separate session types, separate
+//! stored schemas, separate stores.
+//!
 //! ```mermaid
 //! flowchart TD
-//! Client[Client Applications] --> API[API Layer]
-//! API --> SM[Session Management]
-//! SM --> App[Application Layer]
-//! App --> Domain[Domain Layer]
-//! App --> Infra[Infrastructure Layer]
-//! Domain --> SimEngine[Simulation Engine]
-//! Infra --> ClickHouse[(ClickHouse DB)]
-//! Infra --> Redis[(Redis)]
-//! Infra --> MongoDB[(MongoDB)]
+//!   Client[Client]
+//!
+//!   subgraph api["api — REST, f64 at the boundary"]
+//!     V1["/api/v1/chain"]
+//!     V2["/api/v2/simulations"]
+//!     Export["/api/v2/simulations/{id}/export"]
+//!   end
+//!
+//!   subgraph session["session — lifecycle, effective parameters"]
+//!     SM[SessionManager]
+//!     SIM[SimulationManager]
+//!   end
+//!
+//!   subgraph domain["domain — private, seeded, pure"]
+//!     Simulator[Simulator + Walker]
+//!     Tape[FactorTape]
+//!     Planner[RollingPlanner]
+//!     Series[SeriesBuilder]
+//!   end
+//!
+//!   subgraph infra["infrastructure — adapters"]
+//!     Redis[(Redis)]
+//!     Mongo[(MongoDB)]
+//!     CH[(ClickHouse)]
+//!   end
+//!
+//!   Client --> V1 & V2 & Export
+//!   V1 --> SM --> Simulator
+//!   V2 --> SIM
+//!   Export --> SIM
+//!   SIM --> Tape
+//!   Tape --> Series
+//!   Planner --> Series
+//!   SM -.sessions.-> Redis
+//!   SIM -.simulations.-> Redis
+//!   SM -.events.-> Mongo
+//!   Simulator -.historical prices.-> CH
+//!   SIM -.snapshots, opt-in.-> CH
+//!   Export -.persisted rows first.-> CH
 //! ```
+//!
+//! `domain` is a **private** module: the walk, the tape, the planner and the
+//! snapshots are implementation, and the REST contract is what is public. The
+//! dependency arrows only ever point down — an infrastructure adapter that
+//! imported `api` would invert the layering, which is why the persistence layer
+//! carries its own row types instead of naming the domain snapshot.
 //!
 //! ## Session State Transitions
 //!
@@ -35,6 +77,28 @@
 //!
 //! `GET /api/v1/chain` is a safe, repeatable peek and does not appear here because it
 //! never changes the session state — only `POST /api/v1/chain/step` advances the cursor.
+//!
+//! A v2 simulation walks a smaller machine, because it is immutable after
+//! creation: there is no PATCH or PUT to reach `Modified` or `Reinitialized`,
+//! and a stored document in either state is rejected on load rather than
+//! served.
+//!
+//! ```mermaid
+//! stateDiagram-v2
+//! [*] --> Initialized: POST /api/v2/simulations
+//! Initialized --> InProgress: POST /{id}/step
+//! InProgress --> InProgress: POST /{id}/step
+//! InProgress --> Completed: POST /{id}/step (last)
+//! Initialized --> [*]: DELETE or idle TTL
+//! InProgress --> [*]: DELETE or idle TTL
+//! Completed --> [*]: DELETE or idle TTL
+//! ```
+//!
+//! The state and the cursor are validated together: `Initialized` only at step
+//! zero, `Completed` only at the horizon, `InProgress` strictly between them.
+//! `GET /{id}/snapshot` and the export appear nowhere here — neither moves the
+//! cursor, and the idle TTL is measured from the last write, so peeking does
+//! not keep a simulation alive.
 //!
 //! ## API Request Flow
 //!
@@ -65,6 +129,44 @@
 //! SS-->>SM: Step data (no advance)
 //! SM-->>API: Chain data
 //! API-->>Client: 200 OK (same snapshot, repeatable)
+//! ```
+//!
+//! A v2 advance does more work behind the same shape. The tape is built on
+//! first use rather than at creation, chains are priced per snapshot from a
+//! factor row and the planner's live expirations, and — when persistence is on
+//! — the served step is queued for the warehouse **after** the cursor commits,
+//! so the write is never on the response's clock.
+//!
+//! ```mermaid
+//! sequenceDiagram
+//! participant Client
+//! participant API as REST API
+//! participant SIM as SimulationManager
+//! participant Tape as FactorTape
+//! participant Series as SeriesBuilder
+//! participant CH as ClickHouse
+//!
+//! Client->>API: POST /api/v2/simulations
+//! API->>SIM: Resolve seed, start, interval, schedules
+//! SIM-->>API: Simulation created (every replay input echoed)
+//! API-->>Client: 201 Created
+//!
+//! Client->>API: POST /api/v2/simulations/{id}/step
+//! API->>SIM: Advance (expected_step precondition)
+//! SIM->>Tape: Build once, then cache (single flight)
+//! Tape-->>SIM: Factor row for the cursor
+//! SIM->>Series: Price the live expirations at that row
+//! Series-->>SIM: Snapshot
+//! SIM->>SIM: Commit the cursor (compare-and-swap)
+//! SIM-->>API: Snapshot + new cursor
+//! API-->>Client: 200 OK
+//! SIM--)CH: Queue the served step (detached, best effort)
+//!
+//! Client->>API: GET /api/v2/simulations/{id}/export
+//! API->>CH: Read the persisted range
+//! CH-->>API: Rows for the steps it has
+//! API->>Series: Replay whatever is missing
+//! API-->>Client: 200 OK (streamed JSON or CSV)
 //! ```
 //!
 //! ## REST API Endpoints
@@ -173,9 +275,10 @@
 //!   degrades one request.
 //! - **v2 operational knobs** — `OCS_V2_RETENTION_SECS`,
 //!   `OCS_V2_CLEANUP_INTERVAL_SECS`, `OCS_MAX_CACHED_TAPES`,
-//!   `OCS_MAX_CACHED_SNAPSHOTS`, `OCS_MAX_CACHED_SNAPSHOT_CONTRACTS`,
-//!   `OCS_MAX_EXPORT_ROWS`, `OCS_SNAPSHOT_*` — are **validated at startup** and
-//!   fail the process with a message naming the variable. Silently reverting a
+//!   `OCS_MAX_CACHED_SNAPSHOTS`, `OCS_MAX_SNAPSHOT_CONTRACTS`,
+//!   `OCS_MAX_CACHED_SNAPSHOT_CONTRACTS`, `OCS_MAX_EXPORT_ROWS`,
+//!   `OCS_SNAPSHOT_*` — are **validated at startup** and fail the process with
+//!   a message naming the variable. Silently reverting a
 //!   retention window would expire simulations a client is still walking, and
 //!   silently reverting a cache bound would change the service's memory
 //!   profile with nothing to show for it.
@@ -198,9 +301,11 @@
 //! ## Exporting a tape
 //!
 //! `GET /api/v2/simulations/{id}/export?dataset=…&format=…&from_step=&to_step=`
-//! replays a simulation and streams it, which is what turns a
+//! streams a simulation's tape, which is what turns a
 //! walked-one-request-at-a-time simulation into something a backtester loads in
-//! one go.
+//! one go. With persistence on it reads the steps the warehouse already holds,
+//! in windows, and replays the rest; with it off, or for a simulation nobody
+//! has walked, every step is replayed. Either source renders the same bytes.
 //!
 //! | Parameter | Values |
 //! |-----------|--------|
@@ -208,9 +313,10 @@
 //! | `format`  | `json` \| `csv` |
 //! | `from_step`, `to_step` | inclusive bounds; default to the whole tape |
 //!
-//! **Read-only in the strong sense.** The export takes an immutable snapshot of
-//! the effective parameters and replays from those: it never advances the
-//! cursor, changes the state or version, or alters what the next peek returns.
+//! **Read-only in the strong sense.** The export works from an immutable copy
+//! of the effective parameters and, where it reads them, from rows already
+//! written: it never advances the cursor, changes the state or version, writes
+//! a snapshot of its own, or alters what the next peek returns.
 //! A simulation that has never been walked exports its whole tape, a completed
 //! one still does, and two clients can export the same simulation at once.
 //!
@@ -271,13 +377,19 @@
 //!         "time_frame": "day",
 //!         "dividend_yield": 0.005,
 //!         "smile_curve": 0.0005,
-//!         "spread": 0.02
+//!         "spread": 0.02,
+//!         "seed": 13748925402398765431
 //!     },
 //!     "current_step": 0,
 //!     "total_steps": 10,
 //!     "state": "Initialized"
 //! }
 //! ```
+//!
+//! The request omitted `seed`, so one was generated at conversion and echoed
+//! here. Recording it is what lets the same session be recreated later: the
+//! same parameters and the same seed reproduce the identical sequence of
+//! snapshots, which is the guarantee IronCondor's replay depends on.
 //!
 //! ### 2. Peek Current Step (GET /api/v1/chain?sessionid=6af613b6-569c-5c22-9c37-2ed93f31d3af)
 //!
@@ -601,6 +713,8 @@
 //!
 //! ## Domain Models
 //!
+//! ### v1 — one expiration, one chain per step
+//!
 //! ```mermaid
 //! classDiagram
 //! class SessionManager {
@@ -612,16 +726,14 @@
 //! }
 //!
 //! class Session {
-//! +id UUID
-//! +createdAt DateTime
-//! +updatedAt DateTime
+//! +id Uuid
+//! +createdAt SystemTime
+//! +updatedAt SystemTime
 //! +parameters SimulationParameters
 //! +currentStep usize
 //! +totalSteps usize
 //! +state SessionState
-//! +advanceStep() Result
-//! +modifyParameters(params)
-//! +reinitialize(params, steps)
+//! +version u64
 //! }
 //!
 //! class SessionState {
@@ -636,45 +748,158 @@
 //!
 //! class SimulationParameters {
 //! +symbol String
+//! +steps usize
 //! +initialPrice Positive
+//! +daysToExpiration Positive
 //! +volatility Positive
 //! +riskFreeRate Decimal
-//! +strikes Vec~Positive~
-//! +expirations Vec~String~
+//! +dividendYield Positive
 //! +method SimulationMethod
 //! +timeFrame TimeFrame
+//! +chainSize Option~usize~
+//! +strikeInterval Option~Positive~
+//! +seed Option~u64~
 //! }
 //!
 //! class Simulator {
 //! +simulateNextStep(session) OptionChain
-//! -createRandomWalk(session) RandomWalk
+//! -walkCache Map~Uuid, RandomWalk~
 //! }
 //!
-//! class OptionChain {
-//! +underlying String
-//! +timestamp DateTime
-//! +price Positive
-//! +contracts Vec~OptionContract~
-//! }
-//!
-//! class OptionContract {
-//! +strike Positive
-//! +expiration String
-//! +call OptionData
-//! +put OptionData
-//! +impliedVolatility Positive
-//! +gamma Positive
+//! class Walker {
+//! +rng Arc~Mutex~StdRng~~
+//! +overrides every stochastic kernel
 //! }
 //!
 //! Session --> SimulationParameters
 //! Session --> SessionState
 //! SessionManager --> Session: manages
 //! SessionManager --> Simulator: uses
+//! Simulator --> Walker: draws from
 //! Simulator --> OptionChain: produces
-//! OptionChain --> OptionContract: contains
 //! ```
 //!
+//! `OptionChain` and its `OptionData` are upstream `optionstratlib` types — the
+//! pricing lives there, and nothing here reimplements it. The seed is optional
+//! on the way in and resolved exactly once, so the response always carries the
+//! effective one.
+//!
+//! ### v2 — a rolling inventory, priced from a factor row
+//!
+//! ```mermaid
+//! classDiagram
+//! class SimulationManager {
+//! +create(params) SessionV2
+//! +peek(id) (SessionV2, SeriesSnapshot)
+//! +advance(id) (SessionV2, SeriesSnapshot)
+//! +delete(id) bool
+//! +cleanup() Vec~Uuid~
+//! }
+//!
+//! class SessionV2 {
+//! +id Uuid
+//! +schemaVersion u32
+//! +parameters SimulationParametersV2
+//! +currentStep usize
+//! +totalSteps usize
+//! +state SessionState
+//! +version u64
+//! }
+//!
+//! class SimulationParametersV2 {
+//! +symbol String
+//! +steps usize
+//! +effectiveStart DateTime~Utc~
+//! +stepIntervalSeconds u64
+//! +schedule ExpirationSchedule
+//! +tzdbVersion String
+//! +initialPrice Positive
+//! +volatility Positive
+//! +method SimulationMethod
+//! +seed u64
+//! }
+//!
+//! class ExpirationSchedule {
+//! +calendar CalendarVersion
+//! +timezone Tz
+//! +expirationTime NaiveTime
+//! +rules Vec~ExpiryRule~
+//! }
+//!
+//! class ExpiryRule {
+//! +ruleId String
+//! +kind ExpiryRuleKind
+//! +targetCount NonZeroUsize
+//! }
+//!
+//! class ExpiryRuleKind {
+//! <<enumeration>>
+//! Daily
+//! Weekly
+//! Monthly
+//! Yearly
+//! }
+//!
+//! class RollingPlanner {
+//! +activeAt(instant) Vec~ActiveExpiry~
+//! }
+//!
+//! class FactorTape {
+//! +rows Vec~FactorRow~
+//! +build(params, method) FactorTape
+//! }
+//!
+//! class FactorRow {
+//! +step usize
+//! +simulatedAt DateTime~Utc~
+//! +spot Positive
+//! +baseVolatility Positive
+//! }
+//!
+//! class SeriesBuilder {
+//! +snapshot(step) SeriesSnapshot
+//! }
+//!
+//! class SeriesSnapshot {
+//! +step usize
+//! +simulatedAt DateTime~Utc~
+//! +spot Positive
+//! +baseVolatility Positive
+//! +chains Vec~ExpiryChain~
+//! }
+//!
+//! class ExpiryChain {
+//! +expiresAt DateTime~Utc~
+//! +daysToExpiration Positive
+//! +labels Vec~String~
+//! +chain OptionChain
+//! }
+//!
+//! SessionV2 --> SimulationParametersV2
+//! SimulationParametersV2 --> ExpirationSchedule
+//! ExpirationSchedule --> ExpiryRule
+//! ExpiryRule --> ExpiryRuleKind
+//! SimulationManager --> SessionV2: manages
+//! SimulationManager --> FactorTape: builds once, caches
+//! FactorTape --> FactorRow: one per step
+//! SeriesBuilder --> FactorRow: prices at
+//! SeriesBuilder --> RollingPlanner: asks what is alive
+//! SeriesBuilder --> SeriesSnapshot: produces
+//! SeriesSnapshot --> ExpiryChain: one per live expiration
+//! ```
+//!
+//! The split is what makes a long horizon affordable. The tape is `O(steps)`
+//! four-field rows and carries the whole market path; chains are priced on
+//! demand from one row plus the planner's output, so memory does not grow with
+//! `steps × expirations × strikes`. Both halves are pure functions of the
+//! effective parameters, which is why evicting either is invisible in what a
+//! client is served.
+//!
 //! ## Infrastructure Components
+//!
+//! Every external system sits behind a trait, and every driver error converts
+//! into `ChainError` at the boundary that meets it — no `redis::`,
+//! `mongodb::` or `clickhouse::` type appears in a public signature.
 //!
 //! ```mermaid
 //! classDiagram
@@ -682,44 +907,78 @@
 //! <<interface>>
 //! +get(id) Session
 //! +save(session) void
+//! +saveCas(session, expectedVersion) void
 //! +delete(id) bool
 //! +cleanup() int
 //! }
 //!
-//! class InMemorySessionStore {
-//! -sessions Map~UUID, Session~
-//! +get(id) Session
-//! +save(session) void
+//! class InMemorySessionStore
+//! class InRedisSessionStore
+//!
+//! class SimulationStore {
+//! <<interface>>
+//! +get(id) SessionV2
+//! +create(simulation) void
+//! +saveCas(simulation, expectedVersion) void
 //! +delete(id) bool
-//! +cleanup() int
+//! +cleanup() Vec~Uuid~
 //! }
 //!
-//! class RedisSessionStore {
-//! -client RedisClient
-//! +get(id) Session
-//! +save(session) void
-//! +delete(id) bool
-//! +cleanup() int
-//! }
+//! class InMemorySimulationStore
+//! class InRedisSimulationStore
 //!
 //! class HistoricalDataRepository {
 //! <<interface>>
-//! +getHistoricalPrices(symbol, timeframe, startDate, endDate) Vec~Positive~
+//! +getHistoricalPrices(symbol, timeframe, start, end) Vec~Positive~
 //! +listAvailableSymbols() Vec~String~
 //! +getDateRangeForSymbol(symbol) (DateTime, DateTime)
 //! }
 //!
-//! class ClickHouseHistoricalRepository {
-//! -client ClickHouseClient
-//! +getHistoricalPrices(symbol, timeframe, startDate, endDate) Vec~Positive~
-//! +listAvailableSymbols() Vec~String~
-//! +getDateRangeForSymbol(symbol) (DateTime, DateTime)
+//! class ClickHouseHistoricalRepository
+//!
+//! class SimulationSnapshotRepository {
+//! <<interface>>
+//! +persist(record) void
+//! +get(simulation, generation, step) Option~SnapshotRecord~
+//! +readRange(simulation, generation, from, to) Vec~SnapshotRecord~
+//! +contractSeries(query) Vec~ContractQuote~
+//! }
+//!
+//! class ClickHouseSnapshotRepository {
+//! +ensureSchema() void
+//! -simulation_snapshots ReplacingMergeTree
+//! -simulation_option_quotes ReplacingMergeTree
+//! }
+//!
+//! class MongoDBRepository {
+//! +saveChainStep(step) void
+//! +saveEvent(event) void
 //! }
 //!
 //! SessionStore <|.. InMemorySessionStore: implements
-//! SessionStore <|.. RedisSessionStore: implements
+//! SessionStore <|.. InRedisSessionStore: implements
+//! SimulationStore <|.. InMemorySimulationStore: implements
+//! SimulationStore <|.. InRedisSimulationStore: implements
 //! HistoricalDataRepository <|.. ClickHouseHistoricalRepository: implements
+//! SimulationSnapshotRepository <|.. ClickHouseSnapshotRepository: implements
 //! ```
+//!
+//! The two ClickHouse repositories point in opposite directions.
+//! `ClickHouseHistoricalRepository` is an **input**: it feeds real price series
+//! into a `Historical` walk. `ClickHouseSnapshotRepository` is an **output**,
+//! and an optional one: with `OCS_SNAPSHOT_PERSISTENCE_ENABLED` on it files
+//! every advanced step as one metadata row plus one flattened row per
+//! expiration and strike, and the export reads those back before falling back
+//! to replay.
+//!
+//! Both v2 tables are `ReplacingMergeTree` sorted on
+//! `(simulation, generation, step, …)` and partitioned on `simulated_at` — a
+//! **content** key, because the engine only collapses duplicates within a
+//! partition and an ingestion-derived key would let a backfilled step survive
+//! as a permanent second copy. The generation is the tape's, not the session's
+//! compare-and-swap revision, and it moves whenever a release changes what a
+//! step is priced at, so two builds that disagree address different rows
+//! instead of overwriting each other.
 //!
 //! ### 🚀 Deploy the project
 //!
