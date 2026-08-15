@@ -38,6 +38,24 @@
 //!   seeded [`Walker`] for the same `WalkParams` v1 builds, and reads the price
 //!   path from `generate_with_vol`. It does not reimplement the mathematics, so
 //!   there is no second copy to diverge.
+//!
+//! # Where v2 knowingly differs from v1: historical volatility
+//!
+//! A `Historical` walk carries no volatility of its own — it is a price series,
+//! and `WalkType::volatility()` returns `None` for it. v1 prices such a walk
+//! with a rolling causal estimate, because `walk_steps_par` computes one with
+//! upstream's `expanding_window_vols`. v2 never enters that driver, and the
+//! estimator is private to it, so **every step of a historical v2 tape is
+//! priced at the constant `volatility` the request supplied**.
+//!
+//! This is a stated behaviour, not an oversight. The same series and seed run
+//! through v1 and v2 produce the same price path — the tape pins that — and
+//! different premiums, because the volatility pricing them differs. Closing the
+//! gap needs the estimator to be reachable from outside the driver, which is
+//! asked for upstream in optionstratlib#423; porting a second copy of the
+//! mathematics into this module would contradict the property directly above
+//! it. Issue #63 tracks it here, and ADR 0001 §8 records it as part of the
+//! contract rather than leaving a client to infer it from two runs.
 
 use crate::domain::Walker;
 use crate::domain::simulator::{
@@ -1026,6 +1044,49 @@ mod tests {
                 expected,
                 "step {} must replay its own observation",
                 row.step
+            );
+        }
+    }
+
+    /// Later observations cannot change an earlier step's base volatility.
+    ///
+    /// The property the estimator question turns on (#63): whatever prices a
+    /// historical step, it must be a function of that step and what came before
+    /// it. Today the answer is the requested constant, so extending the series
+    /// changes nothing — and if optionstratlib#423 lands and a causal estimate
+    /// replaces the constant, this test keeps holding while a look-ahead one
+    /// would break it.
+    #[test]
+    fn test_a_longer_series_leaves_earlier_steps_untouched() {
+        // The observation count is a `u32` so the index converts to `f64`
+        // losslessly and infallibly — no conversion to swallow, which is what a
+        // fallback of zero would have done, quietly flattening the series.
+        let build = |steps: usize, observations: u32| {
+            let prices: Vec<f64> = (0..observations)
+                .map(|i| 5000.0 + (f64::from(i) * 7.0).sin() * 250.0)
+                .collect();
+            let mut historical = request(steps, brownian(0.18), 0.18);
+            historical.method = ApiWalkType::Historical {
+                timeframe: ApiTimeFrame::Day,
+                prices,
+                symbol: Some("SPX".to_string()),
+            };
+            tape(&parameters(historical))
+        };
+
+        let short = build(15, 20);
+        let long = build(15, 400);
+
+        for (early, later) in short.rows().iter().zip(long.rows()) {
+            assert_eq!(
+                early.base_volatility, later.base_volatility,
+                "step {} must not depend on observations after it",
+                early.step
+            );
+            assert_eq!(
+                early.spot, later.spot,
+                "step {} replayed differently",
+                early.step
             );
         }
     }

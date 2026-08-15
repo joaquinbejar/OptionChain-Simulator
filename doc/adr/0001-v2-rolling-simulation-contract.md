@@ -484,6 +484,25 @@ unversioned would be a false guarantee, so the effective tzdb release
 the seed. A replay against a different tzdb is still a replay — it is just one
 the client can now detect.
 
+**What a `Historical` walk is priced at.** A historical walk carries no
+volatility of its own — it is a price series, and `WalkType::volatility()`
+returns `None` for it. v1 prices one with a rolling causal estimate, because its
+walk driver computes an expanding-window realized volatility per step. v2 never
+enters that driver — the factor tape exists precisely to stop materialising a
+chain per step — and upstream keeps the estimator private to it, so **every step
+of a historical v2 tape is priced at the constant `volatility` the request
+supplied**.
+
+This is part of the contract, not an accident. The same series and the same seed
+produce the *same price path* under v1 and v2, and *different premiums*, because
+the volatility pricing them differs. A client comparing the two should expect
+that. Closing the gap needs the estimator reachable from outside the driver,
+which is asked for in optionstratlib#423; porting a second copy of the
+mathematics into the tape would contradict the module's stated premise of not
+reimplementing upstream. Issue #63 tracks it, and if the estimator lands the
+per-step value goes into `FactorRow.base_volatility`, which is already defined
+as the exact number that step's chains are priced at.
+
 Three properties keep the guarantee honest, and each is a test in the issues
 that implement it:
 
