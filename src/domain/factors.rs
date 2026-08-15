@@ -208,7 +208,14 @@ impl FactorTape {
 
     /// The rows, in step order.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by the export in #49"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the whole-tape accessor the tests compare against; the service reads \
+                      one row at a time through `row`"
+        )
+    )]
     pub(crate) fn rows(&self) -> &[FactorRow] {
         &self.rows
     }
@@ -223,7 +230,14 @@ impl FactorTape {
     /// validated at the request boundary — but the accessor keeps clippy and
     /// callers honest.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by the export in #49"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "clippy's len_without_is_empty requires this alongside `len`; a built \
+                      tape is never empty, since `steps >= 1` is validated at creation"
+        )
+    )]
     pub(crate) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }

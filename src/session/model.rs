@@ -261,7 +261,7 @@ pub struct Session {
     /// * `state` - The current state of the session, represented by an instance
     pub state: SessionState,
     /// * `version` - Optimistic-concurrency revision counter. It starts at `0` at
-    ///   creation and is bumped by the [`SessionManager`] (via
+    ///   creation and is bumped by the [`crate::session::SessionManager`] (via
     ///   [`Session::bump_version`]) immediately before a compare-and-swap save, so
     ///   two concurrent mutations that read the same snapshot cannot silently
     ///   overwrite one another: the second save fails with
@@ -473,7 +473,7 @@ impl Session {
     ///
     /// The state-transition methods (`advance_step`, `modify_parameters`,
     /// `reinitialize`) are deliberately kept as pure state changes and do NOT
-    /// touch the version. The [`SessionManager`] calls this helper right before a
+    /// touch the version. The [`crate::session::SessionManager`] calls this helper right before a
     /// compare-and-swap save so the persisted revision advances exactly once per
     /// successfully served mutation. Uses `checked_add` (the ruleset forbids
     /// `saturating_*`): saturating at `u64::MAX` would freeze the revision and let

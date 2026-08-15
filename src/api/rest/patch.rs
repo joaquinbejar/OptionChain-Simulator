@@ -29,7 +29,7 @@ use serde::ser::{Serialize, Serializer};
 /// Tri-state wrapper distinguishing an absent JSON key, an explicit `null`, and
 /// a present value in a partial-update (PATCH) request body.
 ///
-/// See the [module documentation](self) for how each state maps to serde and to
+/// See this module's documentation for how each state maps to serde and to
 /// the PATCH merge semantics (absent = keep, null = clear, value = replace).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum Patch<T> {

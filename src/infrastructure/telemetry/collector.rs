@@ -303,6 +303,7 @@ impl MetricsCollector {
         self.v2_simulations_expired.inc_by(count as u64);
     }
 
+    /// Records the current memory usage
     pub fn record_memory_usage(&self, bytes: f64) {
         self.memory_usage.set(bytes);
     }

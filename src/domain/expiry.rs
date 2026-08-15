@@ -153,7 +153,7 @@ impl CalendarVersion {
     /// expiry back to the previous eligible weekday here without touching any
     /// simulation stored under `weekdays_v1`. Note that such a hook can map two
     /// candidates onto the same date, which is why per-rule projection counts
-    /// **distinct instants** (see [`RollingPlanner::project_rule`]).
+    /// **distinct instants** (see `RollingPlanner::project_rule`).
     #[must_use]
     pub fn eligible_date(self, date: NaiveDate) -> Option<NaiveDate> {
         match self {
@@ -175,7 +175,7 @@ impl CalendarVersion {
 
 /// What a rule expires on, independent of how many expirations it keeps.
 ///
-/// The wire form is flat and tagged by `kind` — see [`ExpiryRuleWire`], which
+/// The wire form is flat and tagged by `kind` — see `ExpiryRuleWire`, which
 /// carries the serde derives so that `deny_unknown_fields` and per-kind field
 /// validity both hold. A stored rule reads exactly as ADR 0001 §14.2 shows it:
 /// `{"rule_id": "monthlies", "kind": "monthly", "target_count": 12, "weekday": "Fri"}`.
@@ -260,7 +260,7 @@ impl ExpiryRuleKind {
 ///
 /// Fields are private and the constructor validates, so an out-of-range
 /// `target_count` or a malformed `rule_id` is unrepresentable. Both directions
-/// of serde go through [`ExpiryRuleWire`], which is what makes a schedule
+/// of serde go through `ExpiryRuleWire`, which is what makes a schedule
 /// loaded from the session store as safe as one built from a request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(into = "ExpiryRuleWire", try_from = "ExpiryRuleWire")]
@@ -385,7 +385,7 @@ impl TryFrom<ExpiryRuleWire> for ExpiryRule {
 
 impl ExpiryRule {
     /// Builds a rule, rejecting a malformed `rule_id` and a `target_count` of
-    /// zero or above [`MAX_TARGET_COUNT`].
+    /// zero or above `MAX_TARGET_COUNT`.
     ///
     /// A rule keeping zero expirations is not a rule, and the type reflects
     /// that: `target_count` is a [`NonZeroUsize`] internally, so the invalid
@@ -395,7 +395,7 @@ impl ExpiryRule {
     ///
     /// Returns [`ChainError::Validation`] naming
     /// `schedules.<rule_id>.target_count` when the count is zero or exceeds
-    /// [`MAX_TARGET_COUNT`], or `schedules.rule_id` when the id is empty, too
+    /// `MAX_TARGET_COUNT`, or `schedules.rule_id` when the id is empty, too
     /// long, or carries a character outside `[A-Za-z0-9_-]`.
     pub fn new(
         rule_id: impl Into<String>,
@@ -576,17 +576,17 @@ impl ExpirationSchedule {
     ///
     /// Per-rule invariants — the `rule_id` charset and length, the
     /// `target_count` bound, and the kind-specific fields — are already
-    /// established by [`ExpiryRule::from_parts`]; this checks what only the
+    /// established by `ExpiryRule::from_parts`; this checks what only the
     /// whole schedule knows.
     ///
     /// # Errors
     ///
     /// Returns [`ChainError::Validation`] naming the offending field when:
     ///
-    /// - the rule list is empty, or longer than [`MAX_SCHEDULE_RULES`];
+    /// - the rule list is empty, or longer than `MAX_SCHEDULE_RULES`;
     /// - a `rule_id` is duplicated;
     /// - the pre-deduplication sum of `target_count` exceeds
-    ///   [`MAX_EXPIRATIONS_PER_SNAPSHOT`], or overflows.
+    ///   `MAX_EXPIRATIONS_PER_SNAPSHOT`, or overflows.
     pub fn validate(&self) -> Result<(), ChainError> {
         if self.rules.is_empty() {
             return Err(ChainError::Validation {

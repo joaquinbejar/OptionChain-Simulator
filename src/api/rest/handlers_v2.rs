@@ -284,7 +284,7 @@ pub(crate) fn json_error_handler(
 ///
 /// Best effort by design: serde's own messages name the field for the cases
 /// that matter (`unknown field \`x\``, and this crate's own validation errors,
-/// which are formatted as `Validation Error: <field>: <reason>`). Anything else
+/// which are formatted as ``Validation Error: `field`: `reason` ``). Anything else
 /// reports an empty field rather than inventing one, which is more useful to a
 /// client than a confident wrong answer.
 #[must_use]

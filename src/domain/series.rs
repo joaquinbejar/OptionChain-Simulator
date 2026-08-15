@@ -128,7 +128,8 @@ impl SeriesSnapshot {
         not(test),
         expect(
             dead_code,
-            reason = "consumed by the export in #49 and the cache metrics in #48"
+            reason = "the by-expiration lookup the tests use; the DTO layer walks \
+                      `chains` in order instead"
         )
     )]
     pub(crate) fn chain_at(&self, expires_at: DateTime<Utc>) -> Option<&ExpiryChain> {
@@ -145,7 +146,8 @@ impl SeriesSnapshot {
         not(test),
         expect(
             dead_code,
-            reason = "consumed by the export in #49 and the cache metrics in #48"
+            reason = "the per-rule view the inventory tests assert on; nothing served \
+                      needs it, because a chain carries its own labels"
         )
     )]
     pub(crate) fn chains_for(&self, rule_id: &str) -> impl Iterator<Item = &ExpiryChain> {
@@ -333,7 +335,7 @@ impl SnapshotCache {
         not(test),
         expect(
             dead_code,
-            reason = "consumed by the export in #49 and the cache metrics in #48"
+            reason = "clippy's len_without_is_empty requires this alongside `len`"
         )
     )]
     pub(crate) fn is_empty(&self) -> bool {
@@ -346,7 +348,8 @@ impl SnapshotCache {
         not(test),
         expect(
             dead_code,
-            reason = "consumed by the export in #49 and the cache metrics in #48"
+            reason = "the configured bound, asserted by the tests that pin the \
+                      zero-capacity floor"
         )
     )]
     pub(crate) fn capacity(&self) -> usize {
