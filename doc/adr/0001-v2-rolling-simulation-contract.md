@@ -496,13 +496,36 @@ observed by step `i` and nothing later.
 
 v2 never enters that driver — the factor tape exists precisely to stop
 materialising a chain per step — so it is its own caller and estimates the same
-way, composing the window from the same public upstream functions v1's driver
-composes its own from. There is no second copy of upstream's kernel in this
-repo. **Every step of a historical v2 tape therefore carries its own causal
+way. It composes the window from public upstream primitives rather than copying
+the private kernel: upstream's expanding estimator inlines its own prefix-sum
+variance, but records that the result is algebraically identical to
+`constant_volatility`, which *is* public, so v2 writes an indexing policy over
+upstream mathematics. There is no second copy of upstream's kernel in this repo.
+**Every step of a historical v2 tape therefore carries its own causal
 volatility, and the request's `volatility` field prices none of them.** It is
 not silently swallowed: the values actually used are the per-step ones in
 `FactorRow.base_volatility`, which every snapshot and the `volatility` export
 report, so a client reads back what priced its chains.
+
+Nothing outside the horizon is read, the seeding chain's volatility included: a
+historical walk replays `prices[..steps]`, and every reduction is taken over
+that prefix. This is a deliberate divergence from v1, whose fallback reduces the
+whole embedded series. Two consequences follow, both of which **refuse a request
+that v1 would have served**, which §11's error table lists and which issue #63
+accepts as an answer:
+
+- A horizon of fewer than three steps has one return at most and therefore no
+  dispersion to measure. v1 falls back to the whole-series constant, pricing the
+  simulation from observations past its own horizon; v2 refuses it.
+- A series whose realized volatility over the horizon is zero, or above the
+  `1.0` an option chain can be priced at, is refused. Both were previously
+  masked by pricing every step at the request's constant.
+
+Both refusals arrive **when the simulation is first served, not when it is
+created**: creation does not build a tape, deliberately, so a historical
+simulation with an unpriceable series returns `201` and then `400` from its
+first peek. The error names `method.prices`, because the volatility comes from
+the series and lowering the request's would change nothing.
 
 The same series and the same seed produce the same price path *and* the same
 volatility path under v1 and v2, to a numeric tolerance rather than bit-exactly:
@@ -517,9 +540,19 @@ answer.
 
 Composing costs quadratic time where upstream's recurrence is linear, because
 the recurrence is not reachable from outside it: at the 10 000-step cap the
-estimate takes seconds. It is paid once per simulation, only by `Historical`,
-and on the blocking pool rather than a request worker. optionstratlib#423 asks
-for the estimator to be exposed, which would make it a single linear call.
+estimate measures 3.3 s. Only `Historical` pays it, and it runs on the blocking
+pool rather than a request worker. It is paid once per **tape build**, which is
+not once per simulation: the tape cache is a bounded LRU, so an eviction, a
+restart, or an export — which builds its own tape and does not consult the
+cache — pays it again. optionstratlib#423 asks for the estimator to be exposed,
+which would make it a single linear call.
+
+A last note for the day v2 ships. The per-step values are a function of the
+binary as well as the inputs, so a change to how they are estimated changes what
+a replay produces. Snapshots persisted by an older binary and steps replayed by
+a newer one would then disagree inside a single export. Today that is free —
+this behaviour has never been released — but once it has, a change here is a
+schema event and not only a code change.
 
 Three properties keep the guarantee honest, and each is a test in the issues
 that implement it:
@@ -727,6 +760,14 @@ v2 maps failures through `ChainError` and the single existing HTTP boundary
 | `410` | the simulation is completed / the tape is exhausted | `{ "error": "..." }` |
 | `412` | `expected_step` does not match the stored cursor | `{ "error": "...", "current_step": N }` |
 | `500` | internal failure | `{ "error": "Internal server error" }` |
+
+One `400` does not arrive at the request that caused it. A historical series
+whose realized volatility cannot price a chain — zero, above `1.0`, or a horizon
+too short to estimate one from (§8.1) — is only discovered when the tape is
+built, and creation deliberately does not build one. That simulation is created
+with a `201` and returns `400` naming `method.prices` from its first peek
+onward. Building the tape at creation instead would trade this for a
+multi-second `POST` on every historical simulation, which is the worse deal.
 
 The `400` body is the existing `ValidationErrorResponse` shape — `error` plus
 the offending `field` — so a client can point a user at one input. The `412`

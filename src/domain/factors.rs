@@ -49,11 +49,20 @@
 //! what had been observed by step `i` and nothing later.
 //!
 //! v2 never enters that driver, so [`expanding_window_volatilities`] is v2's
-//! caller-side answer, **composed from the same public upstream functions v1's
-//! is composed from** rather than copied out of it — see that function for the
-//! indexing and the cost. A historical tape therefore carries a volatility per
-//! step, causally, and the request's own `volatility` field prices none of it
-//! (see [`resolve_base_volatility`]).
+//! caller-side answer. It is **composed from public upstream primitives rather
+//! than copied out of the private estimator**: upstream's expanding kernel
+//! inlines its own prefix-sum variance, but records that the result is
+//! algebraically identical to `constant_volatility`, which is public — so the
+//! window here writes an indexing policy over upstream mathematics instead of a
+//! second copy of it. See that function for the indexing and the cost. A
+//! historical tape therefore carries a volatility per step, causally, and the
+//! request's own `volatility` field prices none of it (see
+//! [`resolve_base_volatility`]).
+//!
+//! Every value read is inside the horizon, the seeding chain's included: a
+//! historical walk replays `prices[..steps]`, and nothing here reduces more
+//! than that. A horizon of fewer than three steps has no dispersion to measure
+//! and is refused rather than priced from observations it could not have seen.
 //!
 //! Parity with v1 is numeric, not bit-exact: upstream accumulates the window
 //! with prefix sums while `constant_volatility` centres in two passes, and the
@@ -94,10 +103,13 @@ pub(crate) struct FactorRow {
     /// The **canonical** base implied volatility used to price every chain at
     /// this step.
     ///
-    /// For a constant-volatility model this is the model's volatility at every
-    /// row. For `Garch`, `Heston`, `Custom` and `Telegraph` it is the
-    /// annualised volatility prevailing at this step, index-aligned with
-    /// `spot`, as upstream's `generate_with_vol` reports it.
+    /// Three cases, one field. For a constant-volatility model this is the
+    /// model's volatility at every row. For `Garch`, `Heston`, `Custom` and
+    /// `Telegraph` it is the annualised volatility prevailing at this step,
+    /// index-aligned with `spot`, as upstream's `generate_with_vol` reports it.
+    /// For `Historical` it is the realized volatility of the walked prices up
+    /// to and including this step, estimated here because upstream leaves it to
+    /// the caller — see [`expanding_window_volatilities`].
     pub(crate) base_volatility: Positive,
 }
 
@@ -125,12 +137,19 @@ impl FactorTape {
     ///
     /// Returns [`ChainError::Validation`] when the parameters are invalid, when
     /// the model's volatility disagrees with the parameters' (see
-    /// [`resolve_base_volatility`]), when a `Historical` series is too short
-    /// for the horizon, when a stochastic-volatility path exceeds the 1.0 an
-    /// option chain can be priced at, or when the simulated clock overflows;
-    /// and [`ChainError::Internal`] when the resolved method is not the one the
+    /// [`resolve_base_volatility`]), when a `Historical` series is too short for
+    /// the horizon or carries a zero price, when a volatility — a
+    /// stochastic-volatility path's or a historical estimate's — leaves the
+    /// range an option chain can be priced at, when a historical window cannot
+    /// be reduced or annualised, or when the simulated clock overflows; and
+    /// [`ChainError::Internal`] when the resolved method is not the one the
     /// parameters name, when the initial chain cannot be built, or when the
     /// walk returns fewer points than requested.
+    ///
+    /// A historical simulation is refused *lazily*, when its tape is first
+    /// built, because creation does not build one. A series whose realized
+    /// volatility leaves the priceable range therefore creates successfully and
+    /// fails at the first peek — see ADR 0001 §8.1.
     #[instrument(skip(parameters, method), level = "debug")]
     pub(crate) fn build(
         parameters: &SimulationParametersV2,
@@ -145,7 +164,7 @@ impl FactorTape {
         ensure_method_matches(parameters, method)?;
         ensure_historical_series_covers_the_horizon(parameters, method)?;
         let base_volatility = resolve_base_volatility(parameters, method)?;
-        reject_unpriceable_volatility(base_volatility, None)?;
+        reject_unpriceable_volatility(base_volatility, None, volatility_source(method))?;
         let walker = Walker::new_with_seed(parameters.seed);
 
         // The walk starts from an `OptionChain` because that is the shape v1's
@@ -226,7 +245,7 @@ impl FactorTape {
                 None => base_volatility,
             };
 
-            reject_unpriceable_volatility(row_volatility, Some(step))?;
+            reject_unpriceable_volatility(row_volatility, Some(step), volatility_source(method))?;
 
             rows.push(FactorRow {
                 step,
@@ -322,13 +341,22 @@ fn ensure_method_matches(
     }
 }
 
-/// Rejects a historical series too short to cover the requested horizon.
+/// Rejects a historical series that cannot be walked or priced.
 ///
-/// Upstream's `historical` kernel errors when the embedded series is shorter
-/// than the walk, and that error would surface as a `500`. It is a client
-/// mistake — a request embedding five prices and asking for a hundred steps —
-/// so it is caught here and named, the way v1 avoids the problem entirely by
-/// refetching from the database.
+/// Two client mistakes, both of which would otherwise surface as a `500`:
+///
+/// - **Too short for the horizon.** Upstream's `historical` kernel errors when
+///   the embedded series is shorter than the walk — a request embedding five
+///   prices and asking for a hundred steps — so it is caught here and named,
+///   the way v1 avoids the problem entirely by refetching from the database.
+/// - **A zero price.** A log return divides by the previous price, and
+///   `Positive`'s division *panics* on a zero divisor rather than returning an
+///   error, so one zero close would take down the thread building the tape.
+///   `SimulationParametersV2::validate` already rejects it on the stored
+///   series, but the method passed here is the **resolved** one — the whole
+///   reason the argument exists is that a `Historical` walk may have been
+///   filled in from the database since — and that series has passed no
+///   validation at all.
 ///
 /// # Errors
 ///
@@ -348,6 +376,16 @@ fn ensure_historical_series_covers_the_horizon(
                 "must carry at least one price per step: {} supplied for {} steps",
                 prices.len(),
                 parameters.steps
+            ),
+        });
+    }
+
+    if let Some(index) = prices.iter().position(|price| price.is_zero()) {
+        return Err(ChainError::Validation {
+            field: "method.prices".to_string(),
+            reason: format!(
+                "must be strictly positive: the price at index {index} is zero, and a log \
+                 return cannot divide by it"
             ),
         });
     }
@@ -385,11 +423,26 @@ fn ensure_historical_series_covers_the_horizon(
 /// chains rather than what it asked for. Dropping the field for this one
 /// variant is a DTO change and is deliberately not made here.
 ///
+/// # Only the walked window is read
+///
+/// The estimate covers `prices[..steps]` — the prefix upstream's historical
+/// kernel actually replays — and not the whole embedded series. Reducing the
+/// series would let an observation *past* the horizon price the simulation, or
+/// refuse it, in a change whose entire point is that nothing later may reach an
+/// earlier step. It is a deliberate divergence from v1, which reduces the whole
+/// series for its own fallback.
+///
+/// A consequence worth stating: a horizon shorter than three steps has at most
+/// one return and therefore no dispersion to measure, so the estimate is zero
+/// and [`reject_unpriceable_volatility`] refuses the simulation. v1 would have
+/// priced it from data it could not have seen; issue #63 lists refusing as an
+/// accepted answer, and it is the honest one.
+///
 /// # Errors
 ///
 /// Returns [`ChainError::Validation`] naming `volatility` when a synthetic
-/// model's volatility and the parameters' disagree, or when the historical
-/// series cannot be reduced to a volatility.
+/// model's volatility and the parameters' disagree, or `method.prices` when the
+/// walked window cannot be reduced to a volatility.
 fn resolve_base_volatility(
     parameters: &SimulationParametersV2,
     method: &SimulationMethod,
@@ -411,7 +464,24 @@ fn resolve_base_volatility(
         None => match method {
             SimulationMethod::Historical {
                 timeframe, prices, ..
-            } => historical_constant_volatility(prices, *timeframe),
+            } => {
+                // The length is guaranteed by
+                // `ensure_historical_series_covers_the_horizon`, which runs
+                // first; the checked slice keeps a future reordering from
+                // becoming a panic.
+                let window =
+                    prices
+                        .get(..parameters.steps)
+                        .ok_or_else(|| ChainError::Validation {
+                            field: "method.prices".to_string(),
+                            reason: format!(
+                                "must carry at least one price per step: {} supplied for {} steps",
+                                prices.len(),
+                                parameters.steps
+                            ),
+                        })?;
+                historical_constant_volatility(window, *timeframe)
+            }
             // `volatility()` returns `None` only for `Historical`; the match is
             // exhaustive over what can reach here, and a future variant that
             // also returns `None` lands on the requested value rather than
@@ -421,13 +491,16 @@ fn resolve_base_volatility(
     }
 }
 
-/// The whole-series volatility of a historical price series, annualised.
+/// The single volatility of a stretch of historical prices, annualised.
 ///
-/// v1's fallback, composed from the same three public upstream functions v1
-/// composes it from (`walk_driver::walk_volatility`): log returns, the sample
-/// standard deviation of those returns, and a rescaling from the series'
-/// timeframe to a year. It prices the seeding chain, and it is what a series
-/// too short for an expanding window falls back to.
+/// Composed from the same three public upstream functions v1's own whole-series
+/// fallback (`walk_driver::walk_volatility`) composes itself from: log returns,
+/// the sample standard deviation of those returns, and a rescaling from the
+/// series' timeframe to a year.
+///
+/// Callers pass the walked window, never the whole embedded series — see
+/// [`resolve_base_volatility`] for why. It prices the seeding chain, and it is
+/// what a window too short for an expanding estimate reduces to.
 ///
 /// # Errors
 ///
@@ -577,33 +650,94 @@ fn annualise(volatility: Positive, timeframe: TimeFrame) -> Result<Positive, Cha
     })
 }
 
+/// Which of the two a walk method's volatility comes from.
+fn volatility_source(method: &SimulationMethod) -> VolatilitySource {
+    match method {
+        SimulationMethod::Historical { .. } => VolatilitySource::Series,
+        _ => VolatilitySource::Model,
+    }
+}
+
+/// Where a volatility that failed the priceable range came from, so the error
+/// names a field the client can actually act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolatilitySource {
+    /// The walk model's own volatility, or the request's, which must agree.
+    Model,
+    /// Estimated from a historical price series, where the request's
+    /// `volatility` prices nothing and lowering it would change nothing.
+    Series,
+}
+
+impl VolatilitySource {
+    /// The request field to name.
+    fn field(self) -> &'static str {
+        match self {
+            Self::Model => "volatility",
+            Self::Series => "method.prices",
+        }
+    }
+
+    /// What the client has to change.
+    fn remedy(self) -> &'static str {
+        match self {
+            Self::Model => "lower the model's volatility or shorten the horizon",
+            Self::Series => {
+                "the volatility is estimated from the series, so it is the series that has to \
+                 change — the request's volatility prices nothing for a historical walk"
+            }
+        }
+    }
+}
+
 /// Rejects a volatility no option chain can be priced at.
 ///
-/// Upstream refuses anything above 1.0 annualised, so without this a run whose
-/// volatility crosses it fails with an internal error the first time a chain is
-/// built — at creation for a constant model, and halfway through the horizon
-/// for a stochastic one, at whatever step crosses first. Both become one 400
-/// naming the field, at tape build, where the whole path is in hand.
+/// Upstream refuses anything above 1.0 annualised **and anything equal to
+/// zero**, so without this a run whose volatility leaves that range fails with
+/// an internal error the first time a chain is built — at creation for a
+/// constant model, and halfway through the horizon for a stochastic or
+/// historical one, at whatever step crosses first. All of them become one 400
+/// naming a field, at tape build, where the whole path is in hand.
+///
+/// The lower bound is not theoretical for a historical walk: three equal prices
+/// give two zero log returns, so the estimate over that window is exactly zero.
+/// The session layer already refuses a zero the *request* supplies; an
+/// estimated one has to be refused here, because this is the only gate it
+/// passes through.
 ///
 /// Rejecting rather than clamping: a clamped path is a different tape, and the
 /// seed would no longer reproduce it.
 fn reject_unpriceable_volatility(
     volatility: Positive,
     step: Option<usize>,
+    source: VolatilitySource,
 ) -> Result<(), ChainError> {
+    let at = match step {
+        Some(step) => format!(" at step {step}"),
+        None => String::new(),
+    };
+
+    if volatility.is_zero() {
+        return Err(ChainError::Validation {
+            field: source.field().to_string(),
+            reason: format!(
+                "the volatility is zero{at}, and an option chain priced at zero volatility is a \
+                 chain of zero-value options; {}",
+                source.remedy()
+            ),
+        });
+    }
+
     if volatility <= Positive::ONE {
         return Ok(());
     }
 
-    let found = match step {
-        Some(step) => format!("the walk reaches {volatility} at step {step}"),
-        None => format!("{volatility}"),
-    };
     Err(ChainError::Validation {
-        field: "volatility".to_string(),
+        field: source.field().to_string(),
         reason: format!(
-            "{found}, above the 1.0 maximum an option chain can be priced at; \
-             lower the model's volatility or shorten the horizon"
+            "the volatility reaches {volatility}{at}, above the 1.0 maximum an option chain can \
+             be priced at; {}",
+            source.remedy()
         ),
     })
 }
@@ -1201,6 +1335,110 @@ mod tests {
         }
     }
 
+    /// A horizon of fewer than three steps has one return at most, and one
+    /// return has no dispersion. v1 would price it from the whole embedded
+    /// series — data past the horizon — so v2 refuses instead, which issue #63
+    /// lists as an accepted answer.
+    #[test]
+    fn test_a_horizon_too_short_to_estimate_is_refused() {
+        let mut historical = request(2, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices: volatile_prices(60),
+            symbol: Some("SPX".to_string()),
+        };
+        let parameters = parameters(historical);
+
+        match FactorTape::build(&parameters, &parameters.method) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "method.prices");
+                assert!(reason.contains("zero"), "{reason}");
+                assert!(reason.contains("prices nothing"), "{reason}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    /// A series that never moves has no volatility, and upstream refuses to
+    /// price a chain at zero. It becomes one 400 naming the series rather than
+    /// a 500 from inside the chain builder.
+    #[test]
+    fn test_a_series_without_dispersion_is_refused() {
+        let mut historical = request(4, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices: vec![5000.0; 8],
+            symbol: Some("SPX".to_string()),
+        };
+        let parameters = parameters(historical);
+
+        match FactorTape::build(&parameters, &parameters.method) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "method.prices");
+                assert!(reason.contains("zero-value options"), "{reason}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    /// A series too turbulent to price is refused with advice that applies: the
+    /// volatility comes from the series, so lowering the request's does nothing.
+    #[test]
+    fn test_a_series_above_the_priceable_volatility_is_refused() {
+        let prices: Vec<f64> = (0..20)
+            .map(|index| if index % 2 == 0 { 5000.0 } else { 5500.0 })
+            .collect();
+        let mut historical = request(10, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices,
+            symbol: Some("SPX".to_string()),
+        };
+        let parameters = parameters(historical);
+
+        match FactorTape::build(&parameters, &parameters.method) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "method.prices");
+                assert!(reason.contains("above the 1.0 maximum"), "{reason}");
+                assert!(reason.contains("the series that has to change"), "{reason}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    /// The resolved method is separately supplied and passes no boundary
+    /// validation, so a zero close reaching it from the database has to be
+    /// caught here — a log return would divide by it, and that division panics.
+    #[test]
+    fn test_a_zero_price_in_the_resolved_series_is_refused() {
+        let mut historical = request(4, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices: volatile_prices(20),
+            symbol: Some("SPX".to_string()),
+        };
+        let parameters = parameters(historical);
+
+        let mut resolved = volatile_series(20);
+        match resolved.get_mut(3) {
+            Some(price) => *price = Positive::ZERO,
+            None => panic!("the fixture must have a fourth price"),
+        }
+        let resolved = SimulationMethod::Historical {
+            timeframe: TimeFrame::Day,
+            prices: resolved,
+            symbol: Some("SPX".to_string()),
+        };
+
+        match FactorTape::build(&parameters, &resolved) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "method.prices");
+                assert!(reason.contains("index 3 is zero"), "{reason}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
     /// A historical walk prices itself: the volatility comes from the series,
     /// never from the `volatility` the request happened to carry.
     #[test]
@@ -1539,12 +1777,12 @@ mod tests {
 
     /// Later observations cannot change an earlier step's base volatility.
     ///
-    /// The property the estimator question turns on (#63): whatever prices a
-    /// historical step, it must be a function of that step and what came before
-    /// it. Today the answer is the requested constant, so extending the series
-    /// changes nothing — and if optionstratlib#423 lands and a causal estimate
-    /// replaces the constant, this test keeps holding while a look-ahead one
-    /// would break it.
+    /// The property the estimator turns on (#63): whatever prices a historical
+    /// step must be a function of that step and what came before it. Now that
+    /// the price is an estimate rather than a constant, this is where it is
+    /// load-bearing — it proves the estimate is taken over the *walked* prefix
+    /// and not the embedded series, the one place v2 could have diverged from
+    /// v1 while every other test still passed.
     #[test]
     fn test_a_longer_series_leaves_earlier_steps_untouched() {
         // The observation count is a `u32` so the index converts to `f64`

@@ -56,7 +56,7 @@ pub struct CreateSimulationRequest {
     pub schedules: Vec<ExpiryRule>,
     /// Initial price of the underlying.
     pub initial_price: f64,
-    /// Initial (and, for constant-volatility models, the only) volatility.
+    /// The base volatility, for every walk model that carries one.
     ///
     /// Must equal the walk model's own `volatility` where the model carries
     /// one: a simulation has exactly one base volatility, and a disagreement is
@@ -64,9 +64,12 @@ pub struct CreateSimulationRequest {
     /// (ADR 0001 §4.4).
     ///
     /// `Historical` carries none and needs none — it prices every step from the
-    /// realized volatility of the series up to that step, so this field prices
-    /// nothing there (ADR 0001 §8.1). The values that did price the chains are
-    /// the per-step ones in each snapshot's `base_volatility`.
+    /// realized volatility of its own series up to that step, so this field
+    /// prices nothing there (ADR 0001 §8.1). The values that did price the
+    /// chains are the per-step ones in each snapshot's `base_volatility`. A
+    /// historical series whose realized volatility is zero or above `1.0`
+    /// cannot price a chain at all, and is refused when the simulation is first
+    /// served rather than when it is created.
     pub volatility: f64,
     /// Annualised risk-free rate, as a decimal fraction.
     pub risk_free_rate: f64,

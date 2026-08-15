@@ -48,7 +48,7 @@ struct TapeEntry {
 pub struct SimulationManager {
     store: Arc<dyn SimulationStore>,
     config: SimulationV2Config,
-    tapes: Mutex<HashMap<Uuid, TapeEntry>>,
+    tapes: Arc<Mutex<HashMap<Uuid, TapeEntry>>>,
     snapshots: Mutex<SnapshotCache>,
     /// Where served snapshots are queued for filing, when the operator turned
     /// persistence on. `None` is the default and the whole feature is then
@@ -101,7 +101,7 @@ impl SimulationManager {
         Self {
             store,
             config,
-            tapes: Mutex::new(HashMap::new()),
+            tapes: Arc::new(Mutex::new(HashMap::new())),
             snapshots: Mutex::new(SnapshotCache::with_bounds(
                 config.max_cached_snapshots,
                 config.max_cached_snapshot_contracts,
@@ -475,21 +475,31 @@ impl SimulationManager {
     /// worker that would stall every other request the worker holds, so it goes
     /// to the blocking pool, exactly as the export path already does with the
     /// same call.
+    ///
+    /// The result is filed **inside** the blocking task rather than after the
+    /// await. A `spawn_blocking` task cannot be cancelled, but awaiting it can:
+    /// a client that disconnects or times out mid-build drops this future, and
+    /// filing afterwards would throw away a build that ran to completion
+    /// anyway. At three seconds a caller retrying under a shorter timeout would
+    /// then never warm the cache and would pin a blocking thread on every
+    /// attempt.
     async fn tape_for(&self, simulation: &SessionV2) -> Result<FactorTape, ChainError> {
         if let Some(tape) = self.cached_tape(simulation.id) {
             return Ok(tape);
         }
 
         let parameters = simulation.parameters.clone();
-        let tape =
-            tokio::task::spawn_blocking(move || FactorTape::build(&parameters, &parameters.method))
-                .await
-                .map_err(|e| {
-                    ChainError::Internal(format!("the factor tape build did not finish: {e}"))
-                })??;
+        let id = simulation.id;
+        let tapes = Arc::clone(&self.tapes);
+        let max_cached_tapes = self.config.max_cached_tapes;
 
-        self.cache_tape(simulation.id, tape.clone());
-        Ok(tape)
+        tokio::task::spawn_blocking(move || {
+            let tape = FactorTape::build(&parameters, &parameters.method)?;
+            Self::cache_tape(&tapes, max_cached_tapes, id, tape.clone());
+            Ok(tape)
+        })
+        .await
+        .map_err(|e| ChainError::Internal(format!("the factor tape build did not finish: {e}")))?
     }
 
     /// Reads a cached tape, refreshing its recency.
@@ -504,8 +514,16 @@ impl SimulationManager {
     }
 
     /// Stores a built tape, evicting the least recently used first.
-    fn cache_tape(&self, id: Uuid, tape: FactorTape) {
-        let mut tapes = match self.tapes.lock() {
+    ///
+    /// Takes the map rather than `&self` so the builder can file its result
+    /// from inside the blocking task, where no caller can drop it.
+    fn cache_tape(
+        tapes: &Mutex<HashMap<Uuid, TapeEntry>>,
+        max_cached_tapes: usize,
+        id: Uuid,
+        tape: FactorTape,
+    ) {
+        let mut tapes = match tapes.lock() {
             Ok(tapes) => tapes,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -514,7 +532,7 @@ impl SimulationManager {
         // The capacity is validated `>= 1` when the configuration loads, so
         // `- 1` cannot underflow. Evicting before the insert keeps the id being
         // inserted out of the running for victim.
-        let max = self.config.max_cached_tapes;
+        let max = max_cached_tapes;
         debug_assert!(
             max >= 1,
             "the configured capacity is validated >= 1 at load"

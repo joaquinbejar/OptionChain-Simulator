@@ -107,7 +107,12 @@ pub struct SimulationParametersResponse {
     pub schedules: Vec<ScheduleRuleResponse>,
     /// Initial price of the underlying.
     pub initial_price: f64,
-    /// The one base volatility of the simulation.
+    /// The volatility the simulation was created with, echoed back for replay.
+    ///
+    /// It is the one base volatility for every walk model that carries one. For
+    /// `Historical` it prices nothing — that walk estimates a volatility per
+    /// step from its own series (ADR 0001 §8.1) — and the values that did price
+    /// the chains are each snapshot's `base_volatility`.
     pub volatility: f64,
     /// Annualised risk-free rate.
     pub risk_free_rate: f64,
