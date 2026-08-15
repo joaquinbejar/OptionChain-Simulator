@@ -387,7 +387,7 @@ impl SessionManager {
     ///
     /// Read-only helper the API layer uses to publish the `simulation_cache_size`
     /// gauge after operations that grow or shrink the cache (advance, delete). It
-    /// delegates to [`crate::domain`]'s simulator without touching session state or
+    /// delegates to the domain simulator without touching session state or
     /// the store.
     pub async fn simulation_cache_len(&self) -> usize {
         self.simulator.cache_len().await

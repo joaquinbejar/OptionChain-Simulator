@@ -412,12 +412,12 @@ pub(crate) fn validate_walk_type(walk: &WalkType) -> Result<(), ChainError> {
 impl TryFrom<ApiWalkType> for WalkType {
     type Error = ChainError;
 
-    /// Validates a client-supplied [`ApiWalkType`] and converts it into the domain
+    /// Validates a client-supplied `ApiWalkType` and converts it into the domain
     /// [`WalkType`]. Every raw `f64` field is checked before conversion: `dt` must be
     /// strictly positive, volatilities and other `Positive` fields must be finite and
     /// non-negative, `Decimal` fields must be finite, an `autocorrelation` (when present)
     /// must lie in `[-1, 1]`, and a `Historical` price series must be non-negative and no
-    /// longer than [`MAX_HISTORICAL_PRICES`]. Invalid input yields a
+    /// longer than `MAX_HISTORICAL_PRICES`. Invalid input yields a
     /// [`ChainError::Validation`] naming the offending field instead of panicking.
     ///
     /// # Errors

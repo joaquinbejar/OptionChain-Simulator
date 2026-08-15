@@ -111,7 +111,7 @@ services:
     # Published by .github/workflows/docker-publish.yml on every Cargo.toml
     # version bump, or by `make docker-push` from a workstation. Bump the
     # default tag in the same PR that bumps the crate version.
-    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.1.0}
+    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.0}
     deploy:
       replicas: 1
       restart_policy:

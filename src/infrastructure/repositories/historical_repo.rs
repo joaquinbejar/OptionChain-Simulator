@@ -33,6 +33,13 @@ const DATE_RANGE_QUERY: &str = "SELECT \
     FROM ohlcv \
     WHERE symbol = ?";
 
+/// Reads historical OHLCV series from ClickHouse.
+///
+/// The [`HistoricalDataRepository`] implementation behind a `Historical` walk:
+/// it lists the symbols the warehouse holds, reports the date range available
+/// for one, and fetches a price series from a given start. Every query binds
+/// its symbol as an escaped parameter rather than interpolating it, and every
+/// driver error is mapped into [`ChainError`] before it leaves this layer.
 pub struct ClickHouseHistoricalRepository {
     /// The underlying ClickHouse client
     client: Arc<ClickHouseClient>,
