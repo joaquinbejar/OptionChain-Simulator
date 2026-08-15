@@ -35,6 +35,19 @@ use crate::infrastructure::{
 /// from the new ones.
 pub(crate) const SNAPSHOT_TAPE_GENERATION: u64 = CURRENT_SNAPSHOT_GENERATION;
 
+/// How many quote rows a snapshot would become.
+///
+/// Counted from the domain snapshot rather than from a built record, so a
+/// caller can decide whether to build one at all.
+#[must_use]
+pub(crate) fn snapshot_quote_count(snapshot: &SeriesSnapshot) -> usize {
+    snapshot
+        .chains
+        .iter()
+        .map(|chain| chain.chain.options.len())
+        .sum()
+}
+
 /// Builds the persistence record for a snapshot the manager just served.
 ///
 /// Ordering is inherited, not imposed: the planner already yields expirations

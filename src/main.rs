@@ -153,6 +153,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tables are created here rather than on the first advance, so a schema
     // problem is a startup failure with a message rather than a warning buried
     // in the serving path.
+    //
+    // The manager owns the one repository: it writes through it, and the v2
+    // export reads back through the same handle — the routes take it off the
+    // manager rather than being passed a second one, because two handles could
+    // be configured differently and there is only ever one warehouse.
     let mut simulation_manager = SimulationManager::new(simulation_store, v2_config);
     match ClickHouseSnapshotRepository::from_env()? {
         Some(warehouse) => {

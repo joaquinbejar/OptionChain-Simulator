@@ -9,7 +9,7 @@ use crate::api::rest::handlers_v2::{
 };
 use crate::api::rest::middleware::metrics_endpoint;
 use crate::api::rest::swagger::ApiDoc;
-use crate::infrastructure::{MetricsCollector, MongoDBRepository};
+use crate::infrastructure::{MetricsCollector, MongoDBRepository, SimulationSnapshotRepository};
 use crate::session::{SessionManager, SimulationManager};
 use actix_web::web;
 use std::sync::Arc;
@@ -29,6 +29,8 @@ use utoipa_swagger_ui::SwaggerUi;
 /// * `session_manager` - An `Arc` instance of `SessionManager`. This is wrapped in `web::Data`
 ///   to make it accessible to the route handlers. The `SessionManager` is responsible for managing
 ///   session data and operations.
+/// * `snapshots` - The v2 snapshot warehouse, when the operator enabled persistence. `None` is the
+///   normal case and leaves the v2 export replaying every step.
 ///
 /// # Endpoints
 ///
@@ -65,7 +67,11 @@ pub fn configure_routes(
     metrics_collector: Arc<MetricsCollector>,
     mongodb_repo: Arc<MongoDBRepository>,
 ) {
-    configure_v2_routes(cfg, simulation_manager);
+    // The export reads from the same warehouse the manager files into, taken
+    // off the manager rather than threaded separately: two handles could be
+    // configured differently, and there is only ever one warehouse.
+    let snapshots = simulation_manager.warehouse();
+    configure_v2_routes(cfg, simulation_manager, snapshots);
 
     cfg.app_data(web::Data::new(session_manager))
         .app_data(web::Data::new(metrics_collector.clone()))
@@ -106,10 +112,21 @@ pub fn configure_routes(
 /// - **DELETE** `/api/v2/simulations/{id}` — delete it and evict its caches.
 /// - **GET** `/api/v2/simulations/{id}/export` — stream the complete tape, or a
 ///   step range of it, as JSON or CSV.
+///
+/// `snapshots` is the warehouse the export reads persisted steps from. It is an
+/// `Option` because persistence is opt-in: registered, the export prefers a
+/// stored snapshot over replaying it; absent, nothing about the export changes.
+/// The handler extracts it as `Option<web::Data<_>>`, so a deployment without
+/// ClickHouse registers nothing rather than a null.
 pub(crate) fn configure_v2_routes(
     cfg: &mut web::ServiceConfig,
     simulation_manager: Arc<SimulationManager>,
+    snapshots: Option<Arc<dyn SimulationSnapshotRepository>>,
 ) {
+    if let Some(snapshots) = snapshots {
+        cfg.app_data(web::Data::new(snapshots));
+    }
+
     cfg.app_data(web::Data::new(simulation_manager))
         // A rejected v2 body must come back as the documented `{error, field}`
         // shape. Rule-level failures are raised *inside* deserialization, so

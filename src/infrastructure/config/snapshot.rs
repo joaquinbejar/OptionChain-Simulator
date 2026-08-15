@@ -22,6 +22,9 @@
 //! every advance. Persistence is therefore opt-in: an operator who has the
 //! warehouse turns it on explicitly.
 
+use crate::infrastructure::config::simulation_v2::{
+    DEFAULT_MAX_SNAPSHOT_CONTRACTS, max_snapshot_contracts,
+};
 use crate::utils::ChainError;
 use std::env;
 use std::time::Duration;
@@ -36,12 +39,17 @@ pub const DEFAULT_SNAPSHOT_PERSISTENCE_ENABLED: bool = false;
 /// Default cap on the quote rows one snapshot may carry, in rows.
 ///
 /// A snapshot is `expirations × strikes` rows; ADR 0001's reference
-/// configuration is a few hundred, and the per-snapshot contract budget in
-/// `SimulationParametersV2::validate` already bounds what the domain will
-/// price. This is the *storage* bound: a snapshot larger than it is rejected
-/// before a single row is written, so one pathological simulation cannot turn
-/// into an unbounded insert.
-pub const DEFAULT_SNAPSHOT_BATCH_ROWS: usize = 100_000;
+/// configuration is a few hundred. This is the *storage* bound: a snapshot
+/// larger than it is rejected before a single row is written, so one
+/// pathological simulation cannot turn into an unbounded insert.
+///
+/// It defaults to the per-snapshot contract cap the API accepts, and not
+/// lower, on purpose. A storage bound below what creation admits would make
+/// every persist of a perfectly legal simulation fail — the API would say yes
+/// and the warehouse would say no, for every step, forever. `from_env` refuses
+/// that combination outright rather than leaving it to be discovered in the
+/// logs.
+pub const DEFAULT_SNAPSHOT_BATCH_ROWS: usize = DEFAULT_MAX_SNAPSHOT_CONTRACTS;
 
 /// Default cap on the rows one read may return, in rows.
 ///
@@ -154,6 +162,23 @@ impl SnapshotPersistenceConfig {
                 MAX_RETENTION_DAYS,
             )?,
         };
+
+        // The two bounds have to agree, or the service accepts simulations it
+        // can never persist. Checked here rather than at the write, because the
+        // failure is a configuration mistake and belongs at startup with both
+        // variables named.
+        let accepted = max_snapshot_contracts();
+        if config.enabled && config.batch_rows < accepted {
+            return Err(ChainError::Validation {
+                field: "OCS_SNAPSHOT_BATCH_ROWS".to_string(),
+                reason: format!(
+                    "is {} but OCS_MAX_SNAPSHOT_CONTRACTS accepts snapshots of up to \
+                     {accepted} rows, so every persist of a snapshot above {} would fail; \
+                     raise this or lower that",
+                    config.batch_rows, config.batch_rows
+                ),
+            });
+        }
 
         info!(
             enabled = config.enabled,
@@ -307,6 +332,18 @@ fn invalid(variable: &str, raw: &str) -> ChainError {
 
 #[cfg(test)]
 mod tests {
+    /// The storage bound defaults to what creation accepts, so the default
+    /// configuration cannot accept a simulation it could never persist.
+    #[test]
+    fn test_the_default_storage_bound_covers_what_creation_accepts() {
+        const {
+            assert!(
+                DEFAULT_SNAPSHOT_BATCH_ROWS >= DEFAULT_MAX_SNAPSHOT_CONTRACTS,
+                "a storage bound below the accepted snapshot size fails every persist"
+            );
+        }
+    }
+
     use super::*;
 
     /// The defaults are the documented ones.

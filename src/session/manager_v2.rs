@@ -26,11 +26,12 @@ use crate::domain::factors::FactorTape;
 use crate::domain::series::{SeriesBuilder, SeriesSnapshot, SnapshotCache};
 use crate::infrastructure::{SimulationSnapshotRepository, SimulationV2Config, SnapshotRecord};
 use crate::session::model::SessionState;
-use crate::session::snapshot_record::snapshot_record;
+use crate::session::snapshot_record::{snapshot_quote_count, snapshot_record};
 use crate::session::store::SimulationStore;
 use crate::session::{SessionV2, SimulationParametersV2};
 use crate::utils::ChainError;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -53,21 +54,41 @@ pub struct SimulationManager {
     /// persistence on. `None` is the default and the whole feature is then
     /// absent from the serving path — no connection, no latency, no failure
     /// mode.
-    warehouse: Option<mpsc::Sender<SnapshotRecord>>,
+    warehouse: Option<Warehouse>,
 }
 
-/// How many snapshots may be waiting to be filed before the oldest is dropped.
+/// The queue in front of the warehouse, and what is currently in it.
+struct Warehouse {
+    /// The repository itself, so a reader — the export — can consult the same
+    /// warehouse the writer fills without being handed a second handle to it.
+    repository: Arc<dyn SimulationSnapshotRepository>,
+    sender: mpsc::Sender<SnapshotRecord>,
+    /// Quote rows queued but not yet written. Incremented before a send and
+    /// decremented by the writer once the record leaves the queue, so it
+    /// measures what is resident rather than what has been served.
+    queued_contracts: Arc<AtomicUsize>,
+}
+
+/// How many snapshots may be waiting to be filed.
 ///
 /// The queue is what keeps a degraded warehouse from becoming a memory leak. An
 /// unbounded spawn-per-advance cannot delay a response, but at a sustained
 /// advance rate against a warehouse that is timing out it accumulates records
 /// until the process dies — which fails every request, not just the write.
-///
-/// The depth is generous relative to the reference configuration (a record is
-/// on the order of a few hundred quotes) and deliberately not a knob: a
-/// deployment that needs to tune it is a deployment whose warehouse cannot keep
-/// up, and the answer there is the warehouse, not a bigger buffer.
 const SNAPSHOT_QUEUE_DEPTH: usize = 1_024;
+
+/// How many quote rows may be waiting to be filed, across every queued record.
+///
+/// A depth in *records* is the wrong unit for the same reason an entry count
+/// was the wrong unit for the snapshot cache: a record is a few hundred quotes
+/// in the reference configuration and up to the per-snapshot cap in a large
+/// one, so 1 024 of them is anywhere from a hundred thousand to two hundred
+/// million rows. This bounds what is actually resident.
+///
+/// Neither bound is a knob. A deployment that needs to tune them is one whose
+/// warehouse cannot keep up with its advance rate, and the answer there is the
+/// warehouse, not a deeper buffer in front of it.
+const SNAPSHOT_QUEUE_CONTRACTS: usize = 4_000_000;
 
 impl SimulationManager {
     /// Creates a manager over a simulation store.
@@ -96,8 +117,11 @@ impl SimulationManager {
     /// have to name the feature to not use it, and the serving path should not
     /// branch on a config flag it can express as a missing dependency.
     #[must_use]
-    pub fn with_warehouse(mut self, warehouse: Arc<dyn SimulationSnapshotRepository>) -> Self {
+    pub fn with_warehouse(mut self, repository: Arc<dyn SimulationSnapshotRepository>) -> Self {
         let (sender, mut receiver) = mpsc::channel::<SnapshotRecord>(SNAPSHOT_QUEUE_DEPTH);
+        let queued_contracts = Arc::new(AtomicUsize::new(0));
+        let writer_contracts = Arc::clone(&queued_contracts);
+        let warehouse = Arc::clone(&repository);
 
         // One writer, not one task per advance: the queue bounds what a slow
         // warehouse can accumulate, and serialising the writes means two steps
@@ -106,7 +130,12 @@ impl SimulationManager {
             while let Some(record) = receiver.recv().await {
                 let simulation = record.simulation;
                 let step = record.step;
-                if let Err(error) = warehouse.persist(record).await {
+                let contracts = record.quote_count();
+
+                let result = warehouse.persist(record).await;
+                writer_contracts.fetch_sub(contracts, Ordering::SeqCst);
+
+                if let Err(error) = result {
                     warn!(
                         simulation_id = %simulation,
                         step,
@@ -117,8 +146,25 @@ impl SimulationManager {
             }
         });
 
-        self.warehouse = Some(sender);
+        self.warehouse = Some(Warehouse {
+            repository,
+            sender,
+            queued_contracts,
+        });
         self
+    }
+
+    /// The warehouse this manager files into, if any.
+    ///
+    /// Exists so the export can prefer persisted snapshots over replay without
+    /// the binary threading a second handle through the server: the manager
+    /// already owns the one the writer uses, and two handles could drift to two
+    /// different configurations.
+    #[must_use]
+    pub fn warehouse(&self) -> Option<Arc<dyn SimulationSnapshotRepository>> {
+        self.warehouse
+            .as_ref()
+            .map(|warehouse| Arc::clone(&warehouse.repository))
     }
 
     /// The operational configuration this manager applies.
@@ -272,8 +318,34 @@ impl SimulationManager {
             return;
         };
 
+        // Decide before building anything. Materialising a record clones every
+        // quote, so doing it and *then* discovering the queue is full would put
+        // the cost of a degraded warehouse back on the advance — which is the
+        // one thing this path exists to avoid.
+        let incoming = snapshot_quote_count(snapshot);
+        let queued = warehouse.queued_contracts.load(Ordering::SeqCst);
+        if warehouse.sender.capacity() == 0
+            || queued.saturating_add(incoming) > SNAPSHOT_QUEUE_CONTRACTS
+        {
+            warn!(
+                simulation_id = %simulation.id,
+                step = snapshot.step,
+                queued,
+                "The snapshot queue is full; the step was not filed and can be replayed"
+            );
+            return;
+        }
+
         let record = snapshot_record(simulation.id, &simulation.parameters.symbol, snapshot);
-        if let Err(error) = warehouse.try_send(record) {
+        warehouse
+            .queued_contracts
+            .fetch_add(incoming, Ordering::SeqCst);
+
+        if let Err(error) = warehouse.sender.try_send(record) {
+            // Lost the race with another advance; undo the reservation.
+            warehouse
+                .queued_contracts
+                .fetch_sub(incoming, Ordering::SeqCst);
             warn!(
                 simulation_id = %simulation.id,
                 step = snapshot.step,
@@ -610,6 +682,54 @@ mod tests {
         }
     }
 
+    /// A warehouse whose first write never completes — the shape a degraded
+    /// deployment has, and the one an unbounded queue cannot survive.
+    #[derive(Default)]
+    struct StallingWarehouse {
+        started: AtomicUsize,
+    }
+
+    impl StallingWarehouse {
+        fn started(&self) -> usize {
+            self.started.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SimulationSnapshotRepository for StallingWarehouse {
+        async fn persist(&self, _record: SnapshotRecord) -> Result<(), ChainError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _simulation: Uuid,
+            _generation: u64,
+            _step: usize,
+        ) -> Result<Option<SnapshotRecord>, ChainError> {
+            Ok(None)
+        }
+
+        async fn read_range(
+            &self,
+            _simulation: Uuid,
+            _generation: u64,
+            _from_step: usize,
+            _to_step: usize,
+        ) -> Result<Vec<SnapshotRecord>, ChainError> {
+            Ok(Vec::new())
+        }
+
+        async fn contract_series(
+            &self,
+            _query: ContractSeriesQuery,
+        ) -> Result<Vec<ContractQuote>, ChainError> {
+            Ok(Vec::new())
+        }
+    }
+
     /// Filing is detached, so a test has to let the spawned write run before it
     /// can observe it. One yield is enough on the current-thread runtime the
     /// tests use; the loop keeps it from being a race on a busier one.
@@ -677,6 +797,40 @@ mod tests {
             warehouse.filed(),
             vec![(simulation.id, 0)],
             "the step the advance served is the step that is filed"
+        );
+    }
+
+    /// A warehouse that never drains stops receiving, rather than accumulating
+    /// records until the process dies.
+    ///
+    /// The bound that matters is rows, not records: a record is a few hundred
+    /// quotes in this fixture and up to the per-snapshot cap in a large
+    /// configuration, so a depth in records says nothing about what is
+    /// resident.
+    #[tokio::test]
+    async fn test_a_stalled_warehouse_stops_being_queued() {
+        let warehouse = Arc::new(StallingWarehouse::default());
+        let manager = SimulationManager::new(
+            Arc::new(InMemorySimulationStore::new()),
+            SimulationV2Config::default(),
+        )
+        .with_warehouse(Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>);
+
+        // More advances than the queue can hold, against a warehouse whose
+        // first write never returns.
+        for _ in 0..(SNAPSHOT_QUEUE_DEPTH + 8) {
+            let simulation = created(&manager, 2).await;
+            match manager.advance(simulation.id).await {
+                Ok(_) => {}
+                Err(error) => panic!("the advance must serve regardless: {error}"),
+            }
+        }
+        settle().await;
+
+        assert!(
+            warehouse.started() <= SNAPSHOT_QUEUE_DEPTH + 1,
+            "a stalled warehouse must stop receiving, got {} starts",
+            warehouse.started()
         );
     }
 

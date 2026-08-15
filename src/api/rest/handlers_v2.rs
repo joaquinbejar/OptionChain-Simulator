@@ -349,7 +349,9 @@ mod tests {
                 crate::infrastructure::SimulationV2Config::default(),
             ));
             actix_test::init_service(
-                App::new().configure(|cfg| configure_v2_routes(cfg, manager.clone())),
+                // No warehouse: these tests exercise the lifecycle, which is
+                // identical with and without snapshot persistence.
+                App::new().configure(|cfg| configure_v2_routes(cfg, manager.clone(), None)),
             )
             .await
         }};

@@ -14,6 +14,9 @@ use crate::infrastructure::{MetricsCollector, MetricsMiddleware, MongoDBReposito
 ///
 /// * `session_manager` - A shared reference to the `SessionManager`, used to manage user sessions.
 /// * `metrics_collector` - A shared reference to the `MetricsCollector`, used for collecting server metrics.
+/// * `snapshots` - The v2 snapshot warehouse, when snapshot persistence is enabled. It is the same
+///   repository the manager files snapshots into, shared so the v2 export can read them back and
+///   prefer a persisted step over replaying it. `None` leaves the export replaying every step.
 /// * `listen_on` - The address or hostname where the server will listen, typically an IP address or hostname.
 /// * `port` - The port number on which the server will accept requests.
 ///
