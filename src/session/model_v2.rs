@@ -18,13 +18,15 @@
 //!   simulation: changing any parameter changes the tape, so it creates a new
 //!   simulation instead of mutating one.
 
-use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS};
+use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS, strikes_per_chain};
 use crate::api::rest::models::validate_walk_type;
 use crate::api::rest::requests_v2::CreateSimulationRequest;
 use crate::api::rest::validation::{
     decimal_field, positive_field, strictly_positive_field, symbol_field, time_frame_field,
 };
 use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, tzdb_version};
+use crate::domain::simulator::DEFAULT_CHAIN_SIZE;
+use crate::infrastructure::max_snapshot_contracts;
 use crate::session::model::{SessionState, SimulationMethod};
 use crate::utils::{ChainError, UuidGenerator};
 use chrono::{DateTime, NaiveTime, TimeDelta, Timelike, Utc};
@@ -387,6 +389,7 @@ impl SimulationParametersV2 {
             });
         }
         self.schedule.validate()?;
+        self.validate_snapshot_work()?;
 
         // A simulation has exactly one base volatility. v1 accepts a top-level
         // value and a walk model carrying a different one, and silently prices
@@ -414,6 +417,69 @@ impl SimulationParametersV2 {
                 running = %running,
                 "simulation was resolved against a different IANA tzdb release"
             );
+        }
+
+        Ok(())
+    }
+
+    /// Rejects a configuration whose every snapshot would price more contracts
+    /// than the service is willing to build.
+    ///
+    /// The two caps that bound this individually — the chain size and the
+    /// per-snapshot expiration count — are each reasonable, and their product
+    /// is not: 1 001 strikes across 512 live expirations is half a million
+    /// Black-Scholes evaluations for one `/snapshot` call, from a request that
+    /// violates neither. The bound is on the product, checked once at creation
+    /// rather than per step, and it is deliberately generous: the reference
+    /// configuration in ADR 0001 prices about 500 contracts a snapshot.
+    ///
+    /// `Σ target_count` is the tight upper bound on live expirations — rules
+    /// that claim the same date are priced once, so the real count is at most
+    /// this — which means a configuration this accepts can never exceed the
+    /// cap, and one it rejects genuinely asked for more.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Validation`] naming `chain_size`, which is the
+    /// field a client can lower without changing what the simulation means.
+    fn validate_snapshot_work(&self) -> Result<(), ChainError> {
+        let requested = self.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE);
+        let strikes = strikes_per_chain(requested).ok_or_else(|| ChainError::Validation {
+            field: "chain_size".to_string(),
+            reason: format!("a chain of {requested} does not have a representable strike count"),
+        })?;
+        let expirations = self
+            .schedule
+            .rules()
+            .iter()
+            .try_fold(0usize, |total, rule| {
+                total.checked_add(rule.target_count().get())
+            })
+            .ok_or_else(|| ChainError::Validation {
+                field: "schedules".to_string(),
+                reason: "the requested expiration counts overflow".to_string(),
+            })?;
+
+        let contracts = strikes
+            .checked_mul(expirations)
+            .ok_or_else(|| ChainError::Validation {
+                field: "chain_size".to_string(),
+                reason: format!(
+                    "{strikes} strikes across {expirations} expirations overflows the \
+                     contract count"
+                ),
+            })?;
+
+        let cap = max_snapshot_contracts();
+        if contracts > cap {
+            return Err(ChainError::Validation {
+                field: "chain_size".to_string(),
+                reason: format!(
+                    "every snapshot would price {contracts} contracts ({strikes} strikes \
+                     across up to {expirations} expirations), above the {cap} maximum; lower \
+                     chain_size or the schedules' target_count"
+                ),
+            });
         }
 
         Ok(())
@@ -811,11 +877,24 @@ impl fmt::Display for SessionV2 {
 mod tests {
     use super::*;
     use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
-    use crate::domain::expiry::{ExpiryRule, ExpiryRuleKind};
+    use crate::domain::expiry::{ExpiryRule, ExpiryRuleKind, MAX_TARGET_COUNT};
     use chrono::{TimeZone, Weekday};
     use positive::pos_or_panic;
 
     /// The reference configuration from ADR 0001 §14.1, as a request.
+    /// Two rules at the per-rule cap: the most expirations a schedule can keep
+    /// alive, and still under the per-snapshot inventory cap.
+    fn maximal_schedules() -> Vec<ExpiryRule> {
+        vec![
+            rule("zero_dte", ExpiryRuleKind::Daily, MAX_TARGET_COUNT),
+            rule(
+                "weeklies",
+                ExpiryRuleKind::weekly([Weekday::Mon, Weekday::Wed, Weekday::Fri]),
+                MAX_TARGET_COUNT,
+            ),
+        ]
+    }
+
     fn reference_request() -> CreateSimulationRequest {
         CreateSimulationRequest {
             symbol: "SPX".to_string(),
@@ -1377,6 +1456,43 @@ mod tests {
                 error.contains(field),
                 "the error must name {field}, got {error}"
             );
+        }
+    }
+
+    /// A configuration whose snapshots would price more contracts than the cap
+    /// is refused at creation, naming the field a client can lower.
+    #[test]
+    fn test_a_configuration_above_the_snapshot_contract_cap_is_rejected() {
+        let mut request = reference_request();
+        // 500 is the chain-size cap: 1 001 strikes. Two rules at the per-rule
+        // cap keep 512 expirations alive, which is the per-snapshot inventory
+        // cap. Their product is half a million contracts, and neither field
+        // alone is out of range.
+        request.chain_size = Some(500);
+        request.schedules = maximal_schedules();
+
+        match SimulationParametersV2::try_from(request) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "chain_size");
+                assert!(
+                    reason.contains("would price"),
+                    "the reason must say what it refused, got {reason}"
+                );
+            }
+            other => panic!("the product of the two caps must be refused, got {other:?}"),
+        }
+    }
+
+    /// The reference configuration is nowhere near the cap, so the bound costs
+    /// a realistic client nothing.
+    #[test]
+    fn test_the_reference_configuration_is_far_below_the_contract_cap() {
+        match SimulationParametersV2::try_from(reference_request()) {
+            Ok(parameters) => match parameters.validate() {
+                Ok(()) => {}
+                Err(error) => panic!("the reference configuration must validate: {error}"),
+            },
+            Err(error) => panic!("the reference request must convert: {error}"),
         }
     }
 

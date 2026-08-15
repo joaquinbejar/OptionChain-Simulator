@@ -77,7 +77,10 @@ impl SimulationManager {
             uuid_generator: UuidGenerator::new(default_namespace()),
             config,
             tapes: Mutex::new(HashMap::new()),
-            snapshots: Mutex::new(SnapshotCache::with_capacity(config.max_cached_snapshots)),
+            snapshots: Mutex::new(SnapshotCache::with_bounds(
+                config.max_cached_snapshots,
+                config.max_cached_snapshot_contracts,
+            )),
         }
     }
 

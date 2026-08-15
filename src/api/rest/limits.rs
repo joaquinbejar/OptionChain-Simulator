@@ -43,6 +43,19 @@ pub(crate) static MAX_HISTORICAL_PRICES: LazyLock<usize> = LazyLock::new(|| {
     )
 });
 
+/// The number of strikes a chain of `chain_size` carries, or `None` when the
+/// count does not fit.
+///
+/// `chain_size` is upstream's per-side half-width — it counts strikes above
+/// *and* below the money — so the ladder is `2n + 1` wide. Checked rather than
+/// saturating: a saturating width would silently answer a different question
+/// than the caller asked, and the caller is a validator whose whole job is to
+/// reject what it cannot serve.
+#[must_use]
+pub(crate) fn strikes_per_chain(chain_size: usize) -> Option<usize> {
+    chain_size.checked_mul(2)?.checked_add(1)
+}
+
 /// Parses a raw environment value into a positive `usize` limit.
 ///
 /// Returns `default` when `raw` is `None` (variable unset) or when it does not parse

@@ -51,7 +51,7 @@
 
 use crate::domain::expiry::{ActiveExpiry, RollingPlanner};
 use crate::domain::factors::{FactorRow, FactorTape, build_chain};
-use crate::infrastructure::DEFAULT_MAX_CACHED_SNAPSHOTS;
+use crate::infrastructure::{DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS, DEFAULT_MAX_CACHED_SNAPSHOTS};
 use crate::session::SimulationParametersV2;
 use crate::utils::ChainError;
 use chrono::{DateTime, Utc};
@@ -153,6 +153,19 @@ impl SeriesSnapshot {
             .iter()
             .filter(move |chain| chain.labels.iter().any(|label| label == rule_id))
     }
+}
+
+/// How many contracts a snapshot holds.
+///
+/// The unit the cache budgets in: one priced option per strike per live
+/// expiration, which is what makes a snapshot heavy.
+#[must_use]
+fn snapshot_contracts(snapshot: &SeriesSnapshot) -> usize {
+    snapshot
+        .chains
+        .iter()
+        .map(|chain| chain.chain.options.len())
+        .sum()
 }
 
 /// Builds snapshots for one simulation.
@@ -273,6 +286,12 @@ impl<'a> SeriesBuilder<'a> {
 struct CacheEntry {
     snapshot: SeriesSnapshot,
     last_access: Instant,
+    /// The entry's weight, measured once on insert.
+    ///
+    /// Kept rather than recomputed because eviction consults it on every
+    /// iteration: recomputing would walk every strike of every remaining entry
+    /// per victim, under the manager's lock, at a budget measured in millions.
+    contracts: usize,
 }
 
 /// A bounded, least-recently-accessed cache of built snapshots.
@@ -288,6 +307,9 @@ struct CacheEntry {
 pub(crate) struct SnapshotCache {
     entries: HashMap<(Uuid, usize), CacheEntry>,
     capacity: usize,
+    contract_budget: usize,
+    /// The sum of every entry's weight, maintained on insert and removal.
+    resident_contracts: usize,
 }
 
 impl Default for SnapshotCache {
@@ -300,25 +322,51 @@ impl SnapshotCache {
     /// Creates a cache bounded by the documented default.
     ///
     /// The bound is configuration, not a constant of the domain: the service
-    /// passes the operator's value through [`SnapshotCache::with_capacity`].
+    /// passes the operator's values through [`SnapshotCache::with_bounds`].
     /// This constructor exists for tests and for a caller with nothing to say
     /// about it.
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self::with_capacity(DEFAULT_MAX_CACHED_SNAPSHOTS)
+        Self::with_bounds(
+            DEFAULT_MAX_CACHED_SNAPSHOTS,
+            DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS,
+        )
     }
 
-    /// Creates a cache with an explicit bound.
+    /// Creates a cache bounded by both entries and contracts.
     ///
-    /// A capacity of zero is raised to one: a cache that can hold nothing would
-    /// make every `insert` a no-op and every `get` a miss, which is a
+    /// Two bounds, because one entry is not one unit of memory: a snapshot
+    /// holds every strike of every live expiration, so 256 of them is a few
+    /// hundred contracts in the reference configuration and millions in a large
+    /// one. The entry bound keeps the map small; the contract budget is what
+    /// actually bounds the memory. Both floor at one — a cache that can hold
+    /// nothing makes every insert a no-op and every get a miss, which is a
     /// misconfiguration rather than an intent.
     #[must_use]
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_bounds(capacity: usize, contract_budget: usize) -> Self {
         Self {
             entries: HashMap::new(),
             capacity: capacity.max(1),
+            contract_budget: contract_budget.max(1),
+            resident_contracts: 0,
         }
+    }
+
+    /// The number of contracts currently held across every cached snapshot.
+    ///
+    /// Maintained incrementally, so this is O(1) — eviction consults it per
+    /// victim and recomputing would walk every strike of every entry under the
+    /// manager's lock.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the budget is enforced internally; this reports it"
+        )
+    )]
+    pub(crate) fn contracts(&self) -> usize {
+        self.resident_contracts
     }
 
     /// The number of snapshots currently held.
@@ -368,7 +416,27 @@ impl SnapshotCache {
     /// its bound afterwards.
     pub(crate) fn insert(&mut self, simulation: Uuid, snapshot: SeriesSnapshot) {
         let key = (simulation, snapshot.step);
-        self.entries.remove(&key);
+        self.remove_entry(&key);
+
+        let incoming = snapshot_contracts(&snapshot);
+
+        // A snapshot heavier than the whole budget is **not** cached. Admitting
+        // it would put the cache over the bound its own documentation states,
+        // and evicting everything to make room for something that still does
+        // not fit is the worst of both. The step stays servable — it is rebuilt
+        // on demand, which is what every cache miss does — and the operator's
+        // two knobs are what decide whether this can happen at all: the
+        // per-snapshot cap bounds one snapshot, this bounds the resident set.
+        if incoming > self.contract_budget {
+            debug!(
+                step = snapshot.step,
+                contracts = incoming,
+                budget = self.contract_budget,
+                "The snapshot is larger than the cache budget; serving it without caching"
+            );
+            return;
+        }
+
         // `capacity` is raised to at least one in the constructor, so `- 1`
         // cannot underflow. No saturating arithmetic: the rules forbid it, and
         // here it would hide a constructor that stopped enforcing the floor.
@@ -377,13 +445,31 @@ impl SnapshotCache {
             "capacity is floored at one on construction"
         );
         self.evict_to(self.capacity - 1);
+
+        // Make room for this snapshot's own weight before inserting it, so the
+        // cache never exceeds its budget afterwards. The subtraction cannot
+        // underflow: the branch above returned for anything larger.
+        self.evict_to_contracts(self.contract_budget - incoming);
+
+        self.resident_contracts = self.resident_contracts.saturating_add(incoming);
         self.entries.insert(
             key,
             CacheEntry {
                 snapshot,
                 last_access: Instant::now(),
+                contracts: incoming,
             },
         );
+    }
+
+    /// Removes one entry and takes its weight off the running total.
+    ///
+    /// Every removal goes through here, so `resident_contracts` cannot drift
+    /// from what the map holds.
+    fn remove_entry(&mut self, key: &(Uuid, usize)) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.resident_contracts = self.resident_contracts.saturating_sub(entry.contracts);
+        }
     }
 
     /// Drops every entry belonging to `simulation`, returning how many went.
@@ -392,28 +478,50 @@ impl SnapshotCache {
     /// heavyweight snapshot cannot outlive the session it belongs to. #48 wires
     /// it to the store's cleanup.
     pub(crate) fn evict_simulation(&mut self, simulation: Uuid) -> usize {
-        let before = self.entries.len();
-        self.entries.retain(|(id, _), _| *id != simulation);
-        before - self.entries.len()
+        let victims: Vec<(Uuid, usize)> = self
+            .entries
+            .keys()
+            .filter(|(id, _)| *id == simulation)
+            .copied()
+            .collect();
+
+        for key in &victims {
+            self.remove_entry(key);
+        }
+        victims.len()
+    }
+
+    /// Evicts least-recently-accessed entries until the cache holds at most
+    /// `max` contracts.
+    ///
+    /// Shares the victim rule with [`SnapshotCache::evict_to`], so which entry
+    /// goes is the same question either bound asks.
+    fn evict_to_contracts(&mut self, max: usize) {
+        while self.resident_contracts > max {
+            match self.least_recently_used() {
+                Some(key) => self.remove_entry(&key),
+                None => break,
+            }
+        }
+    }
+
+    /// The key of the least recently accessed entry, or `None` when empty.
+    fn least_recently_used(&self) -> Option<(Uuid, usize)> {
+        self.entries
+            .iter()
+            // The key breaks an `Instant` tie, so eviction does not depend on
+            // the map's randomised iteration order. Nothing served depends on
+            // which entry goes — a rebuild is identical — but a deterministic
+            // victim keeps the cache's behaviour reproducible under test.
+            .min_by_key(|(key, entry)| (entry.last_access, **key))
+            .map(|(key, _)| *key)
     }
 
     /// Evicts least-recently-accessed entries until at most `max` remain.
     fn evict_to(&mut self, max: usize) {
         while self.entries.len() > max {
-            let victim = self
-                .entries
-                .iter()
-                // The key breaks an `Instant` tie, so eviction does not depend
-                // on the map's randomised iteration order. Nothing served
-                // depends on which entry goes — a rebuild is identical — but a
-                // deterministic victim keeps the cache's behaviour reproducible
-                // under test.
-                .min_by_key(|(key, entry)| (entry.last_access, **key))
-                .map(|(key, _)| *key);
-            match victim {
-                Some(key) => {
-                    self.entries.remove(&key);
-                }
+            match self.least_recently_used() {
+                Some(key) => self.remove_entry(&key),
                 None => break,
             }
         }
@@ -938,6 +1046,14 @@ mod tests {
 
     // ---- the snapshot cache -----------------------------------------------
 
+    /// A cache bounded by entries alone, for the tests about that bound.
+    ///
+    /// The contract budget is effectively unlimited here, so each test exercises
+    /// exactly the rule it names.
+    fn entry_bounded_cache(capacity: usize) -> SnapshotCache {
+        SnapshotCache::with_bounds(capacity, usize::MAX)
+    }
+
     fn cached_snapshot(step: usize) -> SeriesSnapshot {
         let simulated_at = match Utc.with_ymd_and_hms(2026, 1, 5, 14, 30, 0).single() {
             Some(instant) => instant,
@@ -955,7 +1071,7 @@ mod tests {
     /// A cached snapshot is returned as stored.
     #[test]
     fn test_the_cache_returns_what_it_stored() {
-        let mut cache = SnapshotCache::with_capacity(4);
+        let mut cache = entry_bounded_cache(4);
         let simulation = Uuid::new_v4();
 
         assert!(cache.is_empty());
@@ -973,7 +1089,7 @@ mod tests {
     /// accessed entry first.
     #[test]
     fn test_the_cache_evicts_the_least_recently_accessed_entry() {
-        let mut cache = SnapshotCache::with_capacity(2);
+        let mut cache = entry_bounded_cache(2);
         let simulation = Uuid::new_v4();
 
         cache.insert(simulation, cached_snapshot(0));
@@ -991,11 +1107,94 @@ mod tests {
         assert!(cache.get(simulation, 2).is_some());
     }
 
+    /// The contract budget evicts before the entry bound would.
+    ///
+    /// This is the bound that actually protects memory: one entry is a few
+    /// hundred contracts in the reference configuration and up to the
+    /// per-snapshot cap in a large one, so a cache that holds 256 of anything
+    /// says nothing about how much is resident.
+    #[test]
+    fn test_the_cache_evicts_on_the_contract_budget() {
+        // Real snapshots, because the weight is the point: an empty fixture
+        // would make the budget trivially satisfiable.
+        let parameters = test_parameters();
+        let tape = test_tape(&parameters);
+        let priced = |step: usize| snapshot(&parameters, &tape, step);
+
+        let first = priced(0);
+        let second = priced(1);
+        let budget = snapshot_contracts(&first) + snapshot_contracts(&second);
+        assert!(budget > 0, "the fixture must price something");
+
+        // Room for exactly these two by weight, and for ten by entry count.
+        let mut cache = SnapshotCache::with_bounds(10, budget);
+        let simulation = Uuid::new_v4();
+
+        cache.insert(simulation, first);
+        cache.insert(simulation, second);
+        assert_eq!(cache.len(), 2, "both fit within the budget");
+
+        // The reference tape is two steps long, so the third insert reuses
+        // step 0's snapshot under a second simulation id — a distinct key with
+        // the same weight, which is all this bound cares about.
+        let other = Uuid::new_v4();
+        cache.insert(other, priced(0));
+
+        assert!(
+            cache.len() < 3,
+            "the entry bound of ten cannot be what stopped it"
+        );
+        assert!(
+            cache.contracts() <= budget,
+            "the cache holds {} contracts, above its budget of {budget}",
+            cache.contracts()
+        );
+        assert!(cache.get(other, 0).is_some(), "the newest stayed");
+    }
+
+    /// A snapshot heavier than the whole budget is not cached, and does not
+    /// take the rest of the cache down with it.
+    ///
+    /// Admitting it would put the cache over the bound its own configuration
+    /// states; evicting everything to make room for something that still does
+    /// not fit would be worse. The step is served either way — an uncached step
+    /// is a rebuild, which is what every miss already is.
+    #[test]
+    fn test_a_snapshot_larger_than_the_budget_is_not_cached() {
+        let parameters = test_parameters();
+        let tape = test_tape(&parameters);
+        let weight = snapshot_contracts(&snapshot(&parameters, &tape, 0));
+
+        let mut cache = SnapshotCache::with_bounds(10, weight / 2);
+        let simulation = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        cache.insert(other, snapshot(&parameters, &tape, 1));
+        let resident = cache.len();
+
+        cache.insert(simulation, snapshot(&parameters, &tape, 0));
+
+        assert!(
+            cache.get(simulation, 0).is_none(),
+            "an entry that cannot fit the budget must not be admitted"
+        );
+        assert_eq!(
+            cache.len(),
+            resident,
+            "and it must not evict the entries that do fit"
+        );
+        assert!(
+            cache.contracts() <= weight / 2,
+            "the cache holds {} contracts, above its budget",
+            cache.contracts()
+        );
+    }
+
     /// One simulation's entries do not evict another's wholesale, and a
     /// simulation's entries can be dropped together.
     #[test]
     fn test_a_simulations_entries_can_be_evicted_together() {
-        let mut cache = SnapshotCache::with_capacity(8);
+        let mut cache = entry_bounded_cache(8);
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
 
@@ -1014,7 +1213,7 @@ mod tests {
     /// Re-inserting the same key replaces rather than duplicating.
     #[test]
     fn test_reinserting_a_key_replaces_the_entry() {
-        let mut cache = SnapshotCache::with_capacity(4);
+        let mut cache = entry_bounded_cache(4);
         let simulation = Uuid::new_v4();
 
         cache.insert(simulation, cached_snapshot(7));
@@ -1026,7 +1225,7 @@ mod tests {
     /// A capacity of zero is raised to one rather than making the cache inert.
     #[test]
     fn test_a_zero_capacity_is_raised_to_one() {
-        let mut cache = SnapshotCache::with_capacity(0);
+        let mut cache = entry_bounded_cache(0);
         let simulation = Uuid::new_v4();
 
         assert_eq!(cache.capacity(), 1);
@@ -1043,7 +1242,7 @@ mod tests {
         let parameters = parameters(request(3, reference_schedules()));
         let tape = tape(&parameters);
         let simulation = Uuid::new_v4();
-        let mut cache = SnapshotCache::with_capacity(1);
+        let mut cache = entry_bounded_cache(1);
 
         let original = snapshot(&parameters, &tape, 1);
         cache.insert(simulation, original.clone());

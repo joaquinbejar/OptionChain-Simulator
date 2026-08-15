@@ -12,8 +12,10 @@ pub(crate) use clickhouse::{calculate_required_duration, select_random_date, val
 pub use config::clickhouse::ClickHouseConfig;
 pub use config::redis::RedisConfig;
 pub use config::simulation_v2::{
-    DEFAULT_CLEANUP_INTERVAL_SECS, DEFAULT_MAX_CACHED_SNAPSHOTS, DEFAULT_MAX_CACHED_TAPES,
-    DEFAULT_MAX_EXPORT_ROWS, DEFAULT_RETENTION_SECS, SimulationV2Config,
+    DEFAULT_CLEANUP_INTERVAL_SECS, DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS,
+    DEFAULT_MAX_CACHED_SNAPSHOTS, DEFAULT_MAX_CACHED_TAPES, DEFAULT_MAX_EXPORT_ROWS,
+    DEFAULT_MAX_SNAPSHOT_CONTRACTS, DEFAULT_RETENTION_SECS, SimulationV2Config,
+    max_snapshot_contracts,
 };
 pub use redis::RedisClient;
 pub use repositories::historical_repo::ClickHouseHistoricalRepository;
