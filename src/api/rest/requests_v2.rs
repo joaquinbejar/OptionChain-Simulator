@@ -61,7 +61,12 @@ pub struct CreateSimulationRequest {
     /// Must equal the walk model's own `volatility` where the model carries
     /// one: a simulation has exactly one base volatility, and a disagreement is
     /// a `400` naming this field rather than a silent choice made later
-    /// (ADR 0001 §4.4). `Historical` carries none, so nothing has to match.
+    /// (ADR 0001 §4.4).
+    ///
+    /// `Historical` carries none and needs none — it prices every step from the
+    /// realized volatility of the series up to that step, so this field prices
+    /// nothing there (ADR 0001 §8.1). The values that did price the chains are
+    /// the per-step ones in each snapshot's `base_volatility`.
     pub volatility: f64,
     /// Annualised risk-free rate, as a decimal fraction.
     pub risk_free_rate: f64,

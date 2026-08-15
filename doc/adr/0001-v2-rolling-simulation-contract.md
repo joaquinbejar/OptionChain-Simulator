@@ -307,8 +307,10 @@ simulation:
   pair and silently prices step zero at one while walking on the other, and v2
   refuses the contradiction at the boundary rather than letting the domain pick
   a winner. `Historical` carries no model volatility, so there is nothing to
-  disagree with. The check runs on the stored document too, so a hand-edited
-  simulation cannot smuggle the contradiction back in.
+  disagree with — and nothing to supply either: it prices itself from the series
+  (§8.1), and the request's `volatility` prices none of its steps. The check
+  runs on the stored document too, so a hand-edited simulation cannot smuggle
+  the contradiction back in.
 
 ---
 
@@ -484,24 +486,40 @@ unversioned would be a false guarantee, so the effective tzdb release
 the seed. A replay against a different tzdb is still a replay — it is just one
 the client can now detect.
 
-**What a `Historical` walk is priced at.** A historical walk carries no
-volatility of its own — it is a price series, and `WalkType::volatility()`
-returns `None` for it. v1 prices one with a rolling causal estimate, because its
-walk driver computes an expanding-window realized volatility per step. v2 never
-enters that driver — the factor tape exists precisely to stop materialising a
-chain per step — and upstream keeps the estimator private to it, so **every step
-of a historical v2 tape is priced at the constant `volatility` the request
-supplied**.
+### 8.1 What a `Historical` walk is priced at
 
-This is part of the contract, not an accident. The same series and the same seed
-produce the *same price path* under v1 and v2, and *different premiums*, because
-the volatility pricing them differs. A client comparing the two should expect
-that. Closing the gap needs the estimator reachable from outside the driver,
-which is asked for in optionstratlib#423; porting a second copy of the
-mathematics into the tape would contradict the module's stated premise of not
-reimplementing upstream. Issue #63 tracks it, and if the estimator lands the
-per-step value goes into `FactorRow.base_volatility`, which is already defined
-as the exact number that step's chains are priced at.
+A historical walk carries no volatility of its own — it is a price series, and
+`WalkType::volatility()` returns `None` for it. Upstream leaves the per-step
+estimate to the caller and says so; v1's caller is its walk driver, which
+estimates over an **expanding window**, so step `i` is priced by what had been
+observed by step `i` and nothing later.
+
+v2 never enters that driver — the factor tape exists precisely to stop
+materialising a chain per step — so it is its own caller and estimates the same
+way, composing the window from the same public upstream functions v1's driver
+composes its own from. There is no second copy of upstream's kernel in this
+repo. **Every step of a historical v2 tape therefore carries its own causal
+volatility, and the request's `volatility` field prices none of them.** It is
+not silently swallowed: the values actually used are the per-step ones in
+`FactorRow.base_volatility`, which every snapshot and the `volatility` export
+report, so a client reads back what priced its chains.
+
+The same series and the same seed produce the same price path *and* the same
+volatility path under v1 and v2, to a numeric tolerance rather than bit-exactly:
+upstream accumulates its window with prefix sums where the composed form centres
+in two passes, which is the same expression and not the same last `Decimal`
+digits (observed deviation ~1e-23 on an annualised volatility, pinned by a
+test). One step differs by construction: v1 never asks its estimator about step
+zero and prices its first chain at the request's constant, while v2 serves step
+zero as a snapshot and prices it with the first computable estimate — pricing a
+served step at a volatility its own series contradicts would be the worse
+answer.
+
+Composing costs quadratic time where upstream's recurrence is linear, because
+the recurrence is not reachable from outside it: at the 10 000-step cap the
+estimate takes seconds. It is paid once per simulation, only by `Historical`,
+and on the blocking pool rather than a request worker. optionstratlib#423 asks
+for the estimator to be exposed, which would make it a single linear call.
 
 Three properties keep the guarantee honest, and each is a test in the issues
 that implement it:

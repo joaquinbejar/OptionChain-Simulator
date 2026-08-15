@@ -228,7 +228,9 @@ impl SimulationManager {
         let simulation = self.store.get(id).await?;
         Self::reject_terminal(&simulation, "no current step")?;
 
-        let snapshot = self.snapshot_at(&simulation, simulation.current_step)?;
+        let snapshot = self
+            .snapshot_at(&simulation, simulation.current_step)
+            .await?;
         Ok((simulation, snapshot))
     }
 
@@ -258,7 +260,9 @@ impl SimulationManager {
         let expected_version = simulation.version;
         Self::reject_terminal(&simulation, "no further steps")?;
 
-        let snapshot = self.snapshot_at(&simulation, simulation.current_step)?;
+        let snapshot = self
+            .snapshot_at(&simulation, simulation.current_step)
+            .await?;
 
         simulation.current_step = simulation
             .current_step
@@ -427,7 +431,7 @@ impl SimulationManager {
     /// Locks are held only for the map operations, never across a build: the
     /// tape and the snapshot are produced outside any critical section, so a
     /// slow build cannot stall another simulation's request.
-    fn snapshot_at(
+    async fn snapshot_at(
         &self,
         simulation: &SessionV2,
         step: usize,
@@ -436,7 +440,7 @@ impl SimulationManager {
             return Ok(cached);
         }
 
-        let tape = self.tape_for(simulation)?;
+        let tape = self.tape_for(simulation).await?;
         let snapshot = SeriesBuilder::new(&simulation.parameters, &tape)?.snapshot(step)?;
 
         self.cache_snapshot(simulation.id, snapshot.clone());
@@ -462,16 +466,28 @@ impl SimulationManager {
     }
 
     /// Returns the simulation's factor tape, building it on a miss.
-    fn tape_for(&self, simulation: &SessionV2) -> Result<FactorTape, ChainError> {
+    ///
+    /// Built outside the lock — holding the map while it runs would serialise
+    /// every other simulation behind it — and off the runtime. `FactorTape::build`
+    /// is pure and synchronous, and it is the one place a v2 request does real
+    /// CPU work up front: a historical walk estimates a volatility per step,
+    /// which at the 10 000-step cap measures over three seconds. Left on a
+    /// worker that would stall every other request the worker holds, so it goes
+    /// to the blocking pool, exactly as the export path already does with the
+    /// same call.
+    async fn tape_for(&self, simulation: &SessionV2) -> Result<FactorTape, ChainError> {
         if let Some(tape) = self.cached_tape(simulation.id) {
             return Ok(tape);
         }
 
-        // Built outside the lock. `FactorTape::build` is pure and synchronous —
-        // it is the one place a v2 request does real CPU work up front — and
-        // holding the map while it runs would serialise every other simulation
-        // behind it.
-        let tape = FactorTape::build(&simulation.parameters, &simulation.parameters.method)?;
+        let parameters = simulation.parameters.clone();
+        let tape =
+            tokio::task::spawn_blocking(move || FactorTape::build(&parameters, &parameters.method))
+                .await
+                .map_err(|e| {
+                    ChainError::Internal(format!("the factor tape build did not finish: {e}"))
+                })??;
+
         self.cache_tape(simulation.id, tape.clone());
         Ok(tape)
     }
