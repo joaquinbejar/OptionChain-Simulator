@@ -517,6 +517,15 @@ impl SimulationManager {
     ///
     /// Takes the map rather than `&self` so the builder can file its result
     /// from inside the blocking task, where no caller can drop it.
+    ///
+    /// One race that follows from filing there, recorded because it is benign
+    /// only under the current routes: a build already running when the
+    /// simulation is deleted, completed or reaped will file afterwards, leaving
+    /// a tape for an id the store no longer knows. Nothing can serve it — every
+    /// path reads the store before the cache — so it costs memory until the LRU
+    /// pushes it out. It would stop being benign the day v2 gains a route that
+    /// changes a simulation's parameters in place, because the stale tape would
+    /// then be a tape of the *old* parameters under a live id.
     fn cache_tape(
         tapes: &Mutex<HashMap<Uuid, TapeEntry>>,
         max_cached_tapes: usize,
@@ -961,6 +970,31 @@ mod tests {
             Ok(_) => assert_eq!(manager.cached_tapes(), 1),
             Err(error) => panic!("the peek must succeed: {error}"),
         }
+    }
+
+    /// The tape cache still honours the configured capacity now that the build
+    /// files its own result from inside the blocking task and the cap travels
+    /// as a parameter rather than through `&self`.
+    #[tokio::test]
+    async fn test_the_tape_cache_still_honours_its_capacity() {
+        let config = SimulationV2Config {
+            max_cached_tapes: 2,
+            ..SimulationV2Config::default()
+        };
+        let manager = SimulationManager::new(Arc::new(InMemorySimulationStore::new()), config);
+
+        for _ in 0..4 {
+            let created = created(&manager, 5).await;
+            if let Err(error) = manager.peek(created.id).await {
+                panic!("the peek must succeed: {error}");
+            }
+        }
+
+        assert_eq!(
+            manager.cached_tapes(),
+            2,
+            "four tapes were built under a cap of two"
+        );
     }
 
     /// A peek is repeatable and changes nothing.

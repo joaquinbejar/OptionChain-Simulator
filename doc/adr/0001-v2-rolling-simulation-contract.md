@@ -517,9 +517,14 @@ accepts as an answer:
 - A horizon of fewer than three steps has one return at most and therefore no
   dispersion to measure. v1 falls back to the whole-series constant, pricing the
   simulation from observations past its own horizon; v2 refuses it.
-- A series whose realized volatility over the horizon is zero, or above the
-  `1.0` an option chain can be priced at, is refused. Both were previously
-  masked by pricing every step at the request's constant.
+- A series whose realized volatility over the horizon is above the `1.0` an
+  option chain can be priced at is refused, as is one whose estimate is zero.
+  Zero is reached more easily than "a flat series" suggests: the first two
+  points carry the first computable estimate, so **three equal opening prices**
+  are enough to refuse a simulation that moves freely afterwards. v1 fails on
+  the same input from inside the chain builder, as a `500`; this is the same
+  refusal with a status and a field a client can act on. Both cases were
+  previously masked by pricing every step at the request's constant.
 
 Both refusals arrive **when the simulation is first served, not when it is
 created**: creation does not build a tape, deliberately, so a historical

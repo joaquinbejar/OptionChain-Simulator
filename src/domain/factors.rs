@@ -349,14 +349,14 @@ fn ensure_method_matches(
 ///   the embedded series is shorter than the walk — a request embedding five
 ///   prices and asking for a hundred steps — so it is caught here and named,
 ///   the way v1 avoids the problem entirely by refetching from the database.
-/// - **A zero price.** A log return divides by the previous price, and
-///   `Positive`'s division *panics* on a zero divisor rather than returning an
-///   error, so one zero close would take down the thread building the tape.
-///   `SimulationParametersV2::validate` already rejects it on the stored
-///   series, but the method passed here is the **resolved** one — the whole
-///   reason the argument exists is that a `Historical` walk may have been
-///   filled in from the database since — and that series has passed no
-///   validation at all.
+/// - **A zero price inside the walked window.** A log return divides by the
+///   previous price and takes the log of the ratio, and *both* panic on a zero
+///   rather than returning an error, so one zero close would take down the
+///   thread building the tape. `SimulationParametersV2::validate` already
+///   rejects it on the stored series, but the method passed here is the
+///   **resolved** one — the whole reason the argument exists is that a
+///   `Historical` walk may have been filled in from the database since — and
+///   that series has passed no validation at all.
 ///
 /// # Errors
 ///
@@ -380,12 +380,19 @@ fn ensure_historical_series_covers_the_horizon(
         });
     }
 
-    if let Some(index) = prices.iter().position(|price| price.is_zero()) {
+    // Only the walked window, for the same reason nothing else reads past it: a
+    // zero at index `steps + 50` is touched by no division, no logarithm and no
+    // reduction, and refusing the request over it would be exactly the
+    // look-ahead this module removed.
+    let window = prices
+        .get(..parameters.steps)
+        .ok_or_else(|| ChainError::Internal("the horizon guard above did not hold".to_string()))?;
+    if let Some(index) = window.iter().position(|price| price.is_zero()) {
         return Err(ChainError::Validation {
             field: "method.prices".to_string(),
             reason: format!(
                 "must be strictly positive: the price at index {index} is zero, and a log \
-                 return cannot divide by it"
+                 return divides by the previous price and takes the log of the ratio"
             ),
         });
     }
@@ -504,9 +511,9 @@ fn resolve_base_volatility(
 ///
 /// # Errors
 ///
-/// Returns [`ChainError::Validation`] naming `method.prices` when a price is
-/// not usable as a log-return input, or `volatility` when the reduction or the
-/// annualisation fails.
+/// Returns [`ChainError::Validation`] naming `volatility` when the reduction or
+/// the annualisation fails. Prices are a precondition, not an error case — see
+/// [`log_returns`].
 fn historical_constant_volatility(
     prices: &[Positive],
     timeframe: TimeFrame,
@@ -560,8 +567,9 @@ fn historical_constant_volatility(
 ///
 /// # Errors
 ///
-/// Returns [`ChainError::Validation`] when a price is not usable as a
-/// log-return input, or when a window cannot be reduced or annualised.
+/// Returns [`ChainError::Validation`] when a window cannot be reduced or
+/// annualised. Prices are a precondition, not an error case — see
+/// [`log_returns`].
 fn expanding_window_volatilities(
     prices: &[Positive],
     timeframe: TimeFrame,
@@ -627,8 +635,14 @@ fn expanding_window_volatilities(
 ///
 /// # Errors
 ///
-/// Returns [`ChainError::Validation`] naming `method.prices` when a price is
-/// zero, negative, or otherwise not usable as a log-return input.
+/// Returns [`ChainError::Validation`] naming `method.prices` if upstream's
+/// log-return computation ever reports a failure.
+///
+/// It cannot report a **zero price**, and this is a precondition rather than an
+/// error case: the computation divides by the previous price and takes the log
+/// of the ratio, and both of those panic on a zero instead of returning.
+/// [`ensure_historical_series_covers_the_horizon`] is what makes that
+/// unreachable, and it has to run first.
 fn log_returns(prices: &[Positive]) -> Result<Vec<Decimal>, ChainError> {
     let returns = calculate_log_returns(prices).map_err(|e| ChainError::Validation {
         field: "method.prices".to_string(),
@@ -678,16 +692,29 @@ impl VolatilitySource {
         }
     }
 
-    /// What the client has to change.
-    fn remedy(self) -> &'static str {
+    /// What the client has to change to get under the upper bound.
+    fn remedy_too_high(self) -> &'static str {
         match self {
             Self::Model => "lower the model's volatility or shorten the horizon",
-            Self::Series => {
-                "the volatility is estimated from the series, so it is the series that has to \
-                 change — the request's volatility prices nothing for a historical walk"
-            }
+            Self::Series => Self::SERIES_REMEDY,
         }
     }
+
+    /// What the client has to change to get off zero. Telling a model to lower
+    /// its volatility here would make the zero *more* likely, not less.
+    fn remedy_zero(self) -> &'static str {
+        match self {
+            Self::Model => {
+                "raise the model's volatility, or change the parameters that let its variance \
+                 collapse to zero"
+            }
+            Self::Series => Self::SERIES_REMEDY,
+        }
+    }
+
+    /// The same either way: the request's `volatility` is not the input.
+    const SERIES_REMEDY: &'static str = "the volatility is estimated from the series, so it is the series that has to change — \
+         the request's volatility prices nothing for a historical walk";
 }
 
 /// Rejects a volatility no option chain can be priced at.
@@ -699,11 +726,13 @@ impl VolatilitySource {
 /// historical one, at whatever step crosses first. All of them become one 400
 /// naming a field, at tape build, where the whole path is in hand.
 ///
-/// The lower bound is not theoretical for a historical walk: three equal prices
-/// give two zero log returns, so the estimate over that window is exactly zero.
-/// The session layer already refuses a zero the *request* supplies; an
-/// estimated one has to be refused here, because this is the only gate it
-/// passes through.
+/// The lower bound is not theoretical for a historical walk, and it fires on
+/// **a flat opening, not only a flat series**: the estimate needs two returns,
+/// so points 0 and 1 carry the first computable one, and if the first three
+/// prices are equal that value is zero. A series that is flat for three ticks
+/// and lively afterwards is refused at step 0. v1 fails on the same input, from
+/// inside the chain builder and as a `500`; this is the same refusal with a
+/// status and a field a client can act on.
 ///
 /// Rejecting rather than clamping: a clamped path is a different tape, and the
 /// seed would no longer reproduce it.
@@ -712,18 +741,14 @@ fn reject_unpriceable_volatility(
     step: Option<usize>,
     source: VolatilitySource,
 ) -> Result<(), ChainError> {
-    let at = match step {
-        Some(step) => format!(" at step {step}"),
-        None => String::new(),
-    };
-
     if volatility.is_zero() {
         return Err(ChainError::Validation {
             field: source.field().to_string(),
             reason: format!(
-                "the volatility is zero{at}, and an option chain priced at zero volatility is a \
+                "the volatility is zero{}, and an option chain priced at zero volatility is a \
                  chain of zero-value options; {}",
-                source.remedy()
+                at_step(step),
+                source.remedy_zero()
             ),
         });
     }
@@ -735,11 +760,21 @@ fn reject_unpriceable_volatility(
     Err(ChainError::Validation {
         field: source.field().to_string(),
         reason: format!(
-            "the volatility reaches {volatility}{at}, above the 1.0 maximum an option chain can \
+            "the volatility reaches {volatility}{}, above the 1.0 maximum an option chain can \
              be priced at; {}",
-            source.remedy()
+            at_step(step),
+            source.remedy_too_high()
         ),
     })
+}
+
+/// Names the step in an error, when there is one. Built only on the failing
+/// path — the check above runs once per row.
+fn at_step(step: Option<usize>) -> String {
+    match step {
+        Some(step) => format!(" at step {step}"),
+        None => String::new(),
+    }
 }
 
 /// Builds one option chain from a simulation's shape and a point in the market
@@ -1710,9 +1745,13 @@ mod tests {
     /// A price series with a calm opening and a turbulent tail, so an expanding
     /// window has something to move over.
     fn volatile_series(length: usize) -> Vec<Positive> {
-        volatile_prices(length)
-            .into_iter()
-            .map(|price| match Positive::new(price) {
+        volatile_series_from(&volatile_prices(length))
+    }
+
+    fn volatile_series_from(prices: &[f64]) -> Vec<Positive> {
+        prices
+            .iter()
+            .map(|price| match Positive::new(*price) {
                 Ok(price) => price,
                 Err(error) => panic!("the test price must be positive: {error}"),
             })
@@ -1778,11 +1817,11 @@ mod tests {
     /// Later observations cannot change an earlier step's base volatility.
     ///
     /// The property the estimator turns on (#63): whatever prices a historical
-    /// step must be a function of that step and what came before it. Now that
-    /// the price is an estimate rather than a constant, this is where it is
-    /// load-bearing — it proves the estimate is taken over the *walked* prefix
-    /// and not the embedded series, the one place v2 could have diverged from
-    /// v1 while every other test still passed.
+    /// step must be a function of that step and what came before it. It held
+    /// when the answer was a constant and it holds now that it is an estimate,
+    /// which is the point — it is the invariant, not the implementation, that
+    /// this pins. The narrower claim, that no reduction reads past the horizon,
+    /// is the next test's.
     #[test]
     fn test_a_longer_series_leaves_earlier_steps_untouched() {
         // The observation count is a `u32` so the index converts to `f64`
@@ -1815,6 +1854,68 @@ mod tests {
                 "step {} replayed differently",
                 early.step
             );
+        }
+    }
+
+    /// Turbulence past the horizon cannot refuse a request whose own horizon is
+    /// calm.
+    ///
+    /// This is the case the reduction over the walked prefix exists for. The
+    /// tail here annualises far above the 1.0 a chain can be priced at, so
+    /// reducing the whole embedded series — which is what v1 does for its own
+    /// fallback — would 400 the simulation over observations it never reaches.
+    /// The calm prefix is priceable, so it builds.
+    #[test]
+    fn test_turbulence_past_the_horizon_cannot_refuse_a_calm_one() {
+        let mut prices: Vec<f64> = (0..10).map(|index| 5000.0 + f64::from(index)).collect();
+        prices.extend((0..10).map(|index| if index % 2 == 0 { 5000.0 } else { 5500.0 }));
+
+        let mut historical = request(10, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices: prices.clone(),
+            symbol: Some("SPX".to_string()),
+        };
+        let parameters = parameters(historical);
+
+        let tape = tape(&parameters);
+        assert_eq!(tape.len(), 10);
+
+        // The guard is only meaningful if the tail really is unpriceable: a
+        // whole-series reduction has to be the thing that would have failed.
+        let whole_series = volatile_series_from(&prices);
+        match historical_constant_volatility(&whole_series, TimeFrame::Day) {
+            Ok(volatility) => assert!(
+                volatility > Positive::ONE,
+                "the fixture's tail must be unpriceable for this test to mean anything, got \
+                 {volatility}"
+            ),
+            Err(error) => panic!("the fixture must reduce: {error}"),
+        }
+    }
+
+    /// A flat opening is enough to refuse the simulation, because points 0 and 1
+    /// carry the first computable estimate and three equal prices make that
+    /// estimate zero. The rest of the horizon never gets a say.
+    #[test]
+    fn test_a_flat_opening_is_refused_even_when_the_rest_moves() {
+        let mut prices = vec![5000.0, 5000.0, 5000.0];
+        prices.extend((0..10).map(|index| if index % 2 == 0 { 5050.0 } else { 4980.0 }));
+
+        let mut historical = request(8, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices,
+            symbol: Some("SPX".to_string()),
+        };
+        let parameters = parameters(historical);
+
+        match FactorTape::build(&parameters, &parameters.method) {
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "method.prices");
+                assert!(reason.contains("zero at step 0"), "{reason}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
         }
     }
 

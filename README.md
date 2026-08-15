@@ -145,9 +145,9 @@ window v1 uses, so from step 1 on the two agree on the volatility path as
 well as the price path. (Step 0 differs by construction: v1 prices its first
 chain at the request's constant.) The `volatility` you send prices none of
 its steps; the values that did are the per-step ones every snapshot and the
-`volatility` export report. A series with no dispersion, or one too
-turbulent to price a chain at, is refused when the simulation is first
-served.
+`volatility` export report. A series too turbulent to price a chain at, or
+one whose first three prices are equal, is refused when the simulation is
+first served.
 
 **Advanced steps can be filed in ClickHouse.** With
 `OCS_SNAPSHOT_PERSISTENCE_ENABLED` on, every step an advance serves is

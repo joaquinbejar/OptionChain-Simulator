@@ -67,7 +67,8 @@ pub struct CreateSimulationRequest {
     /// realized volatility of its own series up to that step, so this field
     /// prices nothing there (ADR 0001 §8.1). The values that did price the
     /// chains are the per-step ones in each snapshot's `base_volatility`. A
-    /// historical series whose realized volatility is zero or above `1.0`
+    /// historical series whose realized volatility is above `1.0`, or whose
+    /// first three prices are equal — which makes the opening estimate zero —
     /// cannot price a chain at all, and is refused when the simulation is first
     /// served rather than when it is created.
     pub volatility: f64,
