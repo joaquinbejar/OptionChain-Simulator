@@ -314,7 +314,7 @@ impl SnapshotCache {
     /// Creates a cache bounded by the documented default.
     ///
     /// The bound is configuration, not a constant of the domain: the service
-    /// passes the operator's value through [`SnapshotCache::with_capacity`].
+    /// passes the operator's values through [`SnapshotCache::with_bounds`].
     /// This constructor exists for tests and for a caller with nothing to say
     /// about it.
     #[must_use]
@@ -323,16 +323,6 @@ impl SnapshotCache {
             DEFAULT_MAX_CACHED_SNAPSHOTS,
             DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS,
         )
-    }
-
-    /// Creates a cache with an explicit bound.
-    ///
-    /// A capacity of zero is raised to one: a cache that can hold nothing would
-    /// make every `insert` a no-op and every `get` a miss, which is a
-    /// misconfiguration rather than an intent.
-    #[must_use]
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self::with_bounds(capacity, DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS)
     }
 
     /// Creates a cache bounded by both entries and contracts.
@@ -1007,6 +997,14 @@ mod tests {
 
     // ---- the snapshot cache -----------------------------------------------
 
+    /// A cache bounded by entries alone, for the tests about that bound.
+    ///
+    /// The contract budget is effectively unlimited here, so each test exercises
+    /// exactly the rule it names.
+    fn entry_bounded_cache(capacity: usize) -> SnapshotCache {
+        SnapshotCache::with_bounds(capacity, usize::MAX)
+    }
+
     fn cached_snapshot(step: usize) -> SeriesSnapshot {
         let simulated_at = match Utc.with_ymd_and_hms(2026, 1, 5, 14, 30, 0).single() {
             Some(instant) => instant,
@@ -1024,7 +1022,7 @@ mod tests {
     /// A cached snapshot is returned as stored.
     #[test]
     fn test_the_cache_returns_what_it_stored() {
-        let mut cache = SnapshotCache::with_capacity(4);
+        let mut cache = entry_bounded_cache(4);
         let simulation = Uuid::new_v4();
 
         assert!(cache.is_empty());
@@ -1042,7 +1040,7 @@ mod tests {
     /// accessed entry first.
     #[test]
     fn test_the_cache_evicts_the_least_recently_accessed_entry() {
-        let mut cache = SnapshotCache::with_capacity(2);
+        let mut cache = entry_bounded_cache(2);
         let simulation = Uuid::new_v4();
 
         cache.insert(simulation, cached_snapshot(0));
@@ -1128,7 +1126,7 @@ mod tests {
     /// simulation's entries can be dropped together.
     #[test]
     fn test_a_simulations_entries_can_be_evicted_together() {
-        let mut cache = SnapshotCache::with_capacity(8);
+        let mut cache = entry_bounded_cache(8);
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
 
@@ -1147,7 +1145,7 @@ mod tests {
     /// Re-inserting the same key replaces rather than duplicating.
     #[test]
     fn test_reinserting_a_key_replaces_the_entry() {
-        let mut cache = SnapshotCache::with_capacity(4);
+        let mut cache = entry_bounded_cache(4);
         let simulation = Uuid::new_v4();
 
         cache.insert(simulation, cached_snapshot(7));
@@ -1159,7 +1157,7 @@ mod tests {
     /// A capacity of zero is raised to one rather than making the cache inert.
     #[test]
     fn test_a_zero_capacity_is_raised_to_one() {
-        let mut cache = SnapshotCache::with_capacity(0);
+        let mut cache = entry_bounded_cache(0);
         let simulation = Uuid::new_v4();
 
         assert_eq!(cache.capacity(), 1);
@@ -1176,7 +1174,7 @@ mod tests {
         let parameters = parameters(request(3, reference_schedules()));
         let tape = tape(&parameters);
         let simulation = Uuid::new_v4();
-        let mut cache = SnapshotCache::with_capacity(1);
+        let mut cache = entry_bounded_cache(1);
 
         let original = snapshot(&parameters, &tape, 1);
         cache.insert(simulation, original.clone());
