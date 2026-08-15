@@ -83,10 +83,9 @@ use optionstratlib::chains::{
 use optionstratlib::simulation::steps::{Step, Xstep, Ystep};
 use optionstratlib::simulation::{WalkParams, WalkTypeAble};
 use optionstratlib::utils::TimeFrame;
-use optionstratlib::utils::others::calculate_log_returns;
 use optionstratlib::volatility::{adjust_volatility, constant_volatility};
 use positive::Positive;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, MathematicalOps};
 use tracing::{debug, instrument};
 
 /// One step of the market path: everything a snapshot needs that is not an
@@ -628,27 +627,65 @@ fn expanding_window_volatilities(
 
 /// The log returns of a price series as decimals.
 ///
-/// `Positive::ln` builds its result without revalidating, so a falling price
-/// yields a negative value wearing a `Positive`. Reading each one back as a
-/// `Decimal` — which is what upstream's own estimator does — recovers the true
-/// sign before any arithmetic touches it.
+/// Computed here rather than through upstream's `calculate_log_returns`, which
+/// divides two `Positive`s: that operator panics on a zero divisor **and on a
+/// ratio it cannot represent**, and it never returns an error for either. Both
+/// operands come straight from a request, and a `Decimal` holds about 29
+/// significant digits, so a series stepping from `1e-28` to `7e28` is a
+/// perfectly legal pair of strictly positive prices whose ratio is not
+/// representable. A request must not be able to abort the process, so the
+/// division is checked and an unrepresentable ratio is a rejection naming the
+/// field.
+///
+/// The log itself is taken on the `Decimal`, which is what recovers the true
+/// sign: `Positive::ln` builds its result without revalidating, so a falling
+/// price would otherwise yield a negative value wearing a `Positive`.
 ///
 /// # Errors
 ///
-/// Returns [`ChainError::Validation`] naming `method.prices` if upstream's
-/// log-return computation ever reports a failure.
-///
-/// It cannot report a **zero price**, and this is a precondition rather than an
-/// error case: the computation divides by the previous price and takes the log
-/// of the ratio, and both of those panic on a zero instead of returning.
-/// [`ensure_historical_series_covers_the_horizon`] is what makes that
-/// unreachable, and it has to run first.
+/// Returns [`ChainError::Validation`] naming `method.prices` when a ratio is
+/// not representable, when a price is zero, or when the log of a ratio is not
+/// representable.
 fn log_returns(prices: &[Positive]) -> Result<Vec<Decimal>, ChainError> {
-    let returns = calculate_log_returns(prices).map_err(|e| ChainError::Validation {
+    let unusable = |reason: String| ChainError::Validation {
         field: "method.prices".to_string(),
-        reason: format!("the historical series has no usable log returns: {e}"),
-    })?;
-    Ok(returns.iter().map(Positive::to_dec).collect())
+        reason,
+    };
+
+    let mut returns = Vec::with_capacity(prices.len().saturating_sub(1));
+    for (index, pair) in prices.windows(2).enumerate() {
+        let [previous, current] = pair else {
+            // `windows(2)` yields pairs; destructuring keeps it indexing-free.
+            continue;
+        };
+
+        let previous = previous.to_dec();
+        let current = current.to_dec();
+        if previous.is_zero() {
+            return Err(unusable(format!(
+                "the price at index {index} is zero, so the series has no return at {}",
+                index + 1
+            )));
+        }
+
+        let ratio = current.checked_div(previous).ok_or_else(|| {
+            unusable(format!(
+                "the price ratio at index {} is not representable ({current} over {previous})",
+                index + 1
+            ))
+        })?;
+
+        let log = ratio.checked_ln().ok_or_else(|| {
+            unusable(format!(
+                "the log return at index {} is not representable (ratio {ratio})",
+                index + 1
+            ))
+        })?;
+
+        returns.push(log);
+    }
+
+    Ok(returns)
 }
 
 /// Rescales a volatility from the series' timeframe to a year.
@@ -1783,6 +1820,82 @@ mod tests {
             symbol: Some("SPX".to_string()),
         };
         historical
+    }
+
+    /// A ratio too large to represent is a rejection, not a panic.
+    ///
+    /// Both prices are strictly positive and perfectly legal on their own; it
+    /// is the jump between them that no `Decimal` can hold. Upstream's
+    /// `calculate_log_returns` divides two `Positive`s, which aborts the
+    /// process on exactly this, so the estimator computes the ratio itself.
+    #[test]
+    fn test_an_unrepresentable_price_jump_is_rejected() {
+        let mut prices = vec![1e-28_f64; 4];
+        prices.push(7e28);
+        prices.extend(std::iter::repeat_n(7e28, 8));
+
+        let mut historical = request(4, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices,
+            symbol: Some("SPX".to_string()),
+        };
+        let parameters = parameters(historical);
+
+        match FactorTape::build(&parameters, &parameters.method) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "method.prices"),
+            other => panic!("an unrepresentable ratio must be a 400, got {other:?}"),
+        }
+    }
+
+    /// And the same in the other direction, where the ratio underflows to
+    /// something whose log is not representable.
+    #[test]
+    fn test_an_unrepresentable_price_collapse_is_rejected() {
+        let mut prices = vec![7e28_f64; 4];
+        prices.push(1e-28);
+        prices.extend(std::iter::repeat_n(1e-28, 8));
+
+        let mut historical = request(4, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices,
+            symbol: Some("SPX".to_string()),
+        };
+        let parameters = parameters(historical);
+
+        match FactorTape::build(&parameters, &parameters.method) {
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "method.prices"),
+            other => panic!("an unrepresentable ratio must be a 400, got {other:?}"),
+        }
+    }
+
+    /// A series a client could plausibly send still estimates, so the guard
+    /// above rejects the unrepresentable rather than the merely volatile.
+    ///
+    /// The ceiling on a priceable volatility is a separate check with its own
+    /// tests; this one only has to stay under it.
+    #[test]
+    fn test_a_violently_volatile_series_still_estimates() {
+        // Two percent daily moves, which annualise to about a third — well
+        // inside what a chain can be priced at, and far outside anything the
+        // ratio guard should touch.
+        let prices: Vec<f64> = (0..40)
+            .map(|i| 5000.0 * (1.0 + 0.02 * f64::from(i).sin()))
+            .collect();
+
+        let mut historical = request(20, brownian(0.18), 0.18);
+        historical.method = ApiWalkType::Historical {
+            timeframe: ApiTimeFrame::Day,
+            prices,
+            symbol: Some("SPX".to_string()),
+        };
+        let parameters = parameters(historical);
+
+        match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => assert_eq!(tape.len(), 20),
+            Err(error) => panic!("a two percent daily move is legal, got {error}"),
+        }
     }
 
     /// A historical tape replays the supplied series in order, with no

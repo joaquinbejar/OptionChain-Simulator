@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -49,6 +49,15 @@ pub struct SimulationManager {
     store: Arc<dyn SimulationStore>,
     config: SimulationV2Config,
     tapes: Arc<Mutex<HashMap<Uuid, TapeEntry>>>,
+    /// Tape builds currently running, one entry per simulation.
+    ///
+    /// Without it, N concurrent first reads of one simulation start N identical
+    /// builds — and a build is the one place a v2 request does seconds of CPU,
+    /// so the duplicates are not a wasted allocation, they are the machine.
+    /// `spawn_blocking` does not bound that: its pool grows to hundreds of
+    /// threads, so the cache would still be cold while every core was busy
+    /// filling it with the same answer.
+    builds: Mutex<HashMap<Uuid, broadcast::Sender<Result<FactorTape, String>>>>,
     snapshots: Mutex<SnapshotCache>,
     /// Where served snapshots are queued for filing, when the operator turned
     /// persistence on. `None` is the default and the whole feature is then
@@ -102,6 +111,7 @@ impl SimulationManager {
             store,
             config,
             tapes: Arc::new(Mutex::new(HashMap::new())),
+            builds: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(SnapshotCache::with_bounds(
                 config.max_cached_snapshots,
                 config.max_cached_snapshot_contracts,
@@ -488,6 +498,78 @@ impl SimulationManager {
             return Ok(tape);
         }
 
+        let id = simulation.id;
+
+        // Either this call owns the build or it waits on the one already
+        // running. Decided under the lock, so two callers cannot both decide
+        // they are the owner.
+        let subscription = {
+            let mut builds = match self.builds.lock() {
+                Ok(builds) => builds,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+
+            match builds.get(&id) {
+                Some(running) => Some(running.subscribe()),
+                None => {
+                    let (sender, _) = broadcast::channel(1);
+                    builds.insert(id, sender);
+                    None
+                }
+            }
+        };
+
+        if let Some(mut waiting) = subscription {
+            return match waiting.recv().await {
+                Ok(Ok(tape)) => Ok(tape),
+                // The owner failed; report what it reported rather than
+                // starting a second build that would fail the same way.
+                Ok(Err(reason)) => Err(ChainError::Internal(reason)),
+                // The owner's task died without publishing. Rare, and the
+                // honest answer is to build it here rather than hang.
+                Err(_) => self.build_tape(simulation).await,
+            };
+        }
+
+        let result = self.build_tape(simulation).await;
+
+        // Publish to whoever is waiting and stop being the owner, in that
+        // order: a caller that subscribes after the removal misses the
+        // broadcast, retries, and finds the tape in the cache.
+        let sender = {
+            let mut builds = match self.builds.lock() {
+                Ok(builds) => builds,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            builds.remove(&id)
+        };
+        if let Some(sender) = sender {
+            let published = match &result {
+                Ok(tape) => Ok(tape.clone()),
+                Err(error) => Err(error.to_string()),
+            };
+            // An error means nobody was waiting, which is the common case.
+            let _ = sender.send(published);
+        }
+
+        result
+    }
+
+    /// Builds a tape off the runtime and files it.
+    ///
+    /// `FactorTape::build` is pure and synchronous, and it is the one place a
+    /// v2 request does real CPU work up front: a historical walk estimates a
+    /// volatility per step, which at the 10 000-step cap measures over three
+    /// seconds. Left on a worker it would stall every other request that worker
+    /// holds, so it goes to the blocking pool, exactly as the export path
+    /// already does with the same call.
+    ///
+    /// The result is filed **inside** the blocking task rather than after the
+    /// await. A `spawn_blocking` task cannot be cancelled, but awaiting it can:
+    /// a client that disconnects or times out mid-build drops that future, and
+    /// filing afterwards would throw away a build that ran to completion
+    /// anyway.
+    async fn build_tape(&self, simulation: &SessionV2) -> Result<FactorTape, ChainError> {
         let parameters = simulation.parameters.clone();
         let id = simulation.id;
         let tapes = Arc::clone(&self.tapes);
@@ -817,6 +899,47 @@ mod tests {
                 left.step
             );
         }
+    }
+
+    /// Concurrent first reads of one simulation share a single build.
+    ///
+    /// The build is the one place a v2 request does seconds of CPU, so N
+    /// concurrent peeks starting N identical builds is not wasted allocation,
+    /// it is the machine. What proves the sharing is the snapshots: every
+    /// caller gets the same tape, and only one entry is cached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_first_reads_share_one_build() {
+        let manager = Arc::new(manager());
+        let simulation = created(&manager, 3).await;
+
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let manager = Arc::clone(&manager);
+            let id = simulation.id;
+            readers.push(tokio::spawn(async move { manager.peek(id).await }));
+        }
+
+        let mut snapshots = Vec::new();
+        for reader in readers {
+            match reader.await {
+                Ok(Ok((_, snapshot))) => snapshots.push(snapshot),
+                Ok(Err(error)) => panic!("every reader must be served: {error}"),
+                Err(error) => panic!("a reader panicked: {error}"),
+            }
+        }
+
+        assert_eq!(snapshots.len(), 8);
+        for snapshot in &snapshots {
+            assert_eq!(
+                snapshot, &snapshots[0],
+                "every reader must see the same tape"
+            );
+        }
+        assert_eq!(
+            manager.cached_tapes(),
+            1,
+            "eight readers of one simulation must leave one tape"
+        );
     }
 
     /// An advance files exactly the step it served.
