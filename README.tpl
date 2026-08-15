@@ -2,7 +2,7 @@
 <img src="https://raw.githubusercontent.com/joaquinbejar/OptionChain-Simulator/refs/heads/main/doc/images/logo.png" alt="optionchain_simulator" style="width: 100%; height: 100%;">
 </div>
 
-[![Dual License](https://img.shields.io/badge/license-MIT%20and%20Apache%202.0-blue)](./LICENSE)
+[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Crates.io](https://img.shields.io/crates/v/optionchain_simulator.svg)](https://crates.io/crates/optionchain_simulator)
 [![Downloads](https://img.shields.io/crates/d/optionchain_simulator.svg)](https://crates.io/crates/optionchain_simulator)
 [![Stars](https://img.shields.io/github/stars/joaquinbejar/OptionChain-Simulator.svg)](https://github.com/joaquinbejar/OptionChain-Simulator/stargazers)
@@ -31,12 +31,16 @@ We welcome contributions to this project! If you would like to contribute, pleas
 
 If you have any questions, issues, or would like to provide feedback, please feel free to contact the project maintainer:
 
-**Joaquín Béjar García**
-- Email: jb@taunais.com
-- GitHub: [joaquinbejar](https://github.com/joaquinbejar)
+### **Contact Information**
+
+- **Author**: Joaquín Béjar García
+- **Email**: jb@taunais.com
+- **Telegram**: [@joaquin_bejar](https://t.me/joaquin_bejar)
+- **Repository**: <https://github.com/joaquinbejar/OptionChain-Simulator>
+- **Documentation**: <https://docs.rs/optionchain_simulator>
 
 We appreciate your interest and look forward to your contributions!
 
 ## ✍️ License
 
-Licensed under MIT license
+Licensed under the MIT license. See [LICENSE](./LICENSE) for the full text.
