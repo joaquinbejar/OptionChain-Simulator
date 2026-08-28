@@ -272,6 +272,7 @@ mod tests {
             ("/api/v1/chain/step", "post"),
             ("/api/v2/simulations/{id}/snapshot", "get"),
             ("/api/v2/simulations/{id}/step", "post"),
+            ("/api/v2/simulations/{id}/export", "get"),
         ];
 
         for (path, method) in serving {
@@ -500,6 +501,7 @@ mod tests {
             ("/api/v1/chain/step", "post"),
             ("/api/v2/simulations/{id}/snapshot", "get"),
             ("/api/v2/simulations/{id}/step", "post"),
+            ("/api/v2/simulations/{id}/export", "get"),
         ] {
             let bad_request = parsed
                 .get("paths")
