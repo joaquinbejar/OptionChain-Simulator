@@ -44,8 +44,11 @@ const V1_CREATE_REQUEST: &str = r#"{
   "spread": 0.02
 }"#;
 
-/// A stored v1 `SimulationParameters` document, in the shape the current
-/// binary writes it.
+/// A stored v1 `SimulationParameters` document, in the numeric shape binaries
+/// built against `positive` 0.5 wrote it. Since `positive` 0.6 a `Positive`
+/// serialises as a decimal string, so this fixture is now a second
+/// stored-compatibility case: the contract below asserts the key set, and the
+/// document still has to load.
 const V1_STORED_PARAMETERS: &str = r#"{
   "symbol": "AAPL",
   "steps": 20,

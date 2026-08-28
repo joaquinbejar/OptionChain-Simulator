@@ -538,18 +538,21 @@ fn historical_constant_volatility(
 ///
 /// # Why it composes rather than copies
 ///
-/// Upstream's estimator is private to its driver, but its three ingredients are
-/// public, and upstream's own comment records that its prefix-sum variance is
-/// *algebraically identical to the two-pass form in `constant_volatility`*. So
-/// the window below writes the indexing policy and the backfill and **no
-/// mathematics**: there is no second copy of an upstream kernel in this repo to
-/// drift out of sync, which is the property the module docs above claim.
+/// Upstream's three ingredients are public, and upstream's own comment records
+/// that its prefix-sum variance is *algebraically identical to the two-pass
+/// form in `constant_volatility`*. So the window below writes the indexing
+/// policy and the backfill and **no mathematics**: there is no second copy of
+/// an upstream kernel in this repo to drift out of sync, which is the property
+/// the module docs above claim.
 ///
 /// The cost of composing is quadratic time — `constant_volatility` reduces a
-/// whole slice and upstream's prefix-sum recurrence is not reachable from
-/// outside — where upstream is linear. It runs once per tape and only for
-/// `Historical`; the nine synthetic models never reach it. optionstratlib#423
-/// asks for the estimator to be exposed, which would make this a single call.
+/// whole slice, where upstream's prefix-sum recurrence is linear. It runs once
+/// per tape and only for `Historical`; the nine synthetic models never reach
+/// it. optionstratlib#423 asked for the estimator itself to be exposed, and
+/// 0.20 did expose it as `simulation::expanding_window_vols`, which would
+/// collapse this to a single call and erase the quadratic term. Making that
+/// swap is a change to the priced tape's provenance, so it belongs to its own
+/// issue with its own same-seed comparison, not to a dependency bump.
 ///
 /// # Indexing
 ///
@@ -637,9 +640,11 @@ fn expanding_window_volatilities(
 /// division is checked and an unrepresentable ratio is a rejection naming the
 /// field.
 ///
-/// The log itself is taken on the `Decimal`, which is what recovers the true
-/// sign: `Positive::ln` builds its result without revalidating, so a falling
-/// price would otherwise yield a negative value wearing a `Positive`.
+/// The log itself is taken on the `Decimal` rather than on the ratio's
+/// `Positive`. Since `positive` 0.6 `Positive::ln` returns a `Decimal` and so
+/// carries the sign correctly on its own, but taking it here keeps the checked
+/// division and the checked log in one expression, each with its own
+/// rejection.
 ///
 /// # Errors
 ///

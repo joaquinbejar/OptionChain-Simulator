@@ -48,7 +48,16 @@ pub fn calculate_required_duration(timeframe: &TimeFrame, steps: usize) -> Durat
         TimeFrame::Month => Duration::days(steps as i64 * 30), // Approximation
         TimeFrame::Quarter => Duration::days(steps as i64 * 90), // Approximation
         TimeFrame::Year => Duration::days(steps as i64 * 365),
-        TimeFrame::Custom(p) => Duration::days(p.to_i64()),
+        // Upstream's `Custom` carries periods per year; this arm has always
+        // read it as a day count, and that reading is left as it stands. What
+        // changes is the failure mode: `Positive::to_i64` panicked above
+        // `i64::MAX` and is deprecated in `positive` 0.6, so a value that does
+        // not fit an `i64` — or a day count `chrono` cannot represent — now
+        // clamps to the widest representable duration.
+        TimeFrame::Custom(p) => p
+            .to_i64_checked()
+            .and_then(Duration::try_days)
+            .unwrap_or(Duration::MAX),
     }
 }
 
@@ -93,11 +102,77 @@ mod tests {
     use chrono::{Datelike, TimeZone, Utc};
     use mockall::predicate::*;
     use mockall::*;
+    use positive::pos_or_panic;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     mock! {
         pub Row<'a> {
             fn get<T: 'static>(&self, field_name: &str) -> Result<T, ChainError>;
         }
+    }
+
+    /// `TimeFrame::Custom` carries a value straight off the REST surface
+    /// (`ApiTimeFrame::Custom(f64)`), validated only as finite, strictly
+    /// positive and within `Decimal`. A value too large for an `i64` used to
+    /// abort the process inside the deprecated `Positive::to_i64`; it now
+    /// clamps to the widest duration `chrono` can hold.
+    #[test]
+    fn test_calculate_required_duration_custom_beyond_i64_clamps() {
+        let timeframe = TimeFrame::Custom(pos_or_panic!(1e20));
+
+        assert_eq!(calculate_required_duration(&timeframe, 1), Duration::MAX);
+    }
+
+    /// The second clamp leg: the day count fits an `i64` but not a
+    /// `chrono::Duration`, which tops out near 1.07e11 days. This one used to
+    /// panic one layer lower, inside `Duration::days`.
+    #[test]
+    fn test_calculate_required_duration_custom_beyond_chrono_clamps() {
+        let timeframe = TimeFrame::Custom(pos_or_panic!(5e11));
+
+        assert_eq!(calculate_required_duration(&timeframe, 1), Duration::MAX);
+    }
+
+    /// A custom timeframe small enough to represent is still read as a day
+    /// count, unchanged by the clamp.
+    #[test]
+    fn test_calculate_required_duration_custom_within_range_is_days() {
+        let timeframe = TimeFrame::Custom(pos_or_panic!(7.0));
+
+        assert_eq!(
+            calculate_required_duration(&timeframe, 1),
+            Duration::days(7)
+        );
+    }
+
+    /// The clamp routes into the error channel that already existed: no real
+    /// date range can cover `Duration::MAX`, so the request is rejected by
+    /// name instead of aborting the process.
+    #[test]
+    fn test_select_random_date_with_an_unrepresentable_custom_is_rejected() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let min_date = match Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).single() {
+            Some(date) => date,
+            None => panic!("the fixture date must resolve"),
+        };
+        let max_date = match Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).single() {
+            Some(date) => date,
+            None => panic!("the fixture date must resolve"),
+        };
+
+        let result = select_random_date(
+            &mut rng,
+            min_date,
+            max_date,
+            &TimeFrame::Custom(pos_or_panic!(1e20)),
+            1,
+        );
+
+        assert!(
+            matches!(result, Err(ChainError::NotEnoughData(_))),
+            "an unrepresentable custom timeframe must be rejected, got {result:?}"
+        );
     }
 
     #[test]

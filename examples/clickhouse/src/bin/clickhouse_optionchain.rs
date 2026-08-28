@@ -211,11 +211,9 @@ async fn run_simulation_steps(
 fn calculate_historical_volatility(
     prices: &[Positive],
 ) -> Result<Positive, Box<dyn std::error::Error>> {
-    let log_return = calculate_log_returns(prices).unwrap_or_default();
-    let log_return_dec = log_return
-        .iter()
-        .map(|r| r.to_dec())
-        .collect::<Vec<Decimal>>();
+    // `calculate_log_returns` returns the returns as `Decimal` since
+    // optionstratlib 0.20, so they feed `constant_volatility` directly.
+    let log_return_dec: Vec<Decimal> = calculate_log_returns(prices)?;
 
     let volatility = constant_volatility(&log_return_dec)?;
     let annualized_volatility = annualized_volatility(volatility, TimeFrame::Day)?.round_to(3);

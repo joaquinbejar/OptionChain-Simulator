@@ -659,6 +659,76 @@ mod tests {
         tape
     }
 
+    /// A session whose dividend yield is non-zero, at a fixed seed, with its
+    /// greek columns pinned to literals.
+    ///
+    /// TAPE-BREAKING for the greek columns relative to any release pinned to
+    /// optionstratlib 0.18: upstream #426 made `d1` / `d2` carry the cost of
+    /// carry `b = r - q` rather than the bare risk-free rate, so `delta_call`,
+    /// `delta_put` and `gamma` moved for every session with a non-zero
+    /// `dividend_yield`. Bid, ask and mid are unaffected — the pricing kernels
+    /// already discounted the yield — and so are the seeded price path and any
+    /// session whose yield is zero.
+    ///
+    /// Every other reproducibility test in this crate compares two runs of the
+    /// SAME binary, which is exactly why none of them caught that shift. This
+    /// one holds the numbers themselves, so the next upstream bump has to
+    /// declare what it moved instead of moving it silently.
+    #[tokio::test]
+    async fn test_greek_columns_are_pinned_at_a_non_zero_dividend_yield() {
+        let mut session = create_test_session(Some(Uuid::new_v4()));
+        session.parameters.dividend_yield = pos_or_panic!(0.015);
+        session.parameters.risk_free_rate = dec!(0.04);
+        session.parameters.seed = Some(20260713);
+
+        let simulator = Simulator {
+            simulation_cache: Arc::new(Mutex::new(HashMap::new())),
+            database_repo: None,
+        };
+
+        let chain = match simulator.simulate_next_step(&mut session).await {
+            Ok(chain) => chain,
+            Err(error) => panic!("the first step must produce a chain: {error}"),
+        };
+        assert_eq!(chain.underlying_price, pos_or_panic!(100.0));
+
+        // The money, where the carry term bites hardest.
+        let atm = match chain
+            .iter()
+            .find(|contract| contract.strike_price == pos_or_panic!(100.0))
+        {
+            Some(contract) => contract,
+            None => panic!("the chain must carry the at-the-money strike"),
+        };
+        assert_eq!(atm.delta_call, Some(dec!(0.5250683903310066130344888912)));
+        assert_eq!(atm.delta_put, Some(dec!(-0.4736994926369290798684617156)));
+        assert_eq!(atm.gamma, Some(dec!(0.0693468762175267532729472986)));
+
+        // A wing, so the pin is not a single point on the curve.
+        let wing = match chain
+            .iter()
+            .find(|contract| contract.strike_price == pos_or_panic!(110.0))
+        {
+            Some(contract) => contract,
+            None => panic!("the chain must carry the 110 strike"),
+        };
+        assert_eq!(wing.delta_call, Some(dec!(0.0523243367419569481464854646)));
+        assert_eq!(wing.delta_put, Some(dec!(-0.9464435462259787447564651422)));
+        assert_eq!(wing.gamma, Some(dec!(0.0189194837294070818706825884)));
+
+        // The call and put deltas sum to `e^{-qT}`, not to 1: the dividend
+        // yield is genuinely in the numbers, which is what makes this a test
+        // of the carry term rather than of an arbitrary chain.
+        let parity = match (atm.delta_call, atm.delta_put) {
+            (Some(call), Some(put)) => call - put,
+            _ => panic!("the at-the-money strike must carry both deltas"),
+        };
+        assert!(
+            parity < Decimal::ONE,
+            "call - put must fall short of 1 by the dividend discount, got {parity}"
+        );
+    }
+
     #[tokio::test]
     async fn test_same_seed_produces_identical_tape() {
         // Complete-tape test: two sessions with identical parameters and the

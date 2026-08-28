@@ -893,6 +893,7 @@ mod tests {
     use crate::domain::expiry::{ExpiryRule, ExpiryRuleKind, MAX_TARGET_COUNT};
     use chrono::{TimeZone, Weekday};
     use positive::pos_or_panic;
+    use rust_decimal_macros::dec;
 
     /// The reference configuration from ADR 0001 §14.1, as a request.
     /// Two rules at the per-rule cap: the most expirations a schedule can keep
@@ -1419,33 +1420,34 @@ mod tests {
             // `Positive` admits zero, so these three survive the type and have
             // to be rejected by the validator: a zero price or volatility is a
             // chain of worthless options, and a zero interval collapses every
-            // strike onto one.
+            // strike onto one. Every `Positive` is quoted since `positive` 0.6
+            // writes the exact decimal as a string.
             (
-                r#""initial_price":5000"#,
-                r#""initial_price":0"#,
+                r#""initial_price":"5000""#,
+                r#""initial_price":"0""#,
                 "initial_price",
             ),
             (
-                r#""tzdb_version":"2025b","initial_price":5000,"volatility":0.18"#,
-                r#""tzdb_version":"2025b","initial_price":5000,"volatility":0"#,
+                r#""tzdb_version":"2025b","initial_price":"5000","volatility":"0.18""#,
+                r#""tzdb_version":"2025b","initial_price":"5000","volatility":"0""#,
                 "volatility",
             ),
             (
-                r#""strike_interval":25"#,
-                r#""strike_interval":0"#,
+                r#""strike_interval":"25""#,
+                r#""strike_interval":"0""#,
                 "strike_interval",
             ),
             // The walk's own invariants are not re-derived here: the stored
             // method round-trips through the same mirror the request path
             // validates with, so a `dt` of zero is caught by that check.
-            (r#""dt":0.004"#, r#""dt":0.0"#, "dt"),
+            (r#""dt":"0.004""#, r#""dt":"0.0""#, "dt"),
             // A simulation has exactly one base volatility, and the check that
             // enforces it has to hold on the stored path too — otherwise a
             // document can carry a top-level value the walk never uses. The
             // anchor is needed because "volatility":0.18 appears twice.
             (
-                r#""tzdb_version":"2025b","initial_price":5000,"volatility":0.18"#,
-                r#""tzdb_version":"2025b","initial_price":5000,"volatility":0.25"#,
+                r#""tzdb_version":"2025b","initial_price":"5000","volatility":"0.18""#,
+                r#""tzdb_version":"2025b","initial_price":"5000","volatility":"0.25""#,
                 "volatility",
             ),
         ];
@@ -1730,6 +1732,150 @@ mod tests {
         match simulation.simulated_at() {
             Ok(at) => assert_eq!(at, instant(2026, 1, 7, 14, 30)),
             Err(error) => panic!("must resolve: {error}"),
+        }
+    }
+
+    /// The same wire change on v2's largest stored payload: a `Historical`
+    /// method's `prices: Vec<Positive>`, written as bare JSON numbers.
+    ///
+    /// `Historical` carries no model volatility, so it is also the variant
+    /// that skips the "one base volatility" cross-check — the load has to
+    /// succeed for a different reason than the synthetic models do.
+    #[test]
+    fn test_a_stored_historical_price_series_still_loads() {
+        const STORED_BY_AN_OLDER_BINARY: &str = concat!(
+            r#"{"id":"6ba7b813-9dad-11d1-80b4-00c04fd430c8","schema_version":1,"#,
+            r#""created_at":{"secs_since_epoch":1735689600,"nanos_since_epoch":0},"#,
+            r#""updated_at":{"secs_since_epoch":1735689660,"nanos_since_epoch":0},"#,
+            r#""parameters":{"symbol":"SPX","steps":4,"#,
+            r#""effective_start":"2026-01-05T14:30:00Z","step_interval_seconds":86400,"#,
+            r#""time_frame":"Day","schedule":{"calendar":"weekdays_v1","#,
+            r#""timezone":"America/New_York","expiration_time":"17:00:00","rules":["#,
+            r#"{"rule_id":"zero_dte","kind":"daily","target_count":1}]},"#,
+            r#""tzdb_version":"2025b","initial_price":5000,"volatility":0.18,"#,
+            r#""risk_free_rate":"0.04","dividend_yield":0.012,"#,
+            r#""method":{"Historical":{"timeframe":"Day","#,
+            r#""prices":[5000,5012.5,4987.25,5030],"symbol":"SPX"}},"#,
+            r#""chain_size":15,"strike_interval":25,"skew_slope":"-0.2","#,
+            r#""smile_curve":"0.4","spread":0.02,"seed":42},"#,
+            r#""current_step":0,"total_steps":4,"state":"Initialized","version":0}"#,
+        );
+
+        let simulation: SessionV2 = match serde_json::from_str(STORED_BY_AN_OLDER_BINARY) {
+            Ok(simulation) => simulation,
+            Err(error) => panic!("a stored historical series must load: {error}"),
+        };
+
+        match simulation.parameters.method {
+            SimulationMethod::Historical {
+                ref timeframe,
+                ref prices,
+                ..
+            } => {
+                assert_eq!(*timeframe, TimeFrame::Day);
+                assert_eq!(prices.len(), 4);
+                assert_eq!(prices[0], pos_or_panic!(5000.0));
+                assert_eq!(prices[1], pos_or_panic!(5012.5));
+                assert_eq!(prices[2], pos_or_panic!(4987.25));
+                assert_eq!(prices[3], pos_or_panic!(5030.0));
+            }
+            ref other => panic!("the stored method must survive the load, got {other:?}"),
+        }
+        assert_eq!(simulation.parameters.seed, 42);
+
+        let rewritten = match serde_json::to_string(&simulation) {
+            Ok(rewritten) => rewritten,
+            Err(error) => panic!("must re-serialize: {error}"),
+        };
+        assert!(
+            rewritten.contains(r#""prices":["5000","5012.5","4987.25","5030"]"#),
+            "a rewritten series must carry the 0.6 string form, got {rewritten}"
+        );
+        match serde_json::from_str::<SessionV2>(&rewritten) {
+            Ok(reloaded) => assert_eq!(reloaded.parameters.method, simulation.parameters.method),
+            Err(error) => panic!("the rewritten simulation must load: {error}"),
+        }
+    }
+
+    /// Stored-simulation compatibility across the `positive` 0.6 wire change.
+    ///
+    /// Up to `positive` 0.5 a `Positive` serialised as a JSON number; since 0.6
+    /// it serialises as its exact decimal in a string. Simulations written by
+    /// an earlier binary sit in Redis in the numeric form and must keep
+    /// loading, validation and all — the v2 store reads them back through this
+    /// same `Deserialize`. The document below is that numeric form, value for
+    /// value as `positive` 0.5.1 emitted it.
+    #[test]
+    fn test_a_simulation_written_before_positive_0_6_still_loads() {
+        const STORED_BY_AN_OLDER_BINARY: &str = concat!(
+            r#"{"id":"6ba7b811-9dad-11d1-80b4-00c04fd430c8","schema_version":1,"#,
+            r#""created_at":{"secs_since_epoch":1735689600,"nanos_since_epoch":0},"#,
+            r#""updated_at":{"secs_since_epoch":1735689660,"nanos_since_epoch":0},"#,
+            r#""parameters":{"symbol":"SPX","steps":500,"#,
+            r#""effective_start":"2026-01-05T14:30:00Z","step_interval_seconds":86400,"#,
+            r#""time_frame":"Day","schedule":{"calendar":"weekdays_v1","#,
+            r#""timezone":"America/New_York","expiration_time":"17:00:00","rules":["#,
+            r#"{"rule_id":"monthlies","kind":"monthly","target_count":12,"weekday":"Fri"},"#,
+            r#"{"rule_id":"weeklies","kind":"weekly","target_count":3,"#,
+            r#""weekdays":["Mon","Wed","Fri"]},"#,
+            r#"{"rule_id":"zero_dte","kind":"daily","target_count":1}]},"#,
+            r#""tzdb_version":"2025b","initial_price":5000,"volatility":0.18,"#,
+            r#""risk_free_rate":"0.04","dividend_yield":0.012,"#,
+            r#""method":{"GeometricBrownian":{"dt":0.004,"drift":"0.05","volatility":0.18}},"#,
+            r#""chain_size":15,"strike_interval":25,"skew_slope":"-0.2","#,
+            r#""smile_curve":"0.4","spread":0.02,"seed":42},"#,
+            r#""current_step":7,"total_steps":500,"state":"InProgress","version":9}"#,
+        );
+
+        let simulation: SessionV2 = match serde_json::from_str(STORED_BY_AN_OLDER_BINARY) {
+            Ok(simulation) => simulation,
+            Err(error) => panic!("a simulation stored by an older binary must load: {error}"),
+        };
+
+        assert_eq!(simulation.parameters.initial_price, pos_or_panic!(5000.0));
+        assert_eq!(simulation.parameters.volatility, pos_or_panic!(0.18));
+        assert_eq!(simulation.parameters.dividend_yield, pos_or_panic!(0.012));
+        assert_eq!(
+            simulation.parameters.strike_interval,
+            Some(pos_or_panic!(25.0))
+        );
+        assert_eq!(simulation.parameters.spread, Some(pos_or_panic!(0.02)));
+        match simulation.parameters.method {
+            SimulationMethod::GeometricBrownian {
+                dt,
+                drift,
+                volatility,
+            } => {
+                assert_eq!(dt, pos_or_panic!(0.004));
+                assert_eq!(drift, dec!(0.05));
+                assert_eq!(volatility, pos_or_panic!(0.18));
+            }
+            ref other => panic!("the stored method must survive the load, got {other:?}"),
+        }
+
+        // The seed is the reproducibility contract; a stored simulation that
+        // came back with a different one would serve a different tape.
+        assert_eq!(simulation.parameters.seed, 42);
+        assert_eq!(simulation.current_step, 7);
+        assert_eq!(simulation.state, SessionState::InProgress);
+        assert_eq!(simulation.version, 9);
+
+        // Rewriting it stores the 0.6 shape, which the same reader accepts, so
+        // the store converges on one form with no migration step.
+        let rewritten = match serde_json::to_string(&simulation) {
+            Ok(rewritten) => rewritten,
+            Err(error) => panic!("must re-serialize: {error}"),
+        };
+        assert!(
+            rewritten.contains(r#""initial_price":"5000""#),
+            "a rewritten simulation must carry the 0.6 string form, got {rewritten}"
+        );
+        match serde_json::from_str::<SessionV2>(&rewritten) {
+            Ok(reloaded) => assert_eq!(
+                reloaded.parameters.initial_price,
+                simulation.parameters.initial_price
+            ),
+            Err(error) => panic!("the rewritten simulation must load: {error}"),
         }
     }
 }
