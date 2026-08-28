@@ -51,6 +51,10 @@ services:
   backend:
     container_name: backend
     restart: unless-stopped
+    # The `/ready` healthcheck, the port mapping and OCS_BIND_ADDRESS come from
+    # Docker/docker-compose.yml: compose merges an override service with the
+    # base one key by key, so repeating them here would only create two places
+    # for them to disagree.
     depends_on:
       - redis
       - mongodb

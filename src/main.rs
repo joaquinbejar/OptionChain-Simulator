@@ -67,8 +67,9 @@
 
 use optionchain_simulator::api::start_server;
 use optionchain_simulator::infrastructure::{
-    ClickHouseSnapshotRepository, MetricsCollector, RedisClient, RedisConfig, ServerConfig,
-    SimulationV2Config, init_mongodb, resolve_log_level_from_env,
+    ClickHouseSnapshotRepository, DependencyProbe, MetricsCollector, MongoDbProbe, Readiness,
+    RedisClient, RedisConfig, RedisProbe, ServerConfig, SimulationV2Config, WarehouseProbe,
+    init_mongodb, resolve_log_level_from_env,
 };
 use optionchain_simulator::session::{
     InRedisSessionStore, InRedisSimulationStore, SessionManager, SimulationManager,
@@ -162,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Connecting to Redis at {}", redis_config);
     let redis_client = Arc::new(RedisClient::new(redis_config).await?);
     let redis_client_v2 = Arc::clone(&redis_client);
+    let redis_client_probe = Arc::clone(&redis_client);
     let store = Arc::new(InRedisSessionStore::new(
         redis_client,
         Some("optionchain:session:".to_string()), // Custom key prefix
@@ -238,6 +240,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // What `GET /ready` will check: the services THIS process opened, so an
+    // instance is never reported unready over a dependency it does not use.
+    // Redis and MongoDB are always there — startup aborts without them — and
+    // the warehouse only when snapshot persistence is on.
+    let mut probes: Vec<Arc<dyn DependencyProbe>> = vec![
+        Arc::new(RedisProbe::new(redis_client_probe)),
+        Arc::new(MongoDbProbe::new(Arc::clone(&mongodb_repository))),
+    ];
+    if let Some(warehouse) = simulation_manager.warehouse() {
+        probes.push(Arc::new(WarehouseProbe::new(warehouse)));
+    }
+    let readiness = Readiness::new(probes);
+
     let listen_on = server.address;
     let port = server.port;
 
@@ -262,6 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mongodb_repository,
         listen_on,
         port,
+        readiness,
     )
     .await
     {

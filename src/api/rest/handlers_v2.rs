@@ -795,6 +795,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::infrastructure::SimulationSnapshotRepository for AcceptingWarehouse {
+        /// No server behind it; reachable exactly as long as the process is.
+        async fn ping(&self) -> Result<(), ChainError> {
+            Ok(())
+        }
+
         async fn persist(
             &self,
             _record: crate::infrastructure::SnapshotRecord,

@@ -198,6 +198,26 @@ The OptionChain-Simulator exposes the following REST API endpoints:
 | PUT    | /api/v1/chain      | Replace Session     | Completely replaces session parameters                           |
 | PATCH  | /api/v1/chain      | Update Parameters   | Updates specific session parameters                              |
 | DELETE | /api/v1/chain      | Delete Session      | Terminates and removes a session                                 |
+| GET    | /health            | Liveness            | The process is alive; always 200, no dependency touched          |
+| GET    | /ready             | Readiness           | 200 when every configured dependency answers, 503 naming those that did not |
+
+#### Probes
+
+The two answer different questions, and conflating them is how one outage
+becomes two. `/health` says the process is alive: it touches nothing, so a
+Redis hiccup can never get a healthy instance restarted. `/ready` says this
+instance can take work, and it asks: Redis and MongoDB always, ClickHouse
+when snapshot persistence is enabled, each under a 2-second bound and all of
+them at once. A 503 body names every dependency and why the failing ones
+failed, credential-redacted. Nothing is cached, so an instance whose Redis
+came back reports itself ready again without a restart.
+
+Both are unversioned, unauthenticated, and excluded from the request
+metrics: an orchestrator polling forever would otherwise add a constant to
+every series and a flood of 503s to the error series while a dependency is
+down. `Docker/docker-compose.yml` points its backend healthcheck at
+`/ready`, so `docker compose up -d` reports the service healthy only once it
+can actually serve.
 
 **Step cursor semantics (serve-then-advance):** `current_step` is the 0-based index
 of the NEXT snapshot to serve. `POST /api/v1/chain/step` serves the snapshot at the

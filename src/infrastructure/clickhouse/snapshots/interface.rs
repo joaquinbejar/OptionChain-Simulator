@@ -154,6 +154,20 @@ pub trait SimulationSnapshotRepository: Send + Sync {
         &self,
         query: ContractSeriesQuery,
     ) -> Result<Vec<ContractQuote>, ChainError>;
+
+    /// Asks the warehouse whether it is there, for the readiness probe.
+    ///
+    /// Required rather than defaulted to `Ok(())`: a default would mean an
+    /// implementation that forgot to answer this reports ITSELF reachable, and
+    /// `/ready` would then serve a 200 on the strength of a warehouse nobody
+    /// asked. An implementation with no server behind it says `Ok(())`
+    /// explicitly, which is the truth for it and a decision for the next one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::ClickHouseError`] when the warehouse is
+    /// unreachable or does not answer in time.
+    async fn ping(&self) -> Result<(), ChainError>;
 }
 
 #[cfg(test)]
@@ -180,6 +194,11 @@ mod tests {
 
     #[async_trait]
     impl SimulationSnapshotRepository for InMemorySnapshotRepository {
+        /// No server behind it; reachable exactly as long as the process is.
+        async fn ping(&self) -> Result<(), ChainError> {
+            Ok(())
+        }
+
         async fn persist(&self, record: SnapshotRecord) -> Result<(), ChainError> {
             record.validate()?;
             let key = (record.simulation, record.generation, record.step);

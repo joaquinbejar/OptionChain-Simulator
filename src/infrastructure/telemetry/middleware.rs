@@ -27,6 +27,7 @@ use std::time::Instant;
 ///
 pub struct MetricsMiddleware {
     metrics: Arc<MetricsCollector>,
+    excluded_paths: &'static [&'static str],
 }
 
 impl MetricsMiddleware {
@@ -42,7 +43,26 @@ impl MetricsMiddleware {
     /// A new instance of the struct containing the provided `MetricsCollector`.
     ///
     pub fn new(metrics: Arc<MetricsCollector>) -> Self {
-        Self { metrics }
+        Self {
+            metrics,
+            excluded_paths: &[],
+        }
+    }
+
+    /// Stops these paths from being counted.
+    ///
+    /// For endpoints polled on a timer by something that is not a client: an
+    /// orchestrator probing readiness every few seconds forever adds a constant
+    /// to every request series and a flood of 503s to the error series while a
+    /// dependency is down, which describes the prober rather than the traffic.
+    ///
+    /// The paths are matched exactly, and are supplied by the API layer that
+    /// owns the routes rather than being hardcoded here: a middleware that knew
+    /// route strings would be a second place for them to drift.
+    #[must_use]
+    pub fn excluding(mut self, paths: &'static [&'static str]) -> Self {
+        self.excluded_paths = paths;
+        self
     }
 }
 
@@ -62,6 +82,7 @@ where
         ok(MetricsMiddlewareService {
             service,
             metrics: self.metrics.clone(),
+            excluded_paths: self.excluded_paths,
         })
     }
 }
@@ -69,6 +90,7 @@ where
 pub struct MetricsMiddlewareService<S> {
     service: S,
     metrics: Arc<MetricsCollector>,
+    excluded_paths: &'static [&'static str],
 }
 
 impl<S, B> Service<ServiceRequest> for MetricsMiddlewareService<S>
@@ -84,6 +106,14 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
+        // Excluded before anything is measured, not filtered at export: a probe
+        // must not even cost the timer, and a series that was never created
+        // cannot be mistaken for one that dropped to zero.
+        if self.excluded_paths.contains(&req.path()) {
+            let fut = self.service.call(req);
+            return Box::pin(fut);
+        }
+
         let metrics = self.metrics.clone();
         let path = req.path().to_string();
         let method = req.method().to_string();
@@ -122,6 +152,52 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use std::time::Duration;
+
+    /// An excluded path is not counted, and everything else still is.
+    ///
+    /// Against the REAL middleware and a REAL collector, read back through the
+    /// same `export_metrics` the `/metrics` endpoint serves: the test-only
+    /// mirror further down cannot prove anything about the exclusion, since it
+    /// is a copy rather than the code that ships.
+    #[actix_web::test]
+    async fn test_an_excluded_path_is_not_counted() {
+        let collector = match MetricsCollector::new() {
+            Ok(collector) => Arc::new(collector),
+            Err(error) => panic!("the collector must build: {error}"),
+        };
+
+        let app = test::init_service(
+            App::new()
+                .wrap(MetricsMiddleware::new(Arc::clone(&collector)).excluding(&["/ready"]))
+                .route(
+                    "/ready",
+                    web::get().to(|| async { HttpResponse::ServiceUnavailable().finish() }),
+                )
+                .route(
+                    "/api/v1/chain",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
+                ),
+        )
+        .await;
+
+        // The 503 matters: a probe failing while a dependency is down would
+        // otherwise pour into the error series too.
+        let probe = test::call_service(&app, TestRequest::get().uri("/ready").to_request()).await;
+        assert_eq!(probe.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let served =
+            test::call_service(&app, TestRequest::get().uri("/api/v1/chain").to_request()).await;
+        assert_eq!(served.status(), StatusCode::OK);
+
+        let exported = collector.export_metrics();
+        assert!(
+            !exported.contains("/ready"),
+            "the probe must not appear in the metrics: {exported}"
+        );
+        assert!(
+            exported.contains("/api/v1/chain"),
+            "ordinary traffic must still be counted: {exported}"
+        );
+    }
 
     // Tracking structure for test metrics
     #[derive(Default, Clone)]

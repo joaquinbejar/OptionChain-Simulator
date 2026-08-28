@@ -665,6 +665,18 @@ impl SnapshotWriter for ClickHouseSnapshotRepository {
 
 #[async_trait]
 impl SimulationSnapshotRepository for ClickHouseSnapshotRepository {
+    /// `SELECT 1`, which touches no table.
+    ///
+    /// Deliberately not a query against the snapshot tables: a readiness probe
+    /// answers "can I reach the warehouse", and a table that does not exist yet
+    /// is a schema problem that already failed startup, not a reason to report
+    /// an otherwise healthy instance as unable to take work.
+    #[instrument(skip(self), level = "debug")]
+    async fn ping(&self) -> Result<(), ChainError> {
+        self.client.client.query("SELECT 1").execute().await?;
+        Ok(())
+    }
+
     #[instrument(
         skip(self, record),
         fields(

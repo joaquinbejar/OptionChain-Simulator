@@ -178,6 +178,24 @@ impl RedisClient {
         conn.exists(key).await
     }
 
+    /// Asks the server whether it is there.
+    ///
+    /// `PING` and nothing else: a readiness probe must cost the server less
+    /// than the requests it gates, and it must not depend on any key existing.
+    /// The connection manager reconnects on its own, so a probe that failed
+    /// while Redis was down starts succeeding again without a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns the driver's error when the server is unreachable or does not
+    /// answer within [`RedisConfig::timeout`].
+    #[instrument(skip(self), level = "debug")]
+    pub async fn ping(&self) -> RedisResult<()> {
+        let mut conn = self.manager.clone();
+        debug!("Pinging Redis");
+        redis::cmd("PING").query_async::<()>(&mut conn).await
+    }
+
     /// Returns the Redis configuration
     pub fn get_config(&self) -> &RedisConfig {
         &self.config

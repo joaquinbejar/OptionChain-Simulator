@@ -7,9 +7,12 @@ use crate::api::rest::handlers_v2::{
     advance_simulation, create_simulation, delete_simulation, get_simulation, json_error_handler,
     peek_snapshot, query_error_handler,
 };
+use crate::api::rest::health::{HEALTH_PATH, READY_PATH, health, ready};
 use crate::api::rest::middleware::metrics_endpoint;
 use crate::api::rest::swagger::ApiDoc;
-use crate::infrastructure::{MetricsCollector, MongoDBRepository, SimulationSnapshotRepository};
+use crate::infrastructure::{
+    MetricsCollector, MongoDBRepository, Readiness, SimulationSnapshotRepository,
+};
 use crate::session::{SessionManager, SimulationManager};
 use actix_web::web;
 use std::sync::Arc;
@@ -31,6 +34,8 @@ use utoipa_swagger_ui::SwaggerUi;
 ///   session data and operations.
 /// * `snapshots` - The v2 snapshot warehouse, when the operator enabled persistence. `None` is the
 ///   normal case and leaves the v2 export replaying every step.
+/// * `readiness` - The dependency probes `GET /ready` runs. Assembled by the caller from what the
+///   deployment actually configured, so the endpoint reports on those services and no others.
 ///
 /// # Endpoints
 ///
@@ -54,6 +59,12 @@ use utoipa_swagger_ui::SwaggerUi;
 /// - **DELETE** `/api/v1/chain`  
 ///   Handled by the `delete_session` function. This is used to remove an existing session.
 ///
+/// - **GET** `/health`
+///   Liveness: the process is alive. Always 200, no dependency touched.
+///
+/// - **GET** `/ready`
+///   Readiness: 200 when every configured dependency answers, 503 naming the ones that did not.
+///
 /// # Usage
 ///
 /// This function should be called during the setup phase of the Actix Web application to configure
@@ -66,6 +77,7 @@ pub fn configure_routes(
     simulation_manager: Arc<SimulationManager>,
     metrics_collector: Arc<MetricsCollector>,
     mongodb_repo: Arc<MongoDBRepository>,
+    readiness: Readiness,
 ) {
     // The export reads from the same warehouse the manager files into, taken
     // off the manager rather than threaded separately: two handles could be
@@ -74,6 +86,7 @@ pub fn configure_routes(
     configure_v2_routes(cfg, simulation_manager, snapshots);
 
     cfg.app_data(web::Data::new(session_manager))
+        .app_data(web::Data::new(readiness))
         .app_data(web::Data::new(metrics_collector.clone()))
         .app_data(web::Data::new(mongodb_repo))
         // v1's query DTOs reject unknown keys too, for the same reason: a
@@ -89,6 +102,10 @@ pub fn configure_routes(
                 .route(web::delete().to(delete_session)),
         )
         .service(web::resource("/api/v1/chain/step").route(web::post().to(advance_step)))
+        // Unversioned and unauthenticated on purpose: an orchestrator's probe
+        // configuration should not have to move when the API surface does.
+        .route(HEALTH_PATH, web::get().to(health))
+        .route(READY_PATH, web::get().to(ready))
         .route("/metrics", web::get().to(metrics_endpoint))
         .route("/favicon.ico", web::get().to(get_favicon))
         .service(

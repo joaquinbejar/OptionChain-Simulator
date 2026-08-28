@@ -2030,6 +2030,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SimulationSnapshotRepository for FakeWarehouse {
+        /// No server behind it; reachable exactly as long as the process is.
+        async fn ping(&self) -> Result<(), ChainError> {
+            Ok(())
+        }
+
         async fn persist(&self, record: SnapshotRecord) -> Result<(), ChainError> {
             match self.stored.lock() {
                 Ok(mut stored) => {
