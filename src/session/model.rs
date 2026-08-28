@@ -745,18 +745,22 @@ mod tests_simulation_parameters_serialization {
         // Verify JSON contains all expected fields
         let value: Value = serde_json::from_str(&json).unwrap();
 
+        // Since `positive` 0.6 a `Positive` serialises as its exact decimal in
+        // a string, so every `Positive` field below is quoted; `Decimal` was
+        // already written that way. Trailing zeros do not survive the exact
+        // representation, which is why `45.0` is written `"45"`.
         assert_eq!(value["symbol"], "AAPL");
         assert_eq!(value["steps"], 30);
-        assert_eq!(value["initial_price"], 150.75);
-        assert_eq!(value["days_to_expiration"], 45.0);
-        assert_eq!(value["volatility"], 0.25);
+        assert_eq!(value["initial_price"], "150.75");
+        assert_eq!(value["days_to_expiration"], "45");
+        assert_eq!(value["volatility"], "0.25");
         assert_eq!(value["risk_free_rate"], "0.04");
-        assert_eq!(value["dividend_yield"], 0.015);
+        assert_eq!(value["dividend_yield"], "0.015");
         assert_eq!(value["time_frame"], "Day");
         assert_eq!(value["chain_size"], 15);
-        assert_eq!(value["strike_interval"], 5.0);
+        assert_eq!(value["strike_interval"], "5");
         assert_eq!(value["smile_curve"], "0.5");
-        assert_eq!(value["spread"], 0.02);
+        assert_eq!(value["spread"], "0.02");
 
         // Check the method field specifically
         assert!(value["method"].is_object());
@@ -766,9 +770,9 @@ mod tests_simulation_parameters_serialization {
                 .unwrap()
                 .contains_key("GeometricBrownian")
         );
-        assert_eq!(value["method"]["GeometricBrownian"]["dt"], 0.0027);
+        assert_eq!(value["method"]["GeometricBrownian"]["dt"], "0.0027");
         assert_eq!(value["method"]["GeometricBrownian"]["drift"], "0.05");
-        assert_eq!(value["method"]["GeometricBrownian"]["volatility"], 0.25);
+        assert_eq!(value["method"]["GeometricBrownian"]["volatility"], "0.25");
 
         // Deserialize back to verify round-trip
         let deserialized: SimulationParameters = from_str(&json).unwrap();
@@ -1080,6 +1084,147 @@ mod tests_simulation_parameters_serialization {
                 assert_eq!(jump_mean, dec!(-0.05));
             }
             _ => panic!("Wrong simulation method variant deserialized"),
+        }
+    }
+
+    /// The same wire change, on the largest stored payload there is.
+    ///
+    /// A `Historical` method carries `prices: Vec<Positive>` — hundreds of bare
+    /// JSON numbers in a document written before `positive` 0.6, and the one
+    /// variant this crate special-cases everywhere. The visitor is shared with
+    /// every scalar `Positive`, so a break here is unlikely; "unlikely" is
+    /// precisely what a stored-session test exists to remove.
+    #[test]
+    fn test_a_stored_historical_price_series_still_loads() {
+        const STORED_BY_AN_OLDER_BINARY: &str = concat!(
+            r#"{"id":"6ba7b812-9dad-11d1-80b4-00c04fd430c8","#,
+            r#""created_at":{"secs_since_epoch":1735689600,"nanos_since_epoch":0},"#,
+            r#""updated_at":{"secs_since_epoch":1735689660,"nanos_since_epoch":0},"#,
+            r#""parameters":{"symbol":"AAPL","steps":5,"initial_price":75,"#,
+            r#""days_to_expiration":30,"volatility":0.2,"risk_free_rate":"0.02","#,
+            r#""dividend_yield":0,"method":{"Historical":{"timeframe":"Day","#,
+            r#""prices":[75,76.2,74.8,77.5,78.1],"symbol":"AAPL"}},"#,
+            r#""time_frame":"Day","chain_size":10,"strike_interval":5,"#,
+            r#""skew_slope":"-0.2","smile_curve":"0.5","spread":0.01,"seed":7},"#,
+            r#""current_step":0,"total_steps":5,"state":"Initialized","version":0}"#,
+        );
+
+        let session: Session = match from_str(STORED_BY_AN_OLDER_BINARY) {
+            Ok(session) => session,
+            Err(error) => panic!("a stored historical series must load: {error}"),
+        };
+
+        match session.parameters.method {
+            SimulationMethod::Historical {
+                ref timeframe,
+                ref prices,
+                ..
+            } => {
+                assert_eq!(*timeframe, TimeFrame::Day);
+                assert_eq!(prices.len(), 5);
+                // Every element, at full decimal precision: a series that came
+                // back through an f64 detour would not compare equal here.
+                assert_eq!(prices[0], pos_or_panic!(75.0));
+                assert_eq!(prices[1], pos_or_panic!(76.2));
+                assert_eq!(prices[2], pos_or_panic!(74.8));
+                assert_eq!(prices[3], pos_or_panic!(77.5));
+                assert_eq!(prices[4], pos_or_panic!(78.1));
+            }
+            ref other => panic!("the stored method must survive the load, got {other:?}"),
+        }
+        assert_eq!(session.parameters.seed, Some(7));
+
+        // The rewritten series is the 0.6 string form, and reloads identically.
+        let rewritten = match to_string(&session) {
+            Ok(rewritten) => rewritten,
+            Err(error) => panic!("must re-serialize: {error}"),
+        };
+        assert!(
+            rewritten.contains(r#""prices":["75","76.2","74.8","77.5","78.1"]"#),
+            "a rewritten series must carry the 0.6 string form, got {rewritten}"
+        );
+        match from_str::<Session>(&rewritten) {
+            Ok(reloaded) => assert_eq!(reloaded.parameters.method, session.parameters.method),
+            Err(error) => panic!("the rewritten session must load: {error}"),
+        }
+    }
+
+    /// Stored-session compatibility across the `positive` 0.6 wire change.
+    ///
+    /// Up to `positive` 0.5 a `Positive` serialised as a JSON number; since 0.6
+    /// it serialises as its exact decimal in a string. Sessions written by an
+    /// earlier binary are still in Redis in the numeric form, and the upgrade
+    /// must not strand them: `SessionStore` reads them back through this very
+    /// `Deserialize`. The document below is the numeric form, value for value
+    /// as `positive` 0.5.1 emitted it — integers where the decimal has no
+    /// fractional digits, JSON floats otherwise, and `Decimal` fields quoted
+    /// because `rust_decimal` always wrote them that way.
+    #[test]
+    fn test_a_session_written_before_positive_0_6_still_loads() {
+        const STORED_BY_AN_OLDER_BINARY: &str = concat!(
+            r#"{"id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","#,
+            r#""created_at":{"secs_since_epoch":1735689600,"nanos_since_epoch":0},"#,
+            r#""updated_at":{"secs_since_epoch":1735689660,"nanos_since_epoch":0},"#,
+            r#""parameters":{"symbol":"AAPL","steps":30,"initial_price":150.75,"#,
+            r#""days_to_expiration":45,"volatility":0.25,"risk_free_rate":"0.04","#,
+            r#""dividend_yield":0.015,"method":{"GeometricBrownian":{"dt":0.0027,"#,
+            r#""drift":"0.05","volatility":0.25}},"time_frame":"Day","chain_size":15,"#,
+            r#""strike_interval":5,"skew_slope":"-0.2","smile_curve":"0.5","#,
+            r#""spread":0.02,"seed":42},"#,
+            r#""current_step":3,"total_steps":30,"state":"InProgress","version":4}"#,
+        );
+
+        let session: Session = match from_str(STORED_BY_AN_OLDER_BINARY) {
+            Ok(session) => session,
+            Err(error) => panic!("a session stored by an older binary must load: {error}"),
+        };
+
+        // Every `Positive` carries the value the old document held, at full
+        // decimal precision rather than through a lossy float detour.
+        assert_eq!(session.parameters.initial_price, pos_or_panic!(150.75));
+        assert_eq!(session.parameters.days_to_expiration, pos_or_panic!(45.0));
+        assert_eq!(session.parameters.volatility, pos_or_panic!(0.25));
+        assert_eq!(session.parameters.dividend_yield, pos_or_panic!(0.015));
+        assert_eq!(session.parameters.strike_interval, Some(pos_or_panic!(5.0)));
+        assert_eq!(session.parameters.spread, Some(pos_or_panic!(0.02)));
+        assert_eq!(session.parameters.risk_free_rate, dec!(0.04));
+        match session.parameters.method {
+            SimulationMethod::GeometricBrownian {
+                dt,
+                drift,
+                volatility,
+            } => {
+                assert_eq!(dt, pos_or_panic!(0.0027));
+                assert_eq!(drift, dec!(0.05));
+                assert_eq!(volatility, pos_or_panic!(0.25));
+            }
+            ref other => panic!("the stored method must survive the load, got {other:?}"),
+        }
+
+        // The session's own state is untouched by the wire change, and the seed
+        // — the reproducibility contract — comes back intact.
+        assert_eq!(session.parameters.seed, Some(42));
+        assert_eq!(session.current_step, 3);
+        assert_eq!(session.total_steps, 30);
+        assert_eq!(session.state, SessionState::InProgress);
+        assert_eq!(session.version, 4);
+
+        // Rewriting it stores the 0.6 shape, which the same reader accepts:
+        // the store converges on one form without a migration step.
+        let rewritten = match to_string(&session) {
+            Ok(rewritten) => rewritten,
+            Err(error) => panic!("must re-serialize: {error}"),
+        };
+        assert!(
+            rewritten.contains(r#""initial_price":"150.75""#),
+            "a rewritten session must carry the 0.6 string form, got {rewritten}"
+        );
+        match from_str::<Session>(&rewritten) {
+            Ok(reloaded) => assert_eq!(
+                reloaded.parameters.initial_price,
+                session.parameters.initial_price
+            ),
+            Err(error) => panic!("the rewritten session must load: {error}"),
         }
     }
 }

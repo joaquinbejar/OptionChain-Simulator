@@ -51,8 +51,8 @@ members = [
 
 [workspace.dependencies]
 optionchain_simulator = { path = "." }
-optionstratlib = "0.18"
-positive = "0.5"
+optionstratlib = "0.20"
+positive = "0.6"
 tracing = "0.1"
 rust_decimal = { version = "1.42", features = ["maths", "serde"] }
 rust_decimal_macros = "1.40"

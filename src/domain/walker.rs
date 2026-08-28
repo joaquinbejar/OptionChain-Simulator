@@ -85,7 +85,15 @@ impl Walker {
 
         for _ in 1..steps {
             let dw = self.normal_sample() * sqrt_dt.to_dec();
-            let drift = (theta * mu.sub_or_zero(&x) * dt).to_dec();
+            // `mu - x` floored at zero. This mirrors upstream's
+            // `sub_floor_zero`, which 0.20 substituted for the deprecated
+            // `sub_or_zero` in `generate_ou_process`: same three branches, and
+            // identical on every input including `Decimal` overflow, where
+            // `sub_or_zero` panicked and both of these floor. Flooring is also
+            // the only option here, since `ou_process` returns a
+            // `Vec<Positive>` with no error channel.
+            let gap = mu.checked_sub_dec(x).unwrap_or(Positive::ZERO);
+            let drift = (theta * gap * dt).to_dec();
             let diffusion = volatility.to_dec() * dw;
             x += drift + diffusion;
             x = x.max(Decimal::ZERO);
