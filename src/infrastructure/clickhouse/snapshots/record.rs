@@ -62,7 +62,14 @@ use uuid::Uuid;
 ///   simulation are not, so its rows are a different tape under the same
 ///   coordinates. Generation 1 rows stay in place until their retention expires
 ///   and are simply not read by this build.
-pub const CURRENT_SNAPSHOT_GENERATION: u64 = 2;
+/// - `3` — the bid-ask spread is a per-contract model rather than one scalar
+///   across the chain, and a quote is no longer withdrawn when its mid falls
+///   below the spread. Two things move under the same coordinates: the quotes
+///   themselves, and the STRIKE SET, because upstream stopped extending the
+///   grid at the strike where the wings had been erased and now runs to the
+///   full ladder. A simulation half-filed by an older binary would otherwise
+///   hold two different tapes under one generation.
+pub const CURRENT_SNAPSHOT_GENERATION: u64 = 3;
 
 /// The namespace every deterministic `snapshot_id` is derived under.
 ///
@@ -582,7 +589,9 @@ mod tests {
     fn test_the_current_generation_is_addressable() {
         let simulation = Uuid::from_u128(7);
 
-        assert_eq!(CURRENT_SNAPSHOT_GENERATION, 2);
+        // Pinned so a bump is a deliberate edit here as well as there: the
+        // generation is what keeps two tapes from sharing one coordinate.
+        assert_eq!(CURRENT_SNAPSHOT_GENERATION, 3);
         assert_eq!(
             record(simulation, CURRENT_SNAPSHOT_GENERATION, 0).snapshot_id(),
             snapshot_id(simulation, CURRENT_SNAPSHOT_GENERATION, 0)

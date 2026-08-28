@@ -235,6 +235,59 @@
 //! | POST   | /api/v2/simulations/{id}/step    | Serve the current snapshot, then advance once |
 //! | DELETE | /api/v2/simulations/{id}         | Delete it and evict its cached state |
 //!
+//! ### The bid-ask spread is per contract
+//!
+//! A v2 chain used to be quoted with one spread applied to every contract,
+//! which is not what an option market looks like: a dear in-the-money call and
+//! a five-cent far wing do not carry the same absolute bid-ask, and the wing's
+//! spread is a far larger fraction of its price. A consumer valuing a position
+//! at the touch takes its whole cost of trading from that number.
+//!
+//! The spread is now a small parametric model, evaluated per contract:
+//!
+//! ```text
+//! spread(contract) = max(
+//!     spread_tick,
+//!     spread
+//!       + spread_proportional       * mid
+//!       + spread_moneyness_widening * |ln(strike / underlying)|
+//!       + spread_tenor_widening     * sqrt(days_to_expiration / 365)
+//! )
+//! ```
+//!
+//! Every coefficient is an optional create-request field, echoed back in the
+//! simulation response so a run can be replayed, and every widening term
+//! defaults to zero. A request that carries only the legacy `spread` therefore
+//! quotes exactly as it did: the scalar IS the floor term, and the arithmetic
+//! for every quote is unchanged.
+//!
+//! **A quote is never withdrawn.** Upstream's `apply_spread` sets bid, ask AND
+//! mid to `None` when `mid <= spread`, so the cheap wings vanished from the
+//! chain exactly as they decayed — the moment a consumer most wants to know
+//! what closing them costs. A contract that has a mid now always has a
+//! two-sided quote, with the bid floored at `spread_tick` or at the mid,
+//! whichever is lower: a contract worth less than a tick is quoted `0.00/0.01`
+//! rather than being marked up to a penny it is not worth.
+//!
+//! **Two things a legacy request sees change**, both consequences of that fix:
+//!
+//! - **The chain is longer.** Upstream stopped extending the strike ladder at
+//!   the first pair of strikes with no price, and that condition WAS the
+//!   erasure. With nothing erased the ladder runs to the full
+//!   `2 * chain_size + 1`: at spot 5000, 30 days and `chain_size = 30`, 45
+//!   strikes become 61. Response payloads, export rows and warehouse rows grow
+//!   with it, inside the same configured caps.
+//! - **A spread below the tick is raised to it.** `spread: 0.005` now widens by
+//!   half a cent each way rather than a quarter. At or above the tick — every
+//!   request that took the documented default — the quotes are unchanged.
+//!
+//! Persisted snapshots are therefore a new tape: `CURRENT_SNAPSHOT_GENERATION`
+//! is `3`, so rows written by an older binary stay addressable under generation
+//! `2` and are never mixed with these.
+//!
+//! `/api/v1/chain` is untouched, model and all: it is frozen, and its chains
+//! come from a different upstream path.
+//!
 //! **Serve-then-advance**, as in v1: a simulation with `steps = N` serves
 //! indices `0..N-1` over `N` calls to `/step`, and any call after that returns
 //! `410 Gone`. `expected_step` on the advance is a precondition — a mismatch is

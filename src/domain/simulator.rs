@@ -18,7 +18,7 @@ use optionstratlib::{
         steps::{Step, Xstep, Ystep},
     },
 };
-use positive::{Positive, pos_or_panic};
+use positive::Positive;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rust_decimal::Decimal;
@@ -42,8 +42,21 @@ pub(crate) const DEFAULT_SKEW_SLOPE: Decimal = dec!(-0.2);
 /// Default curvature of the volatility smile.
 pub(crate) const DEFAULT_SMILE_CURVE: Decimal = dec!(0.4);
 
-/// Default bid-ask spread factor.
+/// Default bid-ask spread factor for v1.
+///
+/// v2 reads its floor term from [`crate::domain::spread::DEFAULT_SPREAD_FLOOR`],
+/// which carries the same value: v1 applies one scalar to a whole chain and v2
+/// evaluates a model per contract, so they no longer share a constant even
+/// though they still agree on what silence means.
 pub(crate) const DEFAULT_SPREAD: Decimal = dec!(0.01);
+
+/// [`DEFAULT_SPREAD`] as a `Positive`, built once.
+///
+/// Converted here rather than at the call site so the fallback exists in one
+/// place and is not a value a hundred times too large: a one-dollar spread
+/// across a whole v1 chain would be far worse than the penny it replaces.
+static DEFAULT_SPREAD_POSITIVE: LazyLock<Positive> =
+    LazyLock::new(|| Positive::new_decimal(DEFAULT_SPREAD).unwrap_or(Positive::ZERO));
 
 /// Default upper bound on the number of random walks held in the simulation cache.
 const DEFAULT_MAX_CACHED_WALKS: usize = 1000;
@@ -473,7 +486,9 @@ impl Simulator {
         let strike_interval = params.strike_interval;
         let skew_slope = params.skew_slope.unwrap_or(DEFAULT_SKEW_SLOPE);
         let smile_curve = params.smile_curve.unwrap_or(DEFAULT_SMILE_CURVE);
-        let spread = params.spread.unwrap_or(pos_or_panic!(0.01));
+        // The v1 scalar, from the one constant that documents it rather than
+        // a literal repeated at the call site.
+        let spread = params.spread.unwrap_or(*DEFAULT_SPREAD_POSITIVE);
 
         // Create option data price parameters
         let price_params = OptionDataPriceParams::new(
@@ -835,6 +850,10 @@ mod tests {
             skew_slope: Some(-0.2),
             smile_curve: Some(0.5),
             spread: Some(0.01),
+            spread_proportional: None,
+            spread_moneyness_widening: None,
+            spread_tenor_widening: None,
+            spread_tick: None,
             seed: Some(SEED),
         };
         let parameters = match SimulationParametersV2::try_from(request) {

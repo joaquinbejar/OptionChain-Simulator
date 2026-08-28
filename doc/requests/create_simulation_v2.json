@@ -42,5 +42,9 @@
   "skew_slope": -0.2,
   "smile_curve": 0.4,
   "spread": 0.02,
+  "spread_proportional": 0.01,
+  "spread_moneyness_widening": 0.5,
+  "spread_tenor_widening": 0.1,
+  "spread_tick": 0.01,
   "seed": 42
 }
