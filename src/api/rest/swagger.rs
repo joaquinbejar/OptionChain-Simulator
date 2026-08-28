@@ -272,6 +272,7 @@ mod tests {
             ("/api/v1/chain/step", "post"),
             ("/api/v2/simulations/{id}/snapshot", "get"),
             ("/api/v2/simulations/{id}/step", "post"),
+            ("/api/v2/simulations/{id}/export", "get"),
         ];
 
         for (path, method) in serving {
@@ -500,6 +501,7 @@ mod tests {
             ("/api/v1/chain/step", "post"),
             ("/api/v2/simulations/{id}/snapshot", "get"),
             ("/api/v2/simulations/{id}/step", "post"),
+            ("/api/v2/simulations/{id}/export", "get"),
         ] {
             let bad_request = parsed
                 .get("paths")
@@ -520,19 +522,28 @@ mod tests {
                 description.contains("greeks"),
                 "{method} {path} must say the 400 covers an unknown greek level, got {description}"
             );
-            // These operations answer 400 with two different bodies — the
-            // typed `{error, field}` for a rejected level, and `{error}` alone
-            // for a malformed id or a terminal state — so there is no single
-            // schema to publish. The description has to say which is which
-            // instead of the document promising a `field` that is sometimes
-            // absent.
             assert!(
                 description.contains("ValidationErrorResponse"),
                 "{method} {path} must say when the 400 body is the typed one, got {description}"
             );
-            assert!(
-                bad_request.get("content").is_none(),
-                "{method} {path} must not promise one body schema for two shapes"
+
+            // Whether a schema may be published depends on whether the
+            // operation has ONE 400 shape. The chain endpoints do not: a
+            // rejected level is the typed `{error, field}`, while a malformed
+            // id or a terminal state is `{error}` alone, so declaring a schema
+            // would promise a `field` that is sometimes absent. The export does:
+            // every one of its four rejection paths renders the typed object,
+            // the extractor's included, so it declares it.
+            let publishes_schema = bad_request
+                .get("content")
+                .and_then(|content| content.get("application/json"))
+                .and_then(|json| json.get("schema"))
+                .is_some();
+            let one_shape = path.ends_with("/export");
+            assert_eq!(
+                publishes_schema, one_shape,
+                "{method} {path}: a 400 schema may be published only where every \
+                 rejection has the same shape"
             );
         }
     }

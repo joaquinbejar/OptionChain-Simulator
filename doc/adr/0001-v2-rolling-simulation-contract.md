@@ -685,7 +685,7 @@ but nothing would bound the *work*.
 GET /api/v2/simulations/{id}/export
       ?dataset=underlying|volatility|option_chains
       &format=json|csv
-      &from_step=<usize>&to_step=<usize>
+      &from_step=<usize>&to_step=<usize>&greeks=none|first|all
 ```
 
 Export is **read-only**. It replays from step `0` — or from the requested,
@@ -738,6 +738,42 @@ the same values.
 | `put_bid`, `put_ask`, `put_mid`, `put_delta` | number, optional |
 | `gamma` | number, optional |
 
+Those seventeen are the whole set at `greeks=none`, which is the default and is
+frozen. The greek levels **append** (issue #75), so each level's header is a
+prefix of the next and a consumer parsing by position is never disturbed:
+
+| level | appends |
+|---|---|
+| `first` | `call_theta`, `put_theta`, `call_vega`, `put_vega`, `call_rho`, `put_rho`, `call_rho_d`, `put_rho_d` |
+| `all` | the above, then seven more per style — `gamma`, `alpha`, `vanna`, `vomma`, `veta`, `charm`, `color` — as `call_*` / `put_*`, fourteen columns |
+
+The column set is fixed per level, never per row: a strike whose greeks upstream
+could not compute writes empty fields rather than fewer of them.
+
+`delta` is not repeated, because `call_delta` / `put_delta` already carry it and
+the two agree. `gamma` IS repeated, as the shared mirror plus `call_gamma` /
+`put_gamma`: the mirror stays defined at expiry and at zero volatility where the
+per-style pair goes blank, and the split future-proofs a non-European style
+whose gamma stops being shared.
+
+**Sign and size.** Every greek, here and on the chain endpoints, is per ONE LONG
+CONTRACT. The client applies position sign and size exactly once. Since
+optionstratlib 0.20 the `Greeks` trait applies the `Side` sign inside every
+greek rather than only in `delta`, so a consumer that applies it again
+double-counts.
+
+**Representation differs by surface, deliberately.** The export renders greeks
+as `f64`, like every other export column, because a CSV column has no type and
+this surface's contract is byte-comparability. The chain responses carry
+upstream's `Decimal` verbatim, as JSON strings, because there the contract is
+that the value is exactly what upstream computed. Both surfaces agree on which
+greeks a level carries and on what they mean; reconcile their numbers by value.
+
+**A stored step that cannot answer the level is replayed.** A row filed before
+the greek columns existed reconstructs with no snapshots, so serving it at
+`first` or `all` would put two coverages in one file. The export prices that
+step instead, which keeps §10's promise that the source is invisible.
+
 ### 10.2 Rendering
 
 - **JSON** is a single valid array of row objects, streamed. Numeric columns are
@@ -749,10 +785,17 @@ the same values.
   quotes doubled. An absent optional numeric is an **empty field** — not
   `null`, not `0`. `labels` is joined with `|` inside one field precisely so a
   multi-label chain never depends on quoting to stay one column.
-- **Numbers** are rendered from the same `f64` the JSON carries, using Rust's
-  shortest round-trip formatting: no locale, no thousands separator, `.` as the
-  decimal point, no exponent for the magnitudes involved here. The same input
-  therefore always produces the same characters.
+- **Numbers** are rendered from the same `f64` in both encodings, so the two
+  carry the same values: no locale, no thousands separator, `.` as the decimal
+  point. Within one encoding the same input always produces the same
+  characters, which is what makes a repeated export byte-identical.
+  **Across the two it does not.** CSV uses Rust's shortest round-trip
+  formatting; JSON uses `serde_json`'s, which writes `4950.0` for an integral
+  value and takes exponent form below `1e-5` — reachable since the greek
+  columns landed (issue #75), where a `color` of `6.4101559520200445e-6` is
+  ordinary. Reconcile the two encodings by value, never by text. JSON key order
+  is not part of the contract either: it happens to follow the CSV header, but
+  only because a transitive dependency enables `serde_json/preserve_order`.
 - **Timestamps** are `YYYY-MM-DDTHH:MM:SSZ` in both formats.
 
 Together these make a repeated export of the same simulation byte-identical,

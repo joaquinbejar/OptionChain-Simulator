@@ -44,6 +44,16 @@ struct TapeEntry {
     last_access: Instant,
 }
 
+/// A snapshot's identity in the in-flight map: which simulation, which step.
+type SnapshotKey = (Uuid, usize);
+
+/// How a snapshot build publishes its result to the callers waiting on it.
+///
+/// The error is a `String` rather than a `ChainError` because `broadcast`
+/// requires `Clone` and `ChainError` is not; the waiter rebuilds it as an
+/// internal error, which is what the owner would have reported anyway.
+type SnapshotBuilds = broadcast::Sender<Result<SeriesSnapshot, String>>;
+
 /// Owns the lifecycle of v2 rolling simulations.
 pub struct SimulationManager {
     store: Arc<dyn SimulationStore>,
@@ -58,7 +68,16 @@ pub struct SimulationManager {
     /// threads, so the cache would still be cold while every core was busy
     /// filling it with the same answer.
     builds: Mutex<HashMap<Uuid, broadcast::Sender<Result<FactorTape, String>>>>,
-    snapshots: Mutex<SnapshotCache>,
+    /// Snapshot builds currently running, one entry per `(simulation, step)`.
+    ///
+    /// The same argument as [`SimulationManager::builds`], one level down and
+    /// sharper since issue #74: with a warehouse registered a snapshot build
+    /// prices up to `OCS_MAX_SNAPSHOT_CONTRACTS` contracts WITH both greek
+    /// snapshots, so N concurrent readers of one step used to commit the
+    /// machine to N copies of the same seconds-long job. One owner builds, the
+    /// rest wait on its result.
+    snapshot_builds: Mutex<HashMap<SnapshotKey, SnapshotBuilds>>,
+    snapshots: Arc<Mutex<SnapshotCache>>,
     /// Where served snapshots are queued for filing, when the operator turned
     /// persistence on. `None` is the default and the whole feature is then
     /// absent from the serving path — no connection, no latency, no failure
@@ -118,10 +137,11 @@ impl SimulationManager {
             config,
             tapes: Arc::new(Mutex::new(HashMap::new())),
             builds: Mutex::new(HashMap::new()),
-            snapshots: Mutex::new(SnapshotCache::with_bounds(
+            snapshot_builds: Mutex::new(HashMap::new()),
+            snapshots: Arc::new(Mutex::new(SnapshotCache::with_bounds(
                 config.max_cached_snapshots,
                 config.max_cached_snapshot_contracts,
-            )),
+            ))),
             warehouse: None,
         }
     }
@@ -456,33 +476,99 @@ impl SimulationManager {
             return Ok(cached);
         }
 
+        let key = (simulation.id, step);
+
+        // Either this call owns the build or it waits on the one already
+        // running, decided under the lock so two callers cannot both decide
+        // they are the owner. Without this, N concurrent readers of the same
+        // cold step each start the same priced build.
+        let subscription = {
+            let mut builds = match self.snapshot_builds.lock() {
+                Ok(builds) => builds,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match builds.get(&key) {
+                Some(running) => Some(running.subscribe()),
+                None => {
+                    let (sender, _) = broadcast::channel(1);
+                    builds.insert(key, sender);
+                    None
+                }
+            }
+        };
+
+        if let Some(mut waiting) = subscription {
+            return match waiting.recv().await {
+                Ok(Ok(snapshot)) => Ok(snapshot),
+                // The owner failed; report what it reported rather than
+                // starting a second build that would fail the same way.
+                Ok(Err(reason)) => Err(ChainError::Internal(reason)),
+                // The owner's task died without publishing. Rare, and the
+                // honest answer is to build it here rather than hang.
+                Err(_) => self.build_snapshot(simulation, step).await,
+            };
+        }
+
+        let result = self.build_snapshot(simulation, step).await;
+
+        // Publish, then stop being the owner — in that order, so a caller that
+        // subscribes after the removal misses the broadcast, retries, and finds
+        // the snapshot in the cache.
+        let sender = {
+            let mut builds = match self.snapshot_builds.lock() {
+                Ok(builds) => builds,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            builds.remove(&key)
+        };
+        if let Some(sender) = sender {
+            let published = match &result {
+                Ok(snapshot) => Ok(snapshot.clone()),
+                Err(error) => Err(error.to_string()),
+            };
+            // An error means nobody was waiting, which is the common case.
+            let _ = sender.send(published);
+        }
+
+        result
+    }
+
+    /// Prices one snapshot, off the runtime and under the shared bound.
+    ///
+    /// The greek snapshots are built only when something will read them: a
+    /// registered warehouse files every step, and a filed step has to carry
+    /// what a replayed one does (issue #74). Without a warehouse the API prices
+    /// them per request instead, and only when asked.
+    ///
+    /// Pricing is real synchronous CPU — up to `OCS_MAX_SNAPSHOT_CONTRACTS`
+    /// contracts, about 1.54x that again with the greek snapshots on — so it
+    /// runs under the same bound the API renderers use rather than a second
+    /// one: they compete for the same cores.
+    ///
+    /// The result is cached **inside** the job, exactly as [`Self::build_tape`]
+    /// files a tape. A blocking task cannot be cancelled but awaiting it can,
+    /// so a client that disconnects mid-build would otherwise throw away a
+    /// snapshot that ran to completion anyway and leave the cache cold for the
+    /// next reader.
+    async fn build_snapshot(
+        &self,
+        simulation: &SessionV2,
+        step: usize,
+    ) -> Result<SeriesSnapshot, ChainError> {
         let tape = self.tape_for(simulation).await?;
-        // The greek snapshots are built only when something will read them:
-        // a registered warehouse files every step, and a filed step has to
-        // carry what a replayed one does (issue #74). Without a warehouse the
-        // API prices them per request instead, and only when asked.
         let greek_snapshots = self.warehouse.is_some();
         let parameters = simulation.parameters.clone();
+        let snapshots = Arc::clone(&self.snapshots);
+        let id = simulation.id;
 
-        // Off the runtime and under the shared bound, for the same reason
-        // `tape_for` is: pricing a snapshot is real synchronous CPU — up to
-        // `DEFAULT_MAX_SNAPSHOT_CONTRACTS` priced contracts, and about 1.54x
-        // that again once the greek snapshots are on — and a worker holding it
-        // stalls every other request that worker owns.
-        //
-        // The bound is the one the API renderers use, not a second one: they
-        // compete for the same cores, and a warehouse-backed deployment prices
-        // greeks HERE on every peek and advance, so admitting only the render
-        // side would leave the heavier half unbounded.
-        let snapshot = crate::utils::admission::admit_blocking(move || {
-            SeriesBuilder::new(&parameters, &tape)?
+        crate::utils::admission::admit_blocking(move || {
+            let snapshot = SeriesBuilder::new(&parameters, &tape)?
                 .with_greek_snapshots(greek_snapshots)
-                .snapshot(step)
+                .snapshot(step)?;
+            Self::cache_snapshot_into(&snapshots, id, snapshot.clone());
+            Ok(snapshot)
         })
-        .await?;
-
-        self.cache_snapshot(simulation.id, snapshot.clone());
-        Ok(snapshot)
+        .await
     }
 
     /// Reads a cached snapshot, refreshing its recency.
@@ -495,8 +581,11 @@ impl SimulationManager {
     }
 
     /// Stores a built snapshot.
-    fn cache_snapshot(&self, id: Uuid, snapshot: SeriesSnapshot) {
-        let mut snapshots = match self.snapshots.lock() {
+    ///
+    /// Static so a blocking job can file its own result without borrowing the
+    /// manager; see [`Self::build_snapshot`] for why filing happens there.
+    fn cache_snapshot_into(snapshots: &Mutex<SnapshotCache>, id: Uuid, snapshot: SeriesSnapshot) {
+        let mut snapshots = match snapshots.lock() {
             Ok(snapshots) => snapshots,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -936,6 +1025,62 @@ mod tests {
                 left.step
             );
         }
+    }
+
+    /// Concurrent readers of one cold STEP share one priced build.
+    ///
+    /// The tape has its own single-flight; the snapshot needs the same and for
+    /// a sharper reason since issue #74. With a warehouse registered a snapshot
+    /// build prices up to the per-snapshot cap with both greek sets on, so N
+    /// concurrent readers of the same step used to commit the machine to N
+    /// copies of the same seconds-long job.
+    ///
+    /// Every reader must get the same snapshot, one entry must be cached, and
+    /// the owner must have cleaned up after itself — a stale entry in the
+    /// in-flight map would make the NEXT reader of that step wait forever on a
+    /// broadcast nobody will send.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_readers_of_one_step_share_one_snapshot_build() {
+        let manager = Arc::new(manager().with_warehouse(
+            Arc::new(RecordingWarehouse::default()) as Arc<dyn SimulationSnapshotRepository>
+        ));
+        let simulation = created(&manager, 3).await;
+
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let manager = Arc::clone(&manager);
+            let id = simulation.id;
+            readers.push(tokio::spawn(async move { manager.peek(id).await }));
+        }
+
+        let mut snapshots = Vec::new();
+        for reader in readers {
+            match reader.await {
+                Ok(Ok((_, snapshot))) => snapshots.push(snapshot),
+                Ok(Err(error)) => panic!("every reader must be served: {error}"),
+                Err(error) => panic!("a reader panicked: {error}"),
+            }
+        }
+
+        assert_eq!(snapshots.len(), 8);
+        for snapshot in &snapshots {
+            assert_eq!(
+                snapshot, &snapshots[0],
+                "every reader must see the same snapshot"
+            );
+        }
+        assert_eq!(
+            manager.cached_snapshots(),
+            1,
+            "eight readers of one step must leave one snapshot"
+        );
+        assert!(
+            match manager.snapshot_builds.lock() {
+                Ok(builds) => builds.is_empty(),
+                Err(poisoned) => poisoned.into_inner().is_empty(),
+            },
+            "the owner must stop being the owner once it has published"
+        );
     }
 
     /// Concurrent first reads of one simulation share a single build.

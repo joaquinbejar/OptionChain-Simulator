@@ -50,6 +50,7 @@
 //! backtest harness cache a download and know it is still current.
 
 use crate::api::rest::error::map_error;
+use crate::api::rest::greeks::GreekLevel;
 use crate::domain::factors::FactorTape;
 use crate::domain::series::{SeriesBuilder, SeriesSnapshot};
 use crate::infrastructure::{
@@ -137,6 +138,76 @@ impl Format {
     }
 }
 
+/// The `option_chains` columns every level carries.
+///
+/// Frozen: the greek levels only ever APPEND, so a consumer parsing by position
+/// keeps working and `greeks=none` stays byte-identical to the export before
+/// the parameter existed.
+const CHAIN_COLUMNS: &[&str] = &[
+    "step",
+    "simulated_at",
+    "symbol",
+    "expires_at",
+    "labels",
+    "days_to_expiration",
+    "strike",
+    "implied_volatility",
+    "call_bid",
+    "call_ask",
+    "call_mid",
+    "call_delta",
+    "put_bid",
+    "put_ask",
+    "put_mid",
+    "put_delta",
+    "gamma",
+];
+
+/// What `greeks=first` appends: the first-order greeks the default lacks.
+///
+/// `delta` is not here — it is already `call_delta` / `put_delta`, and the two
+/// agree, so a second column could only drift from the first.
+const FIRST_ORDER_COLUMNS: &[&str] = &[
+    "call_theta",
+    "put_theta",
+    "call_vega",
+    "put_vega",
+    "call_rho",
+    "put_rho",
+    "call_rho_d",
+    "put_rho_d",
+];
+
+/// What `greeks=all` appends ON TOP of [`FIRST_ORDER_COLUMNS`].
+///
+/// Split that way so each level's header is a PREFIX of the next: `none` of
+/// `first`, `first` of `all`. A consumer that parses by position reads the
+/// columns it knows at any level, and a level change never moves one.
+///
+/// `gamma` IS here, per style, even though the shared `gamma` column already
+/// carries it — the one place this set knowingly repeats a number. The shared
+/// column is upstream's convenience mirror, which stays defined at expiry and
+/// at zero volatility where the snapshot is not, and the per-style pair
+/// future-proofs a non-European style whose gamma stops being shared. Same
+/// reasoning, and the same three columns, as the warehouse schema. `delta` is
+/// not repeated because neither of those applies to it.
+const SECOND_ORDER_COLUMNS: &[&str] = &[
+    "call_gamma",
+    "put_gamma",
+    "call_alpha",
+    "put_alpha",
+    "call_vanna",
+    "put_vanna",
+    "call_vomma",
+    "put_vomma",
+    "call_veta",
+    "put_veta",
+    "call_charm",
+    "put_charm",
+    "call_color",
+    "put_color",
+];
+
 impl Dataset {
     /// The dataset's name, used in the suggested filename.
     #[must_use]
@@ -149,30 +220,28 @@ impl Dataset {
     }
 
     /// The CSV header, in the order the rows are written.
+    ///
+    /// Fixed per level, never variable: a level always emits the same columns
+    /// whether or not a particular strike has greeks, so a consumer can parse
+    /// by position as well as by name. `greeks` is ignored by the two datasets
+    /// that carry no chains.
     #[must_use]
-    fn header(self) -> &'static [&'static str] {
+    fn header(self, level: GreekLevel) -> Vec<&'static str> {
         match self {
-            Dataset::Underlying => &["step", "simulated_at", "symbol", "price"],
-            Dataset::Volatility => &["step", "simulated_at", "symbol", "base_volatility"],
-            Dataset::OptionChains => &[
-                "step",
-                "simulated_at",
-                "symbol",
-                "expires_at",
-                "labels",
-                "days_to_expiration",
-                "strike",
-                "implied_volatility",
-                "call_bid",
-                "call_ask",
-                "call_mid",
-                "call_delta",
-                "put_bid",
-                "put_ask",
-                "put_mid",
-                "put_delta",
-                "gamma",
-            ],
+            Dataset::Underlying => vec!["step", "simulated_at", "symbol", "price"],
+            Dataset::Volatility => vec!["step", "simulated_at", "symbol", "base_volatility"],
+            Dataset::OptionChains => {
+                let mut header = CHAIN_COLUMNS.to_vec();
+                match level {
+                    GreekLevel::None => {}
+                    GreekLevel::First => header.extend_from_slice(FIRST_ORDER_COLUMNS),
+                    GreekLevel::All => {
+                        header.extend_from_slice(FIRST_ORDER_COLUMNS);
+                        header.extend_from_slice(SECOND_ORDER_COLUMNS);
+                    }
+                }
+                header
+            }
         }
     }
 
@@ -199,6 +268,13 @@ pub(crate) struct ExportQuery {
     /// Last step to include, inclusive. Defaults to the final generated step.
     #[serde(default)]
     pub(crate) to_step: Option<usize>,
+    /// How much of the greek set the `option_chains` dataset carries: `none`
+    /// (the default), `first` or `all` — the same vocabulary and the same
+    /// default as the chain endpoints, so a tape and a live step agree on what
+    /// a level means. Kept as a raw string so an unknown value is a typed `400`
+    /// naming the field.
+    #[serde(default)]
+    pub(crate) greeks: Option<String>,
 }
 
 /// A validated, inclusive step range.
@@ -289,6 +365,91 @@ fn render_optional(value: Option<f64>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
 }
 
+/// One option style's greek snapshot, flattened to the export's `f64`.
+///
+/// `delta` is absent on purpose: it already has its own `call_delta` /
+/// `put_delta` column, and the two agree — pinned upstream of here by
+/// `test_the_delta_mirror_equals_the_snapshot_delta_at_every_strike`. Emitting
+/// it twice would let one column drift from the other.
+///
+/// The export renders `f64`, not the decimal strings the REST responses carry.
+/// A CSV column has no type to distinguish them, and the export's whole
+/// contract is that a byte comparison of two runs is meaningful — so both
+/// formats render the same `f64` here, and the JSON export matches the CSV
+/// value for value.
+///
+/// Value for value, not character for character: JSON writes `4950.0` where the
+/// CSV writes `4950`, and takes exponent form below `1e-5` where the CSV spells
+/// the zeros out. Compare the two encodings as numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct GreeksView {
+    /// This side's `gamma`.
+    gamma: Option<f64>,
+    /// This side's `theta`.
+    theta: Option<f64>,
+    /// This side's `vega`.
+    vega: Option<f64>,
+    /// This side's `rho`.
+    rho: Option<f64>,
+    /// This side's `rho_d`.
+    rho_d: Option<f64>,
+    /// This side's `alpha`.
+    alpha: Option<f64>,
+    /// This side's `vanna`.
+    vanna: Option<f64>,
+    /// This side's `vomma`.
+    vomma: Option<f64>,
+    /// This side's `veta`.
+    veta: Option<f64>,
+    /// This side's `charm`.
+    charm: Option<f64>,
+    /// This side's `color`.
+    color: Option<f64>,
+}
+
+impl GreeksView {
+    /// Views an upstream snapshot, or nothing when the strike had none.
+    #[must_use]
+    fn of(snapshot: Option<&optionstratlib::greeks::GreeksSnapshot>) -> Self {
+        let Some(snapshot) = snapshot else {
+            return Self::default();
+        };
+        // Destructured, not field-accessed: a thirteenth upstream greek is then
+        // a COMPILE ERROR here rather than a column this export silently stops
+        // carrying while the response and the warehouse both gain it. Same
+        // discipline `ApiWalkType` uses for a new `WalkType` variant.
+        //
+        // `delta` is bound and dropped on purpose — it has its own column.
+        let optionstratlib::greeks::GreeksSnapshot {
+            delta: _,
+            gamma,
+            theta,
+            vega,
+            rho,
+            rho_d,
+            alpha,
+            vanna,
+            vomma,
+            veta,
+            charm,
+            color,
+        } = snapshot;
+        Self {
+            gamma: decimal_to_f64(*gamma),
+            theta: decimal_to_f64(*theta),
+            vega: decimal_to_f64(*vega),
+            rho: rho.and_then(decimal_to_f64),
+            rho_d: rho_d.and_then(decimal_to_f64),
+            alpha: alpha.and_then(decimal_to_f64),
+            vanna: decimal_to_f64(*vanna),
+            vomma: decimal_to_f64(*vomma),
+            veta: decimal_to_f64(*veta),
+            charm: decimal_to_f64(*charm),
+            color: decimal_to_f64(*color),
+        }
+    }
+}
+
 /// One strike of one expiration, flattened to exactly what a row carries.
 ///
 /// The common view both sources are reduced to. Every conversion from a source
@@ -307,6 +468,10 @@ struct QuoteView {
     put_mid: Option<f64>,
     put_delta: Option<f64>,
     gamma: Option<f64>,
+    /// The call's greek snapshot, empty below `greeks=first`.
+    call_greeks: GreeksView,
+    /// The put's greek snapshot, empty below `greeks=first`.
+    put_greeks: GreeksView,
 }
 
 impl QuoteView {
@@ -325,6 +490,8 @@ impl QuoteView {
             put_mid: data.put_middle.map(|value| value.to_f64()),
             put_delta: data.delta_put.and_then(decimal_to_f64),
             gamma: data.gamma.and_then(decimal_to_f64),
+            call_greeks: GreeksView::of(data.greeks_call.as_ref()),
+            put_greeks: GreeksView::of(data.greeks_put.as_ref()),
         }
     }
 
@@ -343,6 +510,8 @@ impl QuoteView {
             put_mid: row.put_mid.map(|value| value.to_f64()),
             put_delta: row.delta_put.and_then(decimal_to_f64),
             gamma: row.gamma.and_then(decimal_to_f64),
+            call_greeks: GreeksView::of(row.greeks_call.as_ref()),
+            put_greeks: GreeksView::of(row.greeks_put.as_ref()),
         }
     }
 }
@@ -624,19 +793,22 @@ impl Stream for RowStream {
         advances the cursor, changes the state or version, or alters what the next peek returns. \
         A simulation that has not been walked at all exports its whole tape. Where snapshot \
         persistence is enabled, an option_chains export serves the steps the warehouse holds from \
-        it and replays the rest; the rows are identical either way. JSON is a single array of row \
-        objects; CSV is RFC 4180 with a header row and CRLF line endings. Repeating the same \
-        export yields byte-identical output.",
+        it and replays the rest; the rows are identical either way, at every greek level — a stored step that predates the greek columns is replayed rather than served short. JSON is \
+        a single array of row objects; CSV is RFC 4180 with a header row and CRLF line endings. \
+        Repeating the same export at the same greek level yields byte-identical output. The two \
+        encodings carry the same values, though not always the same notation: JSON takes exponent \
+        form for very small numbers where the CSV spells them out.",
     params(
         ("id" = String, Path, description = "The simulation's identifier"),
         ("dataset" = String, Query, description = "underlying | volatility | option_chains"),
         ("format" = String, Query, description = "json | csv"),
         ("from_step" = Option<usize>, Query, description = "First step, inclusive; defaults to 0"),
-        ("to_step" = Option<usize>, Query, description = "Last step, inclusive; defaults to the final step")
+        ("to_step" = Option<usize>, Query, description = "Last step, inclusive; defaults to the final step"),
+        ("greeks" = Option<String>, Query, description = "How much of the greek set the option_chains dataset carries: `none` (default), `first` (appends call_theta, put_theta, call_vega, put_vega, call_rho, put_rho, call_rho_d, put_rho_d) or `all` (appends seven more per style, gamma through color: fourteen columns). Each level's header is a PREFIX of the next, so raising it appends columns and never moves one. Values are per ONE LONG CONTRACT. Accepted but immaterial for the underlying and volatility datasets, which carry no chains. An unknown value is a 400")
     ),
     responses(
         (status = 200, description = "The exported rows, streamed", body = String),
-        (status = 400, description = "Unknown dataset or format, or an invalid range; body carries `error` and `field`"),
+        (status = 400, description = "Every rejection carries the typed `{error, field}` of ValidationErrorResponse. `field` names the offender where it is known — `id` for a malformed identifier, `from_step` or `to_step` for a range that is reversed or past the tape, `greeks` for an unknown level. It is EMPTY when the query string fails to deserialise at all (an unknown `dataset` or `format`, a non-numeric step), because serde's message for those does not name the key; the `error` string carries the detail.", body = crate::api::rest::responses::ValidationErrorResponse),
         (status = 404, description = "Simulation not found"),
         (status = 500, description = "Internal server error")
     )
@@ -662,6 +834,15 @@ pub(crate) async fn export_simulation(
                 reason: format!("must be a UUID, got {:?}", path.id),
             });
         }
+    };
+
+    // Resolved before the store is read, so `?greeks=bogus` on a missing
+    // simulation answers 400 here exactly as it does on the snapshot endpoint,
+    // rather than 404 — and long before the stream, where an error would arrive
+    // mid-download with a header already sent.
+    let level = match GreekLevel::parse(query.greeks.as_deref()) {
+        Ok(level) => level,
+        Err(error) => return map_error(error),
     };
 
     // The one read of shared state. From here on the export owns everything it
@@ -695,7 +876,7 @@ pub(crate) async fn export_simulation(
     // Priced chains are minutes of CPU for a long horizon. Producing them on an
     // Actix worker would block every other request on that thread.
     tokio::task::spawn_blocking(move || {
-        if let Err(error) = produce(&parameters, dataset, format, range, stored, &sender) {
+        if let Err(error) = produce(&parameters, dataset, format, level, range, stored, &sender) {
             // A send failure means the client went away, which is not an error
             // worth reporting to anyone.
             let _ = sender.blocking_send(Err(error));
@@ -719,6 +900,23 @@ pub(crate) async fn export_simulation(
         .streaming(RowStream { receiver })
 }
 
+/// Whether a stored record can answer a request for greeks.
+///
+/// True when every quote it carries has both snapshots — which is what a record
+/// filed by this version looks like. A record written before the greek columns
+/// existed has none, and one filed by a build whose chain could not price a
+/// degenerate strike may have some: either way, only a whole record can be
+/// served for a level above the default, because a half-covered one would put
+/// two different coverages in one export.
+#[must_use]
+fn record_carries_greeks(record: &SnapshotRecord) -> bool {
+    record
+        .expirations
+        .iter()
+        .flat_map(|expiration| expiration.quotes.iter())
+        .all(|quote| quote.greeks_call.is_some() && quote.greeks_put.is_some())
+}
+
 /// Produces the range and sends every chunk.
 ///
 /// Runs on a blocking thread. Returns as soon as a send fails, which is how a
@@ -731,18 +929,23 @@ fn produce(
     parameters: &SimulationParametersV2,
     dataset: Dataset,
     format: Format,
+    level: GreekLevel,
     range: StepRange,
     mut stored: Option<StoredSteps>,
     sender: &mpsc::Sender<Result<Vec<u8>, ChainError>>,
 ) -> Result<(), ChainError> {
     let tape = FactorTape::build(parameters, &parameters.method)?;
     let builder = if dataset.needs_chains() {
-        Some(SeriesBuilder::new(parameters, &tape)?)
+        // Priced WITH the greek snapshots exactly when the level asks for them.
+        // This is what makes a replayed step and a stored one carry the same
+        // columns: a warehouse fills its rows from a chain built the same way,
+        // so the two conversion paths cannot disagree about what exists.
+        Some(SeriesBuilder::new(parameters, &tape)?.with_greek_snapshots(level.wants_greeks()))
     } else {
         None
     };
 
-    let mut writer = Writer::new(format, dataset)?;
+    let mut writer = Writer::new(format, dataset, level)?;
     if let Some(chunk) = writer.prologue()?
         && sender.blocking_send(Ok(chunk)).is_err()
     {
@@ -757,8 +960,17 @@ fn produce(
 
         // A persisted step is the same snapshot, already priced: prefer it, and
         // price only what the warehouse does not have.
+        //
+        // Unless it cannot answer the question asked. A row written before the
+        // greek columns existed reconstructs with no snapshots, so preferring it
+        // at `greeks=all` would emit empty greek columns for the persisted
+        // prefix of a range and real ones for the replayed rest — one file, two
+        // coverages, no signal. Such a step is replayed instead, which costs
+        // pricing and keeps the promise that the source is invisible.
         let record = match &mut stored {
-            Some(stored) => stored.take(step, range.to),
+            Some(stored) => stored
+                .take(step, range.to)
+                .filter(|record| !level.wants_greeks() || record_carries_greeks(record)),
             None => None,
         };
         let replayed = match (&record, &builder) {
@@ -776,8 +988,16 @@ fn produce(
                 .ok_or_else(|| ChainError::Internal("the step counter overflowed".to_string()))?;
         }
 
-        let chunk = writer.rows(parameters, row.step, row, chains)?;
-        if !chunk.is_empty() && sender.blocking_send(Ok(chunk)).is_err() {
+        let delivery = writer.rows(parameters, row.step, row, chains, &mut |chunk| {
+            if chunk.is_empty() {
+                return Delivery::Sent;
+            }
+            match sender.blocking_send(Ok(chunk)) {
+                Ok(()) => Delivery::Sent,
+                Err(_) => Delivery::ClientGone,
+            }
+        })?;
+        if delivery == Delivery::ClientGone {
             return Ok(());
         }
     }
@@ -802,22 +1022,27 @@ fn produce(
 /// Encodes rows in the requested format.
 enum Writer {
     /// A streamed JSON array. Tracks whether a comma is due.
-    Json { dataset: Dataset, first: bool },
+    Json {
+        dataset: Dataset,
+        level: GreekLevel,
+        first: bool,
+    },
     /// RFC 4180 CSV. A writer is built per chunk rather than kept: `csv::Writer`
     /// only surrenders its buffer by consuming itself, and constructing one is
     /// cheap next to pricing a chain.
-    Csv { dataset: Dataset },
+    Csv { dataset: Dataset, level: GreekLevel },
 }
 
 impl Writer {
     /// Creates a writer for a dataset and format.
-    fn new(format: Format, dataset: Dataset) -> Result<Self, ChainError> {
+    fn new(format: Format, dataset: Dataset, level: GreekLevel) -> Result<Self, ChainError> {
         Ok(match format {
             Format::Json => Writer::Json {
                 dataset,
+                level,
                 first: true,
             },
-            Format::Csv => Writer::Csv { dataset },
+            Format::Csv => Writer::Csv { dataset, level },
         })
     }
 
@@ -825,9 +1050,12 @@ impl Writer {
     fn prologue(&mut self) -> Result<Option<Vec<u8>>, ChainError> {
         match self {
             Writer::Json { .. } => Ok(Some(b"[".to_vec())),
-            Writer::Csv { dataset } => {
-                let header: Vec<String> =
-                    dataset.header().iter().map(ToString::to_string).collect();
+            Writer::Csv { dataset, level } => {
+                let header: Vec<String> = dataset
+                    .header(*level)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
                 Ok(Some(encode_csv(&[header])?))
             }
         }
@@ -847,20 +1075,29 @@ impl Writer {
     /// chains: it is the tape's instant, the same one a stored record was
     /// written from, and taking it from one place keeps the two sources
     /// rendering identically by construction.
-    fn rows(
+    fn rows<E>(
         &mut self,
         parameters: &SimulationParametersV2,
         step: usize,
         row: &crate::domain::factors::FactorRow,
         chains: Option<StepChains<'_>>,
-    ) -> Result<Vec<u8>, ChainError> {
+        emit: &mut E,
+    ) -> Result<Delivery, ChainError>
+    where
+        E: FnMut(Vec<u8>) -> Delivery,
+    {
         let simulated_at = render_instant(row.simulated_at);
         let symbol = parameters.symbol.as_str();
 
         match self {
-            Writer::Json { dataset, first } => {
-                let values = json_rows(*dataset, step, &simulated_at, symbol, row, chains);
+            Writer::Json {
+                dataset,
+                level,
+                first,
+            } => {
+                let values = json_rows(*dataset, *level, step, &simulated_at, symbol, row, chains);
                 let mut chunk = Vec::new();
+                let mut rows_buffered = 0_usize;
                 for value in values {
                     if !*first {
                         chunk.push(b',');
@@ -870,12 +1107,28 @@ impl Writer {
                         ChainError::Internal(format!("failed to encode an export row: {e}"))
                     })?;
                     chunk.extend_from_slice(&encoded);
+                    rows_buffered += 1;
+
+                    if rows_buffered >= ROWS_PER_CHUNK {
+                        if emit(std::mem::take(&mut chunk)) == Delivery::ClientGone {
+                            return Ok(Delivery::ClientGone);
+                        }
+                        rows_buffered = 0;
+                    }
                 }
-                Ok(chunk)
+                if chunk.is_empty() {
+                    return Ok(Delivery::Sent);
+                }
+                Ok(emit(chunk))
             }
-            Writer::Csv { dataset } => {
-                let records = csv_rows(*dataset, step, &simulated_at, symbol, row, chains);
-                encode_csv(&records)
+            Writer::Csv { dataset, level } => {
+                let records = csv_rows(*dataset, *level, step, &simulated_at, symbol, row, chains);
+                for batch in records.chunks(ROWS_PER_CHUNK) {
+                    if emit(encode_csv(batch)?) == Delivery::ClientGone {
+                        return Ok(Delivery::ClientGone);
+                    }
+                }
+                Ok(Delivery::Sent)
             }
         }
     }
@@ -907,6 +1160,7 @@ fn csv_error(error: csv::Error) -> ChainError {
 /// The JSON objects one step contributes.
 fn json_rows(
     dataset: Dataset,
+    level: GreekLevel,
     step: usize,
     simulated_at: &str,
     symbol: &str,
@@ -935,7 +1189,7 @@ fn json_rows(
                 let expires_at = render_instant(expiration.expires_at);
                 let labels = expiration.labels.join("|");
                 for quote in expiration.quotes.quotes() {
-                    rows.push(serde_json::json!({
+                    let mut value = serde_json::json!({
                         "step": step,
                         "simulated_at": simulated_at,
                         "symbol": symbol,
@@ -953,7 +1207,55 @@ fn json_rows(
                         "put_mid": quote.put_mid,
                         "put_delta": quote.put_delta,
                         "gamma": quote.gamma,
-                    }));
+                    });
+
+                    // The same keys the CSV header carries at this level, and
+                    // always all of them: a strike with no snapshot emits
+                    // `null`, never a missing key, so a JSON row and a CSV row
+                    // describe the same shape.
+                    let mut extra: Vec<(&str, Option<f64>)> = Vec::new();
+                    if level.wants_greeks() {
+                        extra.extend([
+                            ("call_theta", quote.call_greeks.theta),
+                            ("put_theta", quote.put_greeks.theta),
+                            ("call_vega", quote.call_greeks.vega),
+                            ("put_vega", quote.put_greeks.vega),
+                            ("call_rho", quote.call_greeks.rho),
+                            ("put_rho", quote.put_greeks.rho),
+                            ("call_rho_d", quote.call_greeks.rho_d),
+                            ("put_rho_d", quote.put_greeks.rho_d),
+                        ]);
+                    }
+                    if matches!(level, GreekLevel::All) {
+                        extra.extend([
+                            ("call_gamma", quote.call_greeks.gamma),
+                            ("put_gamma", quote.put_greeks.gamma),
+                            ("call_alpha", quote.call_greeks.alpha),
+                            ("put_alpha", quote.put_greeks.alpha),
+                            ("call_vanna", quote.call_greeks.vanna),
+                            ("put_vanna", quote.put_greeks.vanna),
+                            ("call_vomma", quote.call_greeks.vomma),
+                            ("put_vomma", quote.put_greeks.vomma),
+                            ("call_veta", quote.call_greeks.veta),
+                            ("put_veta", quote.put_greeks.veta),
+                            ("call_charm", quote.call_greeks.charm),
+                            ("put_charm", quote.put_greeks.charm),
+                            ("call_color", quote.call_greeks.color),
+                            ("put_color", quote.put_greeks.color),
+                        ]);
+                    }
+                    if let Some(object) = value.as_object_mut() {
+                        for (key, greek) in extra {
+                            object.insert(
+                                key.to_string(),
+                                match greek {
+                                    Some(greek) => serde_json::json!(greek),
+                                    None => serde_json::Value::Null,
+                                },
+                            );
+                        }
+                    }
+                    rows.push(value);
                 }
             }
             rows
@@ -961,9 +1263,38 @@ fn json_rows(
     }
 }
 
+/// How many rows one chunk carries.
+///
+/// The export streams, but a chunk is indivisible: the channel bounds how many
+/// are in flight, not how large they are, so a whole step in one chunk means a
+/// slow client can hold the entire step in memory no matter how small the
+/// channel is. At the per-snapshot cap of 200 000 contracts a `greeks=all` step
+/// is hundreds of megabytes, and sixteen of those in flight is gigabytes.
+///
+/// Rows rather than bytes because a row's width is fixed by the dataset and the
+/// greek level, so a row count IS a byte bound: 512 rows of the widest shape the
+/// `option_chains` dataset can produce is a few hundred kilobytes, and the
+/// narrower datasets are far less. Backpressure then applies within a step
+/// rather than only between steps.
+const ROWS_PER_CHUNK: usize = 512;
+
+/// Whether a chunk reached the client.
+///
+/// A `bool` would read as "success", and the interesting case here is the one
+/// that is neither success nor failure: the client hung up, which is not an
+/// error to report to anyone, just a reason to stop working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// The chunk was handed to the response stream.
+    Sent,
+    /// The receiver is gone. Stop producing; nothing is owed to anyone.
+    ClientGone,
+}
+
 /// The CSV records one step contributes, in the header's order.
 fn csv_rows(
     dataset: Dataset,
+    level: GreekLevel,
     step: usize,
     simulated_at: &str,
     symbol: &str,
@@ -994,7 +1325,7 @@ fn csv_rows(
                 // one column without depending on quoting to do it.
                 let labels = expiration.labels.join("|");
                 for quote in expiration.quotes.quotes() {
-                    records.push(vec![
+                    let mut record = vec![
                         step.to_string(),
                         simulated_at.to_string(),
                         symbol.to_string(),
@@ -1012,7 +1343,37 @@ fn csv_rows(
                         render_optional(quote.put_mid),
                         render_optional(quote.put_delta),
                         render_optional(quote.gamma),
-                    ]);
+                    ];
+                    // Appended in the header's order, and ALWAYS the same count
+                    // for a level: a strike with no snapshot writes empty
+                    // fields, never fewer of them.
+                    if level.wants_greeks() {
+                        record.push(render_optional(quote.call_greeks.theta));
+                        record.push(render_optional(quote.put_greeks.theta));
+                        record.push(render_optional(quote.call_greeks.vega));
+                        record.push(render_optional(quote.put_greeks.vega));
+                        record.push(render_optional(quote.call_greeks.rho));
+                        record.push(render_optional(quote.put_greeks.rho));
+                        record.push(render_optional(quote.call_greeks.rho_d));
+                        record.push(render_optional(quote.put_greeks.rho_d));
+                    }
+                    if matches!(level, GreekLevel::All) {
+                        record.push(render_optional(quote.call_greeks.gamma));
+                        record.push(render_optional(quote.put_greeks.gamma));
+                        record.push(render_optional(quote.call_greeks.alpha));
+                        record.push(render_optional(quote.put_greeks.alpha));
+                        record.push(render_optional(quote.call_greeks.vanna));
+                        record.push(render_optional(quote.put_greeks.vanna));
+                        record.push(render_optional(quote.call_greeks.vomma));
+                        record.push(render_optional(quote.put_greeks.vomma));
+                        record.push(render_optional(quote.call_greeks.veta));
+                        record.push(render_optional(quote.put_greeks.veta));
+                        record.push(render_optional(quote.call_greeks.charm));
+                        record.push(render_optional(quote.put_greeks.charm));
+                        record.push(render_optional(quote.call_greeks.color));
+                        record.push(render_optional(quote.put_greeks.color));
+                    }
+                    records.push(record);
                 }
             }
             records
@@ -1189,9 +1550,9 @@ mod tests {
             Some(first) => first,
             None => panic!("the export must carry rows"),
         };
-        for column in Dataset::OptionChains.header() {
+        for column in Dataset::OptionChains.header(GreekLevel::None) {
             assert!(
-                first.get(*column).is_some(),
+                first.get(column).is_some(),
                 "the export must carry {column}: {first}"
             );
         }
@@ -1642,6 +2003,15 @@ mod tests {
             }
         }
 
+        /// Forgets everything it holds, so a test can compare the replayed
+        /// and the stored path more than once in a row.
+        fn clear(&self) {
+            match self.stored.lock() {
+                Ok(mut stored) => stored.clear(),
+                Err(poisoned) => poisoned.into_inner().clear(),
+            }
+        }
+
         /// The records it holds, ascending by step.
         fn range(&self, from: usize, to: usize) -> Vec<SnapshotRecord> {
             match self.stored.lock() {
@@ -1736,8 +2106,11 @@ mod tests {
             Ok(tape) => tape,
             Err(error) => panic!("the tape must build: {error}"),
         };
+        // With the greek snapshots, exactly as the manager files them when a
+        // warehouse is registered: a stored tape that lacked them would make
+        // the level-aware comparisons below vacuous.
         let builder = match SeriesBuilder::new(&parameters, &tape) {
-            Ok(builder) => builder,
+            Ok(builder) => builder.with_greek_snapshots(true),
             Err(error) => panic!("the builder must accept the parameters: {error}"),
         };
         let snapshot = match builder.snapshot(step) {
@@ -1837,6 +2210,528 @@ mod tests {
         assert!(
             warehouse.reads() >= 4,
             "every chains export must have consulted the warehouse"
+        );
+    }
+
+    /// One step is delivered as several bounded chunks, not one.
+    ///
+    /// The channel bounds how many chunks are in flight, not how large they
+    /// are, so a whole step in one chunk let a slow client hold the entire step
+    /// in memory — hundreds of megabytes at the per-snapshot cap with
+    /// `greeks=all`. Backpressure has to apply WITHIN a step, which it only
+    /// does if a step is more than one chunk.
+    ///
+    /// Checked on both encodings, since they buffer differently: JSON
+    /// accumulates encoded rows, CSV encodes batches of records.
+    #[test]
+    fn test_a_wide_step_is_delivered_in_bounded_chunks() {
+        let mut parameters = reference_parameters();
+        // Wide enough that one step is several chunks.
+        parameters.chain_size = Some(400);
+        parameters.strike_interval =
+            match positive::Positive::new_decimal(rust_decimal::Decimal::ONE) {
+                Ok(interval) => Some(interval),
+                Err(error) => panic!("the fixture interval must be positive: {error}"),
+            };
+
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
+        let builder = match SeriesBuilder::new(&parameters, &tape) {
+            Ok(builder) => builder,
+            Err(error) => panic!("the builder must accept the parameters: {error}"),
+        };
+        let snapshot = match builder.snapshot(0) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("the snapshot must build: {error}"),
+        };
+        let row = match tape.row(0) {
+            Some(row) => row,
+            None => panic!("the tape must have a first row"),
+        };
+
+        let rows: usize = snapshot
+            .chains
+            .iter()
+            .map(|chain| chain.chain.iter().count())
+            .sum();
+        assert!(
+            rows > ROWS_PER_CHUNK,
+            "the fixture must be wider than one chunk, got {rows} rows"
+        );
+
+        for format in [Format::Json, Format::Csv] {
+            let mut writer = match Writer::new(format, Dataset::OptionChains, GreekLevel::All) {
+                Ok(writer) => writer,
+                Err(error) => panic!("the writer must build: {error}"),
+            };
+            let mut chunks: Vec<usize> = Vec::new();
+            let delivery = writer.rows(
+                &parameters,
+                0,
+                row,
+                Some(StepChains::Replayed(&snapshot)),
+                &mut |chunk| {
+                    chunks.push(chunk.len());
+                    Delivery::Sent
+                },
+            );
+            match delivery {
+                Ok(Delivery::Sent) => {}
+                other => panic!("{format:?}: the step must be delivered, got {other:?}"),
+            }
+
+            assert!(
+                chunks.len() > 1,
+                "{format:?}: a step of {rows} rows must be more than one chunk"
+            );
+            // The bound is rows, and a row's width is fixed by the dataset and
+            // the level, so this is a byte bound in practice.
+            let widest = chunks.iter().copied().max().unwrap_or_default();
+            assert!(
+                widest < 4 * 1024 * 1024,
+                "{format:?}: a chunk of {widest} bytes is not bounded"
+            );
+        }
+    }
+
+    /// A client that hangs up stops the work at the next chunk boundary.
+    ///
+    /// The reason `rows` reports delivery rather than returning bytes: it now
+    /// emits several chunks per step, so it has to learn about the disconnect
+    /// itself instead of the caller discovering it after the whole step was
+    /// built.
+    #[test]
+    fn test_a_disconnect_stops_the_step_at_the_next_chunk() {
+        let mut parameters = reference_parameters();
+        parameters.chain_size = Some(400);
+        parameters.strike_interval =
+            match positive::Positive::new_decimal(rust_decimal::Decimal::ONE) {
+                Ok(interval) => Some(interval),
+                Err(error) => panic!("the fixture interval must be positive: {error}"),
+            };
+
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
+        let builder = match SeriesBuilder::new(&parameters, &tape) {
+            Ok(builder) => builder,
+            Err(error) => panic!("the builder must accept the parameters: {error}"),
+        };
+        let snapshot = match builder.snapshot(0) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("the snapshot must build: {error}"),
+        };
+        let row = match tape.row(0) {
+            Some(row) => row,
+            None => panic!("the tape must have a first row"),
+        };
+
+        let mut writer = match Writer::new(Format::Csv, Dataset::OptionChains, GreekLevel::All) {
+            Ok(writer) => writer,
+            Err(error) => panic!("the writer must build: {error}"),
+        };
+        let mut delivered = 0_usize;
+        let outcome = writer.rows(
+            &parameters,
+            0,
+            row,
+            Some(StepChains::Replayed(&snapshot)),
+            &mut |_| {
+                delivered += 1;
+                Delivery::ClientGone
+            },
+        );
+
+        match outcome {
+            Ok(Delivery::ClientGone) => {}
+            other => panic!("a disconnect must be reported, got {other:?}"),
+        }
+        assert_eq!(delivered, 1, "the work must stop at the first refusal");
+    }
+
+    /// Every way of getting a 400 out of this endpoint returns the documented
+    /// shape.
+    ///
+    /// Four different paths reach it — the handler's own validation, the id
+    /// parse, the range check and actix's query extractor — and only the first
+    /// three ever named a field. The extractor's rejection used to be untyped
+    /// plaintext; it now renders the same object with an empty `field`, because
+    /// serde's message for a bad key does not say which one. Pinned so the
+    /// documented schema stays true of all four.
+    #[actix_web::test]
+    async fn test_every_export_rejection_carries_the_documented_shape() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        let cases = [
+            (
+                "/api/v2/simulations/not-a-uuid/export?dataset=option_chains&format=csv"
+                    .to_string(),
+                Some("id"),
+            ),
+            (
+                format!(
+                    "/api/v2/simulations/{id}/export?dataset=option_chains&format=csv&from_step=2&to_step=1"
+                ),
+                Some("from_step"),
+            ),
+            (
+                format!(
+                    "/api/v2/simulations/{id}/export?dataset=option_chains&format=csv&greeks=second"
+                ),
+                Some("greeks"),
+            ),
+            // The extractor's own rejections: typed body, unnamed field.
+            (
+                format!("/api/v2/simulations/{id}/export?dataset=nope&format=csv"),
+                Some(""),
+            ),
+            (
+                format!(
+                    "/api/v2/simulations/{id}/export?dataset=option_chains&format=csv&from_step=abc"
+                ),
+                Some(""),
+            ),
+        ];
+
+        for (uri, field) in cases {
+            let response = actix_test::call_service(
+                &app,
+                actix_test::TestRequest::get().uri(&uri).to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "for {uri}");
+            let body: Value = actix_test::read_body_json(response).await;
+            assert_eq!(
+                body.get("field").and_then(Value::as_str),
+                field,
+                "for {uri}: {body}"
+            );
+            assert!(
+                body.get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(|error| !error.is_empty()),
+                "every rejection must explain itself: {body}"
+            );
+        }
+    }
+
+    /// The two conversion paths agree at every greek level.
+    ///
+    /// The acceptance criterion of issue #75, and the one this stack's design
+    /// exists to satisfy: `QuoteView::replayed` and `QuoteView::stored` are
+    /// different code reading different sources, and the export prefers the
+    /// warehouse whenever it has a step. If they disagreed about a greek, the
+    /// same simulation would export differently depending on whether
+    /// persistence happened to be registered — the asymmetry #74 and #75
+    /// together remove.
+    ///
+    /// Checked in both encodings, because they are also two separate
+    /// renderings of the same view.
+    #[actix_web::test]
+    async fn test_the_two_sources_agree_at_every_greek_level() {
+        let warehouse = Arc::new(FakeWarehouse::default());
+        let app = v2_service!(Some(
+            Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>
+        ));
+        let id = create!(app);
+
+        for level in ["none", "first", "all"] {
+            let mut replayed = Vec::new();
+            for format in ["json", "csv"] {
+                let (status, body) = export!(
+                    app,
+                    id,
+                    format!("dataset=option_chains&format={format}&greeks={level}")
+                );
+                assert_eq!(status, StatusCode::OK, "{format} at {level}");
+                replayed.push(body);
+            }
+
+            warehouse.fill(stored_tape(parse_id(&id)));
+
+            for (format, replayed) in ["json", "csv"].iter().zip(replayed) {
+                let (status, stored) = export!(
+                    app,
+                    id,
+                    format!("dataset=option_chains&format={format}&greeks={level}")
+                );
+                assert_eq!(status, StatusCode::OK, "{format} at {level}");
+                assert_eq!(
+                    replayed, stored,
+                    "{format} at greeks={level}: the stored and replayed paths must agree"
+                );
+            }
+
+            warehouse.clear();
+        }
+    }
+
+    /// The default header is frozen, literally.
+    ///
+    /// `test_the_default_export_is_unchanged` compares the default against
+    /// `greeks=none`, which cannot fail if BOTH moved. This spells the
+    /// pre-change header out by hand, so an edit to `CHAIN_COLUMNS` has to
+    /// break a test rather than a consumer parsing by position.
+    #[test]
+    fn test_the_default_chain_header_is_frozen() {
+        assert_eq!(
+            Dataset::OptionChains.header(GreekLevel::None),
+            vec![
+                "step",
+                "simulated_at",
+                "symbol",
+                "expires_at",
+                "labels",
+                "days_to_expiration",
+                "strike",
+                "implied_volatility",
+                "call_bid",
+                "call_ask",
+                "call_mid",
+                "call_delta",
+                "put_bid",
+                "put_ask",
+                "put_mid",
+                "put_delta",
+                "gamma",
+            ],
+            "the default export's columns are frozen; levels may only append"
+        );
+    }
+
+    /// A warehouse holding pre-#74 rows does not produce a half-covered export.
+    ///
+    /// The failure this prevents: a range whose early steps were filed before
+    /// the greek columns existed and whose later steps were not would emit
+    /// empty greek columns for the prefix and real ones for the rest, in one
+    /// file, with nothing to tell them apart. Such a step is replayed instead.
+    ///
+    /// At the default level the same record is still served from storage,
+    /// because there it answers the question completely.
+    #[actix_web::test]
+    async fn test_a_stored_step_without_greeks_is_replayed_rather_than_served_short() {
+        let warehouse = Arc::new(FakeWarehouse::default());
+        let app = v2_service!(Some(
+            Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>
+        ));
+        let id = create!(app);
+
+        // A tape as a pre-#74 binary filed it: every value but the greeks.
+        let mut old_shape = stored_tape(parse_id(&id));
+        for record in &mut old_shape {
+            for expiration in &mut record.expirations {
+                for quote in &mut expiration.quotes {
+                    quote.greeks_call = None;
+                    quote.greeks_put = None;
+                }
+            }
+        }
+        warehouse.fill(old_shape);
+
+        let (status, all) = export!(
+            app,
+            id,
+            "dataset=option_chains&format=csv&greeks=all".to_string()
+        );
+        assert_eq!(status, StatusCode::OK);
+
+        // Replayed, so every row carries its greeks rather than empty columns.
+        let header = Dataset::OptionChains.header(GreekLevel::All);
+        let charm = match header.iter().position(|column| *column == "call_charm") {
+            Some(index) => index,
+            None => panic!("the all-level header must carry call_charm"),
+        };
+        let lines: Vec<&str> = all.split("\r\n").filter(|line| !line.is_empty()).collect();
+        assert!(lines.len() > 1, "the export must carry rows");
+        for line in &lines[1..] {
+            let fields: Vec<&str> = line.split(',').collect();
+            assert!(
+                fields.get(charm).is_some_and(|value| !value.is_empty()),
+                "a replayed row must carry its greeks: {line}"
+            );
+        }
+
+        // And the same record still answers the default level from storage.
+        let (_, default) = export!(
+            app,
+            id,
+            "dataset=option_chains&format=csv&greeks=none".to_string()
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert!(default.lines().count() > 1);
+    }
+
+    /// The default export is byte-identical to `greeks=none`, and carries no
+    /// greek column at all.
+    ///
+    /// The regression that protects every existing consumer of a tape: a
+    /// backtester parsing by column position must read exactly what it read
+    /// before the parameter existed.
+    #[actix_web::test]
+    async fn test_the_default_export_is_unchanged() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        for format in ["json", "csv"] {
+            let (status, default) =
+                export!(app, id, format!("dataset=option_chains&format={format}"));
+            assert_eq!(status, StatusCode::OK);
+            let (_, explicit) = export!(
+                app,
+                id,
+                format!("dataset=option_chains&format={format}&greeks=none")
+            );
+            assert_eq!(default, explicit, "{format}");
+
+            for absent in ["call_theta", "put_charm", "call_gamma", "put_color"] {
+                assert!(
+                    !default.contains(absent),
+                    "{format}: the default export must not carry {absent}"
+                );
+            }
+        }
+    }
+
+    /// Exporting twice at the same level is byte-identical.
+    ///
+    /// The export's standing guarantee, extended to the new parameter: a level
+    /// must not introduce anything order-dependent or non-deterministic.
+    #[actix_web::test]
+    async fn test_an_export_repeats_byte_for_byte_at_every_level() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        for level in ["none", "first", "all"] {
+            for format in ["json", "csv"] {
+                let query = format!("dataset=option_chains&format={format}&greeks={level}");
+                let (status, first) = export!(app, id, query.clone());
+                let (_, second) = export!(app, id, query);
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(first, second, "{format} at greeks={level}");
+            }
+        }
+    }
+
+    /// The JSON export carries the same values as the CSV export, at every
+    /// level.
+    ///
+    /// Compared as RAW TEXT on both sides, never parsed. `serde_json`'s float
+    /// parser is not bit-exact for every value this export produces — parsing
+    /// `0.009547174464993615` and re-rendering it yields
+    /// `0.009547174464993617` — so a test that parsed the JSON would be
+    /// comparing its own round-trip error against the service and reporting a
+    /// divergence that is not there. The bytes the client receives are
+    /// identical, and those are what this checks.
+    #[actix_web::test]
+    async fn test_the_json_export_matches_the_csv_export_at_every_level() {
+        /// The raw text of one `"key":value` token, exactly as serialised.
+        fn raw_token(row: &str, key: &str) -> String {
+            let needle = format!("\"{key}\":");
+            let start = match row.find(&needle) {
+                Some(start) => start + needle.len(),
+                None => panic!("the JSON row must carry {key}: {row}"),
+            };
+            let rest = &row[start..];
+            let end = rest.find([',', '}']).unwrap_or(rest.len());
+            rest[..end].trim_matches('"').to_string()
+        }
+
+        let app = v2_service!();
+        let id = create!(app);
+
+        for (level, greek_level) in [
+            ("none", GreekLevel::None),
+            ("first", GreekLevel::First),
+            ("all", GreekLevel::All),
+        ] {
+            let (_, csv) = export!(
+                app,
+                id,
+                format!("dataset=option_chains&format=csv&greeks={level}")
+            );
+            let (_, json) = export!(
+                app,
+                id,
+                format!("dataset=option_chains&format=json&greeks={level}")
+            );
+
+            let header = Dataset::OptionChains.header(greek_level);
+            let lines: Vec<&str> = csv.split("\r\n").filter(|line| !line.is_empty()).collect();
+            // Split the array into its objects without parsing them.
+            let objects: Vec<&str> = json
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split("},{")
+                .collect();
+
+            assert_eq!(
+                lines.len() - 1,
+                objects.len(),
+                "row counts differ at {level}"
+            );
+            assert!(!objects.is_empty(), "the export must carry rows at {level}");
+
+            for (line, object) in lines[1..].iter().zip(objects.iter()) {
+                let fields: Vec<&str> = line.split(',').collect();
+                assert_eq!(fields.len(), header.len(), "width differs at {level}");
+                for (column, field) in header.iter().zip(fields.iter()) {
+                    let mut from_json = raw_token(object, column);
+                    // A CSV blank and a JSON null are the same absence.
+                    if from_json == "null" {
+                        from_json = String::new();
+                    }
+                    let expected = field.trim_matches('"');
+
+                    // Numbers are compared as NUMBERS, through one parser. The
+                    // two encoders render the same `f64` differently — JSON
+                    // takes exponent notation below `1e-5` where the CSV spells
+                    // the zeros out, and `4975` is written `4975.0` — so a text
+                    // comparison would report a difference in notation as a
+                    // difference in value. Parsing both sides with the same
+                    // correctly-rounded parser compares what the criterion is
+                    // about, and still catches a genuine divergence.
+                    match (from_json.parse::<f64>(), expected.parse::<f64>()) {
+                        (Ok(json_value), Ok(csv_value)) => assert_eq!(
+                            json_value, csv_value,
+                            "{column} differs between the encodings at {level}"
+                        ),
+                        _ => assert_eq!(
+                            from_json, expected,
+                            "{column} differs between the encodings at {level}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// An unknown level is a typed 400, before a single byte is streamed.
+    ///
+    /// A stream that has already sent its header cannot take an error back, so
+    /// the rejection has to happen on the runtime rather than in the producer.
+    #[actix_web::test]
+    async fn test_an_unknown_greek_level_is_rejected_before_streaming() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        let (status, body) = export!(
+            app,
+            id,
+            "dataset=option_chains&format=csv&greeks=second".to_string()
+        );
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("greeks"),
+            "the 400 must name the field, got {body}"
+        );
+        assert!(
+            !body.contains("call_bid"),
+            "no header may have been streamed, got {body}"
         );
     }
 
@@ -1997,6 +2892,7 @@ mod tests {
             format: Format::Json,
             from_step: from,
             to_step: to,
+            greeks: None,
         }
     }
 
@@ -2041,16 +2937,64 @@ mod tests {
         assert_eq!(render_optional(Some(1.5)), "1.5");
     }
 
-    /// Every dataset's header matches the columns its rows carry.
+    /// Every dataset's header matches the columns its rows carry, at every
+    /// greek level.
     #[test]
     fn test_every_header_matches_its_row_width() {
-        for (dataset, width) in [
-            (Dataset::Underlying, 4),
-            (Dataset::Volatility, 4),
-            (Dataset::OptionChains, 17),
-        ] {
-            assert_eq!(dataset.header().len(), width, "{dataset:?}");
+        for level in [GreekLevel::None, GreekLevel::First, GreekLevel::All] {
+            for (dataset, width) in [
+                (Dataset::Underlying, 4),
+                (Dataset::Volatility, 4),
+                (
+                    Dataset::OptionChains,
+                    match level {
+                        // 17 today, plus four first-order greeks per style,
+                        // plus seven more per style at `all`.
+                        GreekLevel::None => 17,
+                        GreekLevel::First => 17 + 8,
+                        GreekLevel::All => 17 + 8 + 14,
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    dataset.header(level).len(),
+                    width,
+                    "{dataset:?} at {level:?}"
+                );
+            }
         }
+    }
+
+    /// Each level's header is a PREFIX of the next.
+    ///
+    /// What lets a consumer parse by position: raising the level appends and
+    /// never moves a column, so a parser written against `none` keeps reading
+    /// the same fields out of an `all` export.
+    #[test]
+    fn test_each_greek_level_extends_the_previous_header() {
+        let none = Dataset::OptionChains.header(GreekLevel::None);
+        let first = Dataset::OptionChains.header(GreekLevel::First);
+        let all = Dataset::OptionChains.header(GreekLevel::All);
+
+        assert_eq!(first[..none.len()], none[..]);
+        assert_eq!(all[..first.len()], first[..]);
+
+        // And the appended names are the documented ones.
+        assert_eq!(
+            &first[none.len()..],
+            &[
+                "call_theta",
+                "put_theta",
+                "call_vega",
+                "put_vega",
+                "call_rho",
+                "put_rho",
+                "call_rho_d",
+                "put_rho_d"
+            ]
+        );
+        assert_eq!(all[first.len()], "call_gamma");
+        assert_eq!(all[all.len() - 1], "put_color");
     }
 
     /// Only the option-chains dataset needs chains priced, which is why a

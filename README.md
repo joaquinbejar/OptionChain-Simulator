@@ -330,6 +330,7 @@ has walked, every step is replayed. Either source renders the same bytes.
 | `dataset` | `underlying` \| `volatility` \| `option_chains` |
 | `format`  | `json` \| `csv` |
 | `from_step`, `to_step` | inclusive bounds; default to the whole tape |
+| `greeks` | `none` (default) \| `first` \| `all` — `option_chains` only |
 
 **Read-only in the strong sense.** The export works from an immutable copy
 of the effective parameters and, where it reads them, from rows already
@@ -338,6 +339,32 @@ a snapshot of its own, or alters what the next peek returns.
 A simulation that has never been walked exports its whole tape, a completed
 one still does, and two clients can export the same simulation at once.
 
+**The greek columns are opt-in and append-only.** `greeks` takes the same
+three values, with the same meaning and the same default, as the chain
+endpoints, so a tape and a live step agree on what a level means. `first`
+appends `call_theta`, `put_theta`, `call_vega`, `put_vega`, `call_rho`,
+`put_rho`, `call_rho_d`, `put_rho_d`; `all` appends fourteen more, `gamma`
+through `color`, per style. `delta` is not among them — it already has its
+`call_delta` / `put_delta` columns, and a second copy could only drift.
+
+Each level's header is a **prefix** of the next, so raising the level
+appends columns and never moves one: a consumer parsing by position keeps
+working, and the default export is byte-identical to what it was before the
+parameter existed. The column set is fixed per level, so a strike with no
+computable greeks writes empty fields rather than fewer of them.
+
+Measured on a 5 996-row export, release build:
+
+| Level | CSV | JSON | Wall time |
+|-------|-----|------|-----------|
+| `none` | 1.27 MB | 2.54 MB | 303 ms |
+| `first` | 2.23 MB | 4.06 MB | 459 ms |
+| `all` | 4.01 MB | 6.87 MB | 469 ms |
+
+`first` and `all` cost the same to compute — upstream builds the snapshot
+whole and the level only decides what is written — so the step from `first`
+to `all` is paid in bytes, not in time.
+
 **Deterministic.** Repeating an export is byte-identical: every value is a
 function of the effective parameters and the cursor, timestamps render as
 whole-second RFC 3339, and numbers use shortest round-trip formatting with
@@ -345,6 +372,25 @@ no locale. JSON is a single valid array; CSV is RFC 4180 with a header row
 and CRLF endings, and an absent optional is an **empty** field rather than
 `null` or `0`. Chain labels are joined with `|` so a shared expiration stays
 one column.
+
+The two encodings carry the same *values*, though not always the same
+notation. JSON writes `4950.0` where the CSV writes `4950`, so every
+integral value differs, on every row; and JSON takes exponent form below
+`1e-5` — a `color` of `6.4101559520200445e-6` — where the CSV spells the
+zeros out. Compare the two as numbers, never as text. JSON key order is not
+part of the contract; parse by name.
+
+**The greeks are `f64` here**, where the chain endpoints carry them as exact
+decimal strings. A CSV column has no type to make that distinction, and this
+surface's contract is that two runs compare byte for byte. So a tape and a
+live step agree on which greeks a level carries and on what they mean — but
+reconcile their numbers by value, not by string.
+
+`gamma` appears three times at `all`: the shared `gamma` column plus
+`call_gamma` / `put_gamma`. They agree for a European option. The shared one
+is upstream's convenience mirror and stays defined at expiry and at zero
+volatility, where the per-style pair goes blank — which is the case where
+diffing them is informative rather than a bug.
 
 The rows are produced on a blocking thread and handed over a bounded
 channel, so a long `option_chains` export never occupies an Actix worker and
