@@ -94,10 +94,16 @@ const SNAPSHOT_QUEUE_DEPTH: usize = 1_024;
 /// one, so 1 024 of them is anywhere from a hundred thousand to two hundred
 /// million rows. This bounds what is actually resident.
 ///
+/// Like the cache bound, the count is derived from a byte budget of roughly
+/// 850 MB rather than chosen: `size_of::<QuoteRow>()` is 620 bytes since issue
+/// #74 gave it both greek snapshots (212 bytes before), so 1 350 000 × 620 B ≈
+/// 837 MB. The count came down from 4 000 000 in the same change, to hold the
+/// budget the previous count expressed.
+///
 /// Neither bound is a knob. A deployment that needs to tune them is one whose
 /// warehouse cannot keep up with its advance rate, and the answer there is the
 /// warehouse, not a deeper buffer in front of it.
-const SNAPSHOT_QUEUE_CONTRACTS: usize = 4_000_000;
+const SNAPSHOT_QUEUE_CONTRACTS: usize = 1_350_000;
 
 impl SimulationManager {
     /// Creates a manager over a simulation store.
@@ -451,7 +457,29 @@ impl SimulationManager {
         }
 
         let tape = self.tape_for(simulation).await?;
-        let snapshot = SeriesBuilder::new(&simulation.parameters, &tape)?.snapshot(step)?;
+        // The greek snapshots are built only when something will read them:
+        // a registered warehouse files every step, and a filed step has to
+        // carry what a replayed one does (issue #74). Without a warehouse the
+        // API prices them per request instead, and only when asked.
+        let greek_snapshots = self.warehouse.is_some();
+        let parameters = simulation.parameters.clone();
+
+        // Off the runtime and under the shared bound, for the same reason
+        // `tape_for` is: pricing a snapshot is real synchronous CPU — up to
+        // `DEFAULT_MAX_SNAPSHOT_CONTRACTS` priced contracts, and about 1.54x
+        // that again once the greek snapshots are on — and a worker holding it
+        // stalls every other request that worker owns.
+        //
+        // The bound is the one the API renderers use, not a second one: they
+        // compete for the same cores, and a warehouse-backed deployment prices
+        // greeks HERE on every peek and advance, so admitting only the render
+        // side would leave the heavier half unbounded.
+        let snapshot = crate::utils::admission::admit_blocking(move || {
+            SeriesBuilder::new(&parameters, &tape)?
+                .with_greek_snapshots(greek_snapshots)
+                .snapshot(step)
+        })
+        .await?;
 
         self.cache_snapshot(simulation.id, snapshot.clone());
         Ok(snapshot)
@@ -747,7 +775,7 @@ mod tests {
     /// fail — the two behaviours the wiring promises something about.
     #[derive(Default)]
     struct RecordingWarehouse {
-        filed: Mutex<Vec<(Uuid, usize)>>,
+        filed: Mutex<Vec<SnapshotRecord>>,
         fail: bool,
     }
 
@@ -759,11 +787,20 @@ mod tests {
             }
         }
 
-        fn filed(&self) -> Vec<(Uuid, usize)> {
+        /// The records it was handed, whole — so a test can assert on what is
+        /// inside one, not just that one arrived.
+        fn records(&self) -> Vec<SnapshotRecord> {
             match self.filed.lock() {
                 Ok(filed) => filed.clone(),
                 Err(poisoned) => poisoned.into_inner().clone(),
             }
+        }
+
+        fn filed(&self) -> Vec<(Uuid, usize)> {
+            self.records()
+                .iter()
+                .map(|record| (record.simulation, record.step))
+                .collect()
         }
     }
 
@@ -774,8 +811,8 @@ mod tests {
                 return Err(ChainError::Internal("the warehouse is down".to_string()));
             }
             match self.filed.lock() {
-                Ok(mut filed) => filed.push((record.simulation, record.step)),
-                Err(poisoned) => poisoned.into_inner().push((record.simulation, record.step)),
+                Ok(mut filed) => filed.push(record),
+                Err(poisoned) => poisoned.into_inner().push(record),
             }
             Ok(())
         }
@@ -963,6 +1000,173 @@ mod tests {
             warehouse.filed(),
             vec![(simulation.id, 0)],
             "the step the advance served is the step that is filed"
+        );
+    }
+
+    /// A registered warehouse is what turns the greek snapshots on.
+    ///
+    /// The wiring that makes issue #74 work: `SeriesBuilder` builds them only
+    /// when asked, and the manager asks exactly when there is a warehouse to
+    /// file them into. A filed record with empty snapshots would persist a tape
+    /// strictly poorer than a replayed one — the asymmetry the issue removes —
+    /// and every existing test would still pass, because none of them looks
+    /// inside a filed record.
+    #[tokio::test]
+    async fn test_a_registered_warehouse_files_the_greeks() {
+        let warehouse = Arc::new(RecordingWarehouse::default());
+        let manager = SimulationManager::new(
+            Arc::new(InMemorySimulationStore::new()),
+            SimulationV2Config::default(),
+        )
+        .with_warehouse(Arc::clone(&warehouse) as Arc<dyn SimulationSnapshotRepository>);
+
+        let simulation = created(&manager, 3).await;
+        match manager.advance(simulation.id).await {
+            Ok(_) => {}
+            Err(error) => panic!("the advance must serve: {error}"),
+        }
+        settle().await;
+
+        let records = warehouse.records();
+        let record = match records.first() {
+            Some(record) => record,
+            None => panic!("the advance must file a record"),
+        };
+        let quotes: Vec<_> = record
+            .expirations
+            .iter()
+            .flat_map(|expiration| expiration.quotes.iter())
+            .collect();
+        assert!(!quotes.is_empty(), "the filed record must carry quotes");
+        assert!(
+            quotes
+                .iter()
+                .all(|quote| quote.greeks_call.is_some() && quote.greeks_put.is_some()),
+            "every filed quote must carry both snapshots"
+        );
+    }
+
+    /// A registered warehouse does not change the tape.
+    ///
+    /// The flag it turns on selects a different upstream branch inside
+    /// `OptionChain::build_chain`, so two deployments of the same build, same
+    /// parameters and same seed take two different code paths to the same
+    /// market. If they ever disagreed, whether a step was filed would change
+    /// what a client was served — the worst regression this service can have,
+    /// and one no other test would see, because every other comparison is
+    /// between two managers configured the same way.
+    #[tokio::test]
+    async fn test_a_warehouse_does_not_change_the_served_market() {
+        let filing = SimulationManager::new(
+            Arc::new(InMemorySimulationStore::new()),
+            SimulationV2Config::default(),
+        )
+        .with_warehouse(
+            Arc::new(RecordingWarehouse::default()) as Arc<dyn SimulationSnapshotRepository>
+        );
+        let plain = SimulationManager::new(
+            Arc::new(InMemorySimulationStore::new()),
+            SimulationV2Config::default(),
+        );
+
+        let served = async |manager: &SimulationManager| {
+            let simulation = created(manager, 3).await;
+            match manager.peek(simulation.id).await {
+                Ok((_, snapshot)) => snapshot,
+                Err(error) => panic!("the peek must serve: {error}"),
+            }
+        };
+        let with_warehouse = served(&filing).await;
+        let without = served(&plain).await;
+
+        assert_eq!(
+            with_warehouse.spot, without.spot,
+            "the seeded price path must not depend on the warehouse"
+        );
+        assert_eq!(with_warehouse.base_volatility, without.base_volatility);
+        assert_eq!(with_warehouse.chains.len(), without.chains.len());
+
+        // Every priced value, strike by strike. `PartialEq` on `ExpiryChain`
+        // compares the whole chain including the greek snapshots, which DO
+        // differ by design, so the comparison is over what is served.
+        //
+        // Counted, not just zipped: a `zip` over two chains of different
+        // lengths truncates silently, and over two EMPTY ones it asserts
+        // nothing at all — which is the outcome at the low volatilities where a
+        // chain serves no valid strike.
+        let mut compared = 0_usize;
+        for (filed, replayed) in with_warehouse.chains.iter().zip(without.chains.iter()) {
+            assert_eq!(filed.expires_at, replayed.expires_at);
+            assert_eq!(filed.days_to_expiration, replayed.days_to_expiration);
+            assert_eq!(
+                filed.chain.iter().count(),
+                replayed.chain.iter().count(),
+                "the two deployments must quote the same strikes"
+            );
+            for (left, right) in filed.chain.iter().zip(replayed.chain.iter()) {
+                compared += 1;
+                assert_eq!(left.strike_price, right.strike_price);
+                assert_eq!(left.implied_volatility, right.implied_volatility);
+                assert_eq!(left.call_bid, right.call_bid);
+                assert_eq!(left.call_ask, right.call_ask);
+                assert_eq!(left.call_middle, right.call_middle);
+                assert_eq!(left.put_bid, right.put_bid);
+                assert_eq!(left.put_ask, right.put_ask);
+                assert_eq!(left.put_middle, right.put_middle);
+                assert_eq!(left.delta_call, right.delta_call);
+                assert_eq!(left.delta_put, right.delta_put);
+                assert_eq!(left.gamma, right.gamma);
+            }
+        }
+        assert!(compared > 0, "the fixture must actually quote something");
+
+        // And the one thing that IS meant to differ.
+        assert!(
+            with_warehouse
+                .chains
+                .iter()
+                .flat_map(|chain| chain.chain.iter())
+                .all(|data| data.greeks_call.is_some())
+        );
+        assert!(
+            without
+                .chains
+                .iter()
+                .flat_map(|chain| chain.chain.iter())
+                .all(|data| data.greeks_call.is_none())
+        );
+    }
+
+    /// Without a warehouse nothing pays for the greeks.
+    ///
+    /// The other half of the same wiring: a deployment that files nothing and
+    /// whose clients never ask must not be charged about 1.5x a chain build on
+    /// every advance. When a client does ask, the API prices them per request
+    /// instead.
+    #[tokio::test]
+    async fn test_a_manager_without_a_warehouse_does_not_price_the_greeks() {
+        let manager = SimulationManager::new(
+            Arc::new(InMemorySimulationStore::new()),
+            SimulationV2Config::default(),
+        );
+
+        let simulation = created(&manager, 3).await;
+        let (_, snapshot) = match manager.peek(simulation.id).await {
+            Ok(served) => served,
+            Err(error) => panic!("the peek must serve: {error}"),
+        };
+
+        let contracts: Vec<_> = snapshot
+            .chains
+            .iter()
+            .flat_map(|chain| chain.chain.iter())
+            .collect();
+        assert!(!contracts.is_empty(), "the snapshot must quote something");
+        assert!(
+            contracts
+                .iter()
+                .all(|data| data.greeks_call.is_none() && data.greeks_put.is_none()),
+            "no snapshot should have been priced"
         );
     }
 

@@ -30,6 +30,7 @@ use super::record::{ContractQuote, ContractSide, ExpirationRecord, QuoteRow, Sna
 use crate::utils::ChainError;
 use chrono::{DateTime, Utc};
 use clickhouse::Row;
+use optionstratlib::greeks::GreeksSnapshot;
 use positive::Positive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -133,8 +134,75 @@ pub(crate) struct OptionQuoteRow {
     pub(crate) delta_call: Option<i128>,
     /// The put delta, scaled by `10^28`.
     pub(crate) delta_put: Option<i128>,
-    /// Gamma, scaled by `10^28`.
+    /// Gamma, shared by both styles: upstream's convenience mirror, kept
+    /// alongside the per-style snapshot columns. Scaled by `10^28`.
     pub(crate) gamma: Option<i128>,
+    /// The call's `gamma`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) gamma_call: Option<i128>,
+    /// The put's `gamma`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) gamma_put: Option<i128>,
+    /// The call's `theta`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) theta_call: Option<i128>,
+    /// The put's `theta`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) theta_put: Option<i128>,
+    /// The call's `vega`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) vega_call: Option<i128>,
+    /// The put's `vega`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) vega_put: Option<i128>,
+    /// The call's `rho`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) rho_call: Option<i128>,
+    /// The put's `rho`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) rho_put: Option<i128>,
+    /// The call's `rho_d`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) rho_d_call: Option<i128>,
+    /// The put's `rho_d`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) rho_d_put: Option<i128>,
+    /// The call's `alpha`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) alpha_call: Option<i128>,
+    /// The put's `alpha`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) alpha_put: Option<i128>,
+    /// The call's `vanna`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) vanna_call: Option<i128>,
+    /// The put's `vanna`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) vanna_put: Option<i128>,
+    /// The call's `vomma`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) vomma_call: Option<i128>,
+    /// The put's `vomma`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) vomma_put: Option<i128>,
+    /// The call's `veta`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) veta_call: Option<i128>,
+    /// The put's `veta`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) veta_put: Option<i128>,
+    /// The call's `charm`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) charm_call: Option<i128>,
+    /// The put's `charm`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) charm_put: Option<i128>,
+    /// The call's `color`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) color_call: Option<i128>,
+    /// The put's `color`, scaled by `10^28`. NULL when the strike has no
+    /// computable snapshot, or when the row predates issue #74.
+    pub(crate) color_put: Option<i128>,
     /// Ingestion time, as unix milliseconds. See [`SnapshotMetaRow`].
     pub(crate) inserted_at_ms: u64,
 }
@@ -189,8 +257,52 @@ pub(crate) struct QuoteReadRow {
     pub(crate) delta_call: Option<i128>,
     /// The put delta, scaled by `10^28`.
     pub(crate) delta_put: Option<i128>,
-    /// Gamma, scaled by `10^28`.
+    /// Gamma, shared by both styles. Scaled by `10^28`.
     pub(crate) gamma: Option<i128>,
+    /// The call's `gamma`, scaled by `10^28`.
+    pub(crate) gamma_call: Option<i128>,
+    /// The put's `gamma`, scaled by `10^28`.
+    pub(crate) gamma_put: Option<i128>,
+    /// The call's `theta`, scaled by `10^28`.
+    pub(crate) theta_call: Option<i128>,
+    /// The put's `theta`, scaled by `10^28`.
+    pub(crate) theta_put: Option<i128>,
+    /// The call's `vega`, scaled by `10^28`.
+    pub(crate) vega_call: Option<i128>,
+    /// The put's `vega`, scaled by `10^28`.
+    pub(crate) vega_put: Option<i128>,
+    /// The call's `rho`, scaled by `10^28`.
+    pub(crate) rho_call: Option<i128>,
+    /// The put's `rho`, scaled by `10^28`.
+    pub(crate) rho_put: Option<i128>,
+    /// The call's `rho_d`, scaled by `10^28`.
+    pub(crate) rho_d_call: Option<i128>,
+    /// The put's `rho_d`, scaled by `10^28`.
+    pub(crate) rho_d_put: Option<i128>,
+    /// The call's `alpha`, scaled by `10^28`.
+    pub(crate) alpha_call: Option<i128>,
+    /// The put's `alpha`, scaled by `10^28`.
+    pub(crate) alpha_put: Option<i128>,
+    /// The call's `vanna`, scaled by `10^28`.
+    pub(crate) vanna_call: Option<i128>,
+    /// The put's `vanna`, scaled by `10^28`.
+    pub(crate) vanna_put: Option<i128>,
+    /// The call's `vomma`, scaled by `10^28`.
+    pub(crate) vomma_call: Option<i128>,
+    /// The put's `vomma`, scaled by `10^28`.
+    pub(crate) vomma_put: Option<i128>,
+    /// The call's `veta`, scaled by `10^28`.
+    pub(crate) veta_call: Option<i128>,
+    /// The put's `veta`, scaled by `10^28`.
+    pub(crate) veta_put: Option<i128>,
+    /// The call's `charm`, scaled by `10^28`.
+    pub(crate) charm_call: Option<i128>,
+    /// The put's `charm`, scaled by `10^28`.
+    pub(crate) charm_put: Option<i128>,
+    /// The call's `color`, scaled by `10^28`.
+    pub(crate) color_call: Option<i128>,
+    /// The put's `color`, scaled by `10^28`.
+    pub(crate) color_put: Option<i128>,
 }
 
 /// The columns a contract-history read selects, in query order.
@@ -219,8 +331,33 @@ pub(crate) struct ContractReadRow {
     pub(crate) mid: Option<i128>,
     /// The selected side's delta, scaled by `10^28`.
     pub(crate) delta: Option<i128>,
-    /// Gamma, scaled by `10^28`.
+    /// The shared gamma mirror, scaled by `10^28`. What a row written before
+    /// issue #74 carries, and what the `gamma` field of a quote still reports.
     pub(crate) gamma: Option<i128>,
+    /// The selected side's snapshot `gamma`, scaled by `10^28`. Equal to the
+    /// mirror where both exist; separate so a pre-#74 row can carry one and not
+    /// the other.
+    pub(crate) snapshot_gamma: Option<i128>,
+    /// The selected side's `theta`, scaled by `10^28`.
+    pub(crate) theta: Option<i128>,
+    /// The selected side's `vega`, scaled by `10^28`.
+    pub(crate) vega: Option<i128>,
+    /// The selected side's `rho`, scaled by `10^28`.
+    pub(crate) rho: Option<i128>,
+    /// The selected side's `rho_d`, scaled by `10^28`.
+    pub(crate) rho_d: Option<i128>,
+    /// The selected side's `alpha`, scaled by `10^28`.
+    pub(crate) alpha: Option<i128>,
+    /// The selected side's `vanna`, scaled by `10^28`.
+    pub(crate) vanna: Option<i128>,
+    /// The selected side's `vomma`, scaled by `10^28`.
+    pub(crate) vomma: Option<i128>,
+    /// The selected side's `veta`, scaled by `10^28`.
+    pub(crate) veta: Option<i128>,
+    /// The selected side's `charm`, scaled by `10^28`.
+    pub(crate) charm: Option<i128>,
+    /// The selected side's `color`, scaled by `10^28`.
+    pub(crate) color: Option<i128>,
 }
 
 /// Scales a decimal into the `Int128` a `Decimal(38, 28)` column carries.
@@ -452,6 +589,94 @@ pub(crate) fn quote_rows(
                 delta_call: to_storage_optional(quote.delta_call, "delta_call")?,
                 delta_put: to_storage_optional(quote.delta_put, "delta_put")?,
                 gamma: to_storage_optional(quote.gamma, "gamma")?,
+                gamma_call: to_storage_optional(
+                    quote.greeks_call.as_ref().map(|greeks| greeks.gamma),
+                    "gamma_call",
+                )?,
+                gamma_put: to_storage_optional(
+                    quote.greeks_put.as_ref().map(|greeks| greeks.gamma),
+                    "gamma_put",
+                )?,
+                theta_call: to_storage_optional(
+                    quote.greeks_call.as_ref().map(|greeks| greeks.theta),
+                    "theta_call",
+                )?,
+                theta_put: to_storage_optional(
+                    quote.greeks_put.as_ref().map(|greeks| greeks.theta),
+                    "theta_put",
+                )?,
+                vega_call: to_storage_optional(
+                    quote.greeks_call.as_ref().map(|greeks| greeks.vega),
+                    "vega_call",
+                )?,
+                vega_put: to_storage_optional(
+                    quote.greeks_put.as_ref().map(|greeks| greeks.vega),
+                    "vega_put",
+                )?,
+                rho_call: to_storage_optional(
+                    quote.greeks_call.as_ref().and_then(|greeks| greeks.rho),
+                    "rho_call",
+                )?,
+                rho_put: to_storage_optional(
+                    quote.greeks_put.as_ref().and_then(|greeks| greeks.rho),
+                    "rho_put",
+                )?,
+                rho_d_call: to_storage_optional(
+                    quote.greeks_call.as_ref().and_then(|greeks| greeks.rho_d),
+                    "rho_d_call",
+                )?,
+                rho_d_put: to_storage_optional(
+                    quote.greeks_put.as_ref().and_then(|greeks| greeks.rho_d),
+                    "rho_d_put",
+                )?,
+                alpha_call: to_storage_optional(
+                    quote.greeks_call.as_ref().and_then(|greeks| greeks.alpha),
+                    "alpha_call",
+                )?,
+                alpha_put: to_storage_optional(
+                    quote.greeks_put.as_ref().and_then(|greeks| greeks.alpha),
+                    "alpha_put",
+                )?,
+                vanna_call: to_storage_optional(
+                    quote.greeks_call.as_ref().map(|greeks| greeks.vanna),
+                    "vanna_call",
+                )?,
+                vanna_put: to_storage_optional(
+                    quote.greeks_put.as_ref().map(|greeks| greeks.vanna),
+                    "vanna_put",
+                )?,
+                vomma_call: to_storage_optional(
+                    quote.greeks_call.as_ref().map(|greeks| greeks.vomma),
+                    "vomma_call",
+                )?,
+                vomma_put: to_storage_optional(
+                    quote.greeks_put.as_ref().map(|greeks| greeks.vomma),
+                    "vomma_put",
+                )?,
+                veta_call: to_storage_optional(
+                    quote.greeks_call.as_ref().map(|greeks| greeks.veta),
+                    "veta_call",
+                )?,
+                veta_put: to_storage_optional(
+                    quote.greeks_put.as_ref().map(|greeks| greeks.veta),
+                    "veta_put",
+                )?,
+                charm_call: to_storage_optional(
+                    quote.greeks_call.as_ref().map(|greeks| greeks.charm),
+                    "charm_call",
+                )?,
+                charm_put: to_storage_optional(
+                    quote.greeks_put.as_ref().map(|greeks| greeks.charm),
+                    "charm_put",
+                )?,
+                color_call: to_storage_optional(
+                    quote.greeks_call.as_ref().map(|greeks| greeks.color),
+                    "color_call",
+                )?,
+                color_put: to_storage_optional(
+                    quote.greeks_put.as_ref().map(|greeks| greeks.color),
+                    "color_put",
+                )?,
                 inserted_at_ms,
             });
         }
@@ -522,12 +747,208 @@ pub(crate) fn record_from_rows(
     })
 }
 
+/// The column names of one option style, already suffixed.
+///
+/// Static, so naming a column in an error costs nothing on a read path that
+/// touches twelve of them per style per row.
+struct GreekColumns {
+    /// The style's `delta` column.
+    delta: &'static str,
+    /// The style's `gamma` column.
+    gamma: &'static str,
+    /// The style's `theta` column.
+    theta: &'static str,
+    /// The style's `vega` column.
+    vega: &'static str,
+    /// The style's `rho` column.
+    rho: &'static str,
+    /// The style's `rho_d` column.
+    rho_d: &'static str,
+    /// The style's `alpha` column.
+    alpha: &'static str,
+    /// The style's `vanna` column.
+    vanna: &'static str,
+    /// The style's `vomma` column.
+    vomma: &'static str,
+    /// The style's `veta` column.
+    veta: &'static str,
+    /// The style's `charm` column.
+    charm: &'static str,
+    /// The style's `color` column.
+    color: &'static str,
+}
+
+/// The call's column names.
+const CALL_COLUMNS: GreekColumns = GreekColumns {
+    delta: "delta_call",
+    gamma: "gamma_call",
+    theta: "theta_call",
+    vega: "vega_call",
+    rho: "rho_call",
+    rho_d: "rho_d_call",
+    alpha: "alpha_call",
+    vanna: "vanna_call",
+    vomma: "vomma_call",
+    veta: "veta_call",
+    charm: "charm_call",
+    color: "color_call",
+};
+
+/// The put's column names.
+const PUT_COLUMNS: GreekColumns = GreekColumns {
+    delta: "delta_put",
+    gamma: "gamma_put",
+    theta: "theta_put",
+    vega: "vega_put",
+    rho: "rho_put",
+    rho_d: "rho_d_put",
+    alpha: "alpha_put",
+    vanna: "vanna_put",
+    vomma: "vomma_put",
+    veta: "veta_put",
+    charm: "charm_put",
+    color: "color_put",
+};
+
+/// Rebuilds one style's greek snapshot from its stored columns.
+///
+/// `delta` is read from `delta_call` / `delta_put`, the columns that also serve
+/// as upstream's convenience mirrors, so that number is never written twice and
+/// cannot drift between two homes.
+///
+/// `gamma` is not the same story and deliberately so: it reads the dedicated
+/// `gamma_call` / `gamma_put`, while the shared `gamma` mirror keeps its own
+/// column. The duplication buys the pre-#74 rows, which have only the mirror,
+/// and a future non-European style where upstream's gamma stops being shared.
+///
+/// Returns `Ok(None)` when any value the snapshot requires is NULL, which is
+/// both the degenerate-strike case and the row-written-before-issue-#74 case.
+/// A partial snapshot is never invented: three of the twelve values are
+/// genuinely optional upstream, and defaulting the other nine to zero would
+/// turn "not computed" into a number a client would trade on.
+///
+/// # Errors
+///
+/// As [`from_storage_decimal`].
+fn greeks_from_columns(
+    stored: &StoredGreeks,
+    names: &GreekColumns,
+) -> Result<Option<GreeksSnapshot>, ChainError> {
+    // The names are already suffixed with the side, so nothing is formatted
+    // here: this runs per greek, per style, per row, and a max-size read is a
+    // million rows.
+    let column = |raw: Option<i128>, field: &str| -> Result<Option<Decimal>, ChainError> {
+        from_storage_optional(raw, field)
+    };
+
+    let (
+        Some(delta),
+        Some(gamma),
+        Some(theta),
+        Some(vega),
+        Some(vanna),
+        Some(vomma),
+        Some(veta),
+        Some(charm),
+        Some(color),
+    ) = (
+        column(stored.delta, names.delta)?,
+        column(stored.gamma, names.gamma)?,
+        column(stored.theta, names.theta)?,
+        column(stored.vega, names.vega)?,
+        column(stored.vanna, names.vanna)?,
+        column(stored.vomma, names.vomma)?,
+        column(stored.veta, names.veta)?,
+        column(stored.charm, names.charm)?,
+        column(stored.color, names.color)?,
+    )
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(GreeksSnapshot {
+        delta,
+        gamma,
+        theta,
+        vega,
+        rho: column(stored.rho, names.rho)?,
+        rho_d: column(stored.rho_d, names.rho_d)?,
+        alpha: column(stored.alpha, names.alpha)?,
+        vanna,
+        vomma,
+        veta,
+        charm,
+        color,
+    }))
+}
+
+/// One style's greek columns, in their stored form.
+///
+/// A struct rather than twelve arguments: the values are positional and
+/// interchangeable in type, which is exactly the shape that invites a silent
+/// transposition at a call site.
+struct StoredGreeks {
+    /// The style's delta column.
+    delta: Option<i128>,
+    /// The style's gamma column.
+    gamma: Option<i128>,
+    /// The style's theta column.
+    theta: Option<i128>,
+    /// The style's vega column.
+    vega: Option<i128>,
+    /// The style's rho column.
+    rho: Option<i128>,
+    /// The style's rho_d column.
+    rho_d: Option<i128>,
+    /// The style's alpha column.
+    alpha: Option<i128>,
+    /// The style's vanna column.
+    vanna: Option<i128>,
+    /// The style's vomma column.
+    vomma: Option<i128>,
+    /// The style's veta column.
+    veta: Option<i128>,
+    /// The style's charm column.
+    charm: Option<i128>,
+    /// The style's color column.
+    color: Option<i128>,
+}
+
 /// Rebuilds one strike from its stored row.
 ///
 /// # Errors
 ///
 /// As [`from_storage_decimal`].
 fn quote_from_row(row: &QuoteReadRow) -> Result<QuoteRow, ChainError> {
+    let call_columns = StoredGreeks {
+        delta: row.delta_call,
+        gamma: row.gamma_call,
+        theta: row.theta_call,
+        vega: row.vega_call,
+        rho: row.rho_call,
+        rho_d: row.rho_d_call,
+        alpha: row.alpha_call,
+        vanna: row.vanna_call,
+        vomma: row.vomma_call,
+        veta: row.veta_call,
+        charm: row.charm_call,
+        color: row.color_call,
+    };
+    let put_columns = StoredGreeks {
+        delta: row.delta_put,
+        gamma: row.gamma_put,
+        theta: row.theta_put,
+        vega: row.vega_put,
+        rho: row.rho_put,
+        rho_d: row.rho_d_put,
+        alpha: row.alpha_put,
+        vanna: row.vanna_put,
+        vomma: row.vomma_put,
+        veta: row.veta_put,
+        charm: row.charm_put,
+        color: row.color_put,
+    };
+
     Ok(QuoteRow {
         strike: from_storage_positive(row.strike, "strike")?,
         implied_volatility: from_storage_positive(row.implied_volatility, "implied_volatility")?,
@@ -540,6 +961,8 @@ fn quote_from_row(row: &QuoteReadRow) -> Result<QuoteRow, ChainError> {
         delta_call: from_storage_optional(row.delta_call, "delta_call")?,
         delta_put: from_storage_optional(row.delta_put, "delta_put")?,
         gamma: from_storage_optional(row.gamma, "gamma")?,
+        greeks_call: greeks_from_columns(&call_columns, &CALL_COLUMNS)?,
+        greeks_put: greeks_from_columns(&put_columns, &PUT_COLUMNS)?,
     })
 }
 
@@ -552,6 +975,21 @@ pub(crate) fn contract_quote_from_row(
     row: &ContractReadRow,
     side: ContractSide,
 ) -> Result<ContractQuote, ChainError> {
+    let columns = StoredGreeks {
+        delta: row.delta,
+        gamma: row.snapshot_gamma,
+        theta: row.theta,
+        vega: row.vega,
+        rho: row.rho,
+        rho_d: row.rho_d,
+        alpha: row.alpha,
+        vanna: row.vanna,
+        vomma: row.vomma,
+        veta: row.veta,
+        charm: row.charm,
+        color: row.color,
+    };
+
     Ok(ContractQuote {
         step: usize::try_from(row.step).map_err(|_| {
             ChainError::ClickHouseError(format!("step {} is not addressable here", row.step))
@@ -567,6 +1005,13 @@ pub(crate) fn contract_quote_from_row(
         mid: from_storage_optional_positive(row.mid, "mid")?,
         delta: from_storage_optional(row.delta, "delta")?,
         gamma: from_storage_optional(row.gamma, "gamma")?,
+        greeks: greeks_from_columns(
+            &columns,
+            match side {
+                ContractSide::Call => &CALL_COLUMNS,
+                ContractSide::Put => &PUT_COLUMNS,
+            },
+        )?,
     })
 }
 
@@ -601,6 +1046,49 @@ mod tests {
 
     /// A quote whose values are deliberately awkward: a 28-digit premium, a
     /// negative delta, a missing put side.
+    /// A call's greek snapshot, every value distinct so a transposed column is
+    /// a mismatch rather than a coincidence, and every value at the full 28
+    /// digits the storage scale promises never to round.
+    ///
+    /// `delta` and `gamma` repeat the mirrors on purpose: they share those
+    /// columns, which is the property the round-trip has to prove.
+    fn fixture_greeks_call() -> GreeksSnapshot {
+        GreeksSnapshot {
+            delta: dec!(0.5123),
+            gamma: dec!(0.00312345),
+            theta: dec!(-0.0289390751520225679360302935),
+            vega: dec!(0.0833669467282696047688677110),
+            rho: Some(dec!(0.0169894176861345909734753825)),
+            rho_d: Some(dec!(-0.0175414508192199992738499204)),
+            alpha: Some(dec!(-1.7676156552525424476306277983)),
+            vanna: dec!(1.2473442995808183501801769442),
+            vomma: dec!(0.2838300607436393803867085535),
+            veta: dec!(0.0000348161009099551782779877),
+            charm: dec!(-0.0044637844401925672319270818),
+            color: dec!(-0.0002301924225239124326433752),
+        }
+    }
+
+    /// The put of the same strike, with a different `charm` and a sign-flipped
+    /// `rho`, and `alpha` absent — so the round-trip also proves that an
+    /// optional greek upstream did not compute survives as absent, not as zero.
+    fn fixture_greeks_put() -> GreeksSnapshot {
+        GreeksSnapshot {
+            delta: dec!(-0.4877),
+            gamma: dec!(0.00312345),
+            theta: dec!(-0.0215745200014529089799921330),
+            vega: dec!(0.0833669467282696047688677110),
+            rho: Some(dec!(-0.0690286875414646276502282280)),
+            rho_d: Some(dec!(0.0645490601096514193310401325)),
+            alpha: None,
+            vanna: dec!(1.2473442995808183501801769442),
+            vomma: dec!(0.2838300607436393803867085535),
+            veta: dec!(0.0000348161009099551782779877),
+            charm: dec!(-0.0045048296956570029453340524),
+            color: dec!(-0.0002301924225239124326433752),
+        }
+    }
+
     fn quote(strike: f64) -> QuoteRow {
         let long = match Decimal::from_str("1.2345678901234567890123456789") {
             Ok(value) => value,
@@ -620,6 +1108,8 @@ mod tests {
             )
             .with_put(None, Some(pos_or_panic!(1.1)), None, Some(dec!(-0.4877)))
             .with_gamma(Some(dec!(0.00312345)))
+            .with_greeks_call(Some(fixture_greeks_call()))
+            .with_greeks_put(Some(fixture_greeks_put()))
     }
 
     fn expiration(day: u32, strikes: &[f64]) -> ExpirationRecord {
@@ -688,6 +1178,28 @@ mod tests {
                 delta_call: row.delta_call,
                 delta_put: row.delta_put,
                 gamma: row.gamma,
+                gamma_call: row.gamma_call,
+                gamma_put: row.gamma_put,
+                theta_call: row.theta_call,
+                theta_put: row.theta_put,
+                vega_call: row.vega_call,
+                vega_put: row.vega_put,
+                rho_call: row.rho_call,
+                rho_put: row.rho_put,
+                rho_d_call: row.rho_d_call,
+                rho_d_put: row.rho_d_put,
+                alpha_call: row.alpha_call,
+                alpha_put: row.alpha_put,
+                vanna_call: row.vanna_call,
+                vanna_put: row.vanna_put,
+                vomma_call: row.vomma_call,
+                vomma_put: row.vomma_put,
+                veta_call: row.veta_call,
+                veta_put: row.veta_put,
+                charm_call: row.charm_call,
+                charm_put: row.charm_put,
+                color_call: row.color_call,
+                color_put: row.color_put,
             })
             .collect();
 
@@ -859,6 +1371,147 @@ mod tests {
         }
     }
 
+    /// A row written before issue #74 still reads.
+    ///
+    /// Its greek columns do not exist yet, so ClickHouse returns NULL for every
+    /// one of them. That must rebuild as "no snapshot" — the honest answer —
+    /// rather than failing the whole read or inventing a snapshot of zeros that
+    /// a client would trade on. Every field the row DOES carry survives.
+    #[test]
+    fn test_a_row_written_before_the_greek_columns_reads_as_no_snapshot() {
+        let strike = match to_storage_decimal(dec!(5000), "strike") {
+            Ok(raw) => raw,
+            Err(error) => panic!("the fixture decimal must convert: {error}"),
+        };
+        let volatility = match to_storage_decimal(dec!(0.185), "implied_volatility") {
+            Ok(raw) => raw,
+            Err(error) => panic!("the fixture decimal must convert: {error}"),
+        };
+        let delta_call = match to_storage_decimal(dec!(0.5123), "delta_call") {
+            Ok(raw) => Some(raw),
+            Err(error) => panic!("the fixture decimal must convert: {error}"),
+        };
+        let gamma = match to_storage_decimal(dec!(0.00312345), "gamma") {
+            Ok(raw) => Some(raw),
+            Err(error) => panic!("the fixture decimal must convert: {error}"),
+        };
+
+        let row = QuoteReadRow {
+            step: 3,
+            expires_at: 0,
+            days_to_expiration: strike,
+            labels: vec!["zero_dte".to_string()],
+            strike,
+            implied_volatility: volatility,
+            call_bid: None,
+            call_ask: None,
+            call_mid: None,
+            put_bid: None,
+            put_ask: None,
+            put_mid: None,
+            delta_call,
+            delta_put: None,
+            gamma,
+            gamma_call: None,
+            gamma_put: None,
+            theta_call: None,
+            theta_put: None,
+            vega_call: None,
+            vega_put: None,
+            rho_call: None,
+            rho_put: None,
+            rho_d_call: None,
+            rho_d_put: None,
+            alpha_call: None,
+            alpha_put: None,
+            vanna_call: None,
+            vanna_put: None,
+            vomma_call: None,
+            vomma_put: None,
+            veta_call: None,
+            veta_put: None,
+            charm_call: None,
+            charm_put: None,
+            color_call: None,
+            color_put: None,
+        };
+
+        match quote_from_row(&row) {
+            Ok(quote) => {
+                assert_eq!(quote.greeks_call, None, "an old row has no snapshot");
+                assert_eq!(quote.greeks_put, None, "an old row has no snapshot");
+                // The mirrors it did carry are untouched, which is why they are
+                // kept as their own columns rather than folded into the set.
+                assert_eq!(quote.delta_call, Some(dec!(0.5123)));
+                assert_eq!(quote.gamma, Some(dec!(0.00312345)));
+                assert_eq!(quote.strike, pos_or_panic!(5000.0));
+            }
+            Err(error) => panic!("an old row must still read: {error}"),
+        }
+    }
+
+    /// A snapshot missing one required value rebuilds as absent, not as a
+    /// partial snapshot.
+    ///
+    /// Nine of the twelve values are non-optional upstream. If one of those
+    /// columns is NULL — a half-written row, or a column added later than its
+    /// siblings — defaulting it to zero would hand a client a number that was
+    /// never computed. The whole side is reported absent instead.
+    #[test]
+    fn test_a_partially_stored_snapshot_rebuilds_as_absent() {
+        let (_, rows) = read_rows(&record());
+        let mut read = match rows.first() {
+            Some(row) => row.clone(),
+            None => panic!("the fixture must produce rows"),
+        };
+        assert!(
+            quote_from_row(&read)
+                .map(|quote| quote.greeks_call.is_some())
+                .unwrap_or(false),
+            "the fixture must start with a call snapshot"
+        );
+
+        // `veta` is required, so losing it loses the side.
+        read.veta_call = None;
+
+        match quote_from_row(&read) {
+            Ok(quote) => {
+                assert_eq!(
+                    quote.greeks_call, None,
+                    "a partial snapshot is not a snapshot"
+                );
+                assert!(
+                    quote.greeks_put.is_some(),
+                    "the other side is unaffected: {quote:?}"
+                );
+            }
+            Err(error) => panic!("a partial row must still read: {error}"),
+        }
+    }
+
+    /// The two sides of one strike carry genuinely different greeks.
+    ///
+    /// The columns are per style, so a write that put one side's values in both
+    /// column sets — or a read that projected one for both — would still round
+    /// trip. This is what catches that.
+    #[test]
+    fn test_the_two_sides_store_different_greeks() {
+        let (_, rows) = read_rows(&record());
+        let row = match rows.first() {
+            Some(row) => row,
+            None => panic!("the fixture must produce rows"),
+        };
+        assert_ne!(row.charm_call, row.charm_put, "charm is per style");
+        assert_ne!(row.theta_call, row.theta_put, "theta is per style");
+        assert_ne!(row.rho_call, row.rho_put, "rho is per style");
+        assert_eq!(row.vega_call, row.vega_put, "vega is not");
+        assert_eq!(row.gamma_call, row.gamma_put, "gamma is not");
+        // `alpha` is absent on the put side of the fixture, so this also pins
+        // that an optional greek stores as NULL rather than as a zero.
+        assert!(row.alpha_call.is_some());
+        assert_eq!(row.alpha_put, None);
+    }
+
     /// A contract row rebuilds the side the query selected.
     #[test]
     fn test_a_contract_row_rebuilds_its_side() {
@@ -892,6 +1545,17 @@ mod tests {
                 Err(error) => panic!("the fixture decimal must convert: {error}"),
             },
             gamma: None,
+            snapshot_gamma: None,
+            theta: None,
+            vega: None,
+            rho: None,
+            rho_d: None,
+            alpha: None,
+            vanna: None,
+            vomma: None,
+            veta: None,
+            charm: None,
+            color: None,
         };
 
         match contract_quote_from_row(&row, ContractSide::Put) {
@@ -901,6 +1565,9 @@ mod tests {
                 assert_eq!(quote.strike, pos_or_panic!(5000.0));
                 assert_eq!(quote.delta, Some(dec!(-0.4877)));
                 assert_eq!(quote.bid, None);
+                // A row written before issue #74 carries no greek columns, so
+                // it rebuilds with no snapshot rather than with a zeroed one.
+                assert_eq!(quote.greeks, None);
             }
             Err(error) => panic!("the contract row must rebuild: {error}"),
         }

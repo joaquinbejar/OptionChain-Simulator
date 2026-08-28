@@ -38,8 +38,6 @@ use optionstratlib::chains::OptionData;
 use optionstratlib::greeks::GreeksSnapshot;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
-use tokio::sync::Semaphore;
 use utoipa::ToSchema;
 
 /// How much of the greek set a chain response should carry.
@@ -261,49 +259,21 @@ impl GreeksResponse {
     }
 }
 
-/// Default number of greek-pricing jobs allowed to run at once.
-///
-/// Small on purpose. One job is up to `OCS_MAX_SNAPSHOT_CONTRACTS` contracts of
-/// pricing plus the serialisation of the result, which is seconds of CPU at the
-/// cap; letting every concurrent request start one turns a handful of peeks
-/// into a machine with no cores left for anything else, including the requests
-/// that never asked for greeks.
-pub(crate) const DEFAULT_MAX_CONCURRENT_GREEK_RENDERS: usize = 4;
-
-/// How many greek-pricing jobs may run at once
-/// (`OCS_MAX_CONCURRENT_GREEK_RENDERS`).
-///
-/// The admission bound the whole service shares — v1 and v2, peek and step —
-/// because they contend for the same cores. Requests above the bound WAIT on
-/// the semaphore rather than being rejected, and they wait in async code, so a
-/// client that disconnects while queued drops its future and never occupies a
-/// thread at all. That is the part a bare `spawn_blocking` cannot do: its task
-/// is not cancellable once started, so without admission a burst of peeks
-/// commits the machine to every job in it.
-static GREEK_RENDER_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
-    Semaphore::new(crate::api::rest::limits::parse_limit(
-        std::env::var("OCS_MAX_CONCURRENT_GREEK_RENDERS").ok(),
-        DEFAULT_MAX_CONCURRENT_GREEK_RENDERS,
-    ))
-});
-
-/// Runs a rendering job off the runtime and under admission when the level
-/// makes it expensive.
+/// Runs a rendering job off the runtime and under the shared pricing bound when
+/// the level makes it expensive.
 ///
 /// At [`GreekLevel::None`] there is nothing to price, so the work stays inline
 /// and takes no permit — the default request must not queue behind a burst of
 /// greek requests.
 ///
-/// The job is the WHOLE unit of work, pricing and serialisation together.
-/// Serialising afterwards on the worker would put a large document back on the
-/// thread the job was moved off, which at `greeks=all` on a capped snapshot is
-/// a stall on its own.
+/// The bound itself lives in [`crate::utils::admission`], because the v2 session
+/// manager prices snapshots against the same cores and a bound only one of them
+/// respects is not a bound.
 ///
 /// # Errors
 ///
-/// Returns [`ChainError::Internal`] if the blocking task panics or is dropped,
-/// and whatever the job itself returns.
-pub(crate) async fn admit_blocking<T, F>(level: GreekLevel, job: F) -> Result<T, ChainError>
+/// As [`crate::utils::admission::admit_blocking`].
+pub(crate) async fn admit_render<T, F>(level: GreekLevel, job: F) -> Result<T, ChainError>
 where
     F: FnOnce() -> Result<T, ChainError> + Send + 'static,
     T: Send + 'static,
@@ -311,31 +281,21 @@ where
     if !level.wants_greeks() {
         return job();
     }
-
-    let permit = GREEK_RENDER_PERMITS.acquire().await.map_err(|error| {
-        ChainError::Internal(format!("the greek admission gate is closed: {error}"))
-    })?;
-
-    let outcome = tokio::task::spawn_blocking(job)
-        .await
-        .map_err(|error| ChainError::Internal(format!("greek rendering failed: {error}")))?;
-
-    drop(permit);
-    outcome
+    crate::utils::admission::admit_blocking(job).await
 }
 
-/// Renders one response body under [`admit_blocking`].
+/// Renders one response body under [`admit_render`].
 ///
 /// # Errors
 ///
-/// As [`admit_blocking`], plus [`ChainError::Internal`] when the response
-/// cannot be serialised.
+/// As [`admit_render`], plus [`ChainError::Internal`] when the response cannot
+/// be serialised.
 pub(crate) async fn render_body<T, F>(level: GreekLevel, render: F) -> Result<Vec<u8>, ChainError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: serde::Serialize + Send + 'static,
 {
-    admit_blocking(level, move || serialize_body(&render())).await
+    admit_render(level, move || serialize_body(&render())).await
 }
 
 /// Serialises a response body, reporting a failure as an internal error rather
@@ -351,13 +311,17 @@ pub(crate) fn serialize_body<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, 
 
 /// The greek payloads for both sides of one strike, at the requested level.
 ///
-/// Upstream can compute the snapshots at chain build time, but only when the
-/// build asks for them, and nothing in this crate does: `with_greek_snapshots`
-/// is off by default, and turning it on globally would charge every client for
-/// a payload most never request. So in practice **this function computes
-/// them**, through upstream's own `calculate_greeks`; the `is_some` branch is
-/// the guard for a chain that already carries them, not the normal path. No
-/// greek mathematics lives in this crate either way.
+/// Either branch can be the normal one, depending on the deployment, and the
+/// difference is issue #74's:
+///
+/// * **v2 with a warehouse registered** builds its chains with the snapshots
+///   already on, because a filed step has to carry what a replayed one does.
+///   This function then just *reads* them, and costs nothing.
+/// * **v2 without a warehouse, and v1 always**, build without them, so this
+///   function computes them through upstream's own `calculate_greeks` — and
+///   only for the requests that ask.
+///
+/// No greek mathematics lives in this crate either way.
 ///
 /// # An absent payload is not a zero
 ///
@@ -371,14 +335,17 @@ pub(crate) fn serialize_body<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, 
 ///
 /// # Cost
 ///
-/// Roughly 40 µs per contract in a release build. `first` and `all` cost the
-/// same: upstream builds the snapshot whole and the level only decides what is
-/// written out. Computing here rather than at build time is measurably more
-/// expensive per contract, because `calculate_greeks` recomputes delta and
-/// gamma that this response then reads from the mirrors instead; asking the
-/// builder for snapshots costs about 1.5x a plain chain build. The trade is
-/// deliberate — every client would pay the build-time cost, and only some ask
-/// for the payload.
+/// Nothing, when the chain already carries the snapshots. Roughly 40 µs per
+/// contract in a release build when it does not. `first` and `all` cost the
+/// same either way: upstream builds the snapshot whole and the level only
+/// decides what is written out.
+///
+/// Computing here is measurably more expensive per contract than asking the
+/// builder for it — `calculate_greeks` recomputes the delta and gamma this
+/// response then reads from the mirrors instead, where a build with snapshots
+/// on costs about 1.54x a plain one. Which is cheaper overall depends entirely
+/// on how often the payload is actually read, which is why the decision sits
+/// with the caller that knows: `SeriesBuilder::with_greek_snapshots`.
 ///
 /// Callers must keep this off the async runtime. Both versions render above the
 /// default level inside `spawn_blocking`, because
@@ -537,41 +504,6 @@ mod tests {
                 assert_eq!(subset.rho_d, full.rho_d);
             }
             other => panic!("each level must yield its own variant, got {other:?}"),
-        }
-    }
-
-    /// The admission bound is what the documentation says it is.
-    ///
-    /// The number itself is a judgement call, but `.env.example` and the crate
-    /// docs quote it, so it may not drift from them silently. It also may not
-    /// be zero, which `parse_limit` already enforces for the configured value:
-    /// a bound of zero would deadlock every greek request.
-    #[test]
-    fn test_the_greek_admission_default_matches_the_documentation() {
-        assert_eq!(DEFAULT_MAX_CONCURRENT_GREEK_RENDERS, 4);
-    }
-
-    /// The default level never queues.
-    ///
-    /// `admit_blocking` runs it inline and takes no permit, so a burst of
-    /// `greeks=all` requests cannot make a plain peek wait behind them. Proven
-    /// by exhausting the permits first: this call still completes.
-    #[tokio::test]
-    async fn test_the_default_level_takes_no_permit() {
-        let held = match GREEK_RENDER_PERMITS
-            .acquire_many(u32::try_from(DEFAULT_MAX_CONCURRENT_GREEK_RENDERS).unwrap_or(1))
-            .await
-        {
-            Ok(permits) => permits,
-            Err(error) => panic!("the semaphore must hand out its permits: {error}"),
-        };
-
-        let outcome = admit_blocking(GreekLevel::None, || Ok(7_usize)).await;
-
-        drop(held);
-        match outcome {
-            Ok(value) => assert_eq!(value, 7),
-            Err(error) => panic!("the default level must not wait for a permit: {error}"),
         }
     }
 

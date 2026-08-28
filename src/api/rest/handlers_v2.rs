@@ -68,12 +68,21 @@ pub(crate) struct SnapshotQuery {
 
 /// Renders a snapshot body, under the shared greek admission bound.
 ///
-/// See [`crate::api::rest::greeks::render_body`]: above the default level the
-/// pricing AND the serialisation happen together in one admitted blocking job,
-/// and the handler writes the bytes it returns. The simulation and the snapshot
-/// are moved rather than borrowed — both are already owned clones from the
-/// manager, and moving them keeps the job `'static` without a second copy of a
-/// snapshot that may hold hundreds of thousands of contracts.
+/// See [`crate::api::rest::greeks::admit_blocking`]: above the default level
+/// the pricing AND the serialisation happen together in one admitted blocking
+/// job, and the handler writes the bytes it returns.
+///
+/// How much of that job is pricing depends on the deployment. With a warehouse
+/// registered the snapshot already carries its greeks (issue #74) and the job
+/// is mostly encoding; without one, upstream's `calculate_greeks` runs per
+/// strike per style at roughly 40 µs a contract, and
+/// `DEFAULT_MAX_SNAPSHOT_CONTRACTS` is 200 000. The handler cannot tell the two
+/// apart from here, so it admits and offloads whenever a level is asked for.
+///
+/// The simulation and the snapshot are moved rather than borrowed: both are
+/// already owned clones handed back by the manager, and moving them keeps the
+/// job `'static` without a second copy of a snapshot that may hold hundreds of
+/// thousands of contracts.
 async fn render_snapshot(
     simulation: SessionV2,
     snapshot: SeriesSnapshot,
@@ -772,6 +781,99 @@ mod tests {
 
         assert_eq!(strip(&first), none);
         assert_eq!(strip(&all), none);
+    }
+
+    /// A warehouse that accepts everything and returns nothing.
+    ///
+    /// Registering one is what makes `SeriesBuilder` build the greek snapshots
+    /// (issue #74), so it selects the OTHER branch of `greeks_for` — the one
+    /// that reads a snapshot instead of pricing it. Every other test here runs
+    /// without a warehouse and therefore only ever exercises the repricing
+    /// branch.
+    #[derive(Default)]
+    struct AcceptingWarehouse;
+
+    #[async_trait::async_trait]
+    impl crate::infrastructure::SimulationSnapshotRepository for AcceptingWarehouse {
+        async fn persist(
+            &self,
+            _record: crate::infrastructure::SnapshotRecord,
+        ) -> Result<(), ChainError> {
+            Ok(())
+        }
+
+        async fn get(
+            &self,
+            _simulation: Uuid,
+            _generation: u64,
+            _step: usize,
+        ) -> Result<Option<crate::infrastructure::SnapshotRecord>, ChainError> {
+            Ok(None)
+        }
+
+        async fn read_range(
+            &self,
+            _simulation: Uuid,
+            _generation: u64,
+            _from_step: usize,
+            _to_step: usize,
+        ) -> Result<Vec<crate::infrastructure::SnapshotRecord>, ChainError> {
+            Ok(Vec::new())
+        }
+
+        async fn contract_series(
+            &self,
+            _query: crate::infrastructure::ContractSeriesQuery,
+        ) -> Result<Vec<crate::infrastructure::ContractQuote>, ChainError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// The greeks a client receives do not depend on how they were produced.
+    ///
+    /// With a warehouse registered the chain already carries its snapshots and
+    /// the response reads them; without one the API prices them per request.
+    /// Two code paths, one seed, and the bytes must be identical — otherwise
+    /// registering persistence would quietly change what clients are served,
+    /// which is the regression the whole split exists not to cause.
+    #[actix_web::test]
+    async fn test_the_greeks_are_the_same_whether_read_or_priced() {
+        let read_service = {
+            let manager = Arc::new(
+                crate::session::SimulationManager::new(
+                    Arc::new(InMemorySimulationStore::new()),
+                    crate::infrastructure::SimulationV2Config::default(),
+                )
+                .with_warehouse(Arc::new(AcceptingWarehouse)
+                    as Arc<dyn crate::infrastructure::SimulationSnapshotRepository>),
+            );
+            actix_test::init_service(
+                App::new().configure(|cfg| configure_v2_routes(cfg, manager.clone(), None)),
+            )
+            .await
+        };
+        let priced_service = v2_service!();
+
+        let read_id = id_of(&create!(read_service));
+        let priced_id = id_of(&create!(priced_service));
+
+        let mut read = snapshot!(read_service, read_id, "?greeks=all");
+        let mut priced = snapshot!(priced_service, priced_id, "?greeks=all");
+        // The id is the one thing that legitimately differs.
+        for body in [&mut read, &mut priced] {
+            if let Some(object) = body.as_object_mut() {
+                object.remove("id");
+            }
+        }
+
+        assert_eq!(read, priced);
+        // And the comparison is not vacuous.
+        assert!(
+            quotes(&read)
+                .iter()
+                .all(|quote| quote.get("greeks").is_some()),
+            "both bodies must actually carry greeks"
+        );
     }
 
     /// Creating returns 201 and echoes every replay input.

@@ -86,6 +86,7 @@ use optionstratlib::utils::TimeFrame;
 use optionstratlib::volatility::{adjust_volatility, constant_volatility};
 use positive::Positive;
 use rust_decimal::{Decimal, MathematicalOps};
+use rust_decimal_macros::dec;
 use tracing::{debug, instrument};
 
 /// One step of the market path: everything a snapshot needs that is not an
@@ -759,6 +760,84 @@ impl VolatilitySource {
          the request's volatility prices nothing for a historical walk";
 }
 
+/// Rejects a volatility no chain can be priced at, for a caller outside the
+/// factor tape.
+///
+/// The v2 path reaches [`reject_unpriceable_volatility`] through
+/// `FactorTape::build`, which validates every step of the walk. v1 has no tape
+/// and validates its parameters at the request boundary instead, so it needs the
+/// same bound applied at the same place — otherwise a session created with a
+/// volatility of `1e-13` builds fine and PANICS the first time a client asks for
+/// greeks, inside upstream's `vomma`.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Validation`] naming `field` when the volatility is
+/// zero, above one, or below the adjusted floor.
+pub(crate) fn validate_priceable_volatility(
+    volatility: Positive,
+    field: &str,
+) -> Result<(), ChainError> {
+    reject_unpriceable_volatility(volatility, None, VolatilitySource::Model).map_err(|error| {
+        match error {
+            // The shared guard names the walk model's field; a caller checking a
+            // request field wants its own name on the error.
+            ChainError::Validation { reason, .. } => ChainError::Validation {
+                field: field.to_string(),
+                reason,
+            },
+            other => other,
+        }
+    })
+}
+
+/// The smallest EFFECTIVE per-strike volatility a chain can be priced at.
+///
+/// Not where pricing stops being interesting, but where upstream's greek
+/// arithmetic stops fitting in a `Decimal`: `vomma` is `vega * d1 * d2 / iv`,
+/// and as `iv` goes to zero that quotient overflows and `Positive` PANICS
+/// inside `OptionChain::build_chain`, on a request that passed every field
+/// check — the model's own volatility is only checked for zero and for
+/// exceeding one.
+///
+/// Measured: `1e-11` panics, while `3e-11` and `5e-11` do not. The boundary is
+/// not sharp, because it depends on `d1 * d2` as well as on `iv`, which is why
+/// this is a floor with margin rather than an attempt to predict the overflow.
+/// `1e-9` sits two orders of magnitude above the lowest observed overflow.
+const MIN_PRICEABLE_VOLATILITY: Decimal = dec!(0.000000001);
+
+/// The floor upstream clamps the per-strike skew and smile multiplier to.
+///
+/// `adjust_volatility` ends in `factor.clamp(0.01, 3.0)`, so a strike's
+/// EFFECTIVE volatility is never less than a hundredth of the base — but it can
+/// be exactly that, under a steep enough skew or smile. Checking only the base
+/// would therefore admit a base of `1e-9` that prices strikes at `1e-11`, which
+/// is precisely the overflow region above.
+///
+/// Mirrored here rather than computed: this is the one upstream constant the
+/// guard depends on, and a change to it is a change to what this service must
+/// reject. If upstream lowers the clamp, the tests below start failing, which is
+/// the intended way to find out.
+const SKEW_SMILE_VOLATILITY_FLOOR: Decimal = dec!(0.01);
+
+/// The smallest BASE volatility whose worst-case strike still prices.
+///
+/// The base a client supplies is not what a strike is priced at: the skew and
+/// smile scale it per strike, down to [`SKEW_SMILE_VOLATILITY_FLOOR`] of it. The
+/// bound a request is checked against is therefore the effective floor divided
+/// by that clamp — `1e-7` — so that even the most aggressively shaped strike in
+/// the chain lands above [`MIN_PRICEABLE_VOLATILITY`].
+///
+/// A historical walk estimates its volatility from the client's series and can
+/// legitimately be small; this repo's own fixture reaches `4.5e-7`, which still
+/// clears this bound.
+#[must_use]
+fn min_priceable_base_volatility() -> Decimal {
+    MIN_PRICEABLE_VOLATILITY
+        .checked_div(SKEW_SMILE_VOLATILITY_FLOOR)
+        .unwrap_or(MIN_PRICEABLE_VOLATILITY)
+}
+
 /// Rejects a volatility no option chain can be priced at.
 ///
 /// Upstream refuses anything above 1.0 annualised **and anything equal to
@@ -789,6 +868,20 @@ fn reject_unpriceable_volatility(
             reason: format!(
                 "the volatility is zero{}, and an option chain priced at zero volatility is a \
                  chain of zero-value options; {}",
+                at_step(step),
+                source.remedy_zero()
+            ),
+        });
+    }
+
+    let floor = min_priceable_base_volatility();
+    if volatility < floor {
+        return Err(ChainError::Validation {
+            field: source.field().to_string(),
+            reason: format!(
+                "the volatility falls to {volatility}{}, below the {floor} floor an option chain \
+                 can be priced at — the skew and smile scale it per strike down to a hundredth, \
+                 and {MIN_PRICEABLE_VOLATILITY} is where the greek arithmetic overflows; {}",
                 at_step(step),
                 source.remedy_zero()
             ),
@@ -857,6 +950,7 @@ pub(crate) fn build_chain(
     spot: Positive,
     volatility: Positive,
     expiration: ExpirationDate,
+    greek_snapshots: bool,
 ) -> Result<OptionChain, ChainError> {
     let chain_size = parameters.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE);
     let skew_slope = parameters.skew_slope.unwrap_or(DEFAULT_SKEW_SLOPE);
@@ -876,6 +970,20 @@ pub(crate) fn build_chain(
         Some(parameters.symbol.clone()),
     );
 
+    // `greek_snapshots` asks upstream for the full twelve-value set per style
+    // (issue #74). It is the CALLER's decision, not this function's, because
+    // only the caller knows whether anything will read them: the manager turns
+    // it on when a warehouse is registered, since a persisted tape that lost
+    // everything past delta and gamma would make an exported step strictly
+    // poorer than a live one. A deployment with no warehouse and no client
+    // asking for greeks must not pay for them.
+    //
+    // Measured at about 1.54x a plain chain build. Nothing served changes
+    // either way: upstream computes `delta` and `gamma` the same way on both
+    // branches — `calculate_greeks` calls `calculate_delta` and
+    // `calculate_gamma` first — so the convenience mirrors the default response
+    // reads are identical, and the seeded tape is untouched.
+    // `test_the_greek_snapshots_do_not_move_the_priced_chain` pins that.
     let build_params = OptionChainBuildParams::new(
         parameters.symbol.clone(),
         Some(Positive::ONE),
@@ -887,7 +995,8 @@ pub(crate) fn build_chain(
         2,
         price_params,
         volatility,
-    );
+    )
+    .with_greek_snapshots(greek_snapshots);
 
     OptionChain::build_chain(&build_params)
         .map_err(|e| ChainError::Internal(format!("Failed to build the option chain: {e}")))
@@ -905,11 +1014,14 @@ fn build_initial_chain(
     parameters: &SimulationParametersV2,
     base_volatility: Positive,
 ) -> Result<OptionChain, ChainError> {
+    // Never with greeks: this chain seeds the walk and is never served or
+    // filed, so pricing a full set for it would be pure waste.
     build_chain(
         parameters,
         parameters.initial_price,
         base_volatility,
         ExpirationDate::Days(Positive::ONE),
+        false,
     )
 }
 
@@ -922,6 +1034,7 @@ mod tests {
     use chrono::{TimeZone, Weekday};
     use optionstratlib::error::SimulationError;
     use optionstratlib::simulation::walk_steps_par;
+    use positive::pos_or_panic;
     use std::sync::Mutex;
 
     /// The reference market path: a modest daily Brownian walk over the
@@ -992,6 +1105,305 @@ mod tests {
             xi: 0.3,
             rho: -0.7,
         }
+    }
+
+    /// Asking upstream for the greek snapshots does not move a single served
+    /// number.
+    ///
+    /// Issue #74 turned `with_greek_snapshots` on so a persisted tape carries
+    /// the full set. That flag also changes which upstream branch prices the
+    /// chain, so the claim that nothing served moved has to be checked rather
+    /// than assumed: `delta_call`, `delta_put` and `gamma` are what the default
+    /// response and the pre-#74 warehouse rows are built from, and a shift in
+    /// any of them would be a silent tape break for every existing client.
+    #[test]
+    fn test_the_greek_snapshots_do_not_move_the_priced_chain() {
+        let parameters = parameters(request(4, brownian(0.18), 0.18));
+        let expiration = ExpirationDate::Days(pos_or_panic!(7.0));
+        let spot = pos_or_panic!(5000.0);
+        let volatility = pos_or_panic!(0.18);
+
+        let with_snapshots = match build_chain(&parameters, spot, volatility, expiration, true) {
+            Ok(chain) => chain,
+            Err(error) => panic!("the chain must build: {error}"),
+        };
+
+        // The same call with the flag off, through the function under test —
+        // not a hand-assembled `OptionChainBuildParams`, which would keep
+        // comparing against a chain the service no longer builds the day
+        // `build_chain` changes.
+        let without_snapshots = match build_chain(&parameters, spot, volatility, expiration, false)
+        {
+            Ok(chain) => chain,
+            Err(error) => panic!("the comparison chain must build: {error}"),
+        };
+
+        let served: Vec<_> = with_snapshots
+            .iter()
+            .map(|data| {
+                (
+                    data.strike_price,
+                    data.implied_volatility,
+                    data.call_bid,
+                    data.call_ask,
+                    data.call_middle,
+                    data.put_bid,
+                    data.put_ask,
+                    data.put_middle,
+                    data.delta_call,
+                    data.delta_put,
+                    data.gamma,
+                )
+            })
+            .collect();
+        let baseline: Vec<_> = without_snapshots
+            .iter()
+            .map(|data| {
+                (
+                    data.strike_price,
+                    data.implied_volatility,
+                    data.call_bid,
+                    data.call_ask,
+                    data.call_middle,
+                    data.put_bid,
+                    data.put_ask,
+                    data.put_middle,
+                    data.delta_call,
+                    data.delta_put,
+                    data.gamma,
+                )
+            })
+            .collect();
+
+        assert!(!served.is_empty(), "the fixture chain must quote something");
+        assert_eq!(served, baseline, "the flag must not move a served value");
+
+        // And the flag did what it was turned on for.
+        assert!(
+            with_snapshots
+                .iter()
+                .all(|data| data.greeks_call.is_some() && data.greeks_put.is_some()),
+            "every strike must carry both snapshots"
+        );
+        assert!(
+            without_snapshots
+                .iter()
+                .all(|data| data.greeks_call.is_none()),
+            "the comparison build must carry none"
+        );
+    }
+
+    /// The warehouse stores each side's snapshot `delta` in the SAME column as
+    /// upstream's convenience mirror, so the two must agree at every strike.
+    ///
+    /// Upstream computes them independently and says so, which is exactly why
+    /// this is pinned rather than assumed: if a release made the mirror and the
+    /// snapshot diverge, `simulation_option_quotes` would silently report one
+    /// where it promised the other, and no round-trip test would notice —
+    /// every fixture sets them equal by hand.
+    #[test]
+    fn test_the_delta_mirror_equals_the_snapshot_delta_at_every_strike() {
+        // Several regimes, not one point: upstream warns that the mirrors stay
+        // defined at expiry and at zero volatility where the full set does not,
+        // so a sub-day expiry and a very low volatility are exactly where the
+        // two could part company.
+        let regimes = [
+            (0.18, 7.0),
+            (0.18, 0.5),
+            (0.9, 30.0),
+            (0.01, 7.0),
+            (0.05, 0.25),
+        ];
+
+        let mut compared = 0_usize;
+        for (volatility, days) in regimes {
+            let parameters = parameters(request(4, brownian(volatility), volatility));
+            let chain = match build_chain(
+                &parameters,
+                pos_or_panic!(5000.0),
+                match Positive::new_decimal(match Decimal::try_from(volatility) {
+                    Ok(value) => value,
+                    Err(error) => panic!("the fixture volatility must convert: {error}"),
+                }) {
+                    Ok(value) => value,
+                    Err(error) => panic!("the fixture volatility must be positive: {error}"),
+                },
+                ExpirationDate::Days(
+                    match Positive::new_decimal(match Decimal::try_from(days) {
+                        Ok(value) => value,
+                        Err(error) => panic!("the fixture expiry must convert: {error}"),
+                    }) {
+                        Ok(value) => value,
+                        Err(error) => panic!("the fixture expiry must be positive: {error}"),
+                    },
+                ),
+                true,
+            ) {
+                Ok(chain) => chain,
+                Err(error) => panic!("the chain must build at {volatility}/{days}: {error}"),
+            };
+
+            for data in chain.iter() {
+                assert_eq!(
+                    data.delta_call,
+                    data.greeks_call.as_ref().map(|greeks| greeks.delta),
+                    "the call mirror and its snapshot disagree at strike {}",
+                    data.strike_price
+                );
+                assert_eq!(
+                    data.delta_put,
+                    data.greeks_put.as_ref().map(|greeks| greeks.delta),
+                    "the put mirror and its snapshot disagree at strike {}",
+                    data.strike_price
+                );
+                assert_eq!(
+                    data.gamma,
+                    data.greeks_call.as_ref().map(|greeks| greeks.gamma),
+                    "the gamma mirror and its snapshot disagree at strike {}",
+                    data.strike_price
+                );
+                // The shape the storage cannot represent: a mirror without a
+                // snapshot would be a strike whose `delta_call` column is
+                // written while its other eleven greek columns are NULL, which
+                // reads back as no snapshot and silently drops the delta the
+                // column does hold.
+                assert!(
+                    data.delta_call.is_none() || data.greeks_call.is_some(),
+                    "a mirror without a snapshot at strike {}",
+                    data.strike_price
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 0, "the fixture chains must quote something");
+    }
+
+    /// A volatility small enough to overflow upstream's greek arithmetic is
+    /// rejected, not priced.
+    ///
+    /// `vomma` is `vega * d1 * d2 / iv`, so below roughly `1e-11` that quotient
+    /// leaves `Decimal`'s range and `Positive` PANICS inside
+    /// `OptionChain::build_chain` — on a tokio worker, from a request that
+    /// passed every field-level check, because those only reject zero and
+    /// values above one.
+    ///
+    /// It fires only when the full greek set is computed, so it is reachable
+    /// through `?greeks=` on any deployment and, since issue #74, through the
+    /// DEFAULT path of a warehouse-backed one. The floor closes both.
+    #[test]
+    fn test_a_volatility_below_the_pricing_floor_is_rejected() {
+        for tiny in [1e-10, 1e-11, 1e-13] {
+            let request = request(4, brownian(tiny), tiny);
+            let parameters = match SimulationParametersV2::try_from(request) {
+                Ok(parameters) => parameters,
+                // Rejected even earlier, which is also a rejection.
+                Err(ChainError::Validation { field, .. }) => {
+                    assert_eq!(field, "volatility", "for {tiny:e}");
+                    continue;
+                }
+                Err(error) => panic!("expected a validation failure, got {error:?}"),
+            };
+
+            match FactorTape::build(&parameters, &parameters.method) {
+                Ok(_) => panic!("a volatility of {tiny:e} must be rejected"),
+                Err(ChainError::Validation { field, reason }) => {
+                    assert_eq!(field, "volatility", "for {tiny:e}");
+                    assert!(
+                        reason.contains("floor"),
+                        "the reason must name the floor, got {reason}"
+                    );
+                }
+                Err(error) => panic!("expected a validation failure, got {error:?}"),
+            }
+        }
+    }
+
+    /// The worst strike an extreme skew and smile can produce still prices.
+    ///
+    /// The base volatility is not what a strike is priced at. Upstream scales it
+    /// per strike and clamps the multiplier at a hundredth, so a base that
+    /// passed a naive check could still hand `vomma` a `1e-11` and panic. This
+    /// drives the skew and the smile to the edges of their validated ranges at
+    /// the smallest base the guard admits, and asserts the chain builds with the
+    /// full greek set — which is the code path that overflows.
+    #[test]
+    fn test_the_smallest_admitted_base_prices_under_an_extreme_skew_and_smile() {
+        let floor = min_priceable_base_volatility();
+        let volatility = match Positive::new_decimal(floor) {
+            Ok(volatility) => volatility,
+            Err(error) => panic!("the floor must be a valid volatility: {error}"),
+        };
+
+        for (skew, smile) in [
+            (dec!(-1.0), dec!(-1.0)),
+            (dec!(1.0), dec!(1.0)),
+            (dec!(-1.0), dec!(1.0)),
+            (dec!(1.0), dec!(-1.0)),
+        ] {
+            let mut parameters = parameters(request(4, brownian(0.18), 0.18));
+            parameters.skew_slope = Some(skew);
+            parameters.smile_curve = Some(smile);
+            parameters.chain_size = Some(60);
+
+            match build_chain(
+                &parameters,
+                pos_or_panic!(5000.0),
+                volatility,
+                ExpirationDate::Days(pos_or_panic!(7.0)),
+                true,
+            ) {
+                Ok(_) => {}
+                Err(error) => panic!("skew {skew} smile {smile} must still price: {error}"),
+            }
+        }
+    }
+
+    /// A base just under the floor is rejected, and the message explains why the
+    /// bound is a hundred times the value that actually overflows.
+    #[test]
+    fn test_a_base_below_the_adjusted_floor_names_the_skew() {
+        let parameters = parameters(request(4, brownian(0.18), 0.18));
+        let too_small = match Positive::new_decimal(dec!(0.00000001)) {
+            Ok(value) => value,
+            Err(error) => panic!("the fixture must be positive: {error}"),
+        };
+
+        match reject_unpriceable_volatility(too_small, None, VolatilitySource::Model) {
+            Ok(()) => panic!("a base of 1e-8 prices strikes at 1e-10 and must be rejected"),
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "volatility");
+                assert!(reason.contains("skew"), "the reason must explain: {reason}");
+            }
+            Err(error) => panic!("expected a validation failure, got {error:?}"),
+        }
+        let _ = parameters;
+    }
+
+    /// The floor sits well below anything a real walk produces, so it rejects
+    /// nothing a client could have used.
+    ///
+    /// Two witnesses: a chain at the reference configuration already serves no
+    /// valid strike below about `5e-3`, six orders of magnitude above the
+    /// floor; and the historical fixtures in this module estimate volatilities
+    /// as low as `4.5e-7`, still 450 times above it, and still build.
+    #[test]
+    fn test_the_pricing_floor_admits_every_usable_volatility() {
+        let parameters = parameters(request(4, brownian(0.005), 0.005));
+        let chain = match build_chain(
+            &parameters,
+            pos_or_panic!(5000.0),
+            pos_or_panic!(0.005),
+            ExpirationDate::Days(pos_or_panic!(7.0)),
+            true,
+        ) {
+            Ok(chain) => chain,
+            Err(error) => panic!("a usable volatility must still price: {error}"),
+        };
+
+        assert!(
+            chain.iter().count() > 0,
+            "the lowest volatility above the floor must still quote a strike"
+        );
     }
 
     fn parameters(request: CreateSimulationRequest) -> SimulationParametersV2 {

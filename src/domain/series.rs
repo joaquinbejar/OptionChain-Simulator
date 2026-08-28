@@ -178,6 +178,13 @@ fn snapshot_contracts(snapshot: &SeriesSnapshot) -> usize {
 pub(crate) struct SeriesBuilder<'a> {
     parameters: &'a SimulationParametersV2,
     tape: &'a FactorTape,
+    /// Whether each chain is built with the full per-style greek snapshots.
+    ///
+    /// Off by default, because the set costs about 1.54x a chain build and most
+    /// snapshots are served to a client that never asks for it. The caller that
+    /// knows something will read them turns it on: the manager when a warehouse
+    /// is registered, so a filed step carries what a replayed one does.
+    greek_snapshots: bool,
 }
 
 impl<'a> SeriesBuilder<'a> {
@@ -199,7 +206,22 @@ impl<'a> SeriesBuilder<'a> {
         tape: &'a FactorTape,
     ) -> Result<Self, ChainError> {
         parameters.validate()?;
-        Ok(Self { parameters, tape })
+        Ok(Self {
+            parameters,
+            tape,
+            greek_snapshots: false,
+        })
+    }
+
+    /// Builds every chain with the full per-style greek snapshots.
+    ///
+    /// See [`SeriesBuilder::greek_snapshots`]. Nothing served changes when this
+    /// is on: it adds `greeks_call` / `greeks_put` to each strike and leaves
+    /// every priced value identical.
+    #[must_use = "builders do nothing unless the value is used"]
+    pub(crate) fn with_greek_snapshots(mut self, enabled: bool) -> Self {
+        self.greek_snapshots = enabled;
+        self
     }
 
     /// Builds the snapshot at `step`.
@@ -273,6 +295,7 @@ impl<'a> SeriesBuilder<'a> {
             row.spot,
             row.base_volatility,
             ExpirationDate::Days(days_to_expiration),
+            self.greek_snapshots,
         )?;
 
         Ok(ExpiryChain {

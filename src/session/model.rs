@@ -195,7 +195,16 @@ impl TryFrom<CreateSessionRequest> for SimulationParameters {
             steps: req.steps,
             initial_price: positive_field("initial_price", req.initial_price)?,
             days_to_expiration: positive_field("days_to_expiration", req.days_to_expiration)?,
-            volatility: positive_field("volatility", req.volatility)?,
+            volatility: {
+                // The same bound the v2 tape applies per step. v1 has no tape,
+                // so the request boundary is where an unpriceable volatility has
+                // to be caught — otherwise the session is created happily and
+                // the first `?greeks=` request panics inside upstream's greek
+                // arithmetic, after the cursor has already moved.
+                let volatility = positive_field("volatility", req.volatility)?;
+                crate::domain::factors::validate_priceable_volatility(volatility, "volatility")?;
+                volatility
+            },
             risk_free_rate: decimal_field("risk_free_rate", req.risk_free_rate)?,
             dividend_yield: positive_field("dividend_yield", req.dividend_yield)?,
             method: req.method.try_into()?,

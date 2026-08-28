@@ -66,11 +66,25 @@ pub const DEFAULT_MAX_SNAPSHOT_CONTRACTS: usize = 200_000;
 ///
 /// The honest unit for a memory bound: one entry is a few hundred contracts in
 /// ADR 0001's reference configuration and up to the per-snapshot cap in a large
-/// one, so an entry count says nothing about how much is resident. Four million
-/// contracts is roughly a gigabyte of `OptionData`, and it lets the reference
-/// configuration keep its entry bound's worth of snapshots without ever
-/// reaching this one.
-pub const DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS: usize = 4_000_000;
+/// one, so an entry count says nothing about how much is resident.
+///
+/// The budget is **roughly a gigabyte**, and the count is derived from it
+/// rather than chosen: `size_of::<OptionData>()` is 848 bytes in this build
+/// since issue #74 gave every strike both greek snapshots (204 bytes each, up
+/// from 440 bytes for the whole struct before). 1 200 000 × 848 B ≈ 1.02 GB.
+/// The count came down from 4 000 000 in the same change, because holding the
+/// count would have tripled the resident budget without anyone asking for it —
+/// and the budget, not the count, is what the operator actually cares about.
+///
+/// Two caveats on that arithmetic. The size is measured *in this crate*, where
+/// workspace feature unification decides which of upstream's fields exist; a
+/// standalone probe can read smaller. And the snapshots are only *populated*
+/// when a warehouse is registered (issue #74), so a warehouse-free deployment
+/// keeps the same count within a smaller footprint rather than a larger cache.
+///
+/// It still lets ADR 0001's reference configuration keep its entry bound's
+/// worth of snapshots without ever reaching this one.
+pub const DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS: usize = 1_200_000;
 
 /// The longest retention window that can be configured, in seconds — thirty
 /// days.

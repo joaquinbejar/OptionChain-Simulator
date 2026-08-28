@@ -73,6 +73,17 @@ const SNAPSHOTS_DDL: &str = include_str!("../clickhouse/schema/simulation_snapsh
 /// The DDL of the quotes table. See [`SNAPSHOTS_DDL`].
 const QUOTES_DDL: &str = include_str!("../clickhouse/schema/simulation_option_quotes.sql");
 
+/// The migration that brings a pre-issue-#74 quotes table up to the current
+/// column set.
+///
+/// Run at startup right after the `CREATE TABLE IF NOT EXISTS`, because
+/// `CREATE` does not alter an existing table: without this, a deployment that
+/// predates the greek columns boots green and then fails every insert while its
+/// warehouse silently stops filling. `ADD COLUMN IF NOT EXISTS` is idempotent
+/// and metadata-only, so on a fresh table this is a no-op.
+const QUOTES_GREEKS_MIGRATION: &str =
+    include_str!("../clickhouse/schema/simulation_option_quotes_greeks.sql");
+
 /// The placeholder the retention knob replaces in the DDL.
 const RETENTION_PLACEHOLDER: &str = "{{RETENTION_DAYS}}";
 
@@ -117,7 +128,29 @@ const QUOTES_RANGE_QUERY: &str = "SELECT \
         put_mid, \
         delta_call, \
         delta_put, \
-        gamma \
+        gamma, \
+        gamma_call, \
+        gamma_put, \
+        theta_call, \
+        theta_put, \
+        vega_call, \
+        vega_put, \
+        rho_call, \
+        rho_put, \
+        rho_d_call, \
+        rho_d_put, \
+        alpha_call, \
+        alpha_put, \
+        vanna_call, \
+        vanna_put, \
+        vomma_call, \
+        vomma_put, \
+        veta_call, \
+        veta_put, \
+        charm_call, \
+        charm_put, \
+        color_call, \
+        color_put \
     FROM simulation_option_quotes FINAL \
     WHERE simulation_id = {simulation:String} \
       AND simulation_generation = {generation:UInt64} \
@@ -160,10 +193,68 @@ const COMPLETE_STEPS_SUBQUERY: &str = "SELECT marker.step \
 /// respect.
 #[must_use]
 fn contract_series_query(side: ContractSide, limit: usize) -> String {
-    let (bid, ask, mid, delta) = match side {
-        ContractSide::Call => ("call_bid", "call_ask", "call_mid", "delta_call"),
-        ContractSide::Put => ("put_bid", "put_ask", "put_mid", "delta_put"),
+    // Every column that has a per-style form is chosen here, so a call row and
+    // a put row of the same strike carry genuinely different greeks rather than
+    // one value repeated. `gamma` keeps its shared column too — it is upstream's
+    // convenience mirror, and rows written before issue #74 have only that one.
+    // The names are LITERALS, not built from the side: no identifier is ever
+    // composed, which is what makes `rules/global_rules.md`'s SQL rule hold
+    // here without an argument, and what keeps `grep charm_call` finding the
+    // query that reads it.
+    let (bid, ask, mid, greeks) = match side {
+        ContractSide::Call => (
+            "call_bid",
+            "call_ask",
+            "call_mid",
+            [
+                "delta_call",
+                "gamma_call",
+                "theta_call",
+                "vega_call",
+                "rho_call",
+                "rho_d_call",
+                "alpha_call",
+                "vanna_call",
+                "vomma_call",
+                "veta_call",
+                "charm_call",
+                "color_call",
+            ],
+        ),
+        ContractSide::Put => (
+            "put_bid",
+            "put_ask",
+            "put_mid",
+            [
+                "delta_put",
+                "gamma_put",
+                "theta_put",
+                "vega_put",
+                "rho_put",
+                "rho_d_put",
+                "alpha_put",
+                "vanna_put",
+                "vomma_put",
+                "veta_put",
+                "charm_put",
+                "color_put",
+            ],
+        ),
     };
+    let [
+        delta,
+        snapshot_gamma,
+        theta,
+        vega,
+        rho,
+        rho_d,
+        alpha,
+        vanna,
+        vomma,
+        veta,
+        charm,
+        color,
+    ] = greeks;
 
     // `limit` is a validated `usize` from configuration, never a request value.
     // It is interpolated rather than bound because the named parameters below
@@ -182,7 +273,18 @@ fn contract_series_query(side: ContractSide, limit: usize) -> String {
             quote.{ask} AS ask, \
             quote.{mid} AS mid, \
             quote.{delta} AS delta, \
-            quote.gamma AS gamma \
+            quote.gamma AS gamma, \
+            quote.{snapshot_gamma} AS snapshot_gamma, \
+            quote.{theta} AS theta, \
+            quote.{vega} AS vega, \
+            quote.{rho} AS rho, \
+            quote.{rho_d} AS rho_d, \
+            quote.{alpha} AS alpha, \
+            quote.{vanna} AS vanna, \
+            quote.{vomma} AS vomma, \
+            quote.{veta} AS veta, \
+            quote.{charm} AS charm, \
+            quote.{color} AS color \
         FROM simulation_option_quotes AS quote FINAL \
         WHERE quote.simulation_id = {{simulation:String}} \
           AND quote.simulation_generation = {{generation:UInt64}} \
@@ -299,12 +401,24 @@ impl ClickHouseSnapshotRepository {
         &self.config
     }
 
-    /// Creates the two tables if they are absent.
+    /// Creates the two tables if they are absent, then applies the column
+    /// migrations an older table needs.
     ///
-    /// Idempotent, and safe to call at every startup. It will **not** alter a
-    /// table that already exists, so changing `OCS_SNAPSHOT_RETENTION_DAYS`
-    /// against a live deployment needs an explicit
-    /// `ALTER TABLE ... MODIFY TTL`; the DDL documents that.
+    /// Idempotent, and safe to call at every startup.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` does not alter an existing table, so a
+    /// deployment that predates a column would otherwise boot green and fail
+    /// every insert afterwards — the opposite of the fail-at-boot behaviour
+    /// turning persistence on is supposed to buy. Column additions are
+    /// therefore RUN here, from `simulation_option_quotes_greeks.sql`, not left as a note for
+    /// an operator to expand by hand. `ADD COLUMN IF NOT EXISTS` is idempotent
+    /// and metadata-only, so on a fresh table it costs one no-op round trip.
+    ///
+    /// TTL is the exception and still is not migrated: changing
+    /// `OCS_SNAPSHOT_RETENTION_DAYS` against a live deployment needs an explicit
+    /// `ALTER TABLE ... MODIFY TTL`, because silently rewriting a retention
+    /// window at boot could delete data the operator still wanted. The DDL
+    /// documents it.
     ///
     /// # Errors
     ///
@@ -322,6 +436,14 @@ impl ClickHouseSnapshotRepository {
             );
             self.client.client.query(&statement).execute().await?;
         }
+
+        // After the CREATE, never before: on a fresh deployment the table has
+        // to exist for the ALTER to be the no-op it is meant to be.
+        self.client
+            .client
+            .query(QUOTES_GREEKS_MIGRATION)
+            .execute()
+            .await?;
 
         info!(
             retention_days = self.config.retention_days,
@@ -679,6 +801,7 @@ mod tests {
     use crate::infrastructure::clickhouse::snapshots::model::{DECIMAL_SCALE, to_storage_decimal};
     use crate::infrastructure::clickhouse::snapshots::record::{ExpirationRecord, QuoteRow};
     use chrono::{DateTime, TimeZone};
+    use optionstratlib::greeks::GreeksSnapshot;
     use positive::{Positive, pos_or_panic};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -725,6 +848,53 @@ mod tests {
                 Some(dec!(-0.4877)),
             )
             .with_gamma(Some(dec!(0.00312345)))
+            .with_greeks_call(Some(greeks_call()))
+            .with_greeks_put(Some(greeks_put()))
+    }
+
+    /// A call's greek snapshot, with every value distinct so a transposed
+    /// column shows up as a mismatch rather than as a coincidence.
+    ///
+    /// `delta` and `gamma` repeat the mirrors deliberately: they share their
+    /// columns with them, which is the property the round-trip has to prove.
+    fn greeks_call() -> GreeksSnapshot {
+        GreeksSnapshot {
+            delta: dec!(0.5123),
+            gamma: dec!(0.00312345),
+            theta: dec!(-0.0289390751520225679360302935),
+            vega: dec!(0.083366946728269604768867711),
+            rho: Some(dec!(0.0169894176861345909734753825)),
+            rho_d: Some(dec!(-0.0175414508192199992738499204)),
+            alpha: Some(dec!(-1.7676156552525424476306277983)),
+            vanna: dec!(1.2473442995808183501801769442),
+            vomma: dec!(0.2838300607436393803867085535),
+            veta: dec!(0.0000348161009099551782779877),
+            charm: dec!(-0.0044637844401925672319270818),
+            color: dec!(-0.0002301924225239124326433752),
+        }
+    }
+
+    /// The put of the same strike. `charm` and the sign-flipped `rho` are what
+    /// the per-side projection test reads: they differ from the call's, so a
+    /// projection that served one side's column for both would fail.
+    ///
+    /// `alpha` is `None` here on purpose, so the round-trip proves that an
+    /// absent optional greek survives as absent rather than as a zero.
+    fn greeks_put() -> GreeksSnapshot {
+        GreeksSnapshot {
+            delta: dec!(-0.4877),
+            gamma: dec!(0.00312345),
+            theta: dec!(-0.021574520001452908979992133),
+            vega: dec!(0.083366946728269604768867711),
+            rho: Some(dec!(-0.069028687541464627650228228)),
+            rho_d: Some(dec!(0.0645490601096514193310401325)),
+            alpha: None,
+            vanna: dec!(1.2473442995808183501801769442),
+            vomma: dec!(0.2838300607436393803867085535),
+            veta: dec!(0.0000348161009099551782779877),
+            charm: dec!(-0.0045048296956570029453340524),
+            color: dec!(-0.0002301924225239124326433752),
+        }
     }
 
     fn record(simulation: Uuid, step: usize) -> SnapshotRecord {
@@ -853,6 +1023,28 @@ mod tests {
                 delta_call: row.delta_call,
                 delta_put: row.delta_put,
                 gamma: row.gamma,
+                gamma_call: row.gamma_call,
+                gamma_put: row.gamma_put,
+                theta_call: row.theta_call,
+                theta_put: row.theta_put,
+                vega_call: row.vega_call,
+                vega_put: row.vega_put,
+                rho_call: row.rho_call,
+                rho_put: row.rho_put,
+                rho_d_call: row.rho_d_call,
+                rho_d_put: row.rho_d_put,
+                alpha_call: row.alpha_call,
+                alpha_put: row.alpha_put,
+                vanna_call: row.vanna_call,
+                vanna_put: row.vanna_put,
+                vomma_call: row.vomma_call,
+                vomma_put: row.vomma_put,
+                veta_call: row.veta_call,
+                veta_put: row.veta_put,
+                charm_call: row.charm_call,
+                charm_put: row.charm_put,
+                color_call: row.color_call,
+                color_put: row.color_put,
             })
             .collect();
 
@@ -1197,6 +1389,79 @@ mod tests {
         }
     }
 
+    /// The migration adds exactly the columns the DDL declares, and no others.
+    ///
+    /// Two files describe one table. A column added to the `CREATE` and
+    /// forgotten in the `ALTER` breaks every existing deployment and nothing
+    /// else; a column in the `ALTER` that the `CREATE` never had breaks every
+    /// fresh one. Both directions are checked here, without a server.
+    #[test]
+    fn test_the_migration_and_the_ddl_agree_on_the_greek_columns() {
+        let greeks = [
+            "gamma", "theta", "vega", "rho", "rho_d", "alpha", "vanna", "vomma", "veta", "charm",
+            "color",
+        ];
+        let expected: Vec<String> = greeks
+            .iter()
+            .flat_map(|greek| ["call", "put"].map(|side| format!("{greek}_{side}")))
+            .collect();
+
+        // Every name the migration adds, in the order it adds them.
+        let migrated: Vec<String> = QUOTES_GREEKS_MIGRATION
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("ADD COLUMN IF NOT EXISTS "))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+            .collect();
+
+        assert_eq!(migrated, expected, "the migration must add exactly these");
+        assert!(
+            QUOTES_GREEKS_MIGRATION.contains(QUOTES_TABLE),
+            "the migration must name the quotes table"
+        );
+
+        // And every one of them is a column of the fresh table.
+        for column in &expected {
+            assert!(
+                QUOTES_DDL
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("--"))
+                    .any(|line| line.trim_start().starts_with(&format!("{column} "))),
+                "the DDL must declare {column}"
+            );
+        }
+    }
+
+    /// Every column the range read selects is a column the table declares.
+    ///
+    /// The `SELECT` list and the DDL are edited in different files, and a
+    /// mismatch between them fails only against a live server — in the
+    /// integration job, long after the typo. `rho_d_call` is the name this
+    /// catches.
+    #[test]
+    fn test_the_range_query_selects_only_columns_the_ddl_declares() {
+        let declared: Vec<&str> = QUOTES_DDL
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect();
+
+        for selected in QUOTES_RANGE_QUERY
+            .split("FROM")
+            .next()
+            .unwrap_or_default()
+            .replace("SELECT", "")
+            .split(',')
+            .map(|column| column.trim().trim_end_matches('\\').trim())
+            .filter(|column| !column.is_empty() && !column.contains('('))
+        {
+            assert!(
+                declared.contains(&selected),
+                "the range query selects {selected}, which the DDL does not declare"
+            );
+        }
+    }
+
     /// Retention is anchored to ingestion time, because simulated time may sit
     /// years in the future.
     #[test]
@@ -1215,11 +1480,19 @@ mod tests {
         assert!(SNAPSHOTS_DDL.contains(&column));
         assert!(QUOTES_DDL.contains(&column));
         // A quote upstream never priced must survive as absent rather than as
-        // a zero, so every optional column is nullable: six quotes, two deltas
-        // and gamma.
+        // a zero, so every optional column is nullable: six quotes, two deltas,
+        // the shared gamma mirror, and the twenty-two per-style greek columns
+        // issue #74 added. Comment lines are excluded, since the migration note
+        // in the header spells the same type out.
+        let nullable = QUOTES_DDL
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .filter(|line| line.contains(&format!("Nullable({column})")))
+            .count();
         assert_eq!(
-            QUOTES_DDL.matches(&format!("Nullable({column})")).count(),
-            9
+            nullable,
+            6 + 2 + 1 + 22,
+            "found {nullable} nullable columns"
         );
     }
 
@@ -1559,6 +1832,228 @@ mod tests {
             ),
             other => panic!("the series must read, got {other:?}"),
         }
+    }
+
+    /// An older binary can still INSERT against a migrated table.
+    ///
+    /// The rollback the schema file promises. `clickhouse` validates an
+    /// insert's column list against the table and treats a column with no
+    /// default as one the client must supply, so a row struct that predates the
+    /// greek columns fails with `SchemaMismatch` unless they carry an explicit
+    /// `DEFAULT NULL`. `Nullable` alone does not say that.
+    ///
+    /// The struct below is the pre-issue-#74 `OptionQuoteRow`, field for field.
+    /// Written by hand rather than derived, because the point is to be the
+    /// shape the OLD binary had.
+    #[tokio::test]
+    #[ignore = "requires live ClickHouse on localhost:8123 (override via CLICKHOUSE_* env)"]
+    async fn test_an_old_row_struct_still_inserts_against_live_clickhouse() {
+        #[derive(Debug, clickhouse::Row, serde::Serialize)]
+        struct PreGreekQuoteRow {
+            simulation_id: String,
+            simulation_generation: u64,
+            step: u64,
+            expires_at: i64,
+            strike: i128,
+            snapshot_id: String,
+            simulated_at: i64,
+            symbol: String,
+            days_to_expiration: i128,
+            labels: Vec<String>,
+            implied_volatility: i128,
+            call_bid: Option<i128>,
+            call_ask: Option<i128>,
+            call_mid: Option<i128>,
+            put_bid: Option<i128>,
+            put_ask: Option<i128>,
+            put_mid: Option<i128>,
+            delta_call: Option<i128>,
+            delta_put: Option<i128>,
+            gamma: Option<i128>,
+            inserted_at_ms: u64,
+        }
+
+        let repository = live_repository();
+        let simulation = Uuid::new_v4();
+        match repository.ensure_schema().await {
+            Ok(()) => {}
+            Err(error) => panic!("the schema must be creatable: {error}"),
+        }
+
+        let scaled = |value: Decimal| match to_storage_decimal(value, "fixture") {
+            Ok(raw) => raw,
+            Err(error) => panic!("the fixture decimal must convert: {error}"),
+        };
+        let row = PreGreekQuoteRow {
+            simulation_id: simulation.to_string(),
+            simulation_generation: 2,
+            step: 0,
+            expires_at: 0,
+            strike: scaled(dec!(5000)),
+            snapshot_id: "old".to_string(),
+            simulated_at: 0,
+            symbol: "SPX".to_string(),
+            days_to_expiration: scaled(dec!(1.5)),
+            labels: vec!["weeklies".to_string()],
+            implied_volatility: scaled(dec!(0.185)),
+            call_bid: None,
+            call_ask: None,
+            call_mid: None,
+            put_bid: None,
+            put_ask: None,
+            put_mid: None,
+            delta_call: Some(scaled(dec!(0.5123))),
+            delta_put: Some(scaled(dec!(-0.4877))),
+            gamma: Some(scaled(dec!(0.00312345))),
+            inserted_at_ms: 1,
+        };
+
+        let outcome = async {
+            let mut insert = repository
+                .client
+                .client
+                .insert::<PreGreekQuoteRow>(QUOTES_TABLE)
+                .await?;
+            insert.write(&row).await?;
+            insert.end().await
+        }
+        .await;
+        cleanup(&repository, simulation).await;
+
+        match outcome {
+            Ok(()) => {}
+            Err(error) => panic!(
+                "a pre-#74 row struct must still insert against a migrated table, \
+                 which is what DEFAULT NULL buys: {error}"
+            ),
+        }
+    }
+
+    /// A row without greek columns reads back as a row without greeks.
+    ///
+    /// `ALTER TABLE ... ADD COLUMN` backfills NULL, so this is byte-for-byte
+    /// what a row written before issue #74 looks like once the migration has
+    /// run. Writing the record with no snapshots produces exactly those NULLs,
+    /// which is why it does not need hand-written SQL and a hand-computed
+    /// snapshot identity to reproduce.
+    ///
+    /// The criterion is that such a row still READS — that the reconstruction
+    /// reports no snapshot instead of failing the whole step, and that every
+    /// value the old row did carry survives.
+    #[tokio::test]
+    #[ignore = "requires live ClickHouse on localhost:8123 (override via CLICKHOUSE_* env)"]
+    async fn test_a_row_without_greek_columns_reads_from_live_clickhouse() {
+        let repository = live_repository();
+        let simulation = Uuid::new_v4();
+
+        match repository.ensure_schema().await {
+            Ok(()) => {}
+            Err(error) => panic!("the schema must be creatable: {error}"),
+        }
+
+        let mut original = record(simulation, 0);
+        for expiration in &mut original.expirations {
+            for quote in &mut expiration.quotes {
+                quote.greeks_call = None;
+                quote.greeks_put = None;
+            }
+        }
+        match repository.persist(original.clone()).await {
+            Ok(()) => {}
+            Err(error) => panic!("the snapshot must persist: {error}"),
+        }
+
+        let read = repository.get(simulation, original.generation, 0).await;
+        cleanup(&repository, simulation).await;
+
+        match read {
+            Ok(Some(reconstructed)) => {
+                // Field for field, including the absent snapshots.
+                assert_eq!(reconstructed, original);
+                let quote = match reconstructed
+                    .expirations
+                    .first()
+                    .and_then(|expiration| expiration.quotes.first())
+                {
+                    Some(quote) => quote,
+                    None => panic!("the snapshot must carry a quote"),
+                };
+                assert_eq!(quote.greeks_call, None);
+                assert_eq!(quote.greeks_put, None);
+                // What the old row did carry is untouched.
+                assert_eq!(quote.delta_call, Some(dec!(0.5123)));
+                assert_eq!(quote.delta_put, Some(dec!(-0.4877)));
+                assert_eq!(quote.gamma, Some(dec!(0.00312345)));
+            }
+            other => panic!("an old-shaped row must still read, got {other:?}"),
+        }
+    }
+
+    /// The per-side projection serves each style its own greek columns.
+    ///
+    /// One stored row, two ways to read it: a call query must project
+    /// `charm_call` and a put query `charm_put`, and the two differ. A
+    /// projection that named one side's column for both would pass every
+    /// round-trip test in this file and still be wrong, because the round-trip
+    /// never asks for one side alone.
+    #[tokio::test]
+    #[ignore = "requires live ClickHouse on localhost:8123 (override via CLICKHOUSE_* env)"]
+    async fn test_the_per_side_projection_serves_each_style_against_live_clickhouse() {
+        let repository = live_repository();
+        let simulation = Uuid::new_v4();
+
+        match repository.ensure_schema().await {
+            Ok(()) => {}
+            Err(error) => panic!("the schema must be creatable: {error}"),
+        }
+        match repository.persist(record(simulation, 0)).await {
+            Ok(()) => {}
+            Err(error) => panic!("the snapshot must persist: {error}"),
+        }
+
+        let series_for = async |side| {
+            repository
+                .contract_series(ContractSeriesQuery::new(
+                    simulation,
+                    2,
+                    instant(9),
+                    pos_or_panic!(5000.0),
+                    side,
+                    0,
+                    0,
+                ))
+                .await
+        };
+        let calls = series_for(ContractSide::Call).await;
+        let puts = series_for(ContractSide::Put).await;
+        cleanup(&repository, simulation).await;
+
+        let greeks_of = |series: Result<Vec<ContractQuote>, ChainError>, side| match series {
+            Ok(points) => match points.first() {
+                Some(point) => match &point.greeks {
+                    Some(greeks) => greeks.clone(),
+                    None => panic!("the {side} point must carry a snapshot: {point:?}"),
+                },
+                None => panic!("the {side} series must have a point"),
+            },
+            Err(error) => panic!("the {side} series must read: {error}"),
+        };
+
+        let call = greeks_of(calls, "call");
+        let put = greeks_of(puts, "put");
+
+        // Each side got its own column, not the other's.
+        assert_eq!(call, greeks_call());
+        assert_eq!(put, greeks_put());
+        assert_ne!(call.charm, put.charm, "charm is per style");
+        assert!(
+            call.rho.unwrap_or_default() * put.rho.unwrap_or_default() < Decimal::ZERO,
+            "rho carries opposite signs"
+        );
+        // The put's alpha is absent in the fixture, and NULL must read back as
+        // absent rather than as zero.
+        assert!(call.alpha.is_some());
+        assert_eq!(put.alpha, None);
     }
 
     /// A contract history comes back in simulated-time order, carrying the
