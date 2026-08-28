@@ -1,6 +1,5 @@
 //! This module defines the `ClickHouseConfig` struct and its default implementation.
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::fmt;
 
 /// Configuration structure for connecting to a ClickHouse server.
@@ -55,17 +54,19 @@ impl Default for ClickHouseConfig {
     /// # Returns
     /// A new instance of the struct with properly initialized fields.
     fn default() -> Self {
-        let port = env::var("CLICKHOUSE_PORT")
-            .ok()
+        let port = super::read_var("CLICKHOUSE_PORT")
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(8123);
 
         Self {
-            host: env::var("CLICKHOUSE_HOST").unwrap_or_else(|_| "localhost".to_string()),
+            host: super::read_var("CLICKHOUSE_HOST").unwrap_or_else(|| "localhost".to_string()),
             port,
-            username: env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "admin".to_string()),
-            password: env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "password".to_string()),
-            database: env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "default".to_string()),
+            // Credentials included: a blank one is unset, not an empty
+            // credential (issue #83).
+            username: super::read_var("CLICKHOUSE_USER").unwrap_or_else(|| "admin".to_string()),
+            password: super::read_var("CLICKHOUSE_PASSWORD")
+                .unwrap_or_else(|| "password".to_string()),
+            database: super::read_var("CLICKHOUSE_DB").unwrap_or_else(|| "default".to_string()),
         }
     }
 }
@@ -105,6 +106,44 @@ mod tests {
         #[allow(unused_unsafe)]
         unsafe {
             env::remove_var(name);
+        }
+    }
+
+    /// A blank ClickHouse credential is unset, so its default applies.
+    ///
+    /// The same rule as Redis and Mongo (issue #83): a blank value in a `.env`
+    /// file is a commented-out knob, and an empty credential is never what
+    /// somebody meant.
+    #[test]
+    fn test_blank_clickhouse_variables_fall_back_to_their_defaults() {
+        let _guard = match ENV_MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        for blank in ["", "  "] {
+            set_var("CLICKHOUSE_HOST", blank);
+            set_var("CLICKHOUSE_USER", blank);
+            set_var("CLICKHOUSE_PASSWORD", blank);
+            set_var("CLICKHOUSE_DB", blank);
+            set_var("CLICKHOUSE_PORT", blank);
+
+            let config = ClickHouseConfig::default();
+            assert_eq!(config.host, "localhost", "blank {blank:?}");
+            assert_eq!(config.username, "admin");
+            assert_eq!(config.password, "password");
+            assert_eq!(config.database, "default");
+            assert_eq!(config.port, 8123);
+        }
+
+        for name in [
+            "CLICKHOUSE_HOST",
+            "CLICKHOUSE_USER",
+            "CLICKHOUSE_PASSWORD",
+            "CLICKHOUSE_DB",
+            "CLICKHOUSE_PORT",
+        ] {
+            remove_var(name);
         }
     }
 

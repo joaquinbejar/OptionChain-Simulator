@@ -22,16 +22,18 @@ pub struct MongoDBConfig {
 impl Default for MongoDBConfig {
     fn default() -> Self {
         Self {
-            uri: std::env::var("MONGODB_URI")
-                .unwrap_or_else(|_| "mongodb://admin:password@localhost:27017".to_string()),
-            database: std::env::var("MONGODB_DATABASE")
-                .unwrap_or_else(|_| "optionchain_simulator".to_string()),
-            steps_collection: std::env::var("MONGODB_STEPS_COLLECTION")
-                .unwrap_or_else(|_| "steps".to_string()),
-            events_collection: std::env::var("MONGODB_EVENTS_COLLECTION")
-                .unwrap_or_else(|_| "events".to_string()),
-            timeout: std::env::var("MONGODB_TIMEOUT")
-                .ok()
+            // Blank is unset, everywhere (issue #83): a blank `MONGODB_URI`
+            // is a knob someone commented out, not a request to connect to the
+            // empty string.
+            uri: super::read_var("MONGODB_URI")
+                .unwrap_or_else(|| "mongodb://admin:password@localhost:27017".to_string()),
+            database: super::read_var("MONGODB_DATABASE")
+                .unwrap_or_else(|| "optionchain_simulator".to_string()),
+            steps_collection: super::read_var("MONGODB_STEPS_COLLECTION")
+                .unwrap_or_else(|| "steps".to_string()),
+            events_collection: super::read_var("MONGODB_EVENTS_COLLECTION")
+                .unwrap_or_else(|| "events".to_string()),
+            timeout: super::read_var("MONGODB_TIMEOUT")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(30),
         }
@@ -79,6 +81,36 @@ mod tests {
         unsafe {
             env::remove_var(name);
         }
+    }
+
+    /// A blank Mongo variable is unset, so its documented default applies.
+    ///
+    /// `MONGODB_URI=` is a knob someone commented out, not a request to connect
+    /// to the empty string (issue #83).
+    #[test]
+    fn test_blank_mongo_variables_fall_back_to_their_defaults() {
+        let _guard = match ENV_MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        for blank in ["", "  "] {
+            set_var("MONGODB_URI", blank);
+            set_var("MONGODB_DATABASE", blank);
+            set_var("MONGODB_TIMEOUT", blank);
+
+            let config = MongoDBConfig::default();
+            assert_eq!(
+                config.uri, "mongodb://admin:password@localhost:27017",
+                "a blank URI must fall back, not connect to {blank:?}"
+            );
+            assert_eq!(config.database, "optionchain_simulator");
+            assert_eq!(config.timeout, 30);
+        }
+
+        remove_var("MONGODB_URI");
+        remove_var("MONGODB_DATABASE");
+        remove_var("MONGODB_TIMEOUT");
     }
 
     #[test]

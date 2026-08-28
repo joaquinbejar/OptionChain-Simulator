@@ -26,7 +26,6 @@ use crate::infrastructure::config::simulation_v2::{
     DEFAULT_MAX_SNAPSHOT_CONTRACTS, max_snapshot_contracts,
 };
 use crate::utils::ChainError;
-use std::env;
 use std::time::Duration;
 use tracing::info;
 
@@ -306,19 +305,12 @@ fn too_large(variable: &str, value: &str, max: &str) -> ChainError {
     }
 }
 
-/// Reads a variable, treating an empty or whitespace-only value as unset.
+/// Reads a variable, treating a blank value as unset.
 ///
-/// A blank value in a `.env` file is how a knob gets "commented out" in
-/// practice; treating it as unset is friendlier than failing startup over it,
-/// and unambiguous either way.
+/// The rule itself lives in [`super::read_var`], which every configuration
+/// module in this service now shares.
 fn read(variable: &str) -> Option<String> {
-    let raw = env::var(variable).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    super::read_var(variable)
 }
 
 /// The error for a value that does not parse.
