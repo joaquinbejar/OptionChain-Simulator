@@ -20,7 +20,8 @@
 //!
 //! # Dependencies
 //! - The `optionchain_simulator` crate is used for infrastructure utilities like Redis client and session store setup.
-//! - `optionstratlib::utils::setup_logger` is used for setting up logging.
+//! - `optionstratlib::utils::setup_logger_with_level` sets up logging, at the
+//!   level `LOGLEVEL` resolves to (default `INFO`).
 //! - `tracing` crate is used for log output.
 //!
 //! # Redis Configuration
@@ -59,21 +60,22 @@
 
 use optionchain_simulator::api::{ListenOn, start_server};
 use optionchain_simulator::infrastructure::{
-    ClickHouseSnapshotRepository, MetricsCollector, RedisClient, RedisConfig, SimulationV2Config,
-    init_mongodb,
+    ClickHouseSnapshotRepository, LogLevel, MetricsCollector, RedisClient, RedisConfig,
+    SimulationV2Config, init_mongodb, resolve_log_level_from_env,
 };
 use optionchain_simulator::session::{
     InRedisSessionStore, InRedisSimulationStore, SessionManager, SimulationManager,
 };
 use optionstratlib::utils::setup_logger_with_level;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// The `main` function is the entry point of the application using the Actix Web server framework.
 /// It initializes the logger, sets up the session management with Redis as the backend, and starts the HTTP server.
 ///
 /// # Steps:
-/// 1. Calls `setup_logger()` to initialize logging.
+/// 1. Resolves `LOGLEVEL` (default `INFO`) and initialises logging at that
+///    level, warning once if the value was unrecognised.
 /// 2. Creates a Redis configuration using the default `RedisConfig`.
 /// 3. Logs the Redis connection details.
 /// 4. Initializes a `RedisClient` with the configuration and wraps it in an `Arc` for shared ownership.
@@ -113,7 +115,26 @@ use tracing::{info, warn};
 /// #[actix_web::main]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setup_logger_with_level("DEBUG");
+    // `LOGLEVEL`, not a literal. The level has to be resolved BEFORE a
+    // subscriber exists, so a rejected value is carried out of the resolver and
+    // warned about below, once the subscriber can carry the warning.
+    let log_level = resolve_log_level_from_env();
+    setup_logger_with_level(log_level.level.as_str());
+    if let Some(rejected) = &log_level.rejected {
+        warn!(
+            value = %rejected,
+            default = %log_level.level,
+            "unrecognised LOGLEVEL; using the default"
+        );
+    }
+    // Emitted AT the resolved level, not at INFO: the operator who just set
+    // `LOGLEVEL=WARN` is exactly the one who wants to see that it took, and an
+    // INFO line would be suppressed by the very setting it reports.
+    match log_level.level {
+        LogLevel::Error => error!(level = %log_level.level, "Log level resolved from LOGLEVEL"),
+        LogLevel::Warn => warn!(level = %log_level.level, "Log level resolved from LOGLEVEL"),
+        _ => info!(level = %log_level.level, "Log level resolved from LOGLEVEL"),
+    }
 
     // Create a session store
     let redis_config = RedisConfig::default();

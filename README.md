@@ -282,6 +282,13 @@ need no changes.
 
 ### Configuration
 
+`LOGLEVEL` sets the verbosity, case-insensitively, defaulting to `INFO`. An
+unrecognised value warns once and falls back rather than aborting startup,
+and the effective level is logged at that same level, so setting `WARN` or
+`ERROR` still confirms itself.
+`DEBUG` includes hyper connection traces on every request, which a batch
+consumer will want to avoid.
+
 **A blank value is an unset value.** `KNOB=` and `KNOB="   "` are read
 exactly as if the line were absent, and the documented default applies, so a
 knob is switched off by commenting it out rather than by emptying it.

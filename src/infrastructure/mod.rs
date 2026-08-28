@@ -15,6 +15,10 @@ pub use clickhouse::snapshots::record::{
 };
 pub(crate) use clickhouse::{calculate_required_duration, select_random_date, validate_symbol};
 pub use config::clickhouse::ClickHouseConfig;
+pub use config::logging::{
+    DEFAULT_LOG_LEVEL, LOG_LEVEL_VAR, LogLevel, ResolvedLogLevel, resolve_log_level,
+    resolve_log_level_from_env,
+};
 pub use config::redis::RedisConfig;
 pub use config::simulation_v2::{
     DEFAULT_CLEANUP_INTERVAL_SECS, DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS,

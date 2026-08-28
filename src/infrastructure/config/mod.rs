@@ -4,6 +4,8 @@
 //! reads: **a blank value is an unset value**. See [`crate::utils::env`].
 
 pub mod clickhouse;
+/// Resolving the process log level from `LOGLEVEL`.
+pub mod logging;
 pub mod mongo;
 pub mod redis;
 /// Operational configuration for v2 rolling simulations: retention, the
