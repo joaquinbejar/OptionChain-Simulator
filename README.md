@@ -629,6 +629,80 @@ parameter and returns the same body shown below.
 }
 ```
 
+##### The `greeks` query parameter
+
+Both chain-serving endpoints on each version — `GET /api/v1/chain`,
+`POST /api/v1/chain/step`, `GET /api/v2/simulations/{id}/snapshot` and
+`POST /api/v2/simulations/{id}/step` — accept an optional `greeks` level.
+It is opt-in, and its default is the response shown above: the full set is
+twelve values per option style, and a chain can be a thousand strikes wide
+across many expirations, so a play-loop client that does not need them must
+not be made to download them.
+
+| `greeks` | The `greeks` key on each quoted side |
+|----------|--------------------------------------|
+| absent, or `none` | Not present at all. `implied_volatility`, `gamma` and the per-side `delta` as before |
+| `first` | `theta`, `vega`, `rho`, `rho_d` |
+| `all` | The full twelve-value snapshot: `delta`, `gamma`, `theta`, `vega`, `rho`, `rho_d`, `alpha`, `vanna`, `vomma`, `veta`, `charm`, `color` |
+
+Any other value is a `400` naming `greeks`, never a silent fall back to the
+default: a client that asked for `all` and quietly received nothing would
+price a position against greeks it never got.
+
+One quoted side at `greeks=all`: the 105 strike of a chain built on a 100
+underlying, 30 days to expiration, a 4% rate and a 1.5% dividend yield, with
+a base volatility of 20% that the skew and smile shape to 0.1983 at this
+strike:
+
+```json
+"call": {
+    "bid": 0.66,
+    "ask": 0.68,
+    "mid": 0.67164031192058,
+    "delta": 0.21342098496717668,
+    "greeks": {
+        "delta": "0.2134209849671766791739391948",
+        "gamma": "0.0511531622872449408680866469",
+        "theta": "-0.0289390751520225679360302935",
+        "vega": "0.083366946728269604768867711",
+        "rho": "0.0169894176861345909734753825",
+        "rho_d": "-0.0175414508192199992738499204",
+        "alpha": "-1.7676156552525424476306277983",
+        "vanna": "1.2473442995808183501801769442",
+        "vomma": "0.2838300607436393803867085535",
+        "veta": "0.0000348161009099551782779877",
+        "charm": "-0.0044637844401925672319270818",
+        "color": "-0.0002301924225239124326433752"
+    }
+}
+```
+
+The put of the same strike carries `"rho": "-0.069028687541464627650228228"`
+and `"charm": "-0.0045048296956570029453340524"`: the sign flips on `rho`
+and the value differs on `charm`, so the two sides are genuinely computed
+rather than one copied twice. `gamma`, `vega`, `vanna`, `vomma`, `veta` and
+`color` are style-independent and do agree.
+
+Three things a client has to know about those numbers:
+
+- **Every value is per ONE LONG CONTRACT.** The client applies position
+  sign and size, exactly once. Upstream builds the snapshot as a long
+  position and applies the side sign inside every greek, so a consumer that
+  applies it again double-counts.
+- **They are decimals, so they arrive as JSON strings**, not numbers. That
+  is deliberate: they are the values upstream computed, not a lossy `f64`
+  view of them. Everything else on the wire stays `f64`.
+- **`null` means not meaningful for these inputs**, never zero. Only `rho`,
+  `rho_d` and `alpha` can be null. Distinct from that: a strike whose option
+  cannot be built carries **no `greeks` key at all**, which on the wire looks
+  like the default level. Its `implied_volatility`, `gamma` and `delta` are
+  still there — they are defined where the full set is not.
+
+`delta` and `gamma` keep their existing places on the quote and the
+contract. They are computed independently of the snapshot and stay defined
+at expiry and at zero volatility, where the full set is not, so the default
+response is unchanged at every strike — degenerate ones included.
+
 #### 3. Update Session Parameters (PATCH /api/v1/chain?sessionid=6af613b6-569c-5c22-9c37-2ed93f31d3af)
 
 **Request Body:**

@@ -419,6 +419,9 @@ The example below is cursor `1` of the reference configuration in §14
           "gamma": 0.0031,
           "call": { "bid": 21.4,  "ask": 22.1,  "mid": 21.75, "delta":  0.55 },
           "put":  { "bid":  9.05, "ask":  9.55, "mid":  9.30, "delta": -0.45 }
+          // Each side additionally carries an optional `greeks` object when the
+          // `greeks` query parameter is `first` or `all` (issue #73). Absent at
+          // the default level, which is the shape shown here.
         }
       ]
     }
@@ -439,7 +442,12 @@ Invariants a reviewer can check:
   `base_volatility` by the configured skew and smile — the base is the input to
   the ladder, not a copy of it.
 - All numeric fields are `f64` **at the REST boundary only**; the domain works
-  in `Positive`/`Decimal`.
+  in `Positive`/`Decimal`. The one documented exception is the optional `greeks`
+  object each quoted side carries when the `greeks` query parameter asks for it
+  (issue #73): its values are upstream `Decimal`s carried verbatim, so they
+  render as JSON strings rather than numbers. Nothing shown above changes — the
+  key is absent at the default level, which is what every existing client
+  receives.
 - `expires_at` is the **only** expiration a client sees. Upstream's
   `OptionChain` also carries a `YYYY-MM-DD` string that it stamps from the host
   clock — `get_date_string()` reads `Utc::now()` for a relative expiration and

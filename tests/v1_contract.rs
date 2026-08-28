@@ -314,6 +314,9 @@ fn test_v1_chain_response_shape_is_unchanged() {
                 ask: Some(26.1),
                 mid: Some(26.09),
                 delta: Some(0.95),
+                // The default greek level. The field is skipped when absent,
+                // so the JSON below is the pre-parameter response verbatim.
+                greeks: None,
             },
             put: OptionPriceResponse::default(),
             implied_volatility: Some(0.25),

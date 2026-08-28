@@ -1,4 +1,5 @@
 use crate::api::rest::error::map_error;
+use crate::api::rest::greeks::{GreekLevel, greeks_for};
 use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS};
 use crate::api::rest::models::SessionId;
 use crate::api::rest::patch::Patch;
@@ -25,7 +26,18 @@ use uuid::Uuid;
 /// Builds the `ChainResponse` DTO shared by the advance (`POST /api/v1/chain/step`) and
 /// peek (`GET /api/v1/chain`) endpoints from a session and its current option-chain
 /// snapshot. Kept as a single place so both surfaces emit an identical response shape.
-fn build_chain_response(session: &Session, option_chain: &OptionChain) -> ChainResponse {
+///
+/// `level` is the resolved `greeks` query parameter. At [`GreekLevel::None`] —
+/// the default, and what every existing client sends — the response is
+/// byte-identical to the one before the parameter existed: `implied_volatility`,
+/// `gamma` and the per-side `delta` still come from the convenience mirrors on
+/// `OptionData`, which are defined at expiry and at zero volatility where the
+/// full greek set is not.
+fn build_chain_response(
+    session: &Session,
+    option_chain: &OptionChain,
+    level: GreekLevel,
+) -> ChainResponse {
     let expiration = option_chain.get_expiration_date();
     ChainResponse {
         underlying: option_chain.symbol.clone(),
@@ -40,6 +52,7 @@ fn build_chain_response(session: &Session, option_chain: &OptionChain) -> ChainR
                 let call_bid = contract.get_call_sell_price();
                 let put_bid = contract.get_put_sell_price();
                 let volatility = contract.get_volatility();
+                let (call_greeks, put_greeks) = greeks_for(contract, level);
                 OptionContractResponse {
                     strike: contract.strike().into(),
                     expiration: expiration.clone(),
@@ -48,12 +61,14 @@ fn build_chain_response(session: &Session, option_chain: &OptionChain) -> ChainR
                         ask: call_ask.map(|a| a.into()),
                         mid: contract.call_middle.map(|m| m.into()),
                         delta: call_delta.map(|d| d.to_f64().unwrap_or(0.0)),
+                        greeks: call_greeks,
                     },
                     put: OptionPriceResponse {
                         bid: put_bid.map(|b| b.into()),
                         ask: put_ask.map(|a| a.into()),
                         mid: contract.put_middle.map(|m| m.into()),
                         delta: put_delta.map(|d| d.to_f64().unwrap_or(0.0)),
+                        greeks: put_greeks,
                     },
                     implied_volatility: Some(volatility.into()),
                     gamma: contract.current_gamma().map(|g| g.to_f64().unwrap_or(0.0)),
@@ -196,6 +211,44 @@ pub(crate) fn apply_update(
     Ok(())
 }
 
+/// Renders the v1 chain DTOs, off the runtime whenever greeks have to be priced.
+///
+/// Returns the response to serve and the one to persist. They differ only above
+/// the default greek level, where the served payload carries the greeks and the
+/// persisted one deliberately does not: the event log records the chain at step
+/// N, not what the client who happened to advance it asked for.
+///
+/// At the default level the conversion is a field-by-field copy and stays
+/// inline. Above it, upstream's `calculate_greeks` runs per strike per style at
+/// roughly 40 µs a contract, so a chain at the `OCS_MAX_CHAIN_SIZE` cap is tens
+/// of milliseconds of uninterrupted CPU. Left on a worker that stalls every
+/// other request the worker holds, so it goes to the blocking pool — the same
+/// treatment the v2 tape build and the export path already give their heavy
+/// synchronous work.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Internal`] if the blocking task panics or is dropped.
+async fn render_chain_responses(
+    session: Session,
+    option_chain: OptionChain,
+    level: GreekLevel,
+) -> Result<(ChainResponse, ChainResponse), ChainError> {
+    if !level.wants_greeks() {
+        let response = build_chain_response(&session, &option_chain, level);
+        let persisted = response.clone();
+        return Ok((response, persisted));
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let served = build_chain_response(&session, &option_chain, level);
+        let persisted = build_chain_response(&session, &option_chain, GreekLevel::None);
+        (served, persisted)
+    })
+    .await
+    .map_err(|error| ChainError::Internal(format!("greek pricing failed: {error}")))
+}
+
 #[utoipa::path(
     post,
     path = "/api/v1/chain",
@@ -314,6 +367,28 @@ pub(crate) struct AdvanceStepQuery {
     /// (response lost after the save) without consuming another step.
     #[serde(default)]
     pub(crate) expected_step: Option<usize>,
+    /// How much of the greek set the served chain should carry: `none` (the
+    /// default), `first` or `all`. Kept as a raw string so an unknown value is
+    /// a typed `400` naming the field rather than actix's untyped query
+    /// rejection.
+    #[serde(default)]
+    pub(crate) greeks: Option<String>,
+}
+
+/// The query of the v1 chain peek: the session, plus how much of the greek set
+/// to carry.
+///
+/// Separate from [`SessionId`] because only the two chain-serving endpoints
+/// take the parameter; PUT, PATCH and DELETE return no chain and must not
+/// advertise it.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ChainQuery {
+    /// ID of the session to read the current snapshot for.
+    #[serde(rename = "sessionid")]
+    pub(crate) session_id: String,
+    /// How much of the greek set to carry. See [`AdvanceStepQuery::greeks`].
+    #[serde(default)]
+    pub(crate) greeks: Option<String>,
 }
 
 #[utoipa::path(
@@ -329,10 +404,12 @@ pub(crate) struct AdvanceStepQuery {
         of consuming another one.",
     params(
         ("sessionid" = String, Query, description = "ID of the session to advance one step"),
-        ("expected_step" = Option<usize>, Query, description = "Expected current cursor; mismatch returns 412 without advancing")
+        ("expected_step" = Option<usize>, Query, description = "Expected current cursor; mismatch returns 412 without advancing"),
+        ("greeks" = Option<String>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. An unknown value is a 400")
     ),
     responses(
         (status = 200, description = "Advanced one step; served snapshot returned", body = ChainResponse),
+        (status = 400, description = "Malformed session id, or an unknown `greeks` level. The unknown-level body is the typed `{error, field}` of ValidationErrorResponse with `field` = `greeks`; a malformed id carries `error` alone."),
         (status = 404, description = "Session not found"),
         (status = 409, description = "Concurrent modification: another request advanced or modified the session; retry"),
         (status = 410, description = "Simulation completed. No more steps available"),
@@ -364,6 +441,12 @@ pub(crate) async fn advance_step(
             ));
         }
     };
+    // Rejected before the step is consumed: an unknown level must not advance
+    // the cursor on its way to a 400.
+    let level = match GreekLevel::parse(query.greeks.as_deref()) {
+        Ok(level) => level,
+        Err(error) => return map_error(error),
+    };
 
     // Expected-cursor precondition: a transport-level check (412) so an
     // ambiguous retry can be resolved without consuming another step.
@@ -384,22 +467,28 @@ pub(crate) async fn advance_step(
     // Advance the session one step (mutates state and persists it).
     match session_manager.get_next_step(session_id).await {
         Ok((session, option_chain)) => {
-            let response = build_chain_response(&session, &option_chain);
+            // Read before the session moves into the renderer.
+            let method = session.parameters.method.to_string();
+            // `persisted` is the response at the DEFAULT level: the event log is
+            // a record of the chain at step N, and letting a query parameter
+            // shape it would mean two clients advancing the same session wrote
+            // differently-shaped documents, with a `greeks=all` advance writing
+            // roughly five times the BSON for no gain.
+            let (response, persisted) =
+                match render_chain_responses(session, option_chain, level).await {
+                    Ok(rendered) => rendered,
+                    Err(error) => return map_error(error),
+                };
             let duration = start_time.elapsed();
-            metrics_collector.record_simulation_step(&session.parameters.method.to_string());
+            metrics_collector.record_simulation_step(&method);
             metrics_collector.record_simulation_duration(duration);
             // Publish the current simulation-cache occupancy: an advance may have
             // populated a fresh walk or evicted a completed one (issue #9).
             metrics_collector
                 .set_simulation_cache_size(session_manager.simulation_cache_len().await as i64);
 
-            // Save to MongoDB
             if let Err(e) = mongodb_repo
-                .save_chain_step(
-                    session_id,
-                    response.clone(),
-                    metrics_collector.get_ref().clone(),
-                )
+                .save_chain_step(session_id, persisted, metrics_collector.get_ref().clone())
                 .await
             {
                 error!(session_id = %session_id, "Failed to save chain step to MongoDB: {}", e);
@@ -419,10 +508,12 @@ pub(crate) async fn advance_step(
         explicit advance via POST /api/v1/chain/step moves the cursor. This endpoint does \
         not mutate session state or record a simulation step.",
     params(
-        ("sessionid" = String, Query, description = "ID of the session to read the current snapshot for")
+        ("sessionid" = String, Query, description = "ID of the session to read the current snapshot for"),
+        ("greeks" = Option<String>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. An unknown value is a 400")
     ),
     responses(
         (status = 200, description = "Current snapshot returned (read-only; repeatable)", body = ChainResponse),
+        (status = 400, description = "Malformed session id, or an unknown `greeks` level. The unknown-level body is the typed `{error, field}` of ValidationErrorResponse with `field` = `greeks`; a malformed id carries `error` alone."),
         (status = 404, description = "Session not found"),
         (status = 410, description = "Session completed; no current step available"),
         (status = 500, description = "Internal server error")
@@ -431,7 +522,7 @@ pub(crate) async fn advance_step(
 pub(crate) async fn get_current_step(
     req: HttpRequest,
     session_manager: web::Data<Arc<SessionManager>>,
-    query: web::Query<SessionId>,
+    query: web::Query<ChainQuery>,
 ) -> impl Responder {
     info!(
         "{} {}: session_id={}",
@@ -450,13 +541,20 @@ pub(crate) async fn get_current_step(
         }
     };
 
+    let level = match GreekLevel::parse(query.greeks.as_deref()) {
+        Ok(level) => level,
+        Err(error) => return map_error(error),
+    };
+
     // Peek the current snapshot: read-only, repeatable, no state change and no persistence.
     // No simulation-step metric is recorded and no chain-step event is written, because the
     // same step is served repeatedly.
     match session_manager.peek_current_step(session_id).await {
         Ok((session, option_chain)) => {
-            let response = build_chain_response(&session, &option_chain);
-            HttpResponse::Ok().json(response)
+            match render_chain_responses(session, option_chain, level).await {
+                Ok((response, _)) => HttpResponse::Ok().json(response),
+                Err(error) => map_error(error),
+            }
         }
         Err(error) => map_error(error),
     }
@@ -985,5 +1083,389 @@ mod tests_apply_update {
             changed,
             "seed null should produce a fresh seed different from the previous one"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_chain_response_greeks {
+    use super::*;
+    use crate::api::rest::greeks::GreekLevel;
+    use crate::session::{SimulationMethod, SimulationParameters};
+    use crate::utils::UuidGenerator;
+    use optionstratlib::ExpirationDate;
+    use optionstratlib::chains::OptionChainBuildParams;
+    use optionstratlib::chains::utils::OptionDataPriceParams;
+    use optionstratlib::utils::TimeFrame;
+    use positive::{Positive, pos_or_panic};
+    use rust_decimal_macros::dec;
+    use serde_json::Value;
+
+    /// The twelve values of an upstream `GreeksSnapshot`.
+    const FULL_SET: [&str; 12] = [
+        "delta", "gamma", "theta", "vega", "rho", "rho_d", "alpha", "vanna", "vomma", "veta",
+        "charm", "color",
+    ];
+
+    /// A session and a chain built from the same parameters, with a non-zero
+    /// dividend yield so `rho_d` is a meaningful number rather than a null.
+    fn session_and_chain() -> (Session, OptionChain) {
+        let parameters = SimulationParameters {
+            symbol: "AAPL".to_string(),
+            steps: 10,
+            initial_price: pos_or_panic!(100.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.2),
+            risk_free_rate: dec!(0.04),
+            dividend_yield: pos_or_panic!(0.015),
+            method: SimulationMethod::GeometricBrownian {
+                dt: pos_or_panic!(0.004),
+                drift: dec!(0.0),
+                volatility: pos_or_panic!(0.2),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(3),
+            strike_interval: Some(pos_or_panic!(5.0)),
+            skew_slope: Some(dec!(-0.2)),
+            smile_curve: Some(dec!(0.5)),
+            spread: Some(pos_or_panic!(0.02)),
+            seed: Some(42),
+        };
+
+        let price_params = OptionDataPriceParams::new(
+            Some(Box::new(parameters.initial_price)),
+            Some(ExpirationDate::Days(parameters.days_to_expiration)),
+            Some(parameters.risk_free_rate),
+            Some(parameters.dividend_yield),
+            Some(parameters.symbol.clone()),
+        );
+        let build_params = OptionChainBuildParams::new(
+            parameters.symbol.clone(),
+            Some(Positive::ONE),
+            3,
+            Some(pos_or_panic!(5.0)),
+            dec!(-0.2),
+            dec!(0.5),
+            pos_or_panic!(0.02),
+            2,
+            price_params,
+            parameters.volatility,
+        );
+        let chain = match OptionChain::build_chain(&build_params) {
+            Ok(chain) => chain,
+            Err(error) => panic!("the fixture chain must build: {error}"),
+        };
+
+        let namespace = match Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8") {
+            Ok(namespace) => namespace,
+            Err(error) => panic!("the fixture namespace must parse: {error}"),
+        };
+        let session = Session::new(parameters, &UuidGenerator::new(namespace));
+        (session, chain)
+    }
+
+    /// Renders a chain response at one level and returns its quotes, both
+    /// sides of every strike.
+    fn quotes_at(level: GreekLevel) -> Vec<Value> {
+        let (session, chain) = session_and_chain();
+        let response = build_chain_response(&session, &chain, level);
+        let value = match serde_json::to_value(&response) {
+            Ok(value) => value,
+            Err(error) => panic!("the response must serialize: {error}"),
+        };
+        let contracts = match value.get("contracts").and_then(Value::as_array) {
+            Some(contracts) => contracts.clone(),
+            None => panic!("the response must carry contracts: {value}"),
+        };
+        let mut quotes = Vec::new();
+        for contract in &contracts {
+            for side in ["call", "put"] {
+                match contract.get(side) {
+                    Some(quote) => quotes.push(quote.clone()),
+                    None => panic!("every contract must carry a {side}: {contract}"),
+                }
+            }
+        }
+        assert!(!quotes.is_empty(), "the fixture chain must quote something");
+        quotes
+    }
+
+    /// The regression that protects every existing v1 client: at the default
+    /// level the response carries no `greeks` key at all, so the payload is
+    /// what it has always been.
+    #[test]
+    fn test_the_default_v1_chain_carries_no_greeks_key() {
+        for quote in quotes_at(GreekLevel::None) {
+            assert!(
+                quote.get("greeks").is_none(),
+                "the default quote must carry no greeks key: {quote}"
+            );
+        }
+    }
+
+    /// `greeks=all` carries all twelve values for both styles on every strike.
+    #[test]
+    fn test_the_v1_chain_carries_the_twelve_values_per_style() {
+        for quote in quotes_at(GreekLevel::All) {
+            let greeks = match quote.get("greeks").and_then(Value::as_object) {
+                Some(greeks) => greeks,
+                None => panic!("greeks=all must carry a greeks object: {quote}"),
+            };
+            for key in FULL_SET {
+                assert!(
+                    greeks.contains_key(key),
+                    "greeks=all must carry {key}: {quote}"
+                );
+            }
+            assert_eq!(
+                greeks.len(),
+                FULL_SET.len(),
+                "greeks=all must carry exactly the twelve values: {quote}"
+            );
+        }
+    }
+
+    /// `greeks=first` adds the four the default response lacks, and nothing
+    /// else; `delta` stays on the quote itself.
+    #[test]
+    fn test_the_v1_chain_first_level_carries_only_the_remaining_first_order_set() {
+        for quote in quotes_at(GreekLevel::First) {
+            let greeks = match quote.get("greeks").and_then(Value::as_object) {
+                Some(greeks) => greeks,
+                None => panic!("greeks=first must carry a greeks object: {quote}"),
+            };
+            let mut keys: Vec<&str> = greeks.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, vec!["rho", "rho_d", "theta", "vega"], "{quote}");
+            assert!(quote.get("delta").is_some(), "{quote}");
+        }
+    }
+
+    /// The per-style split is real: `charm` differs between the call and the
+    /// put, and `rho` carries opposite signs.
+    #[test]
+    fn test_the_v1_call_and_put_greeks_are_genuinely_different() {
+        let (session, chain) = session_and_chain();
+        let response = build_chain_response(&session, &chain, GreekLevel::All);
+        let value = match serde_json::to_value(&response) {
+            Ok(value) => value,
+            Err(error) => panic!("the response must serialize: {error}"),
+        };
+        let contracts = match value.get("contracts").and_then(Value::as_array) {
+            Some(contracts) => contracts,
+            None => panic!("the response must carry contracts: {value}"),
+        };
+
+        let greek = |contract: &Value, side: &str, name: &str| -> f64 {
+            let raw = contract
+                .get(side)
+                .and_then(|quote| quote.get("greeks"))
+                .and_then(|greeks| greeks.get(name))
+                .and_then(Value::as_str);
+            match raw {
+                Some(value) => match value.parse::<f64>() {
+                    Ok(parsed) => parsed,
+                    Err(error) => panic!("{side}.{name} must be numeric: {value} ({error})"),
+                },
+                None => panic!("{side}.{name} must be present: {contract}"),
+            }
+        };
+
+        for contract in contracts {
+            assert_ne!(
+                greek(contract, "call", "charm"),
+                greek(contract, "put", "charm"),
+                "charm must differ between the styles: {contract}"
+            );
+            let call_rho = greek(contract, "call", "rho");
+            let put_rho = greek(contract, "put", "rho");
+            assert!(
+                call_rho * put_rho < 0.0,
+                "rho must carry opposite signs, got {call_rho} and {put_rho}"
+            );
+        }
+    }
+
+    /// The level changes only what is added: prices, delta and gamma are the
+    /// same numbers at all three levels, because the greeks are read off the
+    /// option and never fed back into it.
+    #[test]
+    fn test_the_v1_greek_level_does_not_move_the_quoted_market() {
+        let strip = |level: GreekLevel| -> Vec<Value> {
+            quotes_at(level)
+                .into_iter()
+                .map(|quote| {
+                    let mut quote = quote;
+                    if let Some(object) = quote.as_object_mut() {
+                        object.remove("greeks");
+                    }
+                    quote
+                })
+                .collect()
+        };
+
+        let none = strip(GreekLevel::None);
+        assert_eq!(strip(GreekLevel::First), none);
+        assert_eq!(strip(GreekLevel::All), none);
+    }
+}
+
+/// HTTP-level coverage of the `greeks` parameter on the v1 surface.
+///
+/// The conversion tests above call `build_chain_response` directly, which
+/// cannot exercise the query extractor, `map_error`, or the ordering of the
+/// level parse against the store call. v1 is the surface IronCondor is on, so
+/// its rejection path is worth proving through the real routes.
+#[cfg(test)]
+mod tests_v1_greeks_over_http {
+    use super::*;
+    use crate::session::InMemorySessionStore;
+    use actix_web::App;
+    use actix_web::http::StatusCode;
+    use actix_web::test as actix_test;
+    use serde_json::Value;
+
+    /// Mounts the real peek route over an in-memory store.
+    macro_rules! peek_service {
+        () => {{
+            let manager = Arc::new(SessionManager::new(Arc::new(InMemorySessionStore::new())));
+            actix_test::init_service(
+                App::new()
+                    .app_data(web::Data::new(manager))
+                    .service(web::resource("/api/v1/chain").route(web::get().to(get_current_step))),
+            )
+            .await
+        }};
+    }
+
+    /// An unknown level is a typed 400 naming the field.
+    ///
+    /// The id below is well formed but belongs to no session, and the response
+    /// is still a `400` rather than a `404`: the level is resolved before the
+    /// store is touched, which is the ordering the step endpoint depends on.
+    #[actix_web::test]
+    async fn test_an_unknown_greek_level_is_a_typed_400_on_v1() {
+        let app = peek_service!();
+
+        for level in ["second", "ALL", ""] {
+            let uri = format!(
+                "/api/v1/chain?sessionid=6ba7b810-9dad-11d1-80b4-00c04fd430c8&greeks={level}"
+            );
+            let request = actix_test::TestRequest::get().uri(&uri).to_request();
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "greeks={level} must be rejected before the store is read"
+            );
+            let body: Value = actix_test::read_body_json(response).await;
+            assert_eq!(
+                body.get("field").and_then(Value::as_str),
+                Some("greeks"),
+                "the 400 must name the field: {body}"
+            );
+        }
+    }
+
+    /// A rejected level must not consume a step.
+    ///
+    /// The v2 half of this is hermetic; v1's advance handler extracts a
+    /// `MongoDBRepository`, and actix resolves every extractor before the
+    /// handler runs, so this one needs the live service CI provides.
+    #[actix_web::test]
+    #[ignore = "requires live MongoDB on localhost:27017; run with -- --ignored"]
+    async fn test_an_unknown_greek_level_on_v1_step_does_not_advance() {
+        use crate::infrastructure::{MetricsCollector, init_mongodb};
+        use crate::session::{SimulationMethod, SimulationParameters};
+        use optionstratlib::utils::TimeFrame;
+        use positive::pos_or_panic;
+        use rust_decimal_macros::dec;
+
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = Arc::new(SessionManager::new(store));
+        let parameters = SimulationParameters {
+            symbol: "AAPL".to_string(),
+            steps: 10,
+            initial_price: pos_or_panic!(100.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.2),
+            risk_free_rate: dec!(0.04),
+            dividend_yield: pos_or_panic!(0.015),
+            method: SimulationMethod::GeometricBrownian {
+                dt: pos_or_panic!(0.004),
+                drift: dec!(0.0),
+                volatility: pos_or_panic!(0.2),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(3),
+            strike_interval: Some(pos_or_panic!(5.0)),
+            skew_slope: Some(dec!(-0.2)),
+            smile_curve: Some(dec!(0.5)),
+            spread: Some(pos_or_panic!(0.02)),
+            seed: Some(42),
+        };
+        let session = match manager.create_session(parameters).await {
+            Ok(session) => session,
+            Err(error) => panic!("the fixture session must be created: {error}"),
+        };
+        let session_id = session.id;
+
+        let metrics = match MetricsCollector::new() {
+            Ok(metrics) => Arc::new(metrics),
+            Err(error) => panic!("the metrics collector must build: {error}"),
+        };
+        let mongo = match init_mongodb().await {
+            Ok(repository) => repository,
+            Err(error) => panic!("this test needs a live MongoDB: {error}"),
+        };
+
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(manager.clone()))
+                .app_data(web::Data::new(metrics))
+                .app_data(web::Data::new(mongo))
+                .service(web::resource("/api/v1/chain/step").route(web::post().to(advance_step))),
+        )
+        .await;
+
+        let request = actix_test::TestRequest::post()
+            .uri(&format!(
+                "/api/v1/chain/step?sessionid={session_id}&greeks=second"
+            ))
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(body.get("field").and_then(Value::as_str), Some("greeks"));
+
+        match manager.get_session(session_id).await {
+            Ok(session) => assert_eq!(
+                session.current_step, 0,
+                "a rejected level must not consume a step"
+            ),
+            Err(error) => panic!("the session must still exist: {error}"),
+        }
+    }
+
+    /// A known level reaches the store, so the parameter is not swallowing
+    /// well-formed requests: an unknown session is a `404`, not a `400`.
+    #[actix_web::test]
+    async fn test_a_known_greek_level_reaches_the_store_on_v1() {
+        let app = peek_service!();
+
+        for level in ["", "?", "&greeks=none", "&greeks=first", "&greeks=all"] {
+            let query = match level {
+                "" | "?" => String::new(),
+                other => other.to_string(),
+            };
+            let uri =
+                format!("/api/v1/chain?sessionid=6ba7b810-9dad-11d1-80b4-00c04fd430c8{query}");
+            let request = actix_test::TestRequest::get().uri(&uri).to_request();
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "a valid level must reach the store, for {uri}"
+            );
+        }
     }
 }
