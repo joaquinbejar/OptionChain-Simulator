@@ -20,6 +20,9 @@ pub use config::logging::{
     resolve_log_level_from_env,
 };
 pub use config::redis::RedisConfig;
+pub use config::server::{
+    BIND_ADDRESS_VAR, DEFAULT_BIND_ADDRESS, DEFAULT_PORT, ListenOn, PORT_VAR, ServerConfig,
+};
 pub use config::simulation_v2::{
     DEFAULT_CLEANUP_INTERVAL_SECS, DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS,
     DEFAULT_MAX_CACHED_SNAPSHOTS, DEFAULT_MAX_CACHED_TAPES, DEFAULT_MAX_EXPORT_ROWS,

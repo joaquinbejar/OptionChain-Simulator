@@ -226,7 +226,7 @@ pub(crate) fn apply_update(
 /// Both are produced inside one admitted blocking job, serialisation included.
 /// `HttpResponse::json` would otherwise encode a large document on the Actix
 /// worker after the job returned, which is the stall the job exists to avoid.
-/// See [`crate::api::rest::greeks::admit_blocking`] for the bound v1 and v2
+/// See [`crate::api::rest::greeks::admit_render`] for the bound v1 and v2
 /// share.
 ///
 /// # Errors

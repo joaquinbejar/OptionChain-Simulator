@@ -146,8 +146,16 @@ services:
       # non-numeric value, or when unset, warning as it does so.
       REDIS_TIMEOUT: ${REDIS_TIMEOUT:-30}
       REDIS_CONNECT_TIMEOUT: ${REDIS_CONNECT_TIMEOUT:-5}
+      # The service binds loopback when this is unset (src/infrastructure/config
+      # /server.rs), and loopback inside a container is reachable by nobody, so
+      # a published port would lead nowhere. A container has to say 0.0.0.0 out
+      # loud; the network boundary here is the published port, not the bind.
+      OCS_BIND_ADDRESS: ${OCS_BIND_ADDRESS:-0.0.0.0}
+      # Both sides of the mapping below read the same variable, so moving the
+      # service off 7070 is one edit rather than two that can disagree.
+      OCS_PORT: ${OCS_PORT:-7070}
     ports:
-      - "7070:7070"
+      - "${OCS_PORT:-7070}:${OCS_PORT:-7070}"
     networks:
       - optionchain-network
 

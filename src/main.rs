@@ -11,8 +11,9 @@
 //! 4. Creates an `InRedisSessionStore` for managing session data, using the Redis client,
 //!    with a custom Redis key prefix (`optionchain:session:`) and a TTL of 1 hour.
 //! 5. Constructs a `SessionManager` to manage user sessions by wrapping the session store.
-//! 6. Starts an HTTP server using `start_server`, listening on all available interfaces (`ListenOn::All`)
-//!    at port `7070`.
+//! 6. Reads where to listen from `OCS_BIND_ADDRESS` and `OCS_PORT`, refusing to
+//!    start when either is unusable, and starts an HTTP server there using
+//!    `start_server`.
 //!
 //! # Returns
 //! - On success, returns `Ok(())`.
@@ -29,8 +30,14 @@
 //! - The TTL (time-to-live) for session keys in the Redis store is 3600 seconds (1 hour).
 //!
 //! # HTTP Server Details
-//! - Listening Address: `0.0.0.0` (all interfaces).
-//! - Port: `7070`.
+//! - Listening Address: `OCS_BIND_ADDRESS`, an IP address or the words `all`
+//!   and `localhost`. Default: `127.0.0.1`. It used to be a hardcoded
+//!   `0.0.0.0`, so a deployment that relied on being reachable off the host has
+//!   to ask for it now; a container must set `0.0.0.0` for its published port
+//!   to lead anywhere.
+//! - Port: `OCS_PORT`, `1..=65535`. Default: `7070`.
+//! - An unusable value in either FAILS STARTUP naming the variable, rather than
+//!   binding somewhere nobody asked for.
 //!
 //! # Example
 //! ```
@@ -58,15 +65,16 @@
 //! # Author
 //! - Generated and maintained by the developers of `optionchain_simulator`.
 
-use optionchain_simulator::api::{ListenOn, start_server};
+use optionchain_simulator::api::start_server;
 use optionchain_simulator::infrastructure::{
-    ClickHouseSnapshotRepository, MetricsCollector, RedisClient, RedisConfig, SimulationV2Config,
-    init_mongodb, resolve_log_level_from_env,
+    ClickHouseSnapshotRepository, MetricsCollector, RedisClient, RedisConfig, ServerConfig,
+    SimulationV2Config, init_mongodb, resolve_log_level_from_env,
 };
 use optionchain_simulator::session::{
     InRedisSessionStore, InRedisSimulationStore, SessionManager, SimulationManager,
 };
 use optionstratlib::utils::setup_logger_with_level;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -83,7 +91,8 @@ use tracing::{info, warn};
 ///    - An optional custom key prefix (`optionchain:session:`).
 ///    - An optional TTL (time-to-live) of 1 hour for the session keys.
 /// 6. Wraps the session store in an `Arc` for shared ownership and constructs a `SessionManager` instance.
-/// 7. Defines the listening IP/host (`ListenOn::All`, meaning all available interfaces) and the server port (7070).
+/// 7. Resolves the listening IP/host and port from `OCS_BIND_ADDRESS` and `OCS_PORT`, defaulting to
+///    `127.0.0.1:7070` and failing startup when either value is unusable.
 /// 8. Logs the server's starting information.
 /// 9. Calls `start_server` to start the HTTP server with the session manager, listen address, and port:
 ///    - On success, the server runs as expected, and `Ok(())` is returned.
@@ -98,19 +107,21 @@ use tracing::{info, warn};
 /// - `RedisClient`: Redis client for communicating with the Redis database.
 /// - `InRedisSessionStore`: Manages session persistence in Redis.
 /// - `SessionManager`: Manages session lifecycle and retrieval for the web application.
-/// - `ListenOn`: Enum to specify the server's listening IP/host.
+/// - `ServerConfig`: Where to listen, read from `OCS_BIND_ADDRESS` and `OCS_PORT`.
 /// - `start_server`: Function to start the Actix Web server with the provided session manager,
 ///    host, and port.
 ///
 /// # Notes:
 /// - Make sure that the Redis server is running and accessible at the address specified in `RedisConfig`.
 /// - Ensure the Actix-Web dependencies are properly configured with the required features for `#[actix_web::main]`.
-/// - The server listens on all interfaces (`0.0.0.0`) and port 7070 by default.
+/// - The server listens on `127.0.0.1:7070` by default; `OCS_BIND_ADDRESS=0.0.0.0` is what makes it
+///   reachable off the host, which this service leaves to the operator because it has no
+///   authentication and no rate limiting.
 ///
 /// # Example Log Output:
 /// ```text
 /// [INFO] Connecting to Redis at default://127.0.0.1:6379
-/// [INFO] Starting HTTP server at http://0.0.0.0:7070
+/// [INFO] Starting HTTP server at http://127.0.0.1:7070
 /// ```
 /// #[actix_web::main]
 #[tokio::main]
@@ -138,6 +149,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // observable without it — every subsequent line is emitted at the level it
     // resolved to.
     info!(level = %log_level.level, "Log level resolved from LOGLEVEL");
+
+    // `OCS_BIND_ADDRESS` and `OCS_PORT`, not constants, and read HERE — before
+    // Redis, MongoDB and ClickHouse are dialled. A typo in a port should cost a
+    // refusal, not three connections and a schema migration first. An unusable
+    // value fails startup naming the variable rather than binding something
+    // nobody asked for: two shards quietly fighting over one port is worse.
+    let server = ServerConfig::from_env()?;
 
     // Create a session store
     let redis_config = RedisConfig::default();
@@ -219,10 +237,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-    let listen_on = ListenOn::All;
-    let port = 7070;
-    // Start HTTP server
-    info!("Starting HTTP server at http://{}:{}", listen_on, port);
+
+    let listen_on = server.address;
+    let port = server.port;
+
+    // Through `SocketAddr` so an IPv6 literal is bracketed: `http://::1:7070`
+    // is not something an operator can paste anywhere.
+    info!(
+        "Starting HTTP server at http://{}",
+        SocketAddr::new(listen_on.ip(), port)
+    );
+    if listen_on.is_public() {
+        // Said once, out loud: this service has no authentication and no rate
+        // limiting, so reaching it off the host is a decision.
+        warn!(
+            address = %listen_on,
+            "Listening beyond loopback; the service has no authentication"
+        );
+    }
     match start_server(
         session_manager,
         simulation_manager,

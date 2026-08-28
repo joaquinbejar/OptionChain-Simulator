@@ -8,6 +8,8 @@ pub mod clickhouse;
 pub mod logging;
 pub mod mongo;
 pub mod redis;
+/// Where the HTTP server listens: `OCS_BIND_ADDRESS` and `OCS_PORT`.
+pub mod server;
 /// Operational configuration for v2 rolling simulations: retention, the
 /// cleanup cadence, and the domain-cache capacities.
 pub mod simulation_v2;

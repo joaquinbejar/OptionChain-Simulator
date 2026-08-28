@@ -1,7 +1,10 @@
 pub(crate) mod rest;
 
 pub use rest::controller::start_server;
-pub use rest::models::ListenOn;
+// Re-exported from `infrastructure`, where the type lives: `optionchain_simulator
+// ::api::ListenOn` is the path consumers already use, and the move must not cost
+// them an import.
+pub use crate::infrastructure::ListenOn;
 pub use rest::patch::Patch;
 pub use rest::requests::{CreateSessionRequest, UpdateSessionRequest};
 pub use rest::requests_v2::CreateSimulationRequest;
