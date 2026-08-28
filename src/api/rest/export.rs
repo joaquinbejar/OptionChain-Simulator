@@ -808,7 +808,7 @@ impl Stream for RowStream {
     ),
     responses(
         (status = 200, description = "The exported rows, streamed", body = String),
-        (status = 400, description = "An invalid range or an unknown `greeks` level, as the typed `{error, field}` of ValidationErrorResponse — `field` is `from_step`, `to_step` or `greeks`. An unknown `dataset` or `format` is rejected by the query extractor before the handler and carries actix's own untyped body instead"),
+        (status = 400, description = "Every rejection carries the typed `{error, field}` of ValidationErrorResponse. `field` names the offender where it is known — `id` for a malformed identifier, `from_step` or `to_step` for a range that is reversed or past the tape, `greeks` for an unknown level. It is EMPTY when the query string fails to deserialise at all (an unknown `dataset` or `format`, a non-numeric step), because serde's message for those does not name the key; the `error` string carries the detail.", body = crate::api::rest::responses::ValidationErrorResponse),
         (status = 404, description = "Simulation not found"),
         (status = 500, description = "Internal server error")
     )
@@ -988,8 +988,16 @@ fn produce(
                 .ok_or_else(|| ChainError::Internal("the step counter overflowed".to_string()))?;
         }
 
-        let chunk = writer.rows(parameters, row.step, row, chains)?;
-        if !chunk.is_empty() && sender.blocking_send(Ok(chunk)).is_err() {
+        let delivery = writer.rows(parameters, row.step, row, chains, &mut |chunk| {
+            if chunk.is_empty() {
+                return Delivery::Sent;
+            }
+            match sender.blocking_send(Ok(chunk)) {
+                Ok(()) => Delivery::Sent,
+                Err(_) => Delivery::ClientGone,
+            }
+        })?;
+        if delivery == Delivery::ClientGone {
             return Ok(());
         }
     }
@@ -1067,13 +1075,17 @@ impl Writer {
     /// chains: it is the tape's instant, the same one a stored record was
     /// written from, and taking it from one place keeps the two sources
     /// rendering identically by construction.
-    fn rows(
+    fn rows<E>(
         &mut self,
         parameters: &SimulationParametersV2,
         step: usize,
         row: &crate::domain::factors::FactorRow,
         chains: Option<StepChains<'_>>,
-    ) -> Result<Vec<u8>, ChainError> {
+        emit: &mut E,
+    ) -> Result<Delivery, ChainError>
+    where
+        E: FnMut(Vec<u8>) -> Delivery,
+    {
         let simulated_at = render_instant(row.simulated_at);
         let symbol = parameters.symbol.as_str();
 
@@ -1085,6 +1097,7 @@ impl Writer {
             } => {
                 let values = json_rows(*dataset, *level, step, &simulated_at, symbol, row, chains);
                 let mut chunk = Vec::new();
+                let mut rows_buffered = 0_usize;
                 for value in values {
                     if !*first {
                         chunk.push(b',');
@@ -1094,12 +1107,28 @@ impl Writer {
                         ChainError::Internal(format!("failed to encode an export row: {e}"))
                     })?;
                     chunk.extend_from_slice(&encoded);
+                    rows_buffered += 1;
+
+                    if rows_buffered >= ROWS_PER_CHUNK {
+                        if emit(std::mem::take(&mut chunk)) == Delivery::ClientGone {
+                            return Ok(Delivery::ClientGone);
+                        }
+                        rows_buffered = 0;
+                    }
                 }
-                Ok(chunk)
+                if chunk.is_empty() {
+                    return Ok(Delivery::Sent);
+                }
+                Ok(emit(chunk))
             }
             Writer::Csv { dataset, level } => {
                 let records = csv_rows(*dataset, *level, step, &simulated_at, symbol, row, chains);
-                encode_csv(&records)
+                for batch in records.chunks(ROWS_PER_CHUNK) {
+                    if emit(encode_csv(batch)?) == Delivery::ClientGone {
+                        return Ok(Delivery::ClientGone);
+                    }
+                }
+                Ok(Delivery::Sent)
             }
         }
     }
@@ -1232,6 +1261,34 @@ fn json_rows(
             rows
         }
     }
+}
+
+/// How many rows one chunk carries.
+///
+/// The export streams, but a chunk is indivisible: the channel bounds how many
+/// are in flight, not how large they are, so a whole step in one chunk means a
+/// slow client can hold the entire step in memory no matter how small the
+/// channel is. At the per-snapshot cap of 200 000 contracts a `greeks=all` step
+/// is hundreds of megabytes, and sixteen of those in flight is gigabytes.
+///
+/// Rows rather than bytes because a row's width is fixed by the dataset and the
+/// greek level, so a row count IS a byte bound: 512 rows of the widest shape the
+/// `option_chains` dataset can produce is a few hundred kilobytes, and the
+/// narrower datasets are far less. Backpressure then applies within a step
+/// rather than only between steps.
+const ROWS_PER_CHUNK: usize = 512;
+
+/// Whether a chunk reached the client.
+///
+/// A `bool` would read as "success", and the interesting case here is the one
+/// that is neither success nor failure: the client hung up, which is not an
+/// error to report to anyone, just a reason to stop working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// The chunk was handed to the response stream.
+    Sent,
+    /// The receiver is gone. Stop producing; nothing is owed to anyone.
+    ClientGone,
 }
 
 /// The CSV records one step contributes, in the header's order.
@@ -2154,6 +2211,212 @@ mod tests {
             warehouse.reads() >= 4,
             "every chains export must have consulted the warehouse"
         );
+    }
+
+    /// One step is delivered as several bounded chunks, not one.
+    ///
+    /// The channel bounds how many chunks are in flight, not how large they
+    /// are, so a whole step in one chunk let a slow client hold the entire step
+    /// in memory — hundreds of megabytes at the per-snapshot cap with
+    /// `greeks=all`. Backpressure has to apply WITHIN a step, which it only
+    /// does if a step is more than one chunk.
+    ///
+    /// Checked on both encodings, since they buffer differently: JSON
+    /// accumulates encoded rows, CSV encodes batches of records.
+    #[test]
+    fn test_a_wide_step_is_delivered_in_bounded_chunks() {
+        let mut parameters = reference_parameters();
+        // Wide enough that one step is several chunks.
+        parameters.chain_size = Some(400);
+        parameters.strike_interval =
+            match positive::Positive::new_decimal(rust_decimal::Decimal::ONE) {
+                Ok(interval) => Some(interval),
+                Err(error) => panic!("the fixture interval must be positive: {error}"),
+            };
+
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
+        let builder = match SeriesBuilder::new(&parameters, &tape) {
+            Ok(builder) => builder,
+            Err(error) => panic!("the builder must accept the parameters: {error}"),
+        };
+        let snapshot = match builder.snapshot(0) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("the snapshot must build: {error}"),
+        };
+        let row = match tape.row(0) {
+            Some(row) => row,
+            None => panic!("the tape must have a first row"),
+        };
+
+        let rows: usize = snapshot
+            .chains
+            .iter()
+            .map(|chain| chain.chain.iter().count())
+            .sum();
+        assert!(
+            rows > ROWS_PER_CHUNK,
+            "the fixture must be wider than one chunk, got {rows} rows"
+        );
+
+        for format in [Format::Json, Format::Csv] {
+            let mut writer = match Writer::new(format, Dataset::OptionChains, GreekLevel::All) {
+                Ok(writer) => writer,
+                Err(error) => panic!("the writer must build: {error}"),
+            };
+            let mut chunks: Vec<usize> = Vec::new();
+            let delivery = writer.rows(
+                &parameters,
+                0,
+                row,
+                Some(StepChains::Replayed(&snapshot)),
+                &mut |chunk| {
+                    chunks.push(chunk.len());
+                    Delivery::Sent
+                },
+            );
+            match delivery {
+                Ok(Delivery::Sent) => {}
+                other => panic!("{format:?}: the step must be delivered, got {other:?}"),
+            }
+
+            assert!(
+                chunks.len() > 1,
+                "{format:?}: a step of {rows} rows must be more than one chunk"
+            );
+            // The bound is rows, and a row's width is fixed by the dataset and
+            // the level, so this is a byte bound in practice.
+            let widest = chunks.iter().copied().max().unwrap_or_default();
+            assert!(
+                widest < 4 * 1024 * 1024,
+                "{format:?}: a chunk of {widest} bytes is not bounded"
+            );
+        }
+    }
+
+    /// A client that hangs up stops the work at the next chunk boundary.
+    ///
+    /// The reason `rows` reports delivery rather than returning bytes: it now
+    /// emits several chunks per step, so it has to learn about the disconnect
+    /// itself instead of the caller discovering it after the whole step was
+    /// built.
+    #[test]
+    fn test_a_disconnect_stops_the_step_at_the_next_chunk() {
+        let mut parameters = reference_parameters();
+        parameters.chain_size = Some(400);
+        parameters.strike_interval =
+            match positive::Positive::new_decimal(rust_decimal::Decimal::ONE) {
+                Ok(interval) => Some(interval),
+                Err(error) => panic!("the fixture interval must be positive: {error}"),
+            };
+
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
+        let builder = match SeriesBuilder::new(&parameters, &tape) {
+            Ok(builder) => builder,
+            Err(error) => panic!("the builder must accept the parameters: {error}"),
+        };
+        let snapshot = match builder.snapshot(0) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("the snapshot must build: {error}"),
+        };
+        let row = match tape.row(0) {
+            Some(row) => row,
+            None => panic!("the tape must have a first row"),
+        };
+
+        let mut writer = match Writer::new(Format::Csv, Dataset::OptionChains, GreekLevel::All) {
+            Ok(writer) => writer,
+            Err(error) => panic!("the writer must build: {error}"),
+        };
+        let mut delivered = 0_usize;
+        let outcome = writer.rows(
+            &parameters,
+            0,
+            row,
+            Some(StepChains::Replayed(&snapshot)),
+            &mut |_| {
+                delivered += 1;
+                Delivery::ClientGone
+            },
+        );
+
+        match outcome {
+            Ok(Delivery::ClientGone) => {}
+            other => panic!("a disconnect must be reported, got {other:?}"),
+        }
+        assert_eq!(delivered, 1, "the work must stop at the first refusal");
+    }
+
+    /// Every way of getting a 400 out of this endpoint returns the documented
+    /// shape.
+    ///
+    /// Four different paths reach it — the handler's own validation, the id
+    /// parse, the range check and actix's query extractor — and only the first
+    /// three ever named a field. The extractor's rejection used to be untyped
+    /// plaintext; it now renders the same object with an empty `field`, because
+    /// serde's message for a bad key does not say which one. Pinned so the
+    /// documented schema stays true of all four.
+    #[actix_web::test]
+    async fn test_every_export_rejection_carries_the_documented_shape() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        let cases = [
+            (
+                "/api/v2/simulations/not-a-uuid/export?dataset=option_chains&format=csv"
+                    .to_string(),
+                Some("id"),
+            ),
+            (
+                format!(
+                    "/api/v2/simulations/{id}/export?dataset=option_chains&format=csv&from_step=2&to_step=1"
+                ),
+                Some("from_step"),
+            ),
+            (
+                format!(
+                    "/api/v2/simulations/{id}/export?dataset=option_chains&format=csv&greeks=second"
+                ),
+                Some("greeks"),
+            ),
+            // The extractor's own rejections: typed body, unnamed field.
+            (
+                format!("/api/v2/simulations/{id}/export?dataset=nope&format=csv"),
+                Some(""),
+            ),
+            (
+                format!(
+                    "/api/v2/simulations/{id}/export?dataset=option_chains&format=csv&from_step=abc"
+                ),
+                Some(""),
+            ),
+        ];
+
+        for (uri, field) in cases {
+            let response = actix_test::call_service(
+                &app,
+                actix_test::TestRequest::get().uri(&uri).to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "for {uri}");
+            let body: Value = actix_test::read_body_json(response).await;
+            assert_eq!(
+                body.get("field").and_then(Value::as_str),
+                field,
+                "for {uri}: {body}"
+            );
+            assert!(
+                body.get("error")
+                    .and_then(Value::as_str)
+                    .is_some_and(|error| !error.is_empty()),
+                "every rejection must explain itself: {body}"
+            );
+        }
     }
 
     /// The two conversion paths agree at every greek level.
