@@ -287,7 +287,8 @@ Every environment variable the service reads is documented in
 deliberately different failure behaviour:
 
 - **Request caps** — `OCS_MAX_STEPS`, `OCS_MAX_CHAIN_SIZE`,
-  `OCS_MAX_HISTORICAL_PRICES`, `OCS_MAX_CACHED_WALKS` — warn and fall back
+  `OCS_MAX_HISTORICAL_PRICES`, `OCS_MAX_CONCURRENT_GREEK_RENDERS`,
+  `OCS_MAX_CACHED_WALKS` — warn and fall back
   to their defaults when set to something invalid. A bad value there
   degrades one request.
 - **v2 operational knobs** — `OCS_V2_RETENTION_SECS`,
@@ -661,27 +662,28 @@ strike:
     "mid": 0.67164031192058,
     "delta": 0.21342098496717668,
     "greeks": {
-        "delta": "0.2134209849671766791739391948",
-        "gamma": "0.0511531622872449408680866469",
-        "theta": "-0.0289390751520225679360302935",
-        "vega": "0.083366946728269604768867711",
-        "rho": "0.0169894176861345909734753825",
-        "rho_d": "-0.0175414508192199992738499204",
-        "alpha": "-1.7676156552525424476306277983",
-        "vanna": "1.2473442995808183501801769442",
-        "vomma": "0.2838300607436393803867085535",
-        "veta": "0.0000348161009099551782779877",
-        "charm": "-0.0044637844401925672319270818",
-        "color": "-0.0002301924225239124326433752"
+        "delta": 0.21342098496717668,
+        "gamma": 0.051153162287244945,
+        "theta": -0.028939075152022566,
+        "vega": 0.0833669467282696,
+        "rho": 0.016989417686134593,
+        "rho_d": -0.01754145081922,
+        "alpha": -1.7676156552525426,
+        "vanna": 1.2473442995808184,
+        "vomma": 0.28383006074363937,
+        "veta": 0.00003481610090995518,
+        "charm": -0.0044637844401925674,
+        "color": -0.00023019242252391244
     }
 }
 ```
 
-The put of the same strike carries `"rho": "-0.069028687541464627650228228"`
-and `"charm": "-0.0045048296956570029453340524"`: the sign flips on `rho`
-and the value differs on `charm`, so the two sides are genuinely computed
-rather than one copied twice. `gamma`, `vega`, `vanna`, `vomma`, `veta` and
-`color` are style-independent and do agree.
+The put of the same strike carries `"rho": -0.06902868754146463` and
+`"charm": -0.004504829695657003`: the sign flips on `rho` and the value
+differs on `charm`, so the two sides are genuinely computed rather than one
+copied twice. `gamma`, `vega`, `vanna`, `vomma`, `veta` and `color` are
+style-independent and do agree. `alpha` differs too — it is a ratio, and the
+two sides have different thetas.
 
 Three things a client has to know about those numbers:
 
@@ -689,9 +691,10 @@ Three things a client has to know about those numbers:
   sign and size, exactly once. Upstream builds the snapshot as a long
   position and applies the side sign inside every greek, so a consumer that
   applies it again double-counts.
-- **They are decimals, so they arrive as JSON strings**, not numbers. That
-  is deliberate: they are the values upstream computed, not a lossy `f64`
-  view of them. Everything else on the wire stays `f64`.
+- **They are `f64`, like every other number on this surface.** The DTOs are
+  this crate's own twelve- and four-field types, converted from upstream's
+  `Decimal` exactly once at the boundary, so upstream's serialisation never
+  becomes part of this service's contract by accident.
 - **`null` means not meaningful for these inputs**, never zero. Only `rho`,
   `rho_d` and `alpha` can be null. Distinct from that: a strike whose option
   cannot be built carries **no `greeks` key at all**, which on the wire looks

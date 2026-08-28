@@ -20,7 +20,7 @@
 //! first".
 
 use crate::api::rest::error::map_error;
-use crate::api::rest::greeks::GreekLevel;
+use crate::api::rest::greeks::{GreekLevel, render_body};
 use crate::api::rest::requests_v2::CreateSimulationRequest;
 use crate::api::rest::responses_v2::{SimulationResponse, SnapshotResponse, snapshot_response};
 use crate::domain::series::SeriesSnapshot;
@@ -42,6 +42,7 @@ pub(crate) struct SimulationPath {
 
 /// Query parameters for the advance command.
 #[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AdvanceQuery {
     /// Optional expected cursor. When supplied, the advance proceeds only if
     /// the simulation is at exactly this step; otherwise `412` is returned with
@@ -58,39 +59,38 @@ pub(crate) struct AdvanceQuery {
 
 /// The query of a snapshot peek.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotQuery {
     /// How much of the greek set to carry. See [`AdvanceQuery::greeks`].
     #[serde(default)]
     pub(crate) greeks: Option<String>,
 }
 
-/// Renders a snapshot DTO, off the runtime whenever greeks have to be priced.
+/// Renders a snapshot body, under the shared greek admission bound.
 ///
-/// At the default level the conversion is a field-by-field copy of numbers the
-/// snapshot already holds, and stays inline. Above it, upstream's
-/// `calculate_greeks` runs per strike per style at roughly 40 µs a contract.
-/// `DEFAULT_MAX_SNAPSHOT_CONTRACTS` is 200 000, so a single `?greeks=all` call
-/// can be seconds of uninterrupted CPU — which, left on a worker, stalls every
-/// other request that worker is holding. It goes to the blocking pool, for the
-/// same reason and in the same way as the tape build in
-/// [`crate::session::SimulationManager`] and the export path.
-///
-/// The simulation and the snapshot are moved rather than borrowed: both are
-/// already owned clones handed back by the manager, and moving them keeps the
-/// blocking task `'static` without a second copy of a snapshot that may hold
-/// hundreds of thousands of contracts.
+/// See [`crate::api::rest::greeks::render_body`]: above the default level the
+/// pricing AND the serialisation happen together in one admitted blocking job,
+/// and the handler writes the bytes it returns. The simulation and the snapshot
+/// are moved rather than borrowed — both are already owned clones from the
+/// manager, and moving them keeps the job `'static` without a second copy of a
+/// snapshot that may hold hundreds of thousands of contracts.
 async fn render_snapshot(
     simulation: SessionV2,
     snapshot: SeriesSnapshot,
     level: GreekLevel,
-) -> Result<SnapshotResponse, ChainError> {
-    if !level.wants_greeks() {
-        return Ok(snapshot_response(&simulation, &snapshot, level));
-    }
+) -> Result<Vec<u8>, ChainError> {
+    render_body(level, move || {
+        snapshot_response(&simulation, &snapshot, level)
+    })
+    .await
+}
 
-    tokio::task::spawn_blocking(move || snapshot_response(&simulation, &snapshot, level))
-        .await
-        .map_err(|error| ChainError::Internal(format!("greek pricing failed: {error}")))
+/// Writes an already-serialised JSON body.
+#[must_use]
+fn json_body(bytes: Vec<u8>) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .body(bytes)
 }
 
 /// Parses a path id, reporting a malformed one as a validation failure naming
@@ -174,7 +174,7 @@ pub(crate) async fn get_simulation(
         same market. To advance, use POST /api/v2/simulations/{id}/step.",
     params(
         ("id" = String, Path, description = "The simulation's identifier"),
-        ("greeks" = Option<String>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. An unknown value is a 400")
+        ("greeks" = Option<GreekLevel>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. The one exception is `alpha`, the ratio gamma/theta, which a short position leaves unchanged and which must NOT be scaled or sign-flipped. An unknown value is a 400")
     ),
     responses(
         (status = 200, description = "The snapshot at the current cursor", body = SnapshotResponse),
@@ -204,7 +204,7 @@ pub(crate) async fn peek_snapshot(
 
     match manager.peek(id).await {
         Ok((simulation, snapshot)) => match render_snapshot(simulation, snapshot, level).await {
-            Ok(response) => HttpResponse::Ok().json(response),
+            Ok(bytes) => json_body(bytes),
             Err(error) => map_error(error),
         },
         Err(error) => map_error(error),
@@ -222,7 +222,7 @@ pub(crate) async fn peek_snapshot(
     params(
         ("id" = String, Path, description = "The simulation's identifier"),
         ("expected_step" = Option<usize>, Query, description = "Expected current cursor; a mismatch returns 412 without advancing"),
-        ("greeks" = Option<String>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. An unknown value is a 400")
+        ("greeks" = Option<GreekLevel>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. The one exception is `alpha`, the ratio gamma/theta, which a short position leaves unchanged and which must NOT be scaled or sign-flipped. An unknown value is a 400")
     ),
     responses(
         (status = 200, description = "Served the snapshot and advanced once", body = SnapshotResponse),
@@ -267,7 +267,7 @@ pub(crate) async fn advance_simulation(
 
     match manager.advance(id).await {
         Ok((simulation, snapshot)) => match render_snapshot(simulation, snapshot, level).await {
-            Ok(response) => HttpResponse::Ok().json(response),
+            Ok(bytes) => json_body(bytes),
             Err(error) => map_error(error),
         },
         Err(error) => map_error(error),
@@ -332,6 +332,28 @@ pub(crate) async fn delete_simulation(
 /// surfaced verbatim rather than guessed at.
 pub(crate) fn json_error_handler(
     error: actix_web::error::JsonPayloadError,
+    _req: &HttpRequest,
+) -> actix_web::Error {
+    let message = error.to_string();
+    let response =
+        HttpResponse::BadRequest().json(crate::api::rest::responses::ValidationErrorResponse {
+            error: message.clone(),
+            field: field_from_serde_message(&message),
+        });
+    actix_web::error::InternalError::from_response(error, response).into()
+}
+
+/// Renders a rejected QUERY string in the documented `{error, field}` shape.
+///
+/// Without it actix answers a query that fails to deserialize with an untyped
+/// plaintext `400`, which is the one outcome the greek level was built not to
+/// have: `?greek=all` is a misspelling, and a client that gets the default
+/// payload back with a `200` prices a position against greeks it never
+/// received. The query DTOs carry `deny_unknown_fields` so the misspelling is
+/// an error at all, and this turns that error into something a client can act
+/// on — the same treatment [`json_error_handler`] gives a rejected body.
+pub(crate) fn query_error_handler(
+    error: actix_web::error::QueryPayloadError,
     _req: &HttpRequest,
 ) -> actix_web::Error {
     let message = error.to_string();
@@ -584,12 +606,9 @@ mod tests {
                 .get(side)
                 .and_then(|quote| quote.get("greeks"))
                 .and_then(|greeks| greeks.get(name))
-                .and_then(Value::as_str);
+                .and_then(Value::as_f64);
             match raw {
-                Some(value) => match value.parse::<f64>() {
-                    Ok(parsed) => parsed,
-                    Err(error) => panic!("{side}.{name} must be numeric: {value} ({error})"),
-                },
+                Some(value) => value,
                 None => panic!("{side}.{name} must be present: {contract}"),
             }
         };
@@ -628,6 +647,37 @@ mod tests {
                 body.get("field").and_then(Value::as_str),
                 Some("greeks"),
                 "the 400 must name the field: {body}"
+            );
+        }
+    }
+
+    /// A MISSPELLED parameter is a typed 400, not a silent downgrade.
+    ///
+    /// `?greek=all` used to be accepted and ignored, so a client that fat
+    /// fingered the key got a `200` carrying the default payload and priced a
+    /// position against greeks it never received — exactly the failure the
+    /// unknown-VALUE rejection exists to prevent, reached through the key
+    /// instead. The query DTOs reject unknown keys, and the rejection is
+    /// rendered in the documented shape rather than actix's plaintext.
+    #[actix_web::test]
+    async fn test_a_misspelled_query_key_is_a_typed_400() {
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+
+        for key in ["greek", "Greeks", "greeks_level"] {
+            let uri = format!("/api/v2/simulations/{id}/snapshot?{key}=all");
+            let request = actix_test::TestRequest::get().uri(&uri).to_request();
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "?{key}=all must be rejected, not ignored"
+            );
+            let body: Value = actix_test::read_body_json(response).await;
+            assert_eq!(
+                body.get("field").and_then(Value::as_str),
+                Some(key),
+                "the 400 must name the offending key: {body}"
             );
         }
     }
@@ -1246,11 +1296,8 @@ mod tests {
         let body = snapshot!(app, id, "?greeks=all");
 
         let parse = |value: Option<&Value>, what: &str| -> f64 {
-            match value.and_then(Value::as_str) {
-                Some(raw) => match raw.parse::<f64>() {
-                    Ok(parsed) => parsed,
-                    Err(error) => panic!("{what} must be numeric: {raw} ({error})"),
-                },
+            match value.and_then(Value::as_f64) {
+                Some(number) => number,
                 None => panic!("{what} must be present"),
             }
         };

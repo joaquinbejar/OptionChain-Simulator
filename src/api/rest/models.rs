@@ -607,6 +607,7 @@ impl fmt::Display for ApiWalkType {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionId {
     #[serde(rename = "sessionid")]
     pub(crate) session_id: String,

@@ -5,7 +5,7 @@ use crate::api::rest::handlers::{
 };
 use crate::api::rest::handlers_v2::{
     advance_simulation, create_simulation, delete_simulation, get_simulation, json_error_handler,
-    peek_snapshot,
+    peek_snapshot, query_error_handler,
 };
 use crate::api::rest::middleware::metrics_endpoint;
 use crate::api::rest::swagger::ApiDoc;
@@ -76,6 +76,10 @@ pub fn configure_routes(
     cfg.app_data(web::Data::new(session_manager))
         .app_data(web::Data::new(metrics_collector.clone()))
         .app_data(web::Data::new(mongodb_repo))
+        // v1's query DTOs reject unknown keys too, for the same reason: a
+        // misspelled `greeks` must not read as the default level. The rejection
+        // is rendered in the `{error, field}` shape v1 already documents.
+        .app_data(web::QueryConfig::default().error_handler(query_error_handler))
         .service(
             web::resource("/api/v1/chain")
                 .route(web::post().to(create_session))
@@ -133,6 +137,11 @@ pub(crate) fn configure_v2_routes(
         // without this handler actix renders them as plaintext and the
         // structured field is lost.
         .app_data(web::JsonConfig::default().error_handler(json_error_handler))
+        // Same treatment for the query string. The v2 query DTOs reject unknown
+        // keys, so a misspelled `?greek=all` is an error rather than a silent
+        // downgrade to the default level; without this it would surface as
+        // actix's untyped plaintext instead of the documented shape.
+        .app_data(web::QueryConfig::default().error_handler(query_error_handler))
         .service(web::resource("/api/v2/simulations").route(web::post().to(create_simulation)))
         .service(
             web::resource("/api/v2/simulations/{id}")

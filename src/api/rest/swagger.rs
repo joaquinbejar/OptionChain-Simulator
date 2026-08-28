@@ -37,7 +37,8 @@ use utoipa::OpenApi;
             crate::api::rest::responses_v2::CursorResponse,
             crate::api::rest::greeks::GreeksResponse,
             crate::api::rest::greeks::FirstOrderGreeks,
-            optionstratlib::greeks::GreeksSnapshot,
+            crate::api::rest::greeks::FullGreeks,
+            crate::api::rest::greeks::GreekLevel,
         )
     ),
     tags(
@@ -309,6 +310,65 @@ mod tests {
         }
     }
 
+    /// The `greeks` parameter is published as a closed enum, not a free string.
+    ///
+    /// A generated client then cannot send a fourth value at all, and a reader
+    /// of the document sees the vocabulary without reading the prose. The typed
+    /// 400 stays the runtime backstop for a hand-written client.
+    #[test]
+    fn test_the_greek_parameter_is_published_as_an_enum() {
+        let spec = match ApiDoc::openapi().to_json() {
+            Ok(json) => json,
+            Err(error) => panic!("the OpenAPI document must render: {error}"),
+        };
+        let parsed: Value = match serde_json::from_str(&spec) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("the OpenAPI document must parse: {error}"),
+        };
+
+        let level = parsed
+            .get("components")
+            .and_then(|components| components.get("schemas"))
+            .and_then(|schemas| schemas.get("GreekLevel"));
+        let level = match level {
+            Some(level) => level,
+            None => panic!("the document must carry the GreekLevel schema"),
+        };
+        let values: Vec<&str> = level
+            .get("enum")
+            .and_then(Value::as_array)
+            .map(|values| values.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(values, vec!["none", "first", "all"], "{level}");
+
+        for (path, method) in [
+            ("/api/v1/chain", "get"),
+            ("/api/v1/chain/step", "post"),
+            ("/api/v2/simulations/{id}/snapshot", "get"),
+            ("/api/v2/simulations/{id}/step", "post"),
+        ] {
+            let greeks = parsed
+                .get("paths")
+                .and_then(|paths| paths.get(path))
+                .and_then(|operations| operations.get(method))
+                .and_then(|operation| operation.get("parameters"))
+                .and_then(Value::as_array)
+                .and_then(|parameters| {
+                    parameters.iter().find(|parameter| {
+                        parameter.get("name").and_then(Value::as_str) == Some("greeks")
+                    })
+                });
+            let schema = match greeks.and_then(|greeks| greeks.get("schema")) {
+                Some(schema) => schema.to_string(),
+                None => panic!("{method} {path} must give the greeks parameter a schema"),
+            };
+            assert!(
+                schema.contains("GreekLevel"),
+                "{method} {path} must type the parameter as the enum, got {schema}"
+            );
+        }
+    }
+
     /// The greek payload types reach the document, so a generated client has
     /// something to deserialise the new field into.
     #[test]
@@ -330,7 +390,7 @@ mod tests {
             None => panic!("the document must carry component schemas"),
         };
 
-        for name in ["GreeksResponse", "FirstOrderGreeks", "GreeksSnapshot"] {
+        for name in ["GreeksResponse", "FirstOrderGreeks", "FullGreeks"] {
             assert!(
                 schemas.contains_key(name),
                 "the document must carry the {name} schema"
@@ -394,7 +454,7 @@ mod tests {
         assert_eq!(
             refs,
             vec![
-                "#/components/schemas/GreeksSnapshot",
+                "#/components/schemas/FullGreeks",
                 "#/components/schemas/FirstOrderGreeks",
             ],
             "the full snapshot must come first, as it does for serde"

@@ -1,5 +1,5 @@
 use crate::api::rest::error::map_error;
-use crate::api::rest::greeks::{GreekLevel, greeks_for};
+use crate::api::rest::greeks::{GreekLevel, admit_blocking, greeks_for, serialize_body};
 use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS};
 use crate::api::rest::models::SessionId;
 use crate::api::rest::patch::Patch;
@@ -211,42 +211,47 @@ pub(crate) fn apply_update(
     Ok(())
 }
 
-/// Renders the v1 chain DTOs, off the runtime whenever greeks have to be priced.
+/// Renders the v1 chain bodies, under the shared greek admission bound.
 ///
-/// Returns the response to serve and the one to persist. They differ only above
-/// the default greek level, where the served payload carries the greeks and the
-/// persisted one deliberately does not: the event log records the chain at step
-/// N, not what the client who happened to advance it asked for.
+/// Returns the serialised bytes to write and the DTO to persist. They differ
+/// only above the default greek level, where the served payload carries the
+/// greeks and the persisted one deliberately does not: the event log records
+/// the chain at step N, not what the client who happened to advance it asked
+/// for.
 ///
-/// At the default level the conversion is a field-by-field copy and stays
-/// inline. Above it, upstream's `calculate_greeks` runs per strike per style at
-/// roughly 40 µs a contract, so a chain at the `OCS_MAX_CHAIN_SIZE` cap is tens
-/// of milliseconds of uninterrupted CPU. Left on a worker that stalls every
-/// other request the worker holds, so it goes to the blocking pool — the same
-/// treatment the v2 tape build and the export path already give their heavy
-/// synchronous work.
+/// Both are produced inside one admitted blocking job, serialisation included.
+/// `HttpResponse::json` would otherwise encode a large document on the Actix
+/// worker after the job returned, which is the stall the job exists to avoid.
+/// See [`crate::api::rest::greeks::admit_blocking`] for the bound v1 and v2
+/// share.
 ///
 /// # Errors
 ///
-/// Returns [`ChainError::Internal`] if the blocking task panics or is dropped.
+/// Returns [`ChainError::Internal`] if the blocking task panics or is dropped,
+/// or if the response cannot be serialised.
 async fn render_chain_responses(
     session: Session,
     option_chain: OptionChain,
     level: GreekLevel,
-) -> Result<(ChainResponse, ChainResponse), ChainError> {
-    if !level.wants_greeks() {
-        let response = build_chain_response(&session, &option_chain, level);
-        let persisted = response.clone();
-        return Ok((response, persisted));
-    }
-
-    tokio::task::spawn_blocking(move || {
+) -> Result<(Vec<u8>, ChainResponse), ChainError> {
+    admit_blocking(level, move || {
         let served = build_chain_response(&session, &option_chain, level);
-        let persisted = build_chain_response(&session, &option_chain, GreekLevel::None);
-        (served, persisted)
+        let persisted = if level.wants_greeks() {
+            build_chain_response(&session, &option_chain, GreekLevel::None)
+        } else {
+            served.clone()
+        };
+        Ok((serialize_body(&served)?, persisted))
     })
     .await
-    .map_err(|error| ChainError::Internal(format!("greek pricing failed: {error}")))
+}
+
+/// Writes an already-serialised JSON body.
+#[must_use]
+fn json_body(bytes: Vec<u8>) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .body(bytes)
 }
 
 #[utoipa::path(
@@ -357,6 +362,7 @@ pub(crate) async fn create_session(
 /// Query parameters for the advance-step command: the session id plus an
 /// optional expected-cursor precondition for safe retries.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AdvanceStepQuery {
     /// ID of the session to advance one step.
     #[serde(rename = "sessionid")]
@@ -382,6 +388,7 @@ pub(crate) struct AdvanceStepQuery {
 /// take the parameter; PUT, PATCH and DELETE return no chain and must not
 /// advertise it.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ChainQuery {
     /// ID of the session to read the current snapshot for.
     #[serde(rename = "sessionid")]
@@ -405,7 +412,7 @@ pub(crate) struct ChainQuery {
     params(
         ("sessionid" = String, Query, description = "ID of the session to advance one step"),
         ("expected_step" = Option<usize>, Query, description = "Expected current cursor; mismatch returns 412 without advancing"),
-        ("greeks" = Option<String>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. An unknown value is a 400")
+        ("greeks" = Option<GreekLevel>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. The one exception is `alpha`, the ratio gamma/theta, which a short position leaves unchanged and which must NOT be scaled or sign-flipped. An unknown value is a 400")
     ),
     responses(
         (status = 200, description = "Advanced one step; served snapshot returned", body = ChainResponse),
@@ -474,11 +481,11 @@ pub(crate) async fn advance_step(
             // shape it would mean two clients advancing the same session wrote
             // differently-shaped documents, with a `greeks=all` advance writing
             // roughly five times the BSON for no gain.
-            let (response, persisted) =
-                match render_chain_responses(session, option_chain, level).await {
-                    Ok(rendered) => rendered,
-                    Err(error) => return map_error(error),
-                };
+            let (body, persisted) = match render_chain_responses(session, option_chain, level).await
+            {
+                Ok(rendered) => rendered,
+                Err(error) => return map_error(error),
+            };
             let duration = start_time.elapsed();
             metrics_collector.record_simulation_step(&method);
             metrics_collector.record_simulation_duration(duration);
@@ -494,7 +501,7 @@ pub(crate) async fn advance_step(
                 error!(session_id = %session_id, "Failed to save chain step to MongoDB: {}", e);
                 // Continue as this is not critical for the main flow
             }
-            HttpResponse::Ok().json(response)
+            json_body(body)
         }
         Err(error) => map_error(error),
     }
@@ -509,7 +516,7 @@ pub(crate) async fn advance_step(
         not mutate session state or record a simulation step.",
     params(
         ("sessionid" = String, Query, description = "ID of the session to read the current snapshot for"),
-        ("greeks" = Option<String>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. An unknown value is a 400")
+        ("greeks" = Option<GreekLevel>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. The one exception is `alpha`, the ratio gamma/theta, which a short position leaves unchanged and which must NOT be scaled or sign-flipped. An unknown value is a 400")
     ),
     responses(
         (status = 200, description = "Current snapshot returned (read-only; repeatable)", body = ChainResponse),
@@ -552,7 +559,7 @@ pub(crate) async fn get_current_step(
     match session_manager.peek_current_step(session_id).await {
         Ok((session, option_chain)) => {
             match render_chain_responses(session, option_chain, level).await {
-                Ok((response, _)) => HttpResponse::Ok().json(response),
+                Ok((body, _)) => json_body(body),
                 Err(error) => map_error(error),
             }
         }
@@ -1260,12 +1267,9 @@ mod tests_chain_response_greeks {
                 .get(side)
                 .and_then(|quote| quote.get("greeks"))
                 .and_then(|greeks| greeks.get(name))
-                .and_then(Value::as_str);
+                .and_then(Value::as_f64);
             match raw {
-                Some(value) => match value.parse::<f64>() {
-                    Ok(parsed) => parsed,
-                    Err(error) => panic!("{side}.{name} must be numeric: {value} ({error})"),
-                },
+                Some(value) => value,
                 None => panic!("{side}.{name} must be present: {contract}"),
             }
         };
