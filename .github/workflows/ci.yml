@@ -42,6 +42,12 @@ jobs:
       - run: cargo test --workspace
         env:
           LOGLEVEL: WARN
+      # The optional `arrow` export encoding. A separate step, so a failure says
+      # which build broke: the default one ships without the feature, and its
+      # cross-format equality tests only exist when the feature is on.
+      - run: cargo test --workspace --features arrow-export
+        env:
+          LOGLEVEL: WARN
 
   integration_live_services:
     name: Integration (live services)

@@ -1,3 +1,6 @@
+#[cfg(feature = "arrow-export")]
+pub(crate) mod arrow_export;
+pub(crate) mod binary;
 pub(crate) mod controller;
 mod error;
 pub(crate) mod export;

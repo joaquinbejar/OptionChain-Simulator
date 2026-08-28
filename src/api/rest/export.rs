@@ -49,8 +49,12 @@
 //! formatting — no locale, no thousands separators. That is what lets a
 //! backtest harness cache a download and know it is still current.
 
+use crate::api::rest::binary::{
+    BinarySchema, CellType, PackedWriter, ensure_label_capacity, typed_rows,
+};
 use crate::api::rest::error::map_error;
 use crate::api::rest::greeks::GreekLevel;
+use crate::api::rest::limits::EXPORT_BLOCK_ROWS;
 use crate::domain::factors::FactorTape;
 use crate::domain::series::{SeriesBuilder, SeriesSnapshot};
 use crate::infrastructure::{
@@ -116,6 +120,13 @@ pub(crate) enum Format {
     Json,
     /// RFC 4180 CSV with a header row and CRLF line endings.
     Csv,
+    /// Arrow IPC stream, one record batch per block. Available only when the
+    /// crate is built with the `arrow-export` feature; without it a request for
+    /// this format is a typed 400 rather than a 500 or a silent fallback.
+    Arrow,
+    /// The `packed` columnar block format: no dependencies, 8-byte aligned
+    /// payloads, described in [`crate::api::rest::binary`].
+    Packed,
 }
 
 impl Format {
@@ -125,7 +136,15 @@ impl Format {
         match self {
             Format::Json => "application/json",
             Format::Csv => "text/csv; charset=utf-8",
+            Format::Arrow => "application/vnd.apache.arrow.stream",
+            Format::Packed => "application/octet-stream",
         }
+    }
+
+    /// Whether this encoding is binary, and therefore columnar and blocked.
+    #[must_use]
+    fn is_binary(self) -> bool {
+        matches!(self, Format::Arrow | Format::Packed)
     }
 
     /// The extension of the suggested download filename.
@@ -134,6 +153,8 @@ impl Format {
         match self {
             Format::Json => "json",
             Format::Csv => "csv",
+            Format::Arrow => "arrow",
+            Format::Packed => "ocsp",
         }
     }
 }
@@ -226,7 +247,7 @@ impl Dataset {
     /// by position as well as by name. `greeks` is ignored by the two datasets
     /// that carry no chains.
     #[must_use]
-    fn header(self, level: GreekLevel) -> Vec<&'static str> {
+    pub(super) fn header(self, level: GreekLevel) -> Vec<&'static str> {
         match self {
             Dataset::Underlying => vec!["step", "simulated_at", "symbol", "price"],
             Dataset::Volatility => vec!["step", "simulated_at", "symbol", "base_volatility"],
@@ -259,22 +280,22 @@ impl Dataset {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ExportQuery {
     /// Which dataset to export.
-    pub(crate) dataset: Dataset,
+    pub(super) dataset: Dataset,
     /// Which encoding to return.
-    pub(crate) format: Format,
+    pub(super) format: Format,
     /// First step to include, inclusive. Defaults to `0`.
     #[serde(default)]
-    pub(crate) from_step: Option<usize>,
+    pub(super) from_step: Option<usize>,
     /// Last step to include, inclusive. Defaults to the final generated step.
     #[serde(default)]
-    pub(crate) to_step: Option<usize>,
+    pub(super) to_step: Option<usize>,
     /// How much of the greek set the `option_chains` dataset carries: `none`
     /// (the default), `first` or `all` — the same vocabulary and the same
     /// default as the chain endpoints, so a tape and a live step agree on what
     /// a level means. Kept as a raw string so an unknown value is a typed `400`
     /// naming the field.
     #[serde(default)]
-    pub(crate) greeks: Option<String>,
+    pub(super) greeks: Option<String>,
 }
 
 /// A validated, inclusive step range.
@@ -382,29 +403,29 @@ fn render_optional(value: Option<f64>) -> String {
 /// CSV writes `4950`, and takes exponent form below `1e-5` where the CSV spells
 /// the zeros out. Compare the two encodings as numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-struct GreeksView {
+pub(super) struct GreeksView {
     /// This side's `gamma`.
-    gamma: Option<f64>,
+    pub(super) gamma: Option<f64>,
     /// This side's `theta`.
-    theta: Option<f64>,
+    pub(super) theta: Option<f64>,
     /// This side's `vega`.
-    vega: Option<f64>,
+    pub(super) vega: Option<f64>,
     /// This side's `rho`.
-    rho: Option<f64>,
+    pub(super) rho: Option<f64>,
     /// This side's `rho_d`.
-    rho_d: Option<f64>,
+    pub(super) rho_d: Option<f64>,
     /// This side's `alpha`.
-    alpha: Option<f64>,
+    pub(super) alpha: Option<f64>,
     /// This side's `vanna`.
-    vanna: Option<f64>,
+    pub(super) vanna: Option<f64>,
     /// This side's `vomma`.
-    vomma: Option<f64>,
+    pub(super) vomma: Option<f64>,
     /// This side's `veta`.
-    veta: Option<f64>,
+    pub(super) veta: Option<f64>,
     /// This side's `charm`.
-    charm: Option<f64>,
+    pub(super) charm: Option<f64>,
     /// This side's `color`.
-    color: Option<f64>,
+    pub(super) color: Option<f64>,
 }
 
 impl GreeksView {
@@ -456,22 +477,22 @@ impl GreeksView {
 /// value to the wire's `f64` happens here and only here, which is what makes a
 /// persisted row and a replayed row byte-identical rather than merely similar.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct QuoteView {
-    strike: f64,
-    implied_volatility: f64,
-    call_bid: Option<f64>,
-    call_ask: Option<f64>,
-    call_mid: Option<f64>,
-    call_delta: Option<f64>,
-    put_bid: Option<f64>,
-    put_ask: Option<f64>,
-    put_mid: Option<f64>,
-    put_delta: Option<f64>,
-    gamma: Option<f64>,
+pub(super) struct QuoteView {
+    pub(super) strike: f64,
+    pub(super) implied_volatility: f64,
+    pub(super) call_bid: Option<f64>,
+    pub(super) call_ask: Option<f64>,
+    pub(super) call_mid: Option<f64>,
+    pub(super) call_delta: Option<f64>,
+    pub(super) put_bid: Option<f64>,
+    pub(super) put_ask: Option<f64>,
+    pub(super) put_mid: Option<f64>,
+    pub(super) put_delta: Option<f64>,
+    pub(super) gamma: Option<f64>,
     /// The call's greek snapshot, empty below `greeks=first`.
-    call_greeks: GreeksView,
+    pub(super) call_greeks: GreeksView,
     /// The put's greek snapshot, empty below `greeks=first`.
-    put_greeks: GreeksView,
+    pub(super) put_greeks: GreeksView,
 }
 
 impl QuoteView {
@@ -518,7 +539,7 @@ impl QuoteView {
 
 /// The strikes of one expiration, from whichever source produced them.
 #[derive(Debug, Clone, Copy)]
-enum QuoteSource<'a> {
+pub(super) enum QuoteSource<'a> {
     /// Upstream's priced chain, iterated by ascending strike.
     Replayed(&'a OptionChain),
     /// The stored rows, which the repository returns by ascending strike.
@@ -531,7 +552,7 @@ impl<'a> QuoteSource<'a> {
     /// Exactly one of the two options is `Some`, so concatenating them with
     /// [`Iterator::chain`] *is* the branch — one concrete iterator type, no
     /// boxing on a path that runs once per contract.
-    fn quotes(self) -> impl Iterator<Item = QuoteView> + 'a {
+    pub(super) fn quotes(self) -> impl Iterator<Item = QuoteView> + 'a {
         let replayed = match self {
             QuoteSource::Replayed(chain) => Some(chain.iter()),
             QuoteSource::Stored(_) => None,
@@ -551,11 +572,11 @@ impl<'a> QuoteSource<'a> {
 
 /// One expiration of one step, from whichever source produced it.
 #[derive(Debug, Clone, Copy)]
-struct ExpirationView<'a> {
-    expires_at: DateTime<Utc>,
-    days_to_expiration: f64,
-    labels: &'a [String],
-    quotes: QuoteSource<'a>,
+pub(super) struct ExpirationView<'a> {
+    pub(super) expires_at: DateTime<Utc>,
+    pub(super) days_to_expiration: f64,
+    pub(super) labels: &'a [String],
+    pub(super) quotes: QuoteSource<'a>,
 }
 
 /// The chains of one step, from whichever source produced them.
@@ -565,7 +586,7 @@ struct ExpirationView<'a> {
 /// the two sources one view — instead of two row builders that happen to agree
 /// today — is what makes preferring the warehouse safe.
 #[derive(Debug, Clone, Copy)]
-enum StepChains<'a> {
+pub(super) enum StepChains<'a> {
     /// Priced here and now, from the effective parameters.
     Replayed(&'a SeriesSnapshot),
     /// Read back from the warehouse exactly as it was served.
@@ -574,7 +595,7 @@ enum StepChains<'a> {
 
 impl<'a> StepChains<'a> {
     /// The live expirations, ascending — the order both sources guarantee.
-    fn expirations(self) -> impl Iterator<Item = ExpirationView<'a>> {
+    pub(super) fn expirations(self) -> impl Iterator<Item = ExpirationView<'a>> {
         let replayed = match self {
             StepChains::Replayed(snapshot) => Some(snapshot.chains.iter()),
             StepChains::Stored(_) => None,
@@ -788,7 +809,8 @@ impl Stream for RowStream {
 #[utoipa::path(
     get,
     path = "/api/v2/simulations/{id}/export",
-    description = "Export a simulation's complete tape, or a step range of it, as JSON or CSV. \
+    description = "Export a simulation's complete tape, or a step range of it, as JSON, CSV, or one \
+        of the two binary encodings (Arrow IPC and the dependency-free `packed` columnar format). \
         Read-only: it replays from an immutable snapshot of the effective parameters and never \
         advances the cursor, changes the state or version, or alters what the next peek returns. \
         A simulation that has not been walked at all exports its whole tape. Where snapshot \
@@ -797,18 +819,19 @@ impl Stream for RowStream {
         a single array of row objects; CSV is RFC 4180 with a header row and CRLF line endings. \
         Repeating the same export at the same greek level yields byte-identical output. The two \
         encodings carry the same values, though not always the same notation: JSON takes exponent \
-        form for very small numbers where the CSV spells them out.",
+        form for very small numbers where the CSV spells them out. The binary encodings carry the \
+        same values again, in blocks, with the same column names in the same order.",
     params(
         ("id" = String, Path, description = "The simulation's identifier"),
         ("dataset" = String, Query, description = "underlying | volatility | option_chains"),
-        ("format" = String, Query, description = "json | csv"),
+        ("format" = String, Query, description = "json | csv | arrow | packed. The two binary encodings carry the same values as the text ones, in blocks of OCS_EXPORT_BLOCK_ROWS rows, with the same column names in the same order. Numeric columns are f64, exactly what json and csv render: binary is a faster route to the same numbers, NOT a route to the underlying Decimal(38, 28) precision. `arrow` is an Arrow IPC stream and is available only when the service is built with the `arrow-export` feature; asking for it otherwise is a 400 naming the format. `packed` is a dependency-free columnar block format with 8-byte aligned payloads, documented in the crate docs, whose `labels` column is a bitmask over the schedule's rule ids."),
         ("from_step" = Option<usize>, Query, description = "First step, inclusive; defaults to 0"),
         ("to_step" = Option<usize>, Query, description = "Last step, inclusive; defaults to the final step"),
         ("greeks" = Option<String>, Query, description = "How much of the greek set the option_chains dataset carries: `none` (default), `first` (appends call_theta, put_theta, call_vega, put_vega, call_rho, put_rho, call_rho_d, put_rho_d) or `all` (appends seven more per style, gamma through color: fourteen columns). Each level's header is a PREFIX of the next, so raising it appends columns and never moves one. Values are per ONE LONG CONTRACT. Accepted but immaterial for the underlying and volatility datasets, which carry no chains. An unknown value is a 400")
     ),
     responses(
-        (status = 200, description = "The exported rows, streamed", body = String),
-        (status = 400, description = "Every rejection carries the typed `{error, field}` of ValidationErrorResponse. `field` names the offender where it is known — `id` for a malformed identifier, `from_step` or `to_step` for a range that is reversed or past the tape, `greeks` for an unknown level. It is EMPTY when the query string fails to deserialise at all (an unknown `dataset` or `format`, a non-numeric step), because serde's message for those does not name the key; the `error` string carries the detail.", body = crate::api::rest::responses::ValidationErrorResponse),
+        (status = 200, description = "The exported rows, streamed. Text for json and csv; an Arrow IPC stream or a packed columnar document, both binary, for arrow and packed.", body = String),
+        (status = 400, description = "Every rejection carries the typed `{error, field}` of ValidationErrorResponse. `field` names the offender where it is known — `id` for a malformed identifier, `from_step` or `to_step` for a range that is reversed or past the tape, `greeks` for an unknown level, `format` for `arrow` on a build without the `arrow-export` feature. It is EMPTY when the query string fails to deserialise at all (an unknown `dataset` or `format`, a non-numeric step), because serde's message for those does not name the key; the `error` string carries the detail.", body = crate::api::rest::responses::ValidationErrorResponse),
         (status = 404, description = "Simulation not found"),
         (status = 500, description = "Internal server error")
     )
@@ -862,6 +885,15 @@ pub(crate) async fn export_simulation(
 
     let dataset = query.dataset;
     let format = query.format;
+
+    // Checked HERE, not in the producer: the producer runs behind a streaming
+    // response whose header has already gone out, so a rejection raised there
+    // arrives mid-download instead of as the 400 it is. This covers `arrow` on
+    // a build without the feature, and a schedule too wide for a label mask.
+    if let Err(error) = check_format_available(format, dataset, level, &parameters) {
+        return map_error(error);
+    }
+
     let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
 
     // Only the chains dataset can be served from storage; the other two read the
@@ -898,6 +930,52 @@ pub(crate) async fn export_simulation(
             format!("attachment; filename=\"{filename}\""),
         ))
         .streaming(RowStream { receiver })
+}
+
+/// Whether this build, and this simulation, can serve a format.
+///
+/// The two ways a recognised format can still be unserveable: the `arrow`
+/// encoding needs the `arrow-export` feature, and both binary encodings need a
+/// schedule whose rule ids fit a label mask.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Validation`] naming `format`.
+fn check_format_available(
+    format: Format,
+    dataset: Dataset,
+    level: GreekLevel,
+    parameters: &SimulationParametersV2,
+) -> Result<(), ChainError> {
+    if !format.is_binary() {
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "arrow-export"))]
+    if matches!(format, Format::Arrow) {
+        return Err(arrow_unavailable());
+    }
+
+    let schema = BinarySchema::new(dataset, level, parameters);
+    // Only a dataset that actually carries labels can exceed the mask.
+    if schema.types.contains(&CellType::LabelMask) {
+        ensure_label_capacity(&schema)?;
+    }
+    Ok(())
+}
+
+/// The rejection a build without the `arrow-export` feature answers with.
+///
+/// One place, because it is served from two: the handler's up-front check and
+/// the writer's own arm, which is unreachable behind it and kept as defence.
+#[cfg(not(feature = "arrow-export"))]
+fn arrow_unavailable() -> ChainError {
+    ChainError::Validation {
+        field: "format".to_string(),
+        reason: "arrow is unavailable: this build does not have the `arrow-export` feature; \
+                 use packed, json or csv"
+            .to_string(),
+    }
 }
 
 /// Whether a stored record can answer a request for greeks.
@@ -945,7 +1023,10 @@ fn produce(
         None
     };
 
-    let mut writer = Writer::new(format, dataset, level)?;
+    // The block width is read once, here, rather than inside the writer: it is
+    // the export's memory floor, and passing it in is what lets a test drive
+    // several blocks without a process-wide environment variable.
+    let mut writer = Writer::new(format, dataset, level, parameters, *EXPORT_BLOCK_ROWS)?;
     if let Some(chunk) = writer.prologue()?
         && sender.blocking_send(Ok(chunk)).is_err()
     {
@@ -1031,11 +1112,47 @@ enum Writer {
     /// only surrenders its buffer by consuming itself, and constructing one is
     /// cheap next to pricing a chain.
     Csv { dataset: Dataset, level: GreekLevel },
+    /// The `packed` columnar block format. Buffers at most one block, which is
+    /// what keeps a columnar encoding streaming.
+    Packed {
+        dataset: Dataset,
+        level: GreekLevel,
+        writer: Box<PackedWriter>,
+    },
+    /// Arrow IPC stream, one record batch per block.
+    #[cfg(feature = "arrow-export")]
+    Arrow {
+        dataset: Dataset,
+        level: GreekLevel,
+        writer: Box<crate::api::rest::arrow_export::ArrowWriter>,
+    },
 }
 
 impl Writer {
     /// Creates a writer for a dataset and format.
-    fn new(format: Format, dataset: Dataset, level: GreekLevel) -> Result<Self, ChainError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Validation`] naming `format` when the request asks
+    /// for `arrow` on a build without the `arrow-export` feature, or for a
+    /// binary format on a simulation whose schedule carries more rules than a
+    /// label mask holds. Returns [`ChainError::Internal`] when an Arrow stream
+    /// cannot be opened.
+    fn new(
+        format: Format,
+        dataset: Dataset,
+        level: GreekLevel,
+        parameters: &SimulationParametersV2,
+        block_rows: usize,
+    ) -> Result<Self, ChainError> {
+        let binary_schema = if format.is_binary() {
+            let schema = BinarySchema::new(dataset, level, parameters);
+            ensure_label_capacity(&schema)?;
+            Some(schema)
+        } else {
+            None
+        };
+
         Ok(match format {
             Format::Json => Writer::Json {
                 dataset,
@@ -1043,6 +1160,36 @@ impl Writer {
                 first: true,
             },
             Format::Csv => Writer::Csv { dataset, level },
+            Format::Packed => {
+                let schema = match binary_schema {
+                    Some(schema) => schema,
+                    None => BinarySchema::new(dataset, level, parameters),
+                };
+                Writer::Packed {
+                    dataset,
+                    level,
+                    writer: Box::new(PackedWriter::new(schema, block_rows)),
+                }
+            }
+            #[cfg(feature = "arrow-export")]
+            Format::Arrow => {
+                let schema = match binary_schema {
+                    Some(schema) => schema,
+                    None => BinarySchema::new(dataset, level, parameters),
+                };
+                Writer::Arrow {
+                    dataset,
+                    level,
+                    writer: Box::new(crate::api::rest::arrow_export::ArrowWriter::new(
+                        schema, block_rows,
+                    )?),
+                }
+            }
+            // Recognised, and refused: the value is a valid format this BUILD
+            // cannot serve, which is a different answer from "no such format"
+            // and must never be a 500 or a silent fallback to another encoding.
+            #[cfg(not(feature = "arrow-export"))]
+            Format::Arrow => return Err(arrow_unavailable()),
         })
     }
 
@@ -1058,14 +1205,24 @@ impl Writer {
                     .collect();
                 Ok(Some(encode_csv(&[header])?))
             }
+            Writer::Packed { writer, .. } => Ok(Some(writer.header()?)),
+            #[cfg(feature = "arrow-export")]
+            Writer::Arrow { writer, .. } => Ok(Some(writer.header()?)),
         }
     }
 
     /// The bytes that close the document, if any.
+    ///
+    /// For the binary formats this is where the last, partial block goes: it
+    /// exists precisely because a columnar encoding cannot emit a block until
+    /// it is full or the rows run out.
     fn epilogue(&mut self) -> Result<Option<Vec<u8>>, ChainError> {
         match self {
             Writer::Json { .. } => Ok(Some(b"]".to_vec())),
             Writer::Csv { .. } => Ok(None),
+            Writer::Packed { writer, .. } => writer.flush(),
+            #[cfg(feature = "arrow-export")]
+            Writer::Arrow { writer, .. } => writer.finish(),
         }
     }
 
@@ -1125,6 +1282,49 @@ impl Writer {
                 let records = csv_rows(*dataset, *level, step, &simulated_at, symbol, row, chains);
                 for batch in records.chunks(ROWS_PER_CHUNK) {
                     if emit(encode_csv(batch)?) == Delivery::ClientGone {
+                        return Ok(Delivery::ClientGone);
+                    }
+                }
+                Ok(Delivery::Sent)
+            }
+            Writer::Packed {
+                dataset,
+                level,
+                writer,
+            } => {
+                let rows = typed_rows(
+                    writer.schema(),
+                    *dataset,
+                    *level,
+                    step,
+                    row.simulated_at,
+                    row,
+                    chains,
+                )?;
+                for block in writer.push(rows)? {
+                    if emit(block) == Delivery::ClientGone {
+                        return Ok(Delivery::ClientGone);
+                    }
+                }
+                Ok(Delivery::Sent)
+            }
+            #[cfg(feature = "arrow-export")]
+            Writer::Arrow {
+                dataset,
+                level,
+                writer,
+            } => {
+                let rows = typed_rows(
+                    writer.schema(),
+                    *dataset,
+                    *level,
+                    step,
+                    row.simulated_at,
+                    row,
+                    chains,
+                )?;
+                for batch in writer.push(rows)? {
+                    if emit(batch) == Delivery::ClientGone {
                         return Ok(Delivery::ClientGone);
                     }
                 }
@@ -1480,6 +1680,35 @@ mod tests {
         }};
     }
 
+    /// Downloads an export as raw bytes, for the binary encodings.
+    macro_rules! export_bytes {
+        ($app:expr, $id:expr, $query:expr) => {{
+            let uri = format!("/api/v2/simulations/{}/export?{}", $id, $query);
+            let response = actix_test::call_service(
+                &$app,
+                actix_test::TestRequest::get().uri(&uri).to_request(),
+            )
+            .await;
+            let status = response.status();
+            let body = actix_test::read_body(response).await;
+            (status, body.to_vec())
+        }};
+    }
+
+    /// The CSV body as rows of fields, header dropped.
+    fn csv_records_of(body: &str) -> Vec<Vec<String>> {
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(body.as_bytes());
+        reader
+            .records()
+            .map(|record| match record {
+                Ok(record) => record.iter().map(ToString::to_string).collect(),
+                Err(error) => panic!("the csv must parse: {error}"),
+            })
+            .collect()
+    }
+
     /// Counts CSV data rows, excluding the header and the trailing terminator.
     fn csv_rows_of(body: &str) -> usize {
         body.split("\r\n").filter(|line| !line.is_empty()).count() - 1
@@ -1614,6 +1843,428 @@ mod tests {
 
         assert!(body.starts_with("step,simulated_at,symbol,price\r\n"));
         assert!(body.ends_with("\r\n"));
+    }
+
+    // ---- the binary encodings (issue #78) --------------------------------
+
+    /// A `packed` export decodes to exactly the values the CSV renders.
+    ///
+    /// The cross-format equality this issue is about, asserted per dataset and
+    /// per row: the binary encodings are a faster route to the same numbers,
+    /// not a different answer.
+    #[actix_web::test]
+    async fn test_a_packed_export_decodes_to_the_csv_values() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        for dataset in ["underlying", "volatility", "option_chains"] {
+            let (status, text) = export!(app, id, format!("dataset={dataset}&format=csv"));
+            assert_eq!(status, StatusCode::OK);
+            let (binary_status, bytes) =
+                export_bytes!(app, id, format!("dataset={dataset}&format=packed"));
+            assert_eq!(binary_status, StatusCode::OK);
+
+            let expected = csv_records_of(&text);
+            match crate::api::rest::binary::decode_packed(&bytes) {
+                Ok((names, rows)) => {
+                    assert_eq!(
+                        names,
+                        text.lines()
+                            .next()
+                            .unwrap_or_default()
+                            .split(',')
+                            .collect::<Vec<_>>(),
+                        "the packed columns must be the csv header, in order, for {dataset}"
+                    );
+                    assert_eq!(rows.len(), expected.len(), "row count for {dataset}");
+                    assert_eq!(rows, expected, "values for {dataset}");
+                }
+                Err(error) => panic!("the {dataset} export must decode: {error}"),
+            }
+        }
+    }
+
+    /// Exporting the same simulation twice produces byte-identical output, in
+    /// every format.
+    #[actix_web::test]
+    async fn test_every_format_is_byte_identical_on_repeat() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        let mut formats = vec!["json", "csv", "packed"];
+        if cfg!(feature = "arrow-export") {
+            formats.push("arrow");
+        }
+        for format in formats {
+            let (_, first) =
+                export_bytes!(app, id, format!("dataset=option_chains&format={format}"));
+            let (_, second) =
+                export_bytes!(app, id, format!("dataset=option_chains&format={format}"));
+            assert_eq!(first, second, "{format} must be reproducible byte for byte");
+        }
+    }
+
+    /// `from_step` and `to_step` behave identically in the Arrow encoding.
+    #[cfg(feature = "arrow-export")]
+    #[actix_web::test]
+    async fn test_a_step_range_behaves_the_same_in_arrow() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        let (_, text) = export!(
+            app,
+            id,
+            "dataset=underlying&format=csv&from_step=1&to_step=2"
+        );
+        let (status, bytes) = export_bytes!(
+            app,
+            id,
+            "dataset=underlying&format=arrow&from_step=1&to_step=2"
+        );
+        assert_eq!(status, StatusCode::OK);
+
+        match crate::api::rest::arrow_export::decode_stream(&bytes) {
+            Ok(rows) => assert_eq!(rows, csv_records_of(&text)),
+            Err(error) => panic!("the ranged export must decode: {error}"),
+        }
+
+        let (status, body) = export!(
+            app,
+            id,
+            "dataset=underlying&format=arrow&from_step=3&to_step=1"
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// `from_step` and `to_step` behave identically in the binary formats.
+    #[actix_web::test]
+    async fn test_a_step_range_behaves_the_same_in_packed() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        let (_, text) = export!(
+            app,
+            id,
+            "dataset=underlying&format=csv&from_step=1&to_step=2"
+        );
+        let (status, bytes) = export_bytes!(
+            app,
+            id,
+            "dataset=underlying&format=packed&from_step=1&to_step=2"
+        );
+        assert_eq!(status, StatusCode::OK);
+
+        match crate::api::rest::binary::decode_packed(&bytes) {
+            Ok((_, rows)) => assert_eq!(rows, csv_records_of(&text)),
+            Err(error) => panic!("the ranged export must decode: {error}"),
+        }
+
+        // And an invalid range is refused the same way, before any bytes.
+        let (status, body) = export!(
+            app,
+            id,
+            "dataset=underlying&format=packed&from_step=3&to_step=1"
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    /// An absent value stays absent through the encoding.
+    ///
+    /// End to end, against whatever the fixture produces. The stronger
+    /// assertion — that a null is a cleared validity bit rather than a zero or
+    /// a NaN, which are both values a chain can legitimately hold — is pinned
+    /// at the encoder, in `binary::tests`.
+    #[actix_web::test]
+    async fn test_a_null_survives_the_packed_encoding() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        let (_, text) = export!(app, id, "dataset=option_chains&format=csv");
+        let expected = csv_records_of(&text);
+        let empties: usize = expected
+            .iter()
+            .map(|record| record.iter().filter(|field| field.is_empty()).count())
+            .sum();
+
+        let (_, bytes) = export_bytes!(app, id, "dataset=option_chains&format=packed");
+        match crate::api::rest::binary::decode_packed(&bytes) {
+            Ok((_, rows)) => {
+                let decoded: usize = rows
+                    .iter()
+                    .map(|record| record.iter().filter(|field| field.is_empty()).count())
+                    .sum();
+                assert_eq!(decoded, empties, "every null must survive as a null");
+            }
+            Err(error) => panic!("the export must decode: {error}"),
+        }
+    }
+
+    /// The response advertises the format it actually sent.
+    #[actix_web::test]
+    async fn test_the_binary_formats_advertise_their_content_type() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        let uri = format!("/api/v2/simulations/{id}/export?dataset=underlying&format=packed");
+        let response =
+            actix_test::call_service(&app, actix_test::TestRequest::get().uri(&uri).to_request())
+                .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(actix_web::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        let disposition = response
+            .headers()
+            .get(actix_web::http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(disposition.ends_with(".ocsp\""), "{disposition}");
+    }
+
+    /// Asking for `arrow` on a build without the feature is a typed 400 naming
+    /// the format, never a 500 and never a silent fallback to another encoding.
+    #[cfg(not(feature = "arrow-export"))]
+    #[actix_web::test]
+    async fn test_arrow_without_the_feature_is_a_typed_400() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        let (status, body) = export!(app, id, "dataset=underlying&format=arrow");
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error: Value = match serde_json::from_str(&body) {
+            Ok(error) => error,
+            Err(parse_error) => panic!("the rejection must be JSON: {parse_error}, body {body}"),
+        };
+        assert_eq!(
+            error.get("field"),
+            Some(&Value::String("format".to_string()))
+        );
+    }
+
+    /// An `arrow` export decodes to the same values the CSV renders.
+    #[cfg(feature = "arrow-export")]
+    #[actix_web::test]
+    async fn test_an_arrow_export_decodes_to_the_csv_values() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        for dataset in ["underlying", "volatility", "option_chains"] {
+            let (_, text) = export!(app, id, format!("dataset={dataset}&format=csv"));
+            let (status, bytes) = export_bytes!(app, id, format!("dataset={dataset}&format=arrow"));
+            assert_eq!(status, StatusCode::OK);
+
+            match crate::api::rest::arrow_export::decode_stream(&bytes) {
+                Ok(rows) => {
+                    // Value by value, not merely shape: the decoder renders
+                    // timestamps the way the CSV does, so the two compare
+                    // directly and the equality claim means something.
+                    assert_eq!(rows, csv_records_of(&text), "values for {dataset}");
+                }
+                Err(error) => panic!("the {dataset} export must decode: {error}"),
+            }
+        }
+    }
+
+    /// One step of the reference simulation, priced.
+    fn snapshot_of(
+        parameters: &SimulationParametersV2,
+        tape: &FactorTape,
+        step: usize,
+    ) -> Option<SeriesSnapshot> {
+        let builder = match SeriesBuilder::new(parameters, tape) {
+            Ok(builder) => builder.with_greek_snapshots(true),
+            Err(error) => panic!("the builder must accept the parameters: {error}"),
+        };
+        match builder.snapshot(step) {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => panic!("the snapshot must build: {error}"),
+        }
+    }
+
+    /// A packed export split across several blocks carries the same rows.
+    ///
+    /// Every other export in this suite fits one block, so without this the
+    /// blocking path — the whole reason a columnar encoding can stream — is
+    /// exercised only by the encoder's own unit tests.
+    #[actix_web::test]
+    async fn test_a_multi_block_packed_export_carries_every_row() {
+        let parameters = reference_parameters();
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
+        let row = match tape.row(0) {
+            Some(row) => row,
+            None => panic!("the tape must have a first row"),
+        };
+
+        let mut narrow = Vec::new();
+        let mut wide = Vec::new();
+        for (block_rows, sink) in [(2_usize, &mut narrow), (4_096_usize, &mut wide)] {
+            let mut writer = match Writer::new(
+                Format::Packed,
+                Dataset::OptionChains,
+                GreekLevel::None,
+                &parameters,
+                block_rows,
+            ) {
+                Ok(writer) => writer,
+                Err(error) => panic!("the writer must build: {error}"),
+            };
+            if let Some(prologue) = match writer.prologue() {
+                Ok(prologue) => prologue,
+                Err(error) => panic!("the prologue must encode: {error}"),
+            } {
+                sink.extend(prologue);
+            }
+
+            let chains = match snapshot_of(&parameters, &tape, 0) {
+                Some(snapshot) => snapshot,
+                None => panic!("step zero must produce chains"),
+            };
+            match writer.rows(
+                &parameters,
+                0,
+                row,
+                Some(StepChains::Replayed(&chains)),
+                &mut |chunk| {
+                    sink.extend(chunk);
+                    Delivery::Sent
+                },
+            ) {
+                Ok(Delivery::Sent) => {}
+                other => panic!("the rows must be delivered, got {other:?}"),
+            }
+            if let Some(epilogue) = match writer.epilogue() {
+                Ok(epilogue) => epilogue,
+                Err(error) => panic!("the epilogue must encode: {error}"),
+            } {
+                sink.extend(epilogue);
+            }
+        }
+
+        let narrow_rows = match crate::api::rest::binary::decode_packed(&narrow) {
+            Ok((_, rows)) => rows,
+            Err(error) => panic!("the narrow document must decode: {error}"),
+        };
+        let wide_rows = match crate::api::rest::binary::decode_packed(&wide) {
+            Ok((_, rows)) => rows,
+            Err(error) => panic!("the wide document must decode: {error}"),
+        };
+
+        assert!(
+            narrow_rows.len() > 2,
+            "the fixture must span several blocks"
+        );
+        assert_eq!(
+            narrow_rows, wide_rows,
+            "the block width must not change a single value"
+        );
+    }
+
+    /// A row's cell types are the ones the schema declares, for every dataset
+    /// and every greek level.
+    ///
+    /// `BinarySchema::new` assigns types by matching column NAMES with an
+    /// `f64` fallback, so a column added to the header lists — which the greek
+    /// levels do, and which issue #75 did — lands on `f64` by default. A
+    /// mismatch would not panic: the encoder writes a value's own width while a
+    /// decoder reads the column's, and `Dictionary` is the one four-byte type,
+    /// so one wrong cell desynchronises the rest of the block.
+    #[actix_web::test]
+    async fn test_every_row_matches_its_declared_schema() {
+        let parameters = reference_parameters();
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
+        let row = match tape.row(0) {
+            Some(row) => row,
+            None => panic!("the tape must have a first row"),
+        };
+        let chains = match snapshot_of(&parameters, &tape, 0) {
+            Some(snapshot) => snapshot,
+            None => panic!("step zero must produce chains"),
+        };
+
+        for dataset in [
+            Dataset::Underlying,
+            Dataset::Volatility,
+            Dataset::OptionChains,
+        ] {
+            for level in [GreekLevel::None, GreekLevel::First, GreekLevel::All] {
+                let schema = BinarySchema::new(dataset, level, &parameters);
+                let rows = match crate::api::rest::binary::typed_rows(
+                    &schema,
+                    dataset,
+                    level,
+                    0,
+                    row.simulated_at,
+                    row,
+                    Some(StepChains::Replayed(&chains)),
+                ) {
+                    Ok(rows) => rows,
+                    Err(error) => panic!("{dataset:?} at {level:?} must encode: {error}"),
+                };
+
+                assert!(!rows.is_empty(), "{dataset:?} at {level:?} produced no row");
+                for cells in &rows {
+                    assert_eq!(
+                        cells.len(),
+                        schema.types.len(),
+                        "{dataset:?} at {level:?}: a row must carry every declared column"
+                    );
+                    for (position, (cell, declared)) in cells.iter().zip(&schema.types).enumerate()
+                    {
+                        assert_eq!(
+                            cell.cell_type(),
+                            *declared,
+                            "{dataset:?} at {level:?}: column {} ({}) carries the wrong type",
+                            position,
+                            schema.names.get(position).copied().unwrap_or("?")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Records the size and wall time of every format, for the docs.
+    ///
+    /// Ignored by default: it is a measurement, not an assertion, and its
+    /// numbers only mean something from a release build. Run it with
+    /// `cargo test --release --all-features -- --ignored --nocapture`.
+    #[actix_web::test]
+    #[ignore = "a measurement, not an assertion; run it from a release build"]
+    async fn test_measure_every_format() {
+        let app = v2_service!();
+        let id = create!(app);
+
+        for format in ["json", "csv", "packed", "arrow"] {
+            let started = std::time::Instant::now();
+            let (status, bytes) = export_bytes!(
+                app,
+                id,
+                format!("dataset=option_chains&format={format}&greeks=all")
+            );
+            let elapsed = started.elapsed();
+            if status != StatusCode::OK {
+                println!("{format:>7}: unavailable in this build");
+                continue;
+            }
+            println!(
+                "{format:>7}: {:>9} bytes  {:>7.1} ms",
+                bytes.len(),
+                elapsed.as_secs_f64() * 1000.0
+            );
+        }
     }
 
     /// The JSON is a single valid array, even though it is streamed in chunks.
@@ -2267,7 +2918,13 @@ mod tests {
         );
 
         for format in [Format::Json, Format::Csv] {
-            let mut writer = match Writer::new(format, Dataset::OptionChains, GreekLevel::All) {
+            let mut writer = match Writer::new(
+                format,
+                Dataset::OptionChains,
+                GreekLevel::All,
+                &parameters,
+                *EXPORT_BLOCK_ROWS,
+            ) {
                 Ok(writer) => writer,
                 Err(error) => panic!("the writer must build: {error}"),
             };
@@ -2334,7 +2991,13 @@ mod tests {
             None => panic!("the tape must have a first row"),
         };
 
-        let mut writer = match Writer::new(Format::Csv, Dataset::OptionChains, GreekLevel::All) {
+        let mut writer = match Writer::new(
+            Format::Csv,
+            Dataset::OptionChains,
+            GreekLevel::All,
+            &parameters,
+            *EXPORT_BLOCK_ROWS,
+        ) {
             Ok(writer) => writer,
             Err(error) => panic!("the writer must build: {error}"),
         };

@@ -17,7 +17,14 @@ homepage = "https://github.com/joaquinbejar/OptionChain-Simulator"
 keywords = ["finance", "options", "trading"]
 categories = ["finance", "data-structures"]
 
+[features]
+# The Arrow IPC export encoding. Off by default; see `arrow` in
+# [workspace.dependencies]. `cargo test --all-features` covers it, and CI's lint
+# job builds with it.
+arrow-export = ["dep:arrow"]
+
 [dependencies]
+arrow = { workspace = true, optional = true }
 optionstratlib = { workspace = true }
 positive = { workspace = true }
 tracing = { workspace = true }
@@ -90,3 +97,9 @@ mongodb = "3.8"
 mockall = "0.15"
 tempfile = "3.27"
 once_cell = "1.21"
+# Apache Arrow, for the `arrow` export encoding (issue #78). OPTIONAL and off by
+# default: it is a large tree, and a deployment that never exports — or a
+# crates.io consumer using this as a library — must not pay for it.
+# `default-features = false` and the version match IronCondor, which consumes
+# the stream and writes Parquet.
+arrow = { version = "59.2", default-features = false, features = ["ipc"] }
