@@ -643,7 +643,7 @@ adds caps so that a single request cannot ask for unbounded work:
 | `OCS_MAX_EXPIRATIONS_PER_SNAPSHOT` | expirations in one snapshot, enforced at schedule validation on the **pre-deduplication** sum of every rule's `target_count` |
 | `OCS_MAX_EXPORT_ROWS` | rows one export may produce |
 | `OCS_MAX_SNAPSHOT_CONTRACTS` | contracts one snapshot may price — `strikes × Σ target_count`, default 200 000 |
-| `OCS_MAX_CACHED_SNAPSHOT_CONTRACTS` | contracts resident across the snapshot cache, default 4 000 000 |
+| `OCS_MAX_CACHED_SNAPSHOT_CONTRACTS` | contracts resident across the snapshot cache, default 1 200 000 — roughly a gigabyte at 848 bytes a contract (issue #74) |
 | v2 session idle TTL, factor-tape and snapshot cache capacities | §9.1, §9.2 |
 
 The pre-deduplication sum is the tight upper bound on how many chains a snapshot
@@ -860,6 +860,33 @@ Served snapshots may additionally be **filed in ClickHouse**, opt-in via
 deterministic replay is the only way to obtain a past step — without weakening
 it: replay stays canonical, and the warehouse is a materialisation of what
 replay would produce.
+
+**The stored column set (amended by issue #74).** A quote row carries the
+prices, the per-side `delta`, the shared `gamma` mirror and, since #74, the full
+twelve-value `GreeksSnapshot` per option style — twenty-four greek values across
+`*_call` / `*_put` columns, every one `Nullable`. A strike whose option cannot
+be built has no snapshot, and NULL is that absence rather than a zero;
+reconstruction refuses to build a partial snapshot from partial columns.
+
+Four consequences worth stating rather than discovering:
+
+- **A row written before #74 reads as a row with no greeks.** `ADD COLUMN`
+  backfills NULL, and the reconstruction reports the absence. Nothing fails.
+- **The migration is executed, not documented.** `ensure_schema` runs the
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` right after the `CREATE`, because
+  `CREATE TABLE IF NOT EXISTS` does not alter an existing table and the
+  alternative is a deployment that boots green and then silently stops filling
+  its warehouse. This is what keeps §12.1's "a schema problem fails the boot"
+  true for column additions.
+- **`simulation_generation` deliberately does NOT move.** The rule is to bump it
+  when the same simulation and step produce *different values*; #74 produces the
+  same values with more columns, which
+  `test_the_greek_snapshots_do_not_move_the_priced_chain` pins. The cost is that
+  one generation can now mix coverage: steps filed before the upgrade read
+  without greeks, steps filed after read with them. That is a smaller asymmetry
+  than the one the issue removed, and re-filing a step overwrites it.
+- **Storage tripled**, from 121 to 363 compressed bytes per row on a measured
+  tape. The same retention window therefore holds about a third of the history.
 
 Two tables, because the two query patterns are different shapes. One metadata
 row per step in `simulation_snapshots`, and one flattened row per

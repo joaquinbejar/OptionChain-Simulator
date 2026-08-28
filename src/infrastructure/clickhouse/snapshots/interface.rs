@@ -240,16 +240,21 @@ mod tests {
                         }
                         // The side is a projection, exactly as it is in the SQL
                         // implementation: one stored row, two ways to read it.
-                        let (bid, ask, mid, delta) = match query.side {
+                        let (bid, ask, mid, delta, greeks) = match query.side {
                             ContractSide::Call => (
                                 quote.call_bid,
                                 quote.call_ask,
                                 quote.call_mid,
                                 quote.delta_call,
+                                quote.greeks_call.clone(),
                             ),
-                            ContractSide::Put => {
-                                (quote.put_bid, quote.put_ask, quote.put_mid, quote.delta_put)
-                            }
+                            ContractSide::Put => (
+                                quote.put_bid,
+                                quote.put_ask,
+                                quote.put_mid,
+                                quote.delta_put,
+                                quote.greeks_put.clone(),
+                            ),
                         };
                         series.push(ContractQuote {
                             step: record.step,
@@ -264,6 +269,7 @@ mod tests {
                             mid,
                             delta,
                             gamma: quote.gamma,
+                            greeks,
                         });
                     }
                 }

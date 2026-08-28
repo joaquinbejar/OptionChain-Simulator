@@ -81,6 +81,13 @@ pub(crate) fn snapshot_record(
                     delta_call: data.delta_call,
                     delta_put: data.delta_put,
                     gamma: data.gamma,
+                    // Read, never computed: `build_chain` asks upstream for the
+                    // snapshots, so filing a step costs a clone and no
+                    // arithmetic. A strike whose snapshot upstream could not
+                    // build stays `None`, and is stored as NULL rather than as
+                    // a zero somebody would trade on.
+                    greeks_call: data.greeks_call.clone(),
+                    greeks_put: data.greeks_put.clone(),
                 })
                 .collect(),
         })

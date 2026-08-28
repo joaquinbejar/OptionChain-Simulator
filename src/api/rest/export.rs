@@ -1776,6 +1776,8 @@ mod tests {
                                 delta_call: data.delta_call,
                                 delta_put: data.delta_put,
                                 gamma: data.gamma,
+                                greeks_call: data.greeks_call.clone(),
+                                greeks_put: data.greeks_put.clone(),
                             })
                             .collect(),
                     )

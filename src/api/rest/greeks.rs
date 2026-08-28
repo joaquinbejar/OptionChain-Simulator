@@ -351,13 +351,17 @@ pub(crate) fn serialize_body<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, 
 
 /// The greek payloads for both sides of one strike, at the requested level.
 ///
-/// Upstream can compute the snapshots at chain build time, but only when the
-/// build asks for them, and nothing in this crate does: `with_greek_snapshots`
-/// is off by default, and turning it on globally would charge every client for
-/// a payload most never request. So in practice **this function computes
-/// them**, through upstream's own `calculate_greeks`; the `is_some` branch is
-/// the guard for a chain that already carries them, not the normal path. No
-/// greek mathematics lives in this crate either way.
+/// Either branch can be the normal one, depending on the deployment, and the
+/// difference is issue #74's:
+///
+/// * **v2 with a warehouse registered** builds its chains with the snapshots
+///   already on, because a filed step has to carry what a replayed one does.
+///   This function then just *reads* them, and costs nothing.
+/// * **v2 without a warehouse, and v1 always**, build without them, so this
+///   function computes them through upstream's own `calculate_greeks` — and
+///   only for the requests that ask.
+///
+/// No greek mathematics lives in this crate either way.
 ///
 /// # An absent payload is not a zero
 ///
@@ -371,14 +375,17 @@ pub(crate) fn serialize_body<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, 
 ///
 /// # Cost
 ///
-/// Roughly 40 µs per contract in a release build. `first` and `all` cost the
-/// same: upstream builds the snapshot whole and the level only decides what is
-/// written out. Computing here rather than at build time is measurably more
-/// expensive per contract, because `calculate_greeks` recomputes delta and
-/// gamma that this response then reads from the mirrors instead; asking the
-/// builder for snapshots costs about 1.5x a plain chain build. The trade is
-/// deliberate — every client would pay the build-time cost, and only some ask
-/// for the payload.
+/// Nothing, when the chain already carries the snapshots. Roughly 40 µs per
+/// contract in a release build when it does not. `first` and `all` cost the
+/// same either way: upstream builds the snapshot whole and the level only
+/// decides what is written out.
+///
+/// Computing here is measurably more expensive per contract than asking the
+/// builder for it — `calculate_greeks` recomputes the delta and gamma this
+/// response then reads from the mirrors instead, where a build with snapshots
+/// on costs about 1.54x a plain one. Which is cheaper overall depends entirely
+/// on how often the payload is actually read, which is why the decision sits
+/// with the caller that knows: `SeriesBuilder::with_greek_snapshots`.
 ///
 /// Callers must keep this off the async runtime. Both versions render above the
 /// default level inside `spawn_blocking`, because

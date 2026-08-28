@@ -26,6 +26,7 @@
 
 use crate::utils::ChainError;
 use chrono::{DateTime, Utc};
+use optionstratlib::greeks::GreeksSnapshot;
 use positive::Positive;
 use rust_decimal::Decimal;
 use std::fmt;
@@ -139,10 +140,17 @@ impl fmt::Display for ContractSide {
 
 /// One strike of one expiration, both sides.
 ///
-/// Mirrors upstream `OptionData` exactly as far as the v2 surface goes:
-/// upstream carries delta per side and one shared gamma, and no other Greek, so
-/// neither does this. A new upstream Greek is a schema change, deliberately.
+/// Mirrors upstream `OptionData` as far as the v2 surface goes: the quoted
+/// prices, the per-side delta, the shared gamma mirror, and since issue #74 the
+/// full twelve-value greek snapshot per style. A new upstream greek is a schema
+/// change, deliberately — it lands as a compile error at the `GreeksSnapshot`
+/// literal that rebuilds a stored row.
+///
+/// `#[non_exhaustive]`: the greek columns were added to a struct with public
+/// fields, which broke every downstream struct literal. Marking it now means
+/// the next column does not.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct QuoteRow {
     /// The strike price.
     pub strike: Positive,
@@ -165,7 +173,21 @@ pub struct QuoteRow {
     /// The put delta.
     pub delta_put: Option<Decimal>,
     /// Gamma, shared by the call and the put.
+    ///
+    /// Upstream's convenience mirror, computed independently of the snapshots
+    /// below and defined at expiry and at zero volatility where they are not.
+    /// Kept alongside [`Self::greeks_call`] / [`Self::greeks_put`] rather than
+    /// replaced by them, and it is what a row written before issue #74 carries.
     pub gamma: Option<Decimal>,
+    /// The call's full twelve-value greek snapshot, per one long contract.
+    ///
+    /// `None` means the strike had no computable snapshot — a degenerate strike
+    /// — or that the row predates the greek columns. Never a stand-in for zero.
+    pub greeks_call: Option<GreeksSnapshot>,
+    /// The put's full twelve-value greek snapshot, per one long contract.
+    ///
+    /// Same convention as [`Self::greeks_call`].
+    pub greeks_put: Option<GreeksSnapshot>,
 }
 
 impl QuoteRow {
@@ -188,6 +210,8 @@ impl QuoteRow {
             delta_call: None,
             delta_put: None,
             gamma: None,
+            greeks_call: None,
+            greeks_put: None,
         }
     }
 
@@ -227,6 +251,24 @@ impl QuoteRow {
     #[must_use = "builders do nothing unless the value is used"]
     pub fn with_gamma(mut self, gamma: Option<Decimal>) -> Self {
         self.gamma = gamma;
+        self
+    }
+
+    /// Sets the call's greek snapshot.
+    ///
+    /// One setter per style rather than one taking both: two arguments of the
+    /// same type, positionally, is exactly the shape that lets a transposed
+    /// call site compile and store each side's greeks under the other's name.
+    #[must_use = "builders do nothing unless the value is used"]
+    pub fn with_greeks_call(mut self, greeks: Option<GreeksSnapshot>) -> Self {
+        self.greeks_call = greeks;
+        self
+    }
+
+    /// Sets the put's greek snapshot. See [`QuoteRow::with_greeks_call`].
+    #[must_use = "builders do nothing unless the value is used"]
+    pub fn with_greeks_put(mut self, greeks: Option<GreeksSnapshot>) -> Self {
+        self.greeks_put = greeks;
         self
     }
 }
@@ -411,6 +453,7 @@ impl SnapshotRecord {
 /// What `contract_series` returns, ordered by simulated time — the shape a
 /// frontend chart or a backtest consumes.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ContractQuote {
     /// The step this quote came from.
     pub step: usize,
@@ -434,8 +477,12 @@ pub struct ContractQuote {
     pub mid: Option<Positive>,
     /// The delta on this side.
     pub delta: Option<Decimal>,
-    /// Gamma, shared by both sides.
+    /// Gamma, shared by both sides: upstream's convenience mirror.
     pub gamma: Option<Decimal>,
+    /// This side's full twelve-value greek snapshot, per one long contract.
+    ///
+    /// `None` for a degenerate strike, and for a row written before issue #74.
+    pub greeks: Option<GreeksSnapshot>,
 }
 
 #[cfg(test)]
