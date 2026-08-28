@@ -1,3 +1,4 @@
+use crate::api::rest::greeks::GreeksResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
@@ -92,6 +93,15 @@ pub struct OptionPriceResponse {
     pub mid: Option<f64>,
     /// The delta of the option
     pub delta: Option<f64>,
+    /// The greeks selected by the `greeks` query parameter, per one long
+    /// contract. Absent entirely at the default level, so a client that does
+    /// not ask sees the response it has always seen; `first` carries the
+    /// remaining first-order greeks and `all` the full twelve-value snapshot.
+    ///
+    /// Decimal-valued, so these arrive as JSON strings rather than numbers:
+    /// they are the upstream values verbatim, not a lossy `f64` view of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub greeks: Option<GreeksResponse>,
 }
 
 /// Simplified session information for inclusion in chain responses.

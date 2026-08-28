@@ -2,6 +2,7 @@ pub(crate) mod controller;
 mod error;
 pub(crate) mod export;
 mod favicon;
+pub(crate) mod greeks;
 pub(crate) mod handlers;
 pub(crate) mod handlers_v2;
 pub(crate) mod limits;

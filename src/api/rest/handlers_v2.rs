@@ -20,8 +20,10 @@
 //! first".
 
 use crate::api::rest::error::map_error;
+use crate::api::rest::greeks::{GreekLevel, render_body};
 use crate::api::rest::requests_v2::CreateSimulationRequest;
 use crate::api::rest::responses_v2::{SimulationResponse, SnapshotResponse, snapshot_response};
+use crate::domain::series::SeriesSnapshot;
 use crate::session::{SessionV2, SimulationManager, SimulationParametersV2};
 use crate::utils::ChainError;
 use actix_web::{HttpRequest, HttpResponse, Responder, web};
@@ -40,12 +42,55 @@ pub(crate) struct SimulationPath {
 
 /// Query parameters for the advance command.
 #[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AdvanceQuery {
     /// Optional expected cursor. When supplied, the advance proceeds only if
     /// the simulation is at exactly this step; otherwise `412` is returned with
     /// the actual cursor and nothing is consumed.
     #[serde(default)]
     pub(crate) expected_step: Option<usize>,
+    /// How much of the greek set the snapshot should carry: `none` (the
+    /// default), `first` or `all`. Kept as a raw string so an unknown value is
+    /// a typed `400` naming the field rather than actix's untyped query
+    /// rejection.
+    #[serde(default)]
+    pub(crate) greeks: Option<String>,
+}
+
+/// The query of a snapshot peek.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SnapshotQuery {
+    /// How much of the greek set to carry. See [`AdvanceQuery::greeks`].
+    #[serde(default)]
+    pub(crate) greeks: Option<String>,
+}
+
+/// Renders a snapshot body, under the shared greek admission bound.
+///
+/// See [`crate::api::rest::greeks::render_body`]: above the default level the
+/// pricing AND the serialisation happen together in one admitted blocking job,
+/// and the handler writes the bytes it returns. The simulation and the snapshot
+/// are moved rather than borrowed — both are already owned clones from the
+/// manager, and moving them keeps the job `'static` without a second copy of a
+/// snapshot that may hold hundreds of thousands of contracts.
+async fn render_snapshot(
+    simulation: SessionV2,
+    snapshot: SeriesSnapshot,
+    level: GreekLevel,
+) -> Result<Vec<u8>, ChainError> {
+    render_body(level, move || {
+        snapshot_response(&simulation, &snapshot, level)
+    })
+    .await
+}
+
+/// Writes an already-serialised JSON body.
+#[must_use]
+fn json_body(bytes: Vec<u8>) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .body(bytes)
 }
 
 /// Parses a path id, reporting a malformed one as a validation failure naming
@@ -127,10 +172,13 @@ pub(crate) async fn get_simulation(
     description = "Peek the snapshot at the current cursor. Safe and repeatable: it never \
         advances the cursor and never persists anything, so calling it twice returns the \
         same market. To advance, use POST /api/v2/simulations/{id}/step.",
-    params(("id" = String, Path, description = "The simulation's identifier")),
+    params(
+        ("id" = String, Path, description = "The simulation's identifier"),
+        ("greeks" = Option<GreekLevel>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. The one exception is `alpha`, the ratio gamma/theta, which a short position leaves unchanged and which must NOT be scaled or sign-flipped. An unknown value is a 400")
+    ),
     responses(
         (status = 200, description = "The snapshot at the current cursor", body = SnapshotResponse),
-        (status = 400, description = "Malformed id, or the simulation is in a terminal error state"),
+        (status = 400, description = "Malformed id, an unknown `greeks` level, or a simulation in a terminal error state. The malformed-id and unknown-level bodies are the typed `{error, field}` of ValidationErrorResponse, with `field` = `id` or `greeks`; a terminal state carries `error` alone."),
         (status = 404, description = "Simulation not found"),
         (status = 410, description = "Simulation completed; there is no current step"),
         (status = 500, description = "Internal server error")
@@ -140,6 +188,7 @@ pub(crate) async fn peek_snapshot(
     req: HttpRequest,
     manager: web::Data<Arc<SimulationManager>>,
     path: web::Path<SimulationPath>,
+    query: web::Query<SnapshotQuery>,
 ) -> impl Responder {
     info!("{} {}", req.method(), req.path());
 
@@ -147,11 +196,17 @@ pub(crate) async fn peek_snapshot(
         Ok(id) => id,
         Err(error) => return map_error(error),
     };
+    // Resolved before the snapshot is built: an unknown level costs nothing.
+    let level = match GreekLevel::parse(query.greeks.as_deref()) {
+        Ok(level) => level,
+        Err(error) => return map_error(error),
+    };
 
     match manager.peek(id).await {
-        Ok((simulation, snapshot)) => {
-            HttpResponse::Ok().json(snapshot_response(&simulation, &snapshot))
-        }
+        Ok((simulation, snapshot)) => match render_snapshot(simulation, snapshot, level).await {
+            Ok(bytes) => json_body(bytes),
+            Err(error) => map_error(error),
+        },
         Err(error) => map_error(error),
     }
 }
@@ -166,11 +221,12 @@ pub(crate) async fn peek_snapshot(
         the step, the call returns 412 with the actual cursor instead of consuming another.",
     params(
         ("id" = String, Path, description = "The simulation's identifier"),
-        ("expected_step" = Option<usize>, Query, description = "Expected current cursor; a mismatch returns 412 without advancing")
+        ("expected_step" = Option<usize>, Query, description = "Expected current cursor; a mismatch returns 412 without advancing"),
+        ("greeks" = Option<GreekLevel>, Query, description = "How much of the greek set to carry: `none` (default), `first` (adds theta, vega, rho, rho_d) or `all` (the full twelve-value snapshot per style). Every value is per ONE LONG CONTRACT: the client applies position sign and size. The one exception is `alpha`, the ratio gamma/theta, which a short position leaves unchanged and which must NOT be scaled or sign-flipped. An unknown value is a 400")
     ),
     responses(
         (status = 200, description = "Served the snapshot and advanced once", body = SnapshotResponse),
-        (status = 400, description = "Malformed id, or the simulation is in a terminal error state"),
+        (status = 400, description = "Malformed id, an unknown `greeks` level, or a simulation in a terminal error state. The malformed-id and unknown-level bodies are the typed `{error, field}` of ValidationErrorResponse, with `field` = `id` or `greeks`; a terminal state carries `error` alone."),
         (status = 404, description = "Simulation not found"),
         (status = 409, description = "Another request advanced the simulation first; re-read and retry"),
         (status = 410, description = "Simulation completed; no further steps"),
@@ -190,6 +246,12 @@ pub(crate) async fn advance_simulation(
         Ok(id) => id,
         Err(error) => return map_error(error),
     };
+    // Rejected before the step is consumed: an unknown level must not advance
+    // the cursor on its way to a 400.
+    let level = match GreekLevel::parse(query.greeks.as_deref()) {
+        Ok(level) => level,
+        Err(error) => return map_error(error),
+    };
 
     // The precondition is a transport-level check, resolved before anything is
     // built or persisted, so a mismatch costs nothing.
@@ -204,9 +266,10 @@ pub(crate) async fn advance_simulation(
     }
 
     match manager.advance(id).await {
-        Ok((simulation, snapshot)) => {
-            HttpResponse::Ok().json(snapshot_response(&simulation, &snapshot))
-        }
+        Ok((simulation, snapshot)) => match render_snapshot(simulation, snapshot, level).await {
+            Ok(bytes) => json_body(bytes),
+            Err(error) => map_error(error),
+        },
         Err(error) => map_error(error),
     }
 }
@@ -269,6 +332,28 @@ pub(crate) async fn delete_simulation(
 /// surfaced verbatim rather than guessed at.
 pub(crate) fn json_error_handler(
     error: actix_web::error::JsonPayloadError,
+    _req: &HttpRequest,
+) -> actix_web::Error {
+    let message = error.to_string();
+    let response =
+        HttpResponse::BadRequest().json(crate::api::rest::responses::ValidationErrorResponse {
+            error: message.clone(),
+            field: field_from_serde_message(&message),
+        });
+    actix_web::error::InternalError::from_response(error, response).into()
+}
+
+/// Renders a rejected QUERY string in the documented `{error, field}` shape.
+///
+/// Without it actix answers a query that fails to deserialize with an untyped
+/// plaintext `400`, which is the one outcome the greek level was built not to
+/// have: `?greek=all` is a misspelling, and a client that gets the default
+/// payload back with a `200` prices a position against greeks it never
+/// received. The query DTOs carry `deny_unknown_fields` so the misspelling is
+/// an error at all, and this turns that error into something a client can act
+/// on — the same treatment [`json_error_handler`] gives a rejected body.
+pub(crate) fn query_error_handler(
+    error: actix_web::error::QueryPayloadError,
     _req: &HttpRequest,
 ) -> actix_web::Error {
     let message = error.to_string();
@@ -376,6 +461,317 @@ mod tests {
             Some(id) => id.to_string(),
             None => panic!("the response must carry an id: {body}"),
         }
+    }
+
+    /// Every quote in a snapshot body, call and put alike.
+    fn quotes(body: &Value) -> Vec<&Value> {
+        let chains = match body.get("chains").and_then(Value::as_array) {
+            Some(chains) => chains,
+            None => panic!("the snapshot must carry chains: {body}"),
+        };
+        let mut quotes = Vec::new();
+        for chain in chains {
+            let contracts = match chain.get("contracts").and_then(Value::as_array) {
+                Some(contracts) => contracts,
+                None => panic!("every chain must carry contracts: {chain}"),
+            };
+            for contract in contracts {
+                for side in ["call", "put"] {
+                    match contract.get(side) {
+                        Some(quote) => quotes.push(quote),
+                        None => panic!("every contract must carry a {side}: {contract}"),
+                    }
+                }
+            }
+        }
+        assert!(!quotes.is_empty(), "the snapshot must quote something");
+        quotes
+    }
+
+    /// Fetches the current snapshot at a greek level, or with no parameter at
+    /// all when `query` is empty.
+    macro_rules! snapshot {
+        ($app:expr, $id:expr, $query:expr) => {{
+            let uri = format!("/api/v2/simulations/{}/snapshot{}", $id, $query);
+            let request = actix_test::TestRequest::get().uri(&uri).to_request();
+            let response = actix_test::call_service(&$app, request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = actix_test::read_body_json(response).await;
+            body
+        }};
+    }
+
+    /// The regression that protects every existing client: with no `greeks`
+    /// parameter the snapshot is byte-identical to `greeks=none`, and neither
+    /// carries the key at all. A client that ignores unknown fields is
+    /// unaffected either way, but one that compares payloads is not, and the
+    /// tape is meant to be comparable.
+    #[actix_web::test]
+    async fn test_the_default_snapshot_is_identical_to_greeks_none() {
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+
+        let default = snapshot!(app, id, "");
+        let explicit = snapshot!(app, id, "?greeks=none");
+
+        assert_eq!(default, explicit);
+        for quote in quotes(&default) {
+            assert!(
+                quote.get("greeks").is_none(),
+                "the default quote must carry no greeks key: {quote}"
+            );
+        }
+    }
+
+    /// `greeks=all` carries all twelve values for both styles on every strike.
+    #[actix_web::test]
+    async fn test_greeks_all_carries_the_twelve_values_per_style() {
+        const EXPECTED: [&str; 12] = [
+            "delta", "gamma", "theta", "vega", "rho", "rho_d", "alpha", "vanna", "vomma", "veta",
+            "charm", "color",
+        ];
+
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+        let body = snapshot!(app, id, "?greeks=all");
+
+        for quote in quotes(&body) {
+            let greeks = match quote.get("greeks").and_then(Value::as_object) {
+                Some(greeks) => greeks,
+                None => panic!("greeks=all must carry a greeks object: {quote}"),
+            };
+            for key in EXPECTED {
+                assert!(
+                    greeks.contains_key(key),
+                    "greeks=all must carry {key}: {quote}"
+                );
+            }
+            assert_eq!(
+                greeks.len(),
+                EXPECTED.len(),
+                "greeks=all must carry exactly the twelve values: {quote}"
+            );
+        }
+    }
+
+    /// `greeks=first` carries the four first-order values the default response
+    /// does not already have, and nothing beyond them. `delta` stays where it
+    /// is, on the quote itself, so the two cannot drift.
+    #[actix_web::test]
+    async fn test_greeks_first_carries_only_the_remaining_first_order_set() {
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+        let body = snapshot!(app, id, "?greeks=first");
+
+        for quote in quotes(&body) {
+            let greeks = match quote.get("greeks").and_then(Value::as_object) {
+                Some(greeks) => greeks,
+                None => panic!("greeks=first must carry a greeks object: {quote}"),
+            };
+            let mut keys: Vec<&str> = greeks.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, vec!["rho", "rho_d", "theta", "vega"], "{quote}");
+            assert!(
+                quote.get("delta").is_some(),
+                "delta stays on the quote itself: {quote}"
+            );
+        }
+    }
+
+    /// The per-style split is real, not one value copied twice: `charm`
+    /// differs between the call and the put, and `rho` carries opposite signs.
+    #[actix_web::test]
+    async fn test_the_call_and_put_greeks_are_genuinely_different() {
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+        let body = snapshot!(app, id, "?greeks=all");
+
+        let chains = match body.get("chains").and_then(Value::as_array) {
+            Some(chains) => chains,
+            None => panic!("the snapshot must carry chains: {body}"),
+        };
+        let contracts = match chains
+            .first()
+            .and_then(|chain| chain.get("contracts"))
+            .and_then(Value::as_array)
+        {
+            Some(contracts) => contracts,
+            None => panic!("the first chain must carry contracts: {body}"),
+        };
+
+        // Decimal-valued greeks arrive as strings; parsing keeps the assertion
+        // about the numbers rather than about their rendering.
+        let greek = |contract: &Value, side: &str, name: &str| -> f64 {
+            let raw = contract
+                .get(side)
+                .and_then(|quote| quote.get("greeks"))
+                .and_then(|greeks| greeks.get(name))
+                .and_then(Value::as_f64);
+            match raw {
+                Some(value) => value,
+                None => panic!("{side}.{name} must be present: {contract}"),
+            }
+        };
+
+        for contract in contracts {
+            assert_ne!(
+                greek(contract, "call", "charm"),
+                greek(contract, "put", "charm"),
+                "charm must differ between the styles: {contract}"
+            );
+            let call_rho = greek(contract, "call", "rho");
+            let put_rho = greek(contract, "put", "rho");
+            assert!(
+                call_rho * put_rho < 0.0,
+                "rho must carry opposite signs, got {call_rho} and {put_rho}"
+            );
+        }
+    }
+
+    /// An unknown level is a typed `400` naming the field, not a silent
+    /// downgrade to the default.
+    #[actix_web::test]
+    async fn test_an_unknown_greek_level_is_a_typed_400() {
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+
+        for uri in [
+            format!("/api/v2/simulations/{id}/snapshot?greeks=second"),
+            format!("/api/v2/simulations/{id}/snapshot?greeks=ALL"),
+        ] {
+            let request = actix_test::TestRequest::get().uri(&uri).to_request();
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "for {uri}");
+            let body: Value = actix_test::read_body_json(response).await;
+            assert_eq!(
+                body.get("field").and_then(Value::as_str),
+                Some("greeks"),
+                "the 400 must name the field: {body}"
+            );
+        }
+    }
+
+    /// A MISSPELLED parameter is a typed 400, not a silent downgrade.
+    ///
+    /// `?greek=all` used to be accepted and ignored, so a client that fat
+    /// fingered the key got a `200` carrying the default payload and priced a
+    /// position against greeks it never received — exactly the failure the
+    /// unknown-VALUE rejection exists to prevent, reached through the key
+    /// instead. The query DTOs reject unknown keys, and the rejection is
+    /// rendered in the documented shape rather than actix's plaintext.
+    #[actix_web::test]
+    async fn test_a_misspelled_query_key_is_a_typed_400() {
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+
+        for key in ["greek", "Greeks", "greeks_level"] {
+            let uri = format!("/api/v2/simulations/{id}/snapshot?{key}=all");
+            let request = actix_test::TestRequest::get().uri(&uri).to_request();
+            let response = actix_test::call_service(&app, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "?{key}=all must be rejected, not ignored"
+            );
+            let body: Value = actix_test::read_body_json(response).await;
+            assert_eq!(
+                body.get("field").and_then(Value::as_str),
+                Some(key),
+                "the 400 must name the offending key: {body}"
+            );
+        }
+    }
+
+    /// The step endpoint takes the same parameter, and rejects an unknown one
+    /// WITHOUT consuming a step — a 400 that advanced the cursor would make an
+    /// error unrepeatable.
+    #[actix_web::test]
+    async fn test_an_unknown_greek_level_on_step_does_not_advance() {
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+
+        let request = actix_test::TestRequest::post()
+            .uri(&format!("/api/v2/simulations/{id}/step?greeks=second"))
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let request = actix_test::TestRequest::get()
+            .uri(&format!("/api/v2/simulations/{id}"))
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(
+            body.get("cursor")
+                .and_then(|cursor| cursor.get("current_step"))
+                .and_then(Value::as_u64),
+            Some(0),
+            "a rejected level must not consume a step: {body}"
+        );
+    }
+
+    /// The step endpoint serves the greeks too, so a stepping client does not
+    /// have to peek separately to get them.
+    #[actix_web::test]
+    async fn test_the_step_endpoint_serves_the_requested_greeks() {
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+
+        let request = actix_test::TestRequest::post()
+            .uri(&format!("/api/v2/simulations/{id}/step?greeks=all"))
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = actix_test::read_body_json(response).await;
+
+        for quote in quotes(&body) {
+            assert!(
+                quote
+                    .get("greeks")
+                    .and_then(|greeks| greeks.get("vomma"))
+                    .is_some(),
+                "a stepped snapshot must carry the full set: {quote}"
+            );
+        }
+    }
+
+    /// Asking for greeks changes nothing about the market itself: the prices,
+    /// the delta and the gamma a snapshot serves are identical at all three
+    /// levels. The greeks are read off the same option, never fed back into it.
+    #[actix_web::test]
+    async fn test_the_greek_level_does_not_move_the_quoted_market() {
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+
+        let strip = |body: &Value| -> Value {
+            let mut stripped = body.clone();
+            if let Some(chains) = stripped.get_mut("chains").and_then(Value::as_array_mut) {
+                for chain in chains {
+                    if let Some(contracts) =
+                        chain.get_mut("contracts").and_then(Value::as_array_mut)
+                    {
+                        for contract in contracts {
+                            for side in ["call", "put"] {
+                                if let Some(quote) =
+                                    contract.get_mut(side).and_then(Value::as_object_mut)
+                                {
+                                    quote.remove("greeks");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            stripped
+        };
+
+        let none = snapshot!(app, id, "?greeks=none");
+        let first = snapshot!(app, id, "?greeks=first");
+        let all = snapshot!(app, id, "?greeks=all");
+
+        assert_eq!(strip(&first), none);
+        assert_eq!(strip(&all), none);
     }
 
     /// Creating returns 201 and echoes every replay input.
@@ -802,6 +1198,150 @@ mod tests {
         };
 
         assert_eq!(snapshot_of(&first).await, snapshot_of(&second).await);
+    }
+
+    /// Reproducibility holds at the new level too: two simulations built from
+    /// the same body — hence the same seed — serve identical `greeks=all`
+    /// snapshots, greek for greek.
+    ///
+    /// The domain tape test compares two walks and never sees a greek level,
+    /// so it cannot cover this. IronCondor gates on the served bytes, and the
+    /// greeks are now part of them.
+    #[actix_web::test]
+    async fn test_the_same_seed_serves_the_same_greeks() {
+        let app = v2_service!();
+        let first = id_of(&create!(app));
+        let second = id_of(&create!(app));
+        assert_ne!(first, second, "two creations must be distinct simulations");
+
+        let mut left = snapshot!(app, first, "?greeks=all");
+        let mut right = snapshot!(app, second, "?greeks=all");
+        // The id is the one thing that legitimately differs.
+        for body in [&mut left, &mut right] {
+            if let Some(object) = body.as_object_mut() {
+                object.remove("id");
+            }
+        }
+
+        assert_eq!(left, right);
+    }
+
+    /// The style-independent greeks really are shared, and the style-dependent
+    /// ones really are not.
+    ///
+    /// The crate docs make this claim to clients deciding what to store per
+    /// side; without a test it is just a sentence. `gamma`, `vega`, `vanna`,
+    /// `vomma`, `veta` and `color` do not depend on the option style, so a
+    /// call and a put on the same strike must agree on them exactly.
+    #[actix_web::test]
+    async fn test_the_style_independent_greeks_agree_across_the_two_sides() {
+        const SHARED: [&str; 6] = ["gamma", "vega", "vanna", "vomma", "veta", "color"];
+        const PER_STYLE: [&str; 4] = ["delta", "theta", "rho", "rho_d"];
+
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+        let body = snapshot!(app, id, "?greeks=all");
+
+        let chains = match body.get("chains").and_then(Value::as_array) {
+            Some(chains) => chains,
+            None => panic!("the snapshot must carry chains: {body}"),
+        };
+        for chain in chains {
+            let contracts = match chain.get("contracts").and_then(Value::as_array) {
+                Some(contracts) => contracts,
+                None => panic!("every chain must carry contracts: {chain}"),
+            };
+            for contract in contracts {
+                let side = |name: &str, greek: &str| -> Value {
+                    contract
+                        .get(name)
+                        .and_then(|quote| quote.get("greeks"))
+                        .and_then(|greeks| greeks.get(greek))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                };
+                for greek in SHARED {
+                    assert_eq!(
+                        side("call", greek),
+                        side("put", greek),
+                        "{greek} does not depend on the style: {contract}"
+                    );
+                }
+                for greek in PER_STYLE {
+                    assert_ne!(
+                        side("call", greek),
+                        side("put", greek),
+                        "{greek} depends on the style: {contract}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The snapshot's `delta` and `gamma` agree with the `f64` mirrors the
+    /// quote and the contract already carried.
+    ///
+    /// At `greeks=all` a response carries each of those numbers twice, from
+    /// two independent upstream computations. If they ever disagreed a client
+    /// would have to know which one to believe, so the agreement is pinned
+    /// rather than assumed.
+    #[actix_web::test]
+    async fn test_the_snapshot_agrees_with_the_mirrors_it_duplicates() {
+        // The mirrors are rendered as `f64`, the snapshot at full decimal
+        // precision, so they agree to within the `f64` round-trip and no more.
+        const TOLERANCE: f64 = 1e-12;
+
+        let app = v2_service!();
+        let id = id_of(&create!(app));
+        let body = snapshot!(app, id, "?greeks=all");
+
+        let parse = |value: Option<&Value>, what: &str| -> f64 {
+            match value.and_then(Value::as_f64) {
+                Some(number) => number,
+                None => panic!("{what} must be present"),
+            }
+        };
+
+        let chains = match body.get("chains").and_then(Value::as_array) {
+            Some(chains) => chains,
+            None => panic!("the snapshot must carry chains: {body}"),
+        };
+        for chain in chains {
+            let contracts = match chain.get("contracts").and_then(Value::as_array) {
+                Some(contracts) => contracts,
+                None => panic!("every chain must carry contracts: {chain}"),
+            };
+            for contract in contracts {
+                let mirror_gamma = match contract.get("gamma").and_then(Value::as_f64) {
+                    Some(gamma) => gamma,
+                    None => continue,
+                };
+                for side in ["call", "put"] {
+                    let quote = match contract.get(side) {
+                        Some(quote) => quote,
+                        None => panic!("every contract must carry a {side}: {contract}"),
+                    };
+                    let greeks = match quote.get("greeks") {
+                        Some(greeks) => greeks,
+                        None => panic!("greeks=all must carry a greeks object: {quote}"),
+                    };
+                    let snapshot_gamma = parse(greeks.get("gamma"), "the snapshot gamma");
+                    assert!(
+                        (snapshot_gamma - mirror_gamma).abs() < TOLERANCE,
+                        "gamma disagrees with its mirror: {snapshot_gamma} vs {mirror_gamma}"
+                    );
+
+                    if let Some(mirror_delta) = quote.get("delta").and_then(Value::as_f64) {
+                        let snapshot_delta = parse(greeks.get("delta"), "the snapshot delta");
+                        assert!(
+                            (snapshot_delta - mirror_delta).abs() < TOLERANCE,
+                            "{side} delta disagrees with its mirror: \
+                             {snapshot_delta} vs {mirror_delta}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// A malformed id is a validation failure naming the field, not an opaque

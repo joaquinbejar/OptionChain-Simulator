@@ -17,6 +17,7 @@
 //! is deterministic. Surfacing the stamp would put a value in the contract that
 //! changes between two otherwise-identical replays.
 
+use crate::api::rest::greeks::{GreekLevel, GreeksResponse, greeks_for};
 use crate::domain::series::SeriesSnapshot;
 use crate::session::{ExpiryRule, ExpiryRuleKind, SessionV2};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -183,6 +184,15 @@ pub struct OptionQuoteResponse {
     pub mid: Option<f64>,
     /// Delta.
     pub delta: Option<f64>,
+    /// The greeks selected by the `greeks` query parameter, per one long
+    /// contract. Absent entirely at the default level, so a client that does
+    /// not ask sees the response it has always seen; `first` carries the
+    /// remaining first-order greeks and `all` the full twelve-value snapshot.
+    ///
+    /// Decimal-valued, so these arrive as JSON strings rather than numbers:
+    /// they are the upstream values verbatim, not a lossy `f64` view of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub greeks: Option<GreeksResponse>,
 }
 
 /// One strike of one expiration.
@@ -236,25 +246,36 @@ pub struct SnapshotResponse {
     pub chains: Vec<ExpiryChainResponse>,
 }
 
-impl From<&OptionData> for ContractResponse {
-    fn from(data: &OptionData) -> Self {
-        Self {
-            strike: data.strike_price.to_f64(),
-            implied_volatility: data.implied_volatility.to_f64(),
-            gamma: decimal_to_f64(data.gamma),
-            call: OptionQuoteResponse {
-                bid: data.call_bid.map(|value| value.to_f64()),
-                ask: data.call_ask.map(|value| value.to_f64()),
-                mid: data.call_middle.map(|value| value.to_f64()),
-                delta: decimal_to_f64(data.delta_call),
-            },
-            put: OptionQuoteResponse {
-                bid: data.put_bid.map(|value| value.to_f64()),
-                ask: data.put_ask.map(|value| value.to_f64()),
-                mid: data.put_middle.map(|value| value.to_f64()),
-                delta: decimal_to_f64(data.delta_put),
-            },
-        }
+/// Views one strike at the requested greek level.
+///
+/// A free function rather than a `From` impl because the level has to reach it:
+/// the same `OptionData` renders three different payloads depending on what the
+/// caller asked for. `implied_volatility`, `gamma` and the per-side `delta`
+/// keep reading the convenience mirrors on `OptionData` — computed
+/// independently of the snapshots, and defined at expiry and at zero
+/// volatility where the full set is not — so the default response is
+/// unchanged at every strike, degenerate ones included.
+#[must_use]
+pub(crate) fn contract_response(data: &OptionData, level: GreekLevel) -> ContractResponse {
+    let (call_greeks, put_greeks) = greeks_for(data, level);
+    ContractResponse {
+        strike: data.strike_price.to_f64(),
+        implied_volatility: data.implied_volatility.to_f64(),
+        gamma: decimal_to_f64(data.gamma),
+        call: OptionQuoteResponse {
+            bid: data.call_bid.map(|value| value.to_f64()),
+            ask: data.call_ask.map(|value| value.to_f64()),
+            mid: data.call_middle.map(|value| value.to_f64()),
+            delta: decimal_to_f64(data.delta_call),
+            greeks: call_greeks,
+        },
+        put: OptionQuoteResponse {
+            bid: data.put_bid.map(|value| value.to_f64()),
+            ask: data.put_ask.map(|value| value.to_f64()),
+            mid: data.put_middle.map(|value| value.to_f64()),
+            delta: decimal_to_f64(data.delta_put),
+            greeks: put_greeks,
+        },
     }
 }
 
@@ -375,6 +396,7 @@ fn render_system_time(time: std::time::SystemTime) -> String {
 pub(crate) fn snapshot_response(
     simulation: &SessionV2,
     snapshot: &SeriesSnapshot,
+    level: GreekLevel,
 ) -> SnapshotResponse {
     SnapshotResponse {
         id: simulation.id.to_string(),
@@ -397,7 +419,11 @@ pub(crate) fn snapshot_response(
                 expires_at: render_instant(chain.expires_at),
                 days_to_expiration: chain.days_to_expiration.to_f64(),
                 labels: chain.labels.clone(),
-                contracts: chain.chain.iter().map(Into::into).collect(),
+                contracts: chain
+                    .chain
+                    .iter()
+                    .map(|data| contract_response(data, level))
+                    .collect(),
             })
             .collect(),
     }
