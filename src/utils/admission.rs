@@ -38,12 +38,16 @@ pub const DEFAULT_MAX_CONCURRENT_PRICING_JOBS: usize = 4;
 /// once, and the queue is bounded in practice by the client timeouts that sit in
 /// front of it.
 static PRICING_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
-    let configured = std::env::var("OCS_MAX_CONCURRENT_PRICING_JOBS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
+    let raw = super::env::read_var("OCS_MAX_CONCURRENT_PRICING_JOBS");
+    let configured = raw
+        .as_deref()
+        .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|permits| *permits >= 1)
         .unwrap_or_else(|| {
-            if std::env::var("OCS_MAX_CONCURRENT_PRICING_JOBS").is_ok() {
+            // Only a value that was actually written and is unusable warrants a
+            // warning; a blank one reads as unset (`utils::env`) and falls back
+            // in silence, because that is a knob someone commented out.
+            if raw.is_some() {
                 warn!(
                     default = DEFAULT_MAX_CONCURRENT_PRICING_JOBS,
                     "invalid OCS_MAX_CONCURRENT_PRICING_JOBS; falling back to the default"

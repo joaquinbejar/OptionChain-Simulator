@@ -63,6 +63,16 @@ impl Default for ClickHouseConfig {
             port,
             // Credentials included: a blank one is unset, not an empty
             // credential (issue #83).
+            //
+            // CONSEQUENCE, stated because it is a real trade: an EMPTY
+            // ClickHouse password is no longer expressible through the
+            // environment. `CLICKHOUSE_PASSWORD=` used to be the only way to
+            // say "this user has no password", which is how a stock
+            // ClickHouse `default` user is configured; it now falls back to
+            // the default below. The rule is applied uniformly on purpose —
+            // the alternative is one variable in the whole service behaving
+            // differently from the rest — and a password-less deployment sets
+            // the field directly through `ClickHouseConfig`, which is public.
             username: super::read_var("CLICKHOUSE_USER").unwrap_or_else(|| "admin".to_string()),
             password: super::read_var("CLICKHOUSE_PASSWORD")
                 .unwrap_or_else(|| "password".to_string()),

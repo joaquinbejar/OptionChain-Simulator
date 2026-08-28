@@ -222,13 +222,25 @@ mod tests {
         remove_var("REDIS_TIMEOUT");
         remove_var("REDIS_CONNECT_TIMEOUT");
         remove_var("REDIS_USER");
-        set_var("REDIS_PASSWORD", "s3cr:t@pass");
 
+        // Two separate claims. The RESOLVED value must survive verbatim,
+        // punctuation included, which is what blank-is-unset must not disturb.
+        set_var("REDIS_PASSWORD", "s3cr:t@pass");
+        assert_eq!(
+            RedisConfig::default().password,
+            Some("s3cr:t@pass".to_string()),
+            "a real password must reach the config untouched"
+        );
+
+        // That it also reaches the URL is asserted with a plain password on
+        // purpose. `url()` does no percent-encoding, so asserting the
+        // punctuated one round-trips through the URL would freeze that gap as
+        // intended behaviour rather than leave it a known one.
+        set_var("REDIS_PASSWORD", "s3cret");
         let config = RedisConfig::default();
-        assert_eq!(config.password, Some("s3cr:t@pass".to_string()));
         assert!(
-            config.url().contains("s3cr:t@pass"),
-            "the password must survive verbatim, got {}",
+            config.url().contains("s3cret"),
+            "the password must reach the URL, got {}",
             config.url()
         );
 

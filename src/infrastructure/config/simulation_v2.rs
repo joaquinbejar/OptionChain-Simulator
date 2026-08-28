@@ -305,13 +305,9 @@ fn parse_bounded(
     Ok(value)
 }
 
-/// Reads a variable, treating a blank value as unset.
-///
-/// The rule itself lives in [`super::read_var`], which every configuration
-/// module in this service now shares.
-fn read(variable: &str) -> Option<String> {
-    super::read_var(variable)
-}
+/// Reads a variable, treating a blank value as unset. The rule lives in
+/// [`crate::utils::env`], which every layer of this service shares.
+use super::read_var as read;
 
 /// The error for a value that does not parse.
 #[cold]

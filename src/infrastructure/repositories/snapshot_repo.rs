@@ -1591,8 +1591,11 @@ mod tests {
             Ok(None) => {}
             Ok(Some(_)) => {
                 // Only reachable when an operator enabled it in this shell.
+                // `is_some`, not `is_ok`: a blank value reads as unset
+                // everywhere in this service, so "set" and "non-blank" have to
+                // agree here too.
                 assert!(
-                    std::env::var("OCS_SNAPSHOT_PERSISTENCE_ENABLED").is_ok(),
+                    crate::utils::env::read_var("OCS_SNAPSHOT_PERSISTENCE_ENABLED").is_some(),
                     "persistence must not switch itself on"
                 );
             }

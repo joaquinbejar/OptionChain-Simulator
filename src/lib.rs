@@ -265,6 +265,11 @@
 //!
 //! ## Configuration
 //!
+//! **A blank value is an unset value.** `KNOB=` and `KNOB="   "` are read
+//! exactly as if the line were absent, and the documented default applies, so a
+//! knob is switched off by commenting it out rather than by emptying it. The
+//! rule holds for every variable the service reads, credentials included.
+//!
 //! Every environment variable the service reads is documented in
 //! `.env.example` with its default and accepted range. Two families, with
 //! deliberately different failure behaviour:

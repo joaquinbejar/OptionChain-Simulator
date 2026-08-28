@@ -26,5 +26,9 @@ mod uuid;
 /// session manager contend for the same cores.
 pub mod admission;
 
+/// Reading environment variables under one rule: a blank value is an unset
+/// value. Lives here because every layer reads knobs, including `utils` itself.
+pub mod env;
+
 pub use error::*;
 pub use uuid::*;

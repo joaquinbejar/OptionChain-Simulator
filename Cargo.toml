@@ -2,6 +2,10 @@
 name = "optionchain_simulator"
 version = "0.2.0"
 edition = "2024"
+# Declared because the dependency bump moved it: actix-web 4.15 and redis 1.6
+# both require 1.88. Without this a consumer on an older toolchain gets a
+# failure inside a dependency rather than a clear message about this crate.
+rust-version = "1.88"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "OptionChain-Simulator is a lightweight REST API service that simulates an evolving option chain with every request. It is designed for developers building or testing trading systems, backtesters, and visual tools that depend on option data streams but want to avoid relying on live data feeds."
 license = "MIT"

@@ -23,13 +23,17 @@ pub(crate) const DEFAULT_MAX_CHAIN_SIZE: usize = 500;
 pub(crate) const DEFAULT_MAX_HISTORICAL_PRICES: usize = 100_000;
 
 /// Maximum number of simulation steps a session may request (`OCS_MAX_STEPS`).
-pub(crate) static MAX_STEPS: LazyLock<usize> =
-    LazyLock::new(|| parse_limit(std::env::var("OCS_MAX_STEPS").ok(), DEFAULT_MAX_STEPS));
+pub(crate) static MAX_STEPS: LazyLock<usize> = LazyLock::new(|| {
+    parse_limit(
+        crate::utils::env::read_var("OCS_MAX_STEPS"),
+        DEFAULT_MAX_STEPS,
+    )
+});
 
 /// Maximum option-chain size a request may ask for (`OCS_MAX_CHAIN_SIZE`).
 pub(crate) static MAX_CHAIN_SIZE: LazyLock<usize> = LazyLock::new(|| {
     parse_limit(
-        std::env::var("OCS_MAX_CHAIN_SIZE").ok(),
+        crate::utils::env::read_var("OCS_MAX_CHAIN_SIZE"),
         DEFAULT_MAX_CHAIN_SIZE,
     )
 });
@@ -38,7 +42,7 @@ pub(crate) static MAX_CHAIN_SIZE: LazyLock<usize> = LazyLock::new(|| {
 /// (`OCS_MAX_HISTORICAL_PRICES`).
 pub(crate) static MAX_HISTORICAL_PRICES: LazyLock<usize> = LazyLock::new(|| {
     parse_limit(
-        std::env::var("OCS_MAX_HISTORICAL_PRICES").ok(),
+        crate::utils::env::read_var("OCS_MAX_HISTORICAL_PRICES"),
         DEFAULT_MAX_HISTORICAL_PRICES,
     )
 });
@@ -58,9 +62,12 @@ pub(crate) fn strikes_per_chain(chain_size: usize) -> Option<usize> {
 
 /// Parses a raw environment value into a positive `usize` limit.
 ///
-/// Returns `default` when `raw` is `None` (variable unset) or when it does not parse
-/// into an integer `>= 1`. Invalid values are logged at `WARN` and never abort startup,
-/// keeping the service resilient to misconfiguration.
+/// Returns `default` when `raw` is `None` — unset, or blank, which
+/// [`crate::utils::env::read_var`] reads as unset — or when it does not parse
+/// into an integer `>= 1`. Invalid values are logged at `WARN` and never abort
+/// startup, keeping the service resilient to misconfiguration. A blank value
+/// reaches this as `None`, so it falls back SILENTLY: it is a knob someone
+/// commented out, not a mistake worth warning about.
 ///
 /// # Examples
 ///
