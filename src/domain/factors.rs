@@ -760,7 +760,38 @@ impl VolatilitySource {
          the request's volatility prices nothing for a historical walk";
 }
 
-/// The smallest volatility a chain can be priced at.
+/// Rejects a volatility no chain can be priced at, for a caller outside the
+/// factor tape.
+///
+/// The v2 path reaches [`reject_unpriceable_volatility`] through
+/// `FactorTape::build`, which validates every step of the walk. v1 has no tape
+/// and validates its parameters at the request boundary instead, so it needs the
+/// same bound applied at the same place — otherwise a session created with a
+/// volatility of `1e-13` builds fine and PANICS the first time a client asks for
+/// greeks, inside upstream's `vomma`.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Validation`] naming `field` when the volatility is
+/// zero, above one, or below the adjusted floor.
+pub(crate) fn validate_priceable_volatility(
+    volatility: Positive,
+    field: &str,
+) -> Result<(), ChainError> {
+    reject_unpriceable_volatility(volatility, None, VolatilitySource::Model).map_err(|error| {
+        match error {
+            // The shared guard names the walk model's field; a caller checking a
+            // request field wants its own name on the error.
+            ChainError::Validation { reason, .. } => ChainError::Validation {
+                field: field.to_string(),
+                reason,
+            },
+            other => other,
+        }
+    })
+}
+
+/// The smallest EFFECTIVE per-strike volatility a chain can be priced at.
 ///
 /// Not where pricing stops being interesting, but where upstream's greek
 /// arithmetic stops fitting in a `Decimal`: `vomma` is `vega * d1 * d2 / iv`,
@@ -769,27 +800,43 @@ impl VolatilitySource {
 /// check — the model's own volatility is only checked for zero and for
 /// exceeding one.
 ///
-/// The floor is picked from measurement, between two constraints:
-///
-/// * `1e-11` panics, while `3e-11` and `5e-11` do not. The boundary is not
-///   sharp, because it depends on `d1 * d2` as well as on `iv`, which is
-///   exactly why this is a floor with margin rather than an attempt to predict
-///   the overflow.
-/// * A **historical** walk estimates its volatility from the client's series
-///   and can legitimately arrive at a very small one — this repo's own fixture
-///   produces `4.5e-7` — so the floor has to stay well below anything a real
-///   series can yield.
-///
-/// `1e-9` sits an order of magnitude above the lowest observed overflow and
-/// about 450 times below the smallest volatility any fixture here produces.
-///
-/// The panic is only reachable when the full greek set is computed, so before
-/// issue #74 it needed a `?greeks=` request and now it also reaches the default
-/// path of a warehouse-backed deployment. Rejecting here closes both at once,
-/// and it is a rejection rather than a clamp for the same reason the zero and
-/// the upper-bound checks are: a chain the client did not ask for is worse than
-/// an error that names the field.
+/// Measured: `1e-11` panics, while `3e-11` and `5e-11` do not. The boundary is
+/// not sharp, because it depends on `d1 * d2` as well as on `iv`, which is why
+/// this is a floor with margin rather than an attempt to predict the overflow.
+/// `1e-9` sits two orders of magnitude above the lowest observed overflow.
 const MIN_PRICEABLE_VOLATILITY: Decimal = dec!(0.000000001);
+
+/// The floor upstream clamps the per-strike skew and smile multiplier to.
+///
+/// `adjust_volatility` ends in `factor.clamp(0.01, 3.0)`, so a strike's
+/// EFFECTIVE volatility is never less than a hundredth of the base — but it can
+/// be exactly that, under a steep enough skew or smile. Checking only the base
+/// would therefore admit a base of `1e-9` that prices strikes at `1e-11`, which
+/// is precisely the overflow region above.
+///
+/// Mirrored here rather than computed: this is the one upstream constant the
+/// guard depends on, and a change to it is a change to what this service must
+/// reject. If upstream lowers the clamp, the tests below start failing, which is
+/// the intended way to find out.
+const SKEW_SMILE_VOLATILITY_FLOOR: Decimal = dec!(0.01);
+
+/// The smallest BASE volatility whose worst-case strike still prices.
+///
+/// The base a client supplies is not what a strike is priced at: the skew and
+/// smile scale it per strike, down to [`SKEW_SMILE_VOLATILITY_FLOOR`] of it. The
+/// bound a request is checked against is therefore the effective floor divided
+/// by that clamp — `1e-7` — so that even the most aggressively shaped strike in
+/// the chain lands above [`MIN_PRICEABLE_VOLATILITY`].
+///
+/// A historical walk estimates its volatility from the client's series and can
+/// legitimately be small; this repo's own fixture reaches `4.5e-7`, which still
+/// clears this bound.
+#[must_use]
+fn min_priceable_base_volatility() -> Decimal {
+    MIN_PRICEABLE_VOLATILITY
+        .checked_div(SKEW_SMILE_VOLATILITY_FLOOR)
+        .unwrap_or(MIN_PRICEABLE_VOLATILITY)
+}
 
 /// Rejects a volatility no option chain can be priced at.
 ///
@@ -827,12 +874,14 @@ fn reject_unpriceable_volatility(
         });
     }
 
-    if volatility < MIN_PRICEABLE_VOLATILITY {
+    let floor = min_priceable_base_volatility();
+    if volatility < floor {
         return Err(ChainError::Validation {
             field: source.field().to_string(),
             reason: format!(
-                "the volatility falls to {volatility}{}, below the {MIN_PRICEABLE_VOLATILITY} \
-                 floor an option chain can be priced at; {}",
+                "the volatility falls to {volatility}{}, below the {floor} floor an option chain \
+                 can be priced at — the skew and smile scale it per strike down to a hundredth, \
+                 and {MIN_PRICEABLE_VOLATILITY} is where the greek arithmetic overflows; {}",
                 at_step(step),
                 source.remedy_zero()
             ),
@@ -1267,6 +1316,67 @@ mod tests {
                 Err(error) => panic!("expected a validation failure, got {error:?}"),
             }
         }
+    }
+
+    /// The worst strike an extreme skew and smile can produce still prices.
+    ///
+    /// The base volatility is not what a strike is priced at. Upstream scales it
+    /// per strike and clamps the multiplier at a hundredth, so a base that
+    /// passed a naive check could still hand `vomma` a `1e-11` and panic. This
+    /// drives the skew and the smile to the edges of their validated ranges at
+    /// the smallest base the guard admits, and asserts the chain builds with the
+    /// full greek set — which is the code path that overflows.
+    #[test]
+    fn test_the_smallest_admitted_base_prices_under_an_extreme_skew_and_smile() {
+        let floor = min_priceable_base_volatility();
+        let volatility = match Positive::new_decimal(floor) {
+            Ok(volatility) => volatility,
+            Err(error) => panic!("the floor must be a valid volatility: {error}"),
+        };
+
+        for (skew, smile) in [
+            (dec!(-1.0), dec!(-1.0)),
+            (dec!(1.0), dec!(1.0)),
+            (dec!(-1.0), dec!(1.0)),
+            (dec!(1.0), dec!(-1.0)),
+        ] {
+            let mut parameters = parameters(request(4, brownian(0.18), 0.18));
+            parameters.skew_slope = Some(skew);
+            parameters.smile_curve = Some(smile);
+            parameters.chain_size = Some(60);
+
+            match build_chain(
+                &parameters,
+                pos_or_panic!(5000.0),
+                volatility,
+                ExpirationDate::Days(pos_or_panic!(7.0)),
+                true,
+            ) {
+                Ok(_) => {}
+                Err(error) => panic!("skew {skew} smile {smile} must still price: {error}"),
+            }
+        }
+    }
+
+    /// A base just under the floor is rejected, and the message explains why the
+    /// bound is a hundred times the value that actually overflows.
+    #[test]
+    fn test_a_base_below_the_adjusted_floor_names_the_skew() {
+        let parameters = parameters(request(4, brownian(0.18), 0.18));
+        let too_small = match Positive::new_decimal(dec!(0.00000001)) {
+            Ok(value) => value,
+            Err(error) => panic!("the fixture must be positive: {error}"),
+        };
+
+        match reject_unpriceable_volatility(too_small, None, VolatilitySource::Model) {
+            Ok(()) => panic!("a base of 1e-8 prices strikes at 1e-10 and must be rejected"),
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "volatility");
+                assert!(reason.contains("skew"), "the reason must explain: {reason}");
+            }
+            Err(error) => panic!("expected a validation failure, got {error:?}"),
+        }
+        let _ = parameters;
     }
 
     /// The floor sits well below anything a real walk produces, so it rejects

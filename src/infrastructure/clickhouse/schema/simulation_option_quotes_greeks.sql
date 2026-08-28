@@ -13,6 +13,13 @@
 --   it does not rewrite existing parts, and existing rows read the new columns
 --   as NULL — which is exactly how a pre-#74 row is meant to read.
 --
+--   The explicit `DEFAULT NULL` is what keeps a ROLLBACK working. The
+--   `clickhouse` crate validates an insert's column list against the table, and
+--   a column with no default is one the client must supply; an older binary,
+--   whose row struct has no greek fields, would then fail every insert with a
+--   `SchemaMismatch` against a migrated table. `Nullable` alone does not say
+--   this — the default does.
+--
 -- ORDER
 --   Run AFTER the `CREATE TABLE IF NOT EXISTS` of the same table. On a fresh
 --   deployment every column already exists and this is a no-op; on an existing
@@ -23,25 +30,25 @@
 -- The column list must stay in step with `simulation_option_quotes.sql`; a test
 -- asserts that it does.
 ALTER TABLE simulation_option_quotes
-    ADD COLUMN IF NOT EXISTS gamma_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS gamma_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS theta_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS theta_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS vega_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS vega_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS rho_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS rho_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS rho_d_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS rho_d_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS alpha_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS alpha_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS vanna_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS vanna_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS vomma_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS vomma_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS veta_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS veta_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS charm_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS charm_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS color_call Nullable(Decimal(38, 28)) CODEC(ZSTD(1)),
-    ADD COLUMN IF NOT EXISTS color_put Nullable(Decimal(38, 28)) CODEC(ZSTD(1))
+    ADD COLUMN IF NOT EXISTS gamma_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS gamma_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS theta_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS theta_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS vega_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS vega_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS rho_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS rho_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS rho_d_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS rho_d_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS alpha_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS alpha_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS vanna_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS vanna_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS vomma_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS vomma_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS veta_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS veta_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS charm_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS charm_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS color_call Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1)),
+    ADD COLUMN IF NOT EXISTS color_put Nullable(Decimal(38, 28)) DEFAULT NULL CODEC(ZSTD(1))

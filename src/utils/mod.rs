@@ -20,5 +20,11 @@ pub mod error;
 ///
 mod uuid;
 
+/// The shared bound on concurrent CPU-heavy pricing jobs.
+///
+/// Lives here rather than in a layer because the API renderers and the v2
+/// session manager contend for the same cores.
+pub mod admission;
+
 pub use error::*;
 pub use uuid::*;

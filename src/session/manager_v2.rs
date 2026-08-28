@@ -461,9 +461,25 @@ impl SimulationManager {
         // a registered warehouse files every step, and a filed step has to
         // carry what a replayed one does (issue #74). Without a warehouse the
         // API prices them per request instead, and only when asked.
-        let snapshot = SeriesBuilder::new(&simulation.parameters, &tape)?
-            .with_greek_snapshots(self.warehouse.is_some())
-            .snapshot(step)?;
+        let greek_snapshots = self.warehouse.is_some();
+        let parameters = simulation.parameters.clone();
+
+        // Off the runtime and under the shared bound, for the same reason
+        // `tape_for` is: pricing a snapshot is real synchronous CPU — up to
+        // `DEFAULT_MAX_SNAPSHOT_CONTRACTS` priced contracts, and about 1.54x
+        // that again once the greek snapshots are on — and a worker holding it
+        // stalls every other request that worker owns.
+        //
+        // The bound is the one the API renderers use, not a second one: they
+        // compete for the same cores, and a warehouse-backed deployment prices
+        // greeks HERE on every peek and advance, so admitting only the render
+        // side would leave the heavier half unbounded.
+        let snapshot = crate::utils::admission::admit_blocking(move || {
+            SeriesBuilder::new(&parameters, &tape)?
+                .with_greek_snapshots(greek_snapshots)
+                .snapshot(step)
+        })
+        .await?;
 
         self.cache_snapshot(simulation.id, snapshot.clone());
         Ok(snapshot)

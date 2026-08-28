@@ -410,7 +410,7 @@ impl ClickHouseSnapshotRepository {
     /// deployment that predates a column would otherwise boot green and fail
     /// every insert afterwards — the opposite of the fail-at-boot behaviour
     /// turning persistence on is supposed to buy. Column additions are
-    /// therefore RUN here ([`QUOTES_GREEKS_MIGRATION`]), not left as a note for
+    /// therefore RUN here, from `simulation_option_quotes_greeks.sql`, not left as a note for
     /// an operator to expand by hand. `ADD COLUMN IF NOT EXISTS` is idempotent
     /// and metadata-only, so on a fresh table it costs one no-op round trip.
     ///
@@ -1831,6 +1831,101 @@ mod tests {
                 "a contract history must not read from an incomplete step"
             ),
             other => panic!("the series must read, got {other:?}"),
+        }
+    }
+
+    /// An older binary can still INSERT against a migrated table.
+    ///
+    /// The rollback the schema file promises. `clickhouse` validates an
+    /// insert's column list against the table and treats a column with no
+    /// default as one the client must supply, so a row struct that predates the
+    /// greek columns fails with `SchemaMismatch` unless they carry an explicit
+    /// `DEFAULT NULL`. `Nullable` alone does not say that.
+    ///
+    /// The struct below is the pre-issue-#74 `OptionQuoteRow`, field for field.
+    /// Written by hand rather than derived, because the point is to be the
+    /// shape the OLD binary had.
+    #[tokio::test]
+    #[ignore = "requires live ClickHouse on localhost:8123 (override via CLICKHOUSE_* env)"]
+    async fn test_an_old_row_struct_still_inserts_against_live_clickhouse() {
+        #[derive(Debug, clickhouse::Row, serde::Serialize)]
+        struct PreGreekQuoteRow {
+            simulation_id: String,
+            simulation_generation: u64,
+            step: u64,
+            expires_at: i64,
+            strike: i128,
+            snapshot_id: String,
+            simulated_at: i64,
+            symbol: String,
+            days_to_expiration: i128,
+            labels: Vec<String>,
+            implied_volatility: i128,
+            call_bid: Option<i128>,
+            call_ask: Option<i128>,
+            call_mid: Option<i128>,
+            put_bid: Option<i128>,
+            put_ask: Option<i128>,
+            put_mid: Option<i128>,
+            delta_call: Option<i128>,
+            delta_put: Option<i128>,
+            gamma: Option<i128>,
+            inserted_at_ms: u64,
+        }
+
+        let repository = live_repository();
+        let simulation = Uuid::new_v4();
+        match repository.ensure_schema().await {
+            Ok(()) => {}
+            Err(error) => panic!("the schema must be creatable: {error}"),
+        }
+
+        let scaled = |value: Decimal| match to_storage_decimal(value, "fixture") {
+            Ok(raw) => raw,
+            Err(error) => panic!("the fixture decimal must convert: {error}"),
+        };
+        let row = PreGreekQuoteRow {
+            simulation_id: simulation.to_string(),
+            simulation_generation: 2,
+            step: 0,
+            expires_at: 0,
+            strike: scaled(dec!(5000)),
+            snapshot_id: "old".to_string(),
+            simulated_at: 0,
+            symbol: "SPX".to_string(),
+            days_to_expiration: scaled(dec!(1.5)),
+            labels: vec!["weeklies".to_string()],
+            implied_volatility: scaled(dec!(0.185)),
+            call_bid: None,
+            call_ask: None,
+            call_mid: None,
+            put_bid: None,
+            put_ask: None,
+            put_mid: None,
+            delta_call: Some(scaled(dec!(0.5123))),
+            delta_put: Some(scaled(dec!(-0.4877))),
+            gamma: Some(scaled(dec!(0.00312345))),
+            inserted_at_ms: 1,
+        };
+
+        let outcome = async {
+            let mut insert = repository
+                .client
+                .client
+                .insert::<PreGreekQuoteRow>(QUOTES_TABLE)
+                .await?;
+            insert.write(&row).await?;
+            insert.end().await
+        }
+        .await;
+        cleanup(&repository, simulation).await;
+
+        match outcome {
+            Ok(()) => {}
+            Err(error) => panic!(
+                "a pre-#74 row struct must still insert against a migrated table, \
+                 which is what DEFAULT NULL buys: {error}"
+            ),
         }
     }
 

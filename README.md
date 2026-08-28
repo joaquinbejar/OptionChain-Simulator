@@ -287,7 +287,7 @@ Every environment variable the service reads is documented in
 deliberately different failure behaviour:
 
 - **Request caps** — `OCS_MAX_STEPS`, `OCS_MAX_CHAIN_SIZE`,
-  `OCS_MAX_HISTORICAL_PRICES`, `OCS_MAX_CONCURRENT_GREEK_RENDERS`,
+  `OCS_MAX_HISTORICAL_PRICES`, `OCS_MAX_CONCURRENT_PRICING_JOBS`,
   `OCS_MAX_CACHED_WALKS` — warn and fall back
   to their defaults when set to something invalid. A bad value there
   degrades one request.

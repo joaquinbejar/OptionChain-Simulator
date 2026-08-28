@@ -1,5 +1,5 @@
 use crate::api::rest::error::map_error;
-use crate::api::rest::greeks::{GreekLevel, admit_blocking, greeks_for, serialize_body};
+use crate::api::rest::greeks::{GreekLevel, admit_render, greeks_for, serialize_body};
 use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS};
 use crate::api::rest::models::SessionId;
 use crate::api::rest::patch::Patch;
@@ -139,7 +139,11 @@ pub(crate) fn apply_update(
     }
 
     if let Some(volatility) = req.volatility {
-        params.volatility = positive_field("volatility", volatility)?;
+        let volatility = positive_field("volatility", volatility)?;
+        // A PATCH can lower a session's volatility past the point any chain can
+        // be priced at, so it takes the same bound the create path does.
+        crate::domain::factors::validate_priceable_volatility(volatility, "volatility")?;
+        params.volatility = volatility;
     }
 
     if let Some(risk_free_rate) = req.risk_free_rate {
@@ -234,7 +238,7 @@ async fn render_chain_responses(
     option_chain: OptionChain,
     level: GreekLevel,
 ) -> Result<(Vec<u8>, ChainResponse), ChainError> {
-    admit_blocking(level, move || {
+    admit_render(level, move || {
         let served = build_chain_response(&session, &option_chain, level);
         let persisted = if level.wants_greeks() {
             build_chain_response(&session, &option_chain, GreekLevel::None)
@@ -455,6 +459,25 @@ pub(crate) async fn advance_step(
         Err(error) => return map_error(error),
     };
 
+    // A session stored by an older binary, or by one without this bound, can
+    // still carry a volatility no chain can be priced at. Pricing it would
+    // panic inside upstream's greek arithmetic, so it is checked BEFORE the
+    // advance: a 500 after the cursor has already moved is unrecoverable for
+    // the client, and this way the step is still there to retry.
+    if level.wants_greeks() {
+        match session_manager.get_session(session_id).await {
+            Ok(session) => {
+                if let Err(error) = crate::domain::factors::validate_priceable_volatility(
+                    session.parameters.volatility,
+                    "volatility",
+                ) {
+                    return map_error(error);
+                }
+            }
+            Err(error) => return map_error(error),
+        }
+    }
+
     // Expected-cursor precondition: a transport-level check (412) so an
     // ambiguous retry can be resolved without consuming another step.
     if let Some(expected) = query.expected_step {
@@ -558,6 +581,16 @@ pub(crate) async fn get_current_step(
     // same step is served repeatedly.
     match session_manager.peek_current_step(session_id).await {
         Ok((session, option_chain)) => {
+            // Same guard as the advance, for the same reason. A peek changes
+            // nothing, so here it only has to happen before the pricing.
+            if level.wants_greeks()
+                && let Err(error) = crate::domain::factors::validate_priceable_volatility(
+                    session.parameters.volatility,
+                    "volatility",
+                )
+            {
+                return map_error(error);
+            }
             match render_chain_responses(session, option_chain, level).await {
                 Ok((body, _)) => json_body(body),
                 Err(error) => map_error(error),
@@ -1322,7 +1355,7 @@ mod tests_chain_response_greeks {
 #[cfg(test)]
 mod tests_v1_greeks_over_http {
     use super::*;
-    use crate::session::InMemorySessionStore;
+    use crate::session::{InMemorySessionStore, SessionStore};
     use actix_web::App;
     use actix_web::http::StatusCode;
     use actix_web::test as actix_test;
@@ -1339,6 +1372,85 @@ mod tests_v1_greeks_over_http {
             )
             .await
         }};
+    }
+
+    /// A stored session too cold to price is rejected, not panicked on.
+    ///
+    /// v1 has no factor tape, so nothing revalidated a session once it was in
+    /// the store: one written by an older binary — or straight into Redis —
+    /// with a volatility of `1e-13` reached upstream's `vomma`, where the
+    /// quotient leaves `Decimal` and `Positive` PANICS. The guard now runs
+    /// before the pricing on the peek, and before the CURSOR MOVES on the step,
+    /// so a client can retry the same request rather than losing a step to a
+    /// 500 it cannot undo.
+    #[actix_web::test]
+    async fn test_a_stored_session_below_the_pricing_floor_is_rejected_not_priced() {
+        use crate::session::{SimulationMethod, SimulationParameters};
+        use optionstratlib::utils::TimeFrame;
+        use positive::pos_or_panic;
+        use rust_decimal_macros::dec;
+
+        let store = Arc::new(InMemorySessionStore::new());
+        let manager = Arc::new(SessionManager::new(
+            Arc::clone(&store) as Arc<dyn SessionStore>
+        ));
+
+        // Built directly, bypassing the request conversion that would now
+        // refuse it — which is exactly how such a session gets into a store.
+        let parameters = SimulationParameters {
+            symbol: "AAPL".to_string(),
+            steps: 10,
+            initial_price: pos_or_panic!(100.0),
+            days_to_expiration: pos_or_panic!(30.0),
+            volatility: pos_or_panic!(0.0000000000001),
+            risk_free_rate: dec!(0.04),
+            dividend_yield: pos_or_panic!(0.0),
+            method: SimulationMethod::GeometricBrownian {
+                dt: pos_or_panic!(0.004),
+                drift: dec!(0.0),
+                volatility: pos_or_panic!(0.0000000000001),
+            },
+            time_frame: TimeFrame::Day,
+            chain_size: Some(3),
+            strike_interval: Some(pos_or_panic!(5.0)),
+            skew_slope: Some(dec!(-0.2)),
+            smile_curve: Some(dec!(0.5)),
+            spread: Some(pos_or_panic!(0.02)),
+            seed: Some(42),
+        };
+        let session = match manager.create_session(parameters).await {
+            Ok(session) => session,
+            Err(error) => panic!("the store must accept the fixture: {error}"),
+        };
+
+        let app = actix_test::init_service(
+            App::new()
+                .app_data(web::Data::new(Arc::clone(&manager)))
+                .service(web::resource("/api/v1/chain").route(web::get().to(get_current_step))),
+        )
+        .await;
+
+        let uri = format!("/api/v1/chain?sessionid={}&greeks=all", session.id);
+        let request = actix_test::TestRequest::get().uri(&uri).to_request();
+        let response = actix_test::call_service(&app, request).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(
+            body.get("field").and_then(Value::as_str),
+            Some("volatility"),
+            "the 400 must name the field: {body}"
+        );
+
+        // The default level never prices greeks, so it is unaffected.
+        let uri = format!("/api/v1/chain?sessionid={}", session.id);
+        let request = actix_test::TestRequest::get().uri(&uri).to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a request that asks for no greeks must still be served"
+        );
     }
 
     /// An unknown level is a typed 400 naming the field.
