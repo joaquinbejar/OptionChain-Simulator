@@ -559,6 +559,7 @@ mod tests {
     use super::*;
     use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
     use crate::api::rest::requests_v2::CreateSimulationRequest;
+    use crate::domain::ladder::StrikeLadder;
     use crate::session::{ExpiryRule, ExpiryRuleKind};
     use chrono::{TimeZone, Weekday};
 
@@ -643,6 +644,7 @@ mod tests {
             skew_slope: None,
             smile_curve: None,
             spread: Some(0.02),
+            strike_ladder: Default::default(),
             spread_proportional: None,
             spread_moneyness_widening: None,
             spread_tenor_widening: None,
@@ -1024,6 +1026,65 @@ mod tests {
                 "step {step} diverged under the same seed"
             );
         }
+    }
+
+    /// A pinned simulation quotes one strike set for its whole life.
+    ///
+    /// The end-to-end form of issue #91's criterion: walked over enough steps
+    /// for the underlying to move, every snapshot of every expiration carries
+    /// exactly the strikes the simulation pinned at creation. A position opened
+    /// at step 0 can therefore be marked at every later step.
+    ///
+    /// IGNORED, and the reason is the open question on the issue. Within about
+    /// a day of an expiration upstream stops extending its ladder: a wing
+    /// priced at exactly zero makes `some_price_is_none` true on both ends and
+    /// the build loop breaks, so the far strikes do not exist to be filtered
+    /// to. Measured at a spot of 5100 with a width of 10 and a 25-point
+    /// interval: 21 strikes at 1 day, 11 at 0.05 days, 5 at 0.01 days. No
+    /// widening fixes it, because the contracts are never created. Closing this
+    /// needs a decision recorded on #91 — see the PR discussion.
+    #[test]
+    #[ignore = "blocked: upstream truncates its ladder near expiry, see issue #91"]
+    fn test_a_pinned_simulation_keeps_its_strikes_for_every_step() {
+        let mut created = request(40, reference_schedules());
+        created.chain_size = Some(6);
+        created.strike_interval = Some(25.0);
+        created.strike_ladder = Some(StrikeLadder::Pinned);
+        let parameters = parameters(created);
+        let tape = tape(&parameters);
+
+        let mut expected: Option<Vec<String>> = None;
+        let mut spots = Vec::new();
+
+        for step in 0..tape.len() {
+            let snapshot = snapshot(&parameters, &tape, step);
+            spots.push(snapshot.spot);
+
+            for chain in &snapshot.chains {
+                let strikes: Vec<String> = chain
+                    .chain
+                    .iter()
+                    .map(|contract| contract.strike_price.to_string())
+                    .collect();
+
+                match &expected {
+                    None => expected = Some(strikes),
+                    Some(expected) => assert_eq!(
+                        &strikes, expected,
+                        "step {step} quotes a different strike set"
+                    ),
+                }
+            }
+        }
+
+        // The property is only worth asserting if the spot actually moved:
+        // a walk that stood still would keep any ladder intact.
+        let lowest = spots.iter().copied().fold(Positive::MAX, Positive::min);
+        let highest = spots.iter().copied().fold(Positive::ZERO, Positive::max);
+        assert!(
+            highest > lowest,
+            "the fixture must move the underlying, got {lowest} to {highest}"
+        );
     }
 
     /// A different seed produces a different snapshot tape.

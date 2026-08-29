@@ -18,6 +18,7 @@
 //! changes between two otherwise-identical replays.
 
 use crate::api::rest::greeks::{GreekLevel, GreeksResponse, greeks_for};
+use crate::domain::ladder::StrikeLadder;
 use crate::domain::series::SeriesSnapshot;
 use crate::session::{ExpiryRule, ExpiryRuleKind, SessionV2};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -134,6 +135,9 @@ pub struct SimulationParametersResponse {
     /// Curvature of the volatility smile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smile_curve: Option<f64>,
+    /// Which strikes the simulation quotes: `rolling` or `pinned`.
+    #[schema(value_type = String)]
+    pub strike_ladder: StrikeLadder,
     /// The constant term of the spread model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
@@ -349,6 +353,7 @@ impl From<&SessionV2> for SimulationParametersResponse {
             strike_interval: parameters.strike_interval.map(|value| value.to_f64()),
             skew_slope: parameters.skew_slope.and_then(|value| value.to_f64()),
             smile_curve: parameters.smile_curve.and_then(|value| value.to_f64()),
+            strike_ladder: parameters.strike_ladder,
             spread: parameters.spread.map(|value| value.to_f64()),
             spread_proportional: parameters
                 .spread_proportional

@@ -26,6 +26,7 @@ use crate::api::rest::validation::{
     time_frame_field,
 };
 use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, tzdb_version};
+use crate::domain::ladder::StrikeLadder;
 use crate::domain::simulator::DEFAULT_CHAIN_SIZE;
 use crate::domain::spread::{MAX_PROPORTIONAL, MAX_TICK, MAX_WIDENING};
 use crate::infrastructure::max_snapshot_contracts;
@@ -269,6 +270,12 @@ pub struct SimulationParametersV2 {
     pub skew_slope: Option<Decimal>,
     /// Curvature of the volatility smile.
     pub smile_curve: Option<Decimal>,
+    /// Which strikes the simulation quotes: `rolling` rebuilds the ladder
+    /// around the spot at every step, `pinned` fixes it at creation so a
+    /// contract quoted once stays quoted. Defaults to `rolling`, which is what
+    /// the service did before the field existed.
+    #[serde(default)]
+    pub strike_ladder: StrikeLadder,
     /// The constant term of the spread model, and the whole of it when no
     /// widening coefficient is set. The field predates the model and keeps its
     /// meaning: one absolute spread, applied to every contract.
@@ -330,6 +337,8 @@ struct SimulationParametersV2Wire {
     smile_curve: Option<Decimal>,
     spread: Option<Positive>,
     #[serde(default)]
+    strike_ladder: StrikeLadder,
+    #[serde(default)]
     spread_proportional: Option<Decimal>,
     #[serde(default)]
     spread_moneyness_widening: Option<Decimal>,
@@ -362,6 +371,7 @@ impl TryFrom<SimulationParametersV2Wire> for SimulationParametersV2 {
             skew_slope: wire.skew_slope,
             smile_curve: wire.smile_curve,
             spread: wire.spread,
+            strike_ladder: wire.strike_ladder,
             spread_proportional: wire.spread_proportional,
             spread_moneyness_widening: wire.spread_moneyness_widening,
             spread_tenor_widening: wire.spread_tenor_widening,
@@ -432,6 +442,17 @@ impl SimulationParametersV2 {
         }
         if let Some(strike_interval) = self.strike_interval {
             reject_zero("strike_interval", strike_interval)?;
+        }
+        // A pinned ladder is a fixed set of strikes on a fixed grid, and
+        // without an explicit interval upstream derives a different one per
+        // expiration: there would be no single ladder to pin. Refused at the
+        // boundary rather than resolved to some arbitrary expiration's
+        // interval, which would be a number nobody asked for.
+        if self.strike_ladder.is_pinned() && self.strike_interval.is_none() {
+            return Err(ChainError::Validation {
+                field: "strike_interval".to_string(),
+                reason: "a pinned strike_ladder requires an explicit strike_interval".to_string(),
+            });
         }
         // The spread model, BOTH bounds, exactly as the request path applies
         // them. A stored `spread_tick` of zero silently disables the floor that
@@ -722,6 +743,7 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
                 .spread
                 .map(|value| positive_field("spread", value))
                 .transpose()?,
+            strike_ladder: request.strike_ladder.unwrap_or_default(),
             // The widening coefficients are rates, not prices: zero is the
             // documented default and a negative one would NARROW a quote away
             // from the money, which is not a market anyone trades.
@@ -1085,6 +1107,7 @@ mod tests {
             skew_slope: Some(-0.2),
             smile_curve: Some(0.4),
             spread: Some(0.02),
+            strike_ladder: Default::default(),
             spread_proportional: None,
             spread_moneyness_widening: None,
             spread_tenor_widening: None,
@@ -1499,6 +1522,92 @@ mod tests {
                 error.to_string().contains("spread_tick"),
                 "the failure must name the field: {error}"
             ),
+        }
+    }
+
+    /// A pinned ladder without an interval is refused, on both paths.
+    ///
+    /// There is no fixed grid to pin without one, and resolving it to some
+    /// expiration's derived interval would be a number the client never chose.
+    #[test]
+    fn test_a_pinned_ladder_requires_an_explicit_interval() {
+        let mut request = reference_request();
+        request.strike_ladder = Some(StrikeLadder::Pinned);
+        request.strike_interval = None;
+
+        match SimulationParametersV2::try_from(request) {
+            Ok(parameters) => {
+                panic!("a pinned ladder with no grid must be refused: {parameters:?}")
+            }
+            Err(ChainError::Validation { field, .. }) => assert_eq!(field, "strike_interval"),
+            Err(error) => panic!("expected a validation failure, got {error:?}"),
+        }
+
+        // And the stored path, since Redis is an outer layer.
+        let mut pinned = reference_request();
+        pinned.strike_ladder = Some(StrikeLadder::Pinned);
+        pinned.strike_interval = Some(25.0);
+        let parameters = parameters(pinned);
+
+        let json = match serde_json::to_value(&parameters) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.remove("strike_interval");
+                serde_json::Value::Object(map)
+            }
+            other => panic!("the parameters must serialize to an object, got {other:?}"),
+        };
+        match serde_json::from_value::<SimulationParametersV2>(json) {
+            Ok(loaded) => panic!("a stored pinned ladder with no grid must be refused: {loaded:?}"),
+            Err(error) => assert!(
+                error.to_string().contains("strike_interval"),
+                "the failure must name the field: {error}"
+            ),
+        }
+    }
+
+    /// The ladder survives a store round trip, and defaults to rolling.
+    #[test]
+    fn test_the_strike_ladder_round_trips() {
+        let mut request = reference_request();
+        request.strike_ladder = Some(StrikeLadder::Pinned);
+        request.strike_interval = Some(25.0);
+        let pinned = parameters(request);
+
+        assert_eq!(pinned.strike_ladder, StrikeLadder::Pinned);
+
+        let json = match serde_json::to_string(&pinned) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+        match serde_json::from_str::<SimulationParametersV2>(&json) {
+            Ok(loaded) => assert_eq!(loaded.strike_ladder, StrikeLadder::Pinned),
+            Err(error) => panic!("must deserialize: {error}"),
+        }
+
+        // A request that says nothing gets the behaviour the service had.
+        let untouched = parameters(reference_request());
+        assert_eq!(untouched.strike_ladder, StrikeLadder::Rolling);
+    }
+
+    /// A document written before the field still loads, as rolling.
+    #[test]
+    fn test_stored_parameters_without_a_strike_ladder_still_load() {
+        let parameters = parameters(reference_request());
+        let json = match serde_json::to_value(&parameters) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.remove("strike_ladder");
+                serde_json::Value::Object(map)
+            }
+            other => panic!("the parameters must serialize to an object, got {other:?}"),
+        };
+
+        match serde_json::from_value::<SimulationParametersV2>(json) {
+            Ok(loaded) => assert_eq!(
+                loaded.strike_ladder,
+                StrikeLadder::Rolling,
+                "an older document must read as the behaviour it was written under"
+            ),
+            Err(error) => panic!("an older document must still load: {error}"),
         }
     }
 

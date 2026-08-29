@@ -10,6 +10,7 @@
 //! (`crate::session::model_v2`).
 
 use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
+use crate::domain::ladder::StrikeLadder;
 use crate::session::ExpiryRule;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -93,6 +94,20 @@ pub struct CreateSimulationRequest {
     /// Curvature of the volatility smile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smile_curve: Option<f64>,
+    /// Which strikes the simulation quotes, `rolling` or `pinned`.
+    ///
+    /// `rolling` — the default, and what the service has always done —
+    /// rebuilds the ladder around the current underlying at every step, so the
+    /// quoted strikes stay near the money and a contract can leave the chain.
+    /// `pinned` fixes the ladder at creation from `initial_price`,
+    /// `chain_size` and `strike_interval`, so a contract quoted once is quoted
+    /// for the simulation's whole life, which is what a client holding a
+    /// position across steps needs. A pinned simulation must supply
+    /// `strike_interval`: without it the interval is derived per expiration and
+    /// there is no fixed grid to pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    pub strike_ladder: Option<StrikeLadder>,
     /// The constant term of the spread model, applied to every contract. On
     /// its own — which is how every request that predates the model reads — it
     /// IS the whole model, exactly as before: one absolute bid-ask spread. A
