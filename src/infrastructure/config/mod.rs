@@ -1,3 +1,8 @@
+//! Environment-driven configuration for every external service.
+//!
+//! One rule holds across all of it, and across every other knob this service
+//! reads: **a blank value is an unset value**. See [`crate::utils::env`].
+
 pub mod clickhouse;
 pub mod mongo;
 pub mod redis;
@@ -8,6 +13,13 @@ pub mod simulation_v2;
 /// how large a batch may be, how long an insert may take, and how long the rows
 /// are kept.
 pub mod snapshot;
+
+/// Reads an environment variable, treating a blank value as unset.
+///
+/// The rule and its rationale live in [`crate::utils::env`], which every layer
+/// of this service reads knobs through. Re-exported here so the configuration
+/// modules read it from their own namespace.
+pub(crate) use crate::utils::env::{read_secret, read_var};
 
 /// Redacts URL userinfo (credentials) from every URL-like substring inside a
 /// larger text (log lines, driver error messages).

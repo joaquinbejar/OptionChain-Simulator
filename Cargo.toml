@@ -2,6 +2,12 @@
 name = "optionchain_simulator"
 version = "0.2.0"
 edition = "2024"
+# The maximum `rust-version` across the RESOLVED graph, not the highest direct
+# dependency: clickhouse 0.15.1, nalgebra 0.35, statrs 0.19.1 and wide 1.7 all
+# require 1.89, so declaring 1.88 would fail inside a dependency instead of
+# saying clearly that this crate needs a newer toolchain. Re-derive it after a
+# bump with `cargo metadata` over the resolved packages' rust_version.
+rust-version = "1.89"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "OptionChain-Simulator is a lightweight REST API service that simulates an evolving option chain with every request. It is designed for developers building or testing trading systems, backtesters, and visual tools that depend on option data streams but want to avoid relying on live data feeds."
 license = "MIT"
@@ -58,7 +64,7 @@ rust_decimal = { version = "1.42", features = ["maths", "serde"] }
 rust_decimal_macros = "1.40"
 serde_json = "1.0"
 serde = "1.0"
-uuid = { version = "1.23", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.26", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 # IANA timezone database for the v2 rolling-expiry calendar: the local
 # expiration cutoff and its DST fold/gap resolution (ADR 0001, issue #43)
@@ -67,11 +73,11 @@ chrono-tz = { version = "0.10", features = ["serde"] }
 # Write sink so a multi-year download stays bounded-memory (ADR 0001, issue #49)
 csv = "1.4"
 clickhouse = "0.15"
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 async-trait = "0.1"
-actix-web = { version = "4.14", features = ["rustls"] }
-actix-files = "0.6"
-redis = { version = "1.3", features = ["tokio-comp", "connection-manager"] }
+actix-web = { version = "4.15", features = ["rustls"] }
+actix-files = "0.7"
+redis = { version = "1.6", features = ["tokio-comp", "connection-manager"] }
 # actix_extras is unavailable: optionstratlib enables utoipa/axum_extras,
 # and utoipa's framework extras are mutually exclusive
 utoipa = "5.5"

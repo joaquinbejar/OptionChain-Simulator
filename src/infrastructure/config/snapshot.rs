@@ -26,7 +26,6 @@ use crate::infrastructure::config::simulation_v2::{
     DEFAULT_MAX_SNAPSHOT_CONTRACTS, max_snapshot_contracts,
 };
 use crate::utils::ChainError;
-use std::env;
 use std::time::Duration;
 use tracing::info;
 
@@ -228,7 +227,10 @@ fn parse_bounded_usize(
         return Ok(default);
     };
 
-    let value = raw.parse::<usize>().map_err(|_| invalid(variable, raw))?;
+    let value = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| invalid(variable, raw))?;
     if value == 0 {
         return Err(zero(variable));
     }
@@ -249,7 +251,10 @@ fn parse_bounded_u64(
         return Ok(default);
     };
 
-    let value = raw.parse::<u64>().map_err(|_| invalid(variable, raw))?;
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| invalid(variable, raw))?;
     if value == 0 {
         return Err(zero(variable));
     }
@@ -270,7 +275,10 @@ fn parse_bounded_u32(
         return Ok(default);
     };
 
-    let value = raw.parse::<u32>().map_err(|_| invalid(variable, raw))?;
+    let value = raw
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| invalid(variable, raw))?;
     if value == 0 {
         return Err(zero(variable));
     }
@@ -306,20 +314,9 @@ fn too_large(variable: &str, value: &str, max: &str) -> ChainError {
     }
 }
 
-/// Reads a variable, treating an empty or whitespace-only value as unset.
-///
-/// A blank value in a `.env` file is how a knob gets "commented out" in
-/// practice; treating it as unset is friendlier than failing startup over it,
-/// and unambiguous either way.
-fn read(variable: &str) -> Option<String> {
-    let raw = env::var(variable).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
+/// Reads a variable, treating a blank value as unset. The rule lives in
+/// [`crate::utils::env`], which every layer of this service shares.
+use super::read_var as read;
 
 /// The error for a value that does not parse.
 #[cold]

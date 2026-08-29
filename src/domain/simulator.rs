@@ -67,20 +67,22 @@ const HISTORICAL_STREAM_SALT: u64 = 0x0048_4953_544F_5259;
 /// parse-once pattern in `api::rest::limits` but lives in the domain layer to keep
 /// the dependency flow api -> session -> domain intact.
 static MAX_CACHED_WALKS: LazyLock<usize> =
-    LazyLock::new(|| match std::env::var("OCS_MAX_CACHED_WALKS").ok() {
-        None => DEFAULT_MAX_CACHED_WALKS,
-        Some(value) => match value.trim().parse::<usize>() {
-            Ok(parsed) if parsed >= 1 => parsed,
-            _ => {
-                warn!(
-                    raw = %value,
-                    default = DEFAULT_MAX_CACHED_WALKS,
-                    "invalid OCS_MAX_CACHED_WALKS; falling back to default"
-                );
-                DEFAULT_MAX_CACHED_WALKS
-            }
+    LazyLock::new(
+        || match crate::utils::env::read_var("OCS_MAX_CACHED_WALKS") {
+            None => DEFAULT_MAX_CACHED_WALKS,
+            Some(value) => match value.trim().parse::<usize>() {
+                Ok(parsed) if parsed >= 1 => parsed,
+                _ => {
+                    warn!(
+                        raw = %value,
+                        default = DEFAULT_MAX_CACHED_WALKS,
+                        "invalid OCS_MAX_CACHED_WALKS; falling back to default"
+                    );
+                    DEFAULT_MAX_CACHED_WALKS
+                }
+            },
         },
-    });
+    );
 
 /// One cached random walk together with the last time it was accessed.
 ///

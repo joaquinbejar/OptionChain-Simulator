@@ -1,4 +1,4 @@
-use std::{env, fmt};
+use std::fmt;
 
 /// Configuration for a Redis connection
 ///
@@ -32,8 +32,8 @@ pub struct RedisConfig {
 /// (a hung server could then hold a worker forever), so `0`, non-numeric, and
 /// unset values all fall back to `default` — invalid ones with a warning.
 fn parse_timeout_secs(var: &str, default: u64) -> u64 {
-    match env::var(var) {
-        Ok(raw) => match raw.parse::<u64>() {
+    match super::read_var(var) {
+        Some(raw) => match raw.parse::<u64>() {
             Ok(v) if v >= 1 => v,
             _ => {
                 tracing::warn!(
@@ -45,7 +45,7 @@ fn parse_timeout_secs(var: &str, default: u64) -> u64 {
                 default
             }
         },
-        Err(_) => default,
+        None => default,
     }
 }
 
@@ -88,24 +88,33 @@ impl RedisConfig {
 
 impl Default for RedisConfig {
     fn default() -> Self {
-        let port = env::var("REDIS_PORT")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
+        // Trimmed at the call site: these are numbers, so surrounding
+        // whitespace is noise. The credentials below are not trimmed at all.
+        let port = super::read_var("REDIS_PORT")
+            .and_then(|s| s.trim().parse::<u16>().ok())
             .unwrap_or(6379);
 
-        let database = env::var("REDIS_DB")
-            .ok()
-            .and_then(|s| s.parse::<u8>().ok())
+        let database = super::read_var("REDIS_DB")
+            .and_then(|s| s.trim().parse::<u8>().ok())
             .unwrap_or(0);
 
-        let username = env::var("REDIS_USER").ok();
-        let password = env::var("REDIS_PASSWORD").ok();
+        // Blank is unset HERE, unlike ClickHouse: `REDIS_USER=` and
+        // `REDIS_PASSWORD=` used to become `Some("")` and build
+        // `redis://:@host`, an AUTH attempt with an empty password against a
+        // server that has none. An empty Redis credential asks for exactly what
+        // an absent one does, so nothing is expressible only through the blank
+        // form and the failure mode is real. Untrimmed, like every credential:
+        // whatever a present, non-blank value says is what gets sent.
+        let username = super::read_var("REDIS_USER");
+        let password = super::read_var("REDIS_PASSWORD");
 
         let timeout = parse_timeout_secs("REDIS_TIMEOUT", 30);
         let connect_timeout = parse_timeout_secs("REDIS_CONNECT_TIMEOUT", 5);
 
         Self {
-            host: env::var("REDIS_HOST").unwrap_or_else(|_| "localhost".to_string()),
+            host: super::read_var("REDIS_HOST")
+                .map(|host| host.trim().to_string())
+                .unwrap_or_else(|| "localhost".to_string()),
             port,
             username,
             password,
@@ -153,15 +162,96 @@ mod tests {
     fn set_var(name: &str, value: &str) {
         #[allow(unused_unsafe)]
         unsafe {
-            env::set_var(name, value);
+            std::env::set_var(name, value);
         }
     }
 
     fn remove_var(name: &str) {
         #[allow(unused_unsafe)]
         unsafe {
-            env::remove_var(name);
+            std::env::remove_var(name);
         }
+    }
+
+    /// A blank credential is an unset credential, not an empty one.
+    ///
+    /// The failure this closes: `REDIS_PASSWORD=` used to become `Some("")`,
+    /// which built `redis://:@host:6379` — an AUTH attempt with an empty
+    /// password against a server that has none. The connection failed with an
+    /// authentication error that pointed nowhere near the actual cause, and
+    /// `.env.example` shipped exactly that line.
+    #[test]
+    fn test_a_blank_credential_reads_as_unset() {
+        let _guard = match ENV_MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        remove_var("REDIS_HOST");
+        remove_var("REDIS_PORT");
+        remove_var("REDIS_DB");
+        remove_var("REDIS_TIMEOUT");
+        remove_var("REDIS_CONNECT_TIMEOUT");
+
+        for blank in ["", "   "] {
+            set_var("REDIS_USER", blank);
+            set_var("REDIS_PASSWORD", blank);
+
+            let config = RedisConfig::default();
+            assert_eq!(config.username, None, "user {blank:?} must read as unset");
+            assert_eq!(
+                config.password, None,
+                "password {blank:?} must read as unset"
+            );
+            assert!(
+                !config.url().contains('@'),
+                "a password-less server must get a URL with no userinfo, got {}",
+                config.url()
+            );
+        }
+
+        remove_var("REDIS_USER");
+        remove_var("REDIS_PASSWORD");
+    }
+
+    /// A credential that is actually set still reaches the URL unchanged.
+    ///
+    /// The other half of the rule: treating blank as unset must not touch a
+    /// real value, including one with punctuation a URL would otherwise eat.
+    #[test]
+    fn test_a_real_credential_reaches_the_url_unchanged() {
+        let _guard = match ENV_MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        remove_var("REDIS_HOST");
+        remove_var("REDIS_PORT");
+        remove_var("REDIS_DB");
+        remove_var("REDIS_TIMEOUT");
+        remove_var("REDIS_CONNECT_TIMEOUT");
+        remove_var("REDIS_USER");
+
+        // Two separate claims. The RESOLVED value must survive verbatim,
+        // punctuation included, which is what blank-is-unset must not disturb.
+        set_var("REDIS_PASSWORD", "s3cr:t@pass");
+        assert_eq!(
+            RedisConfig::default().password,
+            Some("s3cr:t@pass".to_string()),
+            "a real password must reach the config untouched"
+        );
+
+        // That it also reaches the URL is asserted with a plain password on
+        // purpose. `url()` does no percent-encoding, so asserting the
+        // punctuated one round-trips through the URL would freeze that gap as
+        // intended behaviour rather than leave it a known one.
+        set_var("REDIS_PASSWORD", "s3cret");
+        let config = RedisConfig::default();
+        assert!(
+            config.url().contains("s3cret"),
+            "the password must reach the URL, got {}",
+            config.url()
+        );
+
+        remove_var("REDIS_PASSWORD");
     }
 
     #[test]

@@ -124,23 +124,28 @@ services:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
-      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT-8123}
-      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST-clickhouse}
-      MONGODB_URI: ${MONGODB_URI-mongodb://admin:password@mongodb:27017}
-      MONGODB_DATABASE: ${MONGODB_DATABASE-optionchain_simulator}
-      MONGODB_STEPS_COLLECTION: ${MONGODB_STEPS_COLLECTION-steps}
-      MONGODB_EVENTS_COLLECTION: ${MONGODB_EVENTS_COLLECTION-events}
-      MONGODB_TIMEOUT: ${MONGODB_TIMEOUT-30}
-      REDIS_PORT: ${REDIS_PORT-6379}
-      REDIS_DB: ${REDIS_DB-0}
-      REDIS_USER: ${REDIS_USER}
-      REDIS_PASSWORD: ${REDIS_PASSWORD-password}
-      REDIS_HOST: ${REDIS_HOST-redis}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      MONGODB_URI: ${MONGODB_URI:-mongodb://admin:password@mongodb:27017}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-optionchain_simulator}
+      MONGODB_STEPS_COLLECTION: ${MONGODB_STEPS_COLLECTION:-steps}
+      MONGODB_EVENTS_COLLECTION: ${MONGODB_EVENTS_COLLECTION:-events}
+      MONGODB_TIMEOUT: ${MONGODB_TIMEOUT:-30}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_DB: ${REDIS_DB:-0}
+      # `:-`, not `-`, on every line above and below: `${VAR-default}` only
+      # substitutes when the variable is UNSET, so a blank one in the repo's
+      # `.env` reached the container as "" and the app answered with its own
+      # default, which inside a container points at localhost. `:-` covers
+      # blank too, which is what the service now means by unset.
+      REDIS_USER: ${REDIS_USER:-}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-password}
+      REDIS_HOST: ${REDIS_HOST:-redis}
       # Whole seconds, must parse as an integer >= 1: src/infrastructure/config
       # /redis.rs falls back to these same defaults (30 / 5) on 0, on a
       # non-numeric value, or when unset, warning as it does so.
-      REDIS_TIMEOUT: ${REDIS_TIMEOUT-30}
-      REDIS_CONNECT_TIMEOUT: ${REDIS_CONNECT_TIMEOUT-5}
+      REDIS_TIMEOUT: ${REDIS_TIMEOUT:-30}
+      REDIS_CONNECT_TIMEOUT: ${REDIS_CONNECT_TIMEOUT:-5}
     ports:
       - "7070:7070"
     networks:

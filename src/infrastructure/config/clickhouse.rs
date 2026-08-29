@@ -1,6 +1,5 @@
 //! This module defines the `ClickHouseConfig` struct and its default implementation.
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::fmt;
 
 /// Configuration structure for connecting to a ClickHouse server.
@@ -55,17 +54,35 @@ impl Default for ClickHouseConfig {
     /// # Returns
     /// A new instance of the struct with properly initialized fields.
     fn default() -> Self {
-        let port = env::var("CLICKHOUSE_PORT")
-            .ok()
-            .and_then(|s| s.parse::<u16>().ok())
+        // Trimmed HERE, not in the reader: a port is a number, so surrounding
+        // whitespace is noise, while the credentials below are opaque bytes
+        // where it is not.
+        let port = super::read_var("CLICKHOUSE_PORT")
+            .and_then(|s| s.trim().parse::<u16>().ok())
             .unwrap_or(8123);
 
         Self {
-            host: env::var("CLICKHOUSE_HOST").unwrap_or_else(|_| "localhost".to_string()),
+            host: super::read_var("CLICKHOUSE_HOST")
+                .map(|host| host.trim().to_string())
+                .unwrap_or_else(|| "localhost".to_string()),
             port,
-            username: env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "admin".to_string()),
-            password: env::var("CLICKHOUSE_PASSWORD").unwrap_or_else(|_| "password".to_string()),
-            database: env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "default".to_string()),
+            // Credentials read through `read_secret`, NOT `read_var`: the
+            // blank-is-unset rule does not apply to them, because an empty
+            // ClickHouse password is a real configuration. A stock `default`
+            // user has none, and `CLICKHOUSE_PASSWORD=` is the only way to say
+            // so through the environment. They are also never trimmed: a
+            // credential's surrounding whitespace is part of the credential,
+            // and nothing here can tell that it is not.
+            // The USER follows the ordinary rule: an empty ClickHouse user is
+            // not a configuration any server accepts, so a blank one is a knob
+            // someone commented out. Untrimmed all the same, since a user name
+            // is not this module's to reinterpret.
+            username: super::read_var("CLICKHOUSE_USER").unwrap_or_else(|| "admin".to_string()),
+            password: super::read_secret("CLICKHOUSE_PASSWORD")
+                .unwrap_or_else(|| "password".to_string()),
+            database: super::read_var("CLICKHOUSE_DB")
+                .map(|database| database.trim().to_string())
+                .unwrap_or_else(|| "default".to_string()),
         }
     }
 }
@@ -105,6 +122,46 @@ mod tests {
         #[allow(unused_unsafe)]
         unsafe {
             env::remove_var(name);
+        }
+    }
+
+    /// A blank ClickHouse credential is unset, so its default applies.
+    ///
+    /// The same rule as Redis and Mongo (issue #83): a blank value in a `.env`
+    /// file is a commented-out knob, and an empty credential is never what
+    /// somebody meant.
+    #[test]
+    fn test_blank_clickhouse_variables_fall_back_to_their_defaults() {
+        let _guard = match ENV_MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        for blank in ["", "  "] {
+            set_var("CLICKHOUSE_HOST", blank);
+            set_var("CLICKHOUSE_USER", blank);
+            set_var("CLICKHOUSE_PASSWORD", blank);
+            set_var("CLICKHOUSE_DB", blank);
+            set_var("CLICKHOUSE_PORT", blank);
+
+            let config = ClickHouseConfig::default();
+            assert_eq!(config.host, "localhost", "blank {blank:?}");
+            assert_eq!(config.username, "admin");
+            assert_eq!(config.database, "default");
+            assert_eq!(config.port, 8123);
+            // The PASSWORD is the documented exception: a present variable is
+            // a credential, empty included, so it does not fall back here.
+            assert_eq!(config.password, blank, "blank {blank:?}");
+        }
+
+        for name in [
+            "CLICKHOUSE_HOST",
+            "CLICKHOUSE_USER",
+            "CLICKHOUSE_PASSWORD",
+            "CLICKHOUSE_DB",
+            "CLICKHOUSE_PORT",
+        ] {
+            remove_var(name);
         }
     }
 
