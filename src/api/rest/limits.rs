@@ -11,6 +11,7 @@
 //! | `OCS_MAX_STEPS`            | `10_000`  | Max simulation steps per session         |
 //! | `OCS_MAX_CHAIN_SIZE`       | `500`     | Max option-chain size per request        |
 //! | `OCS_MAX_HISTORICAL_PRICES`| `100_000` | Max historical prices in a walk request  |
+//! | `OCS_EXPORT_BLOCK_ROWS`    | `4_096`   | Rows per block in a binary export        |
 
 use std::sync::LazyLock;
 use tracing::warn;
@@ -21,6 +22,14 @@ pub(crate) const DEFAULT_MAX_STEPS: usize = 10_000;
 pub(crate) const DEFAULT_MAX_CHAIN_SIZE: usize = 500;
 /// Default cap on the number of historical prices in a `Historical` walk request.
 pub(crate) const DEFAULT_MAX_HISTORICAL_PRICES: usize = 100_000;
+/// Default number of rows in one binary export block.
+///
+/// The binary encodings are columnar, so a column cannot be written until its
+/// last row is known: rows are therefore buffered a block at a time, and this
+/// is what the export's memory is a function of instead of the number of steps.
+/// Four thousand rows of the widest dataset is a few megabytes, small enough to
+/// stream and wide enough that the per-block overhead disappears.
+pub(crate) const DEFAULT_EXPORT_BLOCK_ROWS: usize = 4_096;
 
 /// Maximum number of simulation steps a session may request (`OCS_MAX_STEPS`).
 pub(crate) static MAX_STEPS: LazyLock<usize> = LazyLock::new(|| {
@@ -36,6 +45,31 @@ pub(crate) static MAX_CHAIN_SIZE: LazyLock<usize> = LazyLock::new(|| {
         crate::utils::env::read_var("OCS_MAX_CHAIN_SIZE"),
         DEFAULT_MAX_CHAIN_SIZE,
     )
+});
+
+/// The widest a binary export block may be configured.
+///
+/// This knob sets the export's memory floor directly — a block is buffered
+/// whole before it is written — so it is the one limit whose own upper bound
+/// matters. A quarter of a million rows of the widest dataset is already
+/// hundreds of megabytes.
+pub(crate) const MAX_EXPORT_BLOCK_ROWS: usize = 262_144;
+
+/// Rows per block in the binary export encodings (`OCS_EXPORT_BLOCK_ROWS`).
+pub(crate) static EXPORT_BLOCK_ROWS: LazyLock<usize> = LazyLock::new(|| {
+    let configured = parse_limit(
+        crate::utils::env::read_var("OCS_EXPORT_BLOCK_ROWS"),
+        DEFAULT_EXPORT_BLOCK_ROWS,
+    );
+    if configured > MAX_EXPORT_BLOCK_ROWS {
+        warn!(
+            configured,
+            maximum = MAX_EXPORT_BLOCK_ROWS,
+            "OCS_EXPORT_BLOCK_ROWS above the maximum; using the maximum"
+        );
+        return MAX_EXPORT_BLOCK_ROWS;
+    }
+    configured
 });
 
 /// Maximum number of historical prices a `Historical` walk may carry
@@ -137,5 +171,8 @@ mod tests {
         assert_eq!(*MAX_CHAIN_SIZE, 500);
         assert_eq!(*MAX_HISTORICAL_PRICES, DEFAULT_MAX_HISTORICAL_PRICES);
         assert_eq!(*MAX_HISTORICAL_PRICES, 100_000);
+        assert_eq!(*EXPORT_BLOCK_ROWS, DEFAULT_EXPORT_BLOCK_ROWS);
+        assert_eq!(*EXPORT_BLOCK_ROWS, 4_096);
+        assert_eq!(MAX_EXPORT_BLOCK_ROWS, 262_144);
     }
 }

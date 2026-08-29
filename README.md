@@ -382,7 +382,7 @@ deliberately different failure behaviour:
 
 - **Request caps** — `OCS_MAX_STEPS`, `OCS_MAX_CHAIN_SIZE`,
   `OCS_MAX_HISTORICAL_PRICES`, `OCS_MAX_CONCURRENT_PRICING_JOBS`,
-  `OCS_MAX_CACHED_WALKS` — warn and fall back
+  `OCS_MAX_CACHED_WALKS`, `OCS_EXPORT_BLOCK_ROWS` — warn and fall back
   to their defaults when set to something invalid. A bad value there
   degrades one request.
 - **v2 operational knobs** — `OCS_V2_RETENTION_SECS`,
@@ -435,7 +435,7 @@ has walked, every step is replayed. Either source renders the same bytes.
 | Parameter | Values |
 |-----------|--------|
 | `dataset` | `underlying` \| `volatility` \| `option_chains` |
-| `format`  | `json` \| `csv` |
+| `format`  | `json` \| `csv` \| `arrow` \| `packed` |
 | `from_step`, `to_step` | inclusive bounds; default to the whole tape |
 | `greeks` | `none` (default) \| `first` \| `all` — `option_chains` only |
 
@@ -471,6 +471,86 @@ Measured on a 5 996-row export, release build:
 `first` and `all` cost the same to compute — upstream builds the snapshot
 whole and the level only decides what is written — so the step from `first`
 to `all` is paid in bytes, not in time.
+
+#### The binary encodings
+
+`json` and `csv` are text, so every consumer pays a parse, and for the two
+that matter that parse IS the bottleneck: a browser materialising a whole
+tape spends hundreds of milliseconds in `JSON.parse` and allocates an object
+per row, and a Rust consumer writing Parquet re-parses text this service
+already held in typed form.
+
+- **`arrow`** — an Arrow IPC **stream**, one record batch per block.
+  `Content-Type: application/vnd.apache.arrow.stream`, extension `arrow`.
+  Available only when the service is built with the **`arrow-export`**
+  feature, which is off by default because the `arrow` crate is a large tree
+  and a deployment that never exports should not carry it. Asking for
+  `format=arrow` without it is a typed `400` naming the format, never a 500
+  and never a silent fallback.
+- **`packed`** — a dependency-free columnar block format for the browser.
+  `Content-Type: application/octet-stream`, extension `ocsp`.
+
+Both carry the **same column names in the same order as the CSV header**, so
+a reader moves between encodings without a mapping table, and both are
+`f64` for every numeric column — exactly what `json` and `csv` render.
+Binary is a faster route to the same numbers, NOT a route to the underlying
+`Decimal(38, 28)` precision.
+
+**Both stream, in blocks.** A columnar encoding cannot emit a column until
+its last row is known, so rows are buffered `OCS_EXPORT_BLOCK_ROWS` at a
+time (default 4096) and written a block at a time. An export's memory is
+therefore a function of the block width and not of the number of steps.
+
+The `packed` layout, little-endian throughout:
+
+```
+file        := header block* footer
+header      := "OCSP" u32:version u32:block_rows
+               u32:dictionary_count dictionary_entry*
+               u32:column_count column_desc*
+               pad to 8
+dict_entry  := u32:len utf8:value             (the symbol, then the rule ids)
+column_desc := u32:name_len utf8:name u8:type_code u8:nullable pad to 4
+block       := u32:row_count pad to 8 column_payload*
+payload     := [validity bitmap if nullable, padded to 8] values, padded to 8
+footer      := u32:0xFFFFFFFF pad to 8 u64:total_rows
+```
+
+**The footer is required, and a decoder must check it.** No block can carry
+`0xFFFFFFFF` rows, so that value is what says the blocks have ended, and the
+`u64` after it is the total the writer emitted. A document that ends without
+it was truncated and must be REJECTED rather than read as a shorter tape:
+the response is a 200 whose header goes out before the first byte is
+produced, so a dropped connection is otherwise indistinguishable from a
+smaller export. A total that disagrees with the blocks is the same error.
+
+Type codes: `0` = `f64`, `1` = `i64`, `2` = timestamp in nanoseconds since
+the epoch, `3` = an index into the header dictionary, `4` = a **label
+bitmask**, one bit per dictionary entry. Every payload starts on an 8-byte
+boundary, which is the whole point: it is what lets a browser do
+`new Float64Array(buffer, offset, count)` with no copy, and an unaligned
+offset would make that constructor throw. Validity bitmaps follow Arrow's
+convention — LSB-first, `1` = valid — so one decoder serves both formats,
+and a null is a cleared bit rather than a sentinel or a NaN, which are
+values a chain can legitimately hold.
+
+Keeping the text columns out of the blocks is what the dictionary is for:
+the symbol is fixed for a simulation and the schedule's rule ids are fixed
+by its parameters, so both are known before the first row. `labels` is a
+bitmask over those rule ids, and joining the bits it sets reproduces the
+`csv` column character for character, since both orders are lexicographic.
+A simulation is capped at 16 schedule rules at creation, well inside the 63
+a mask carries, and a compile-time assertion keeps the two from drifting
+apart.
+
+Measured on the reference fixture at `greeks=all`, release build:
+
+| Format | Bytes | Wall time |
+|--------|-------|-----------|
+| `json` | 79 888 | 9.7 ms |
+| `csv` | 46 819 | 7.8 ms |
+| `arrow` | 29 640 | 6.5 ms |
+| `packed` | 22 808 | 6.1 ms |
 
 **Deterministic.** Repeating an export is byte-identical: every value is a
 function of the effective parameters and the cursor, timestamps render as
