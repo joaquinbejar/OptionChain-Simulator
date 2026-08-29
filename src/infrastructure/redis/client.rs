@@ -1,5 +1,6 @@
 use crate::infrastructure::config::redact_userinfo;
 use crate::infrastructure::config::redis::RedisConfig;
+use crate::utils::ChainError;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{AsyncCommands, Client, FromRedisValue, RedisError, RedisResult, ToSingleRedisArg};
 use std::time::Duration;
@@ -176,6 +177,35 @@ impl RedisClient {
         let mut conn = self.manager.clone();
         debug!("Checking if key '{}' exists in Redis", key);
         conn.exists(key).await
+    }
+
+    /// Asks the server whether it is there.
+    ///
+    /// `PING` and nothing else: a readiness probe must cost the server less
+    /// than the requests it gates, and it must not depend on any key existing.
+    /// The connection manager reconnects on its own, so a probe that failed
+    /// while Redis was down starts succeeding again without a restart.
+    ///
+    /// `pub(crate)`, and on [`ChainError`] rather than the driver's own result
+    /// type: the driver error boundary stops here, at the adapter, so nothing
+    /// above infrastructure ever pattern-matches a `redis::RedisError`. The only
+    /// caller is the in-crate readiness probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Internal`] when the server is unreachable or does
+    /// not answer within [`RedisConfig::timeout`], credential-redacted, since a
+    /// driver error can echo the connection URL back.
+    #[instrument(skip(self), level = "debug")]
+    pub(crate) async fn ping(&self) -> Result<(), ChainError> {
+        let mut conn = self.manager.clone();
+        debug!("Pinging Redis");
+        redis::cmd("PING")
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|error| {
+                ChainError::Internal(redact_userinfo(&format!("Failed to ping Redis: {error}")))
+            })
     }
 
     /// Returns the Redis configuration

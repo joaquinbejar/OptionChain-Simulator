@@ -895,6 +895,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SimulationSnapshotRepository for RecordingWarehouse {
+        /// No server behind it; reachable exactly as long as the process is.
+        async fn ping(&self) -> Result<(), ChainError> {
+            Ok(())
+        }
+
         async fn persist(&self, record: SnapshotRecord) -> Result<(), ChainError> {
             if self.fail {
                 return Err(ChainError::Internal("the warehouse is down".to_string()));
@@ -948,6 +953,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SimulationSnapshotRepository for StallingWarehouse {
+        /// No server behind it; reachable exactly as long as the process is.
+        async fn ping(&self) -> Result<(), ChainError> {
+            Ok(())
+        }
+
         async fn persist(&self, _record: SnapshotRecord) -> Result<(), ChainError> {
             self.started.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<()>().await;

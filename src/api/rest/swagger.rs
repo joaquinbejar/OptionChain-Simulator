@@ -15,6 +15,8 @@ use utoipa::OpenApi;
         crate::api::rest::handlers_v2::advance_simulation,
         crate::api::rest::handlers_v2::delete_simulation,
         crate::api::rest::export::export_simulation,
+        crate::api::rest::health::health,
+        crate::api::rest::health::ready,
     ),
     components(
         schemas(
@@ -39,10 +41,16 @@ use utoipa::OpenApi;
             crate::api::rest::greeks::FirstOrderGreeks,
             crate::api::rest::greeks::FullGreeks,
             crate::api::rest::greeks::GreekLevel,
+            crate::api::rest::health::HealthResponse,
+            crate::api::rest::health::ReadinessResponse,
+            crate::api::rest::health::DependencyStatus,
+            crate::api::rest::health::DependencyState,
+            crate::api::rest::health::ReadinessState,
         )
     ),
     tags(
-        (name = "Options-Simulator", description = "Options Simulator endpoints")
+        (name = "Options-Simulator", description = "Options Simulator endpoints"),
+        (name = "Operations", description = "Liveness and readiness probes")
     )
 )]
 pub(crate) struct ApiDoc;

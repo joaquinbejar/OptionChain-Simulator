@@ -4,8 +4,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
 
+use crate::api::rest::health::PROBE_PATHS;
 use crate::api::rest::routes::configure_routes;
-use crate::infrastructure::{ListenOn, MetricsCollector, MetricsMiddleware, MongoDBRepository};
+use crate::infrastructure::{
+    ListenOn, MetricsCollector, MetricsMiddleware, MongoDBRepository, Readiness,
+};
 
 /// Starts an HTTP server with the given configuration.
 ///
@@ -16,6 +19,7 @@ use crate::infrastructure::{ListenOn, MetricsCollector, MetricsMiddleware, Mongo
 /// * `snapshots` - The v2 snapshot warehouse, when snapshot persistence is enabled. It is the same
 ///   repository the manager files snapshots into, shared so the v2 export can read them back and
 ///   prefer a persisted step over replaying it. `None` leaves the export replaying every step.
+/// * `readiness` - The dependency probes `GET /ready` runs.
 /// * `listen_on` - The address or hostname where the server will listen, typically an IP address or hostname.
 /// * `port` - The port number on which the server will accept requests.
 ///
@@ -48,6 +52,7 @@ pub async fn start_server(
     mongodb_repo: Arc<MongoDBRepository>,
     listen_on: ListenOn,
     port: u16,
+    readiness: Readiness,
 ) -> std::io::Result<()> {
     // A `SocketAddr`, not a formatted string: an IPv6 literal needs brackets,
     // and `format!("{listen_on}:{port}")` would log `http://::1:7070`, which is
@@ -58,7 +63,10 @@ pub async fn start_server(
 
     HttpServer::new(move || {
         App::new()
-            .wrap(MetricsMiddleware::new(metrics_collector.clone()))
+            // The probe routes are excluded: an orchestrator polls them every
+            // few seconds forever, and counting that constant would bury the
+            // traffic the metrics exist to describe.
+            .wrap(MetricsMiddleware::new(metrics_collector.clone()).excluding(&PROBE_PATHS))
             .configure(|cfg| {
                 configure_routes(
                     cfg,
@@ -66,6 +74,7 @@ pub async fn start_server(
                     simulation_manager.clone(),
                     metrics_collector.clone(),
                     mongodb_repo.clone(),
+                    readiness.clone(),
                 )
             })
     })

@@ -21,6 +21,16 @@ impl MongoDBRepository {
         Self { client }
     }
 
+    /// Asks MongoDB whether it is there, for the readiness probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Internal`] when the server does not answer; the
+    /// message is credential-redacted.
+    pub async fn ping(&self) -> Result<(), ChainError> {
+        self.client.ping().await
+    }
+
     /// Saves a chain response to the steps collection
     #[instrument(skip(self, chain_data, metrics), level = "debug")]
     pub async fn save_chain_step(

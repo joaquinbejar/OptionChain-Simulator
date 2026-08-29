@@ -154,6 +154,25 @@ services:
       # Both sides of the mapping below read the same variable, so moving the
       # service off 7070 is one edit rather than two that can disagree.
       OCS_PORT: ${OCS_PORT:-7070}
+    # `/ready`, not `/health`: the point of the check is that compose reports
+    # the backend healthy only once it can actually serve a request, which
+    # means after Redis, MongoDB and (when persistence is on) ClickHouse
+    # answer. `wget` is busybox's, present in the alpine runtime image, and it
+    # exits non-zero on the 503 the endpoint returns while a dependency is
+    # down, which is exactly the signal compose reads.
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "wget -T 3 -q -O /dev/null http://127.0.0.1:${OCS_PORT:-7070}/ready",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # Startup connects to Redis and MongoDB and may create the ClickHouse
+      # schema, so the first probes are expected to fail rather than to count
+      # against the retries.
+      start_period: 20s
     ports:
       - "${OCS_PORT:-7070}:${OCS_PORT:-7070}"
     networks:

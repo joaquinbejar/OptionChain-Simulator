@@ -1,5 +1,6 @@
 mod clickhouse;
 mod config;
+pub mod health;
 mod mongodb;
 mod redis;
 mod repositories;
@@ -33,6 +34,10 @@ pub use config::snapshot::{
     DEFAULT_SNAPSHOT_BATCH_ROWS, DEFAULT_SNAPSHOT_INSERT_TIMEOUT_SECS,
     DEFAULT_SNAPSHOT_MAX_READ_ROWS, DEFAULT_SNAPSHOT_PERSISTENCE_ENABLED,
     DEFAULT_SNAPSHOT_RETENTION_DAYS, SnapshotPersistenceConfig,
+};
+pub use health::{
+    DependencyProbe, DependencyReport, MongoDbProbe, ProbeFailure, Readiness, RedisProbe,
+    WarehouseProbe,
 };
 pub use redis::RedisClient;
 pub use repositories::historical_repo::ClickHouseHistoricalRepository;

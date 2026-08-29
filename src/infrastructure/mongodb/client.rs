@@ -141,6 +141,35 @@ impl MongoDBClient {
         Ok(())
     }
 
+    /// Asks the server whether it is there.
+    ///
+    /// The same `{ping: 1}` the constructor runs: a no-auth, cheap command that
+    /// says the deployment answered, and nothing about any one collection.
+    ///
+    /// The mutex is released BEFORE the command is awaited. Held across it, a
+    /// probe against an unreachable server would pin the handle for the probe's
+    /// whole timeout, and every `save_step` and `save_event` on the request
+    /// path would block behind a health check that is polled on a timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Internal`] when the command fails, with the
+    /// message passed through `redact_userinfo`: driver errors echo the
+    /// connection URI, and a readiness body is a public surface.
+    #[instrument(skip(self), level = "debug")]
+    pub async fn ping(&self) -> Result<(), ChainError> {
+        // `Database` is a cheap handle; cloning it costs a refcount and buys
+        // back the lock immediately.
+        let db = {
+            let guard = self.db.lock().await;
+            guard.clone()
+        };
+        db.run_command(doc! {"ping": 1}).await.map_err(|e| {
+            ChainError::Internal(redact_userinfo(&format!("Failed to ping MongoDB: {}", e)))
+        })?;
+        Ok(())
+    }
+
     /// Returns the MongoDB configuration
     pub fn get_config(&self) -> &MongoDBConfig {
         &self.config
