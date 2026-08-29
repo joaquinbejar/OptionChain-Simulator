@@ -319,6 +319,19 @@ deliberately different failure behaviour:
   silently reverting a cache bound would change the service's memory
   profile with nothing to show for it.
 
+**Where the server listens** — `OCS_BIND_ADDRESS` (an IP address, or the
+words `all` and `localhost`) and `OCS_PORT` (`1..=65535`) — is configurable
+and validated at startup like the second family: two instances quietly
+fighting over one port is worse than a refusal. The address now defaults to
+**loopback**, where it used to be a hardcoded `0.0.0.0`; this service has no
+authentication and no rate limiting, so reachability off the host is a
+decision. A deployment that relied on the old default must set
+`OCS_BIND_ADDRESS=0.0.0.0` — `Docker/docker-compose.yml` sets it and the dev
+override inherits it. Configuring
+the port is what makes it possible to shard tape materialisation across
+several instances on one host, which is embarrassingly parallel work: each
+simulation is independent and shares no state.
+
 **v2 retention is real time, not simulated time.** A simulation whose
 simulated clock spans three years is still walked one request at a time, so
 its idle window is an operational choice independent of the horizon. It

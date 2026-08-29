@@ -1,12 +1,11 @@
-use crate::api::rest::models::ListenOn;
-
 use crate::session::{SessionManager, SimulationManager};
 use actix_web::{App, HttpServer};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
 
 use crate::api::rest::routes::configure_routes;
-use crate::infrastructure::{MetricsCollector, MetricsMiddleware, MongoDBRepository};
+use crate::infrastructure::{ListenOn, MetricsCollector, MetricsMiddleware, MongoDBRepository};
 
 /// Starts an HTTP server with the given configuration.
 ///
@@ -50,7 +49,10 @@ pub async fn start_server(
     listen_on: ListenOn,
     port: u16,
 ) -> std::io::Result<()> {
-    let bind_address = format!("{}:{}", listen_on, port);
+    // A `SocketAddr`, not a formatted string: an IPv6 literal needs brackets,
+    // and `format!("{listen_on}:{port}")` would log `http://::1:7070`, which is
+    // not an address anyone can paste anywhere.
+    let bind_address = SocketAddr::new(listen_on.ip(), port);
 
     info!("Starting server on {}", bind_address);
 

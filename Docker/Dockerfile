@@ -31,6 +31,10 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/optionchain_simulator /app/
 
+# DEFAULT_PORT in src/infrastructure/config/server.rs. This is metadata, not a
+# binding: the compose file publishes ${OCS_PORT} explicitly, but a bare
+# `docker run -P` publishes what is declared here, so a custom OCS_PORT needs an
+# explicit `-p`.
 EXPOSE 7070
 
 CMD ["/app/optionchain_simulator"]

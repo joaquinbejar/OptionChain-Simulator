@@ -68,7 +68,7 @@ pub(crate) struct SnapshotQuery {
 
 /// Renders a snapshot body, under the shared greek admission bound.
 ///
-/// See [`crate::api::rest::greeks::admit_blocking`]: above the default level
+/// See [`crate::api::rest::greeks::admit_render`]: above the default level
 /// the pricing AND the serialisation happen together in one admitted blocking
 /// job, and the handler writes the bytes it returns.
 ///
