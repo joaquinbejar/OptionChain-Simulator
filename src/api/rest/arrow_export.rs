@@ -117,20 +117,34 @@ impl ArrowWriter {
         Ok(self.drain())
     }
 
-    /// Buffers rows, returning the encoded batches they completed.
+    /// Buffers ONE row, returning a batch only when that row completed one.
+    ///
+    /// Row at a time, like the packed writer and for the same reasons: the
+    /// footprint stays one batch whatever a step carries, and a finished batch
+    /// reaches the client before the next one is encoded.
     ///
     /// # Errors
     ///
     /// Returns [`ChainError::Internal`] when a batch cannot be built or
     /// written.
-    pub(super) fn push(&mut self, rows: Vec<Vec<Cell>>) -> Result<Vec<Vec<u8>>, ChainError> {
-        self.buffered.extend(rows);
+    pub(super) fn push_row(&mut self, row: Vec<Cell>) -> Result<Option<Vec<u8>>, ChainError> {
+        self.buffered.push(row);
+        if self.buffered.len() < self.block_rows {
+            return Ok(None);
+        }
 
+        let block = std::mem::take(&mut self.buffered);
+        Ok(Some(self.write_batch(&block)?))
+    }
+
+    /// The same, for a batch of rows. Test-only, as in the packed writer.
+    #[cfg(test)]
+    pub(super) fn push(&mut self, rows: Vec<Vec<Cell>>) -> Result<Vec<Vec<u8>>, ChainError> {
         let mut chunks = Vec::new();
-        while self.buffered.len() >= self.block_rows {
-            let rest = self.buffered.split_off(self.block_rows);
-            let block = std::mem::replace(&mut self.buffered, rest);
-            chunks.push(self.write_batch(&block)?);
+        for row in rows {
+            if let Some(chunk) = self.push_row(row)? {
+                chunks.push(chunk);
+            }
         }
         Ok(chunks)
     }

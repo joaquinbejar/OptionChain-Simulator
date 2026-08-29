@@ -487,7 +487,7 @@
 //! The `packed` layout, little-endian throughout:
 //!
 //! ```text
-//! file        := header block*
+//! file        := header block* footer
 //! header      := "OCSP" u32:version u32:block_rows
 //!                u32:dictionary_count dictionary_entry*
 //!                u32:column_count column_desc*
@@ -496,7 +496,16 @@
 //! column_desc := u32:name_len utf8:name u8:type_code u8:nullable pad to 4
 //! block       := u32:row_count pad to 8 column_payload*
 //! payload     := [validity bitmap if nullable, padded to 8] values, padded to 8
+//! footer      := u32:0xFFFFFFFF pad to 8 u64:total_rows
 //! ```
+//!
+//! **The footer is required, and a decoder must check it.** No block can carry
+//! `0xFFFFFFFF` rows, so that value is what says the blocks have ended, and the
+//! `u64` after it is the total the writer emitted. A document that ends without
+//! it was truncated and must be REJECTED rather than read as a shorter tape:
+//! the response is a 200 whose header goes out before the first byte is
+//! produced, so a dropped connection is otherwise indistinguishable from a
+//! smaller export. A total that disagrees with the blocks is the same error.
 //!
 //! Type codes: `0` = `f64`, `1` = `i64`, `2` = timestamp in nanoseconds since
 //! the epoch, `3` = an index into the header dictionary, `4` = a **label

@@ -50,7 +50,7 @@
 //! backtest harness cache a download and know it is still current.
 
 use crate::api::rest::binary::{
-    BinarySchema, CellType, PackedWriter, ensure_label_capacity, typed_rows,
+    BinarySchema, CellType, PackedWriter, RowFlow, ensure_label_capacity, visit_typed_rows,
 };
 use crate::api::rest::error::map_error;
 use crate::api::rest::greeks::GreekLevel;
@@ -1287,26 +1287,44 @@ impl Writer {
                 }
                 Ok(Delivery::Sent)
             }
+            // Both binary arms feed the writer ONE ROW AT A TIME and hand each
+            // finished block straight to `emit`. Collecting a step's rows first
+            // would make the footprint a function of the chain size rather than
+            // of the block width, and would delay noticing a disconnected
+            // client until a whole step had been encoded — at the snapshot
+            // contract cap, that is the difference the block width is supposed
+            // to buy.
             Writer::Packed {
                 dataset,
                 level,
                 writer,
             } => {
-                let rows = typed_rows(
-                    writer.schema(),
+                // Cloned once per step so the visitor can hold the writer
+                // mutably: the schema is a handful of small vectors, next to
+                // nothing beside pricing a chain.
+                let schema = writer.schema().clone();
+                let flow = visit_typed_rows(
+                    &schema,
                     *dataset,
                     *level,
                     step,
                     row.simulated_at,
                     row,
                     chains,
+                    &mut |cells| {
+                        let Some(block) = writer.push_row(cells)? else {
+                            return Ok(RowFlow::Continue);
+                        };
+                        if emit(block) == Delivery::ClientGone {
+                            return Ok(RowFlow::Stop);
+                        }
+                        Ok(RowFlow::Continue)
+                    },
                 )?;
-                for block in writer.push(rows)? {
-                    if emit(block) == Delivery::ClientGone {
-                        return Ok(Delivery::ClientGone);
-                    }
-                }
-                Ok(Delivery::Sent)
+                Ok(match flow {
+                    RowFlow::Continue => Delivery::Sent,
+                    RowFlow::Stop => Delivery::ClientGone,
+                })
             }
             #[cfg(feature = "arrow-export")]
             Writer::Arrow {
@@ -1314,21 +1332,32 @@ impl Writer {
                 level,
                 writer,
             } => {
-                let rows = typed_rows(
-                    writer.schema(),
+                // Cloned once per step so the visitor can hold the writer
+                // mutably: the schema is a handful of small vectors, next to
+                // nothing beside pricing a chain.
+                let schema = writer.schema().clone();
+                let flow = visit_typed_rows(
+                    &schema,
                     *dataset,
                     *level,
                     step,
                     row.simulated_at,
                     row,
                     chains,
+                    &mut |cells| {
+                        let Some(batch) = writer.push_row(cells)? else {
+                            return Ok(RowFlow::Continue);
+                        };
+                        if emit(batch) == Delivery::ClientGone {
+                            return Ok(RowFlow::Stop);
+                        }
+                        Ok(RowFlow::Continue)
+                    },
                 )?;
-                for batch in writer.push(rows)? {
-                    if emit(batch) == Delivery::ClientGone {
-                        return Ok(Delivery::ClientGone);
-                    }
-                }
-                Ok(Delivery::Sent)
+                Ok(match flow {
+                    RowFlow::Continue => Delivery::Sent,
+                    RowFlow::Stop => Delivery::ClientGone,
+                })
             }
         }
     }
@@ -2167,6 +2196,111 @@ mod tests {
             narrow_rows, wide_rows,
             "the block width must not change a single value"
         );
+    }
+
+    /// A binary step emits blocks AS THEY FILL, not after the step.
+    ///
+    /// The claim the block width exists to make: at the snapshot contract cap a
+    /// step can carry two hundred thousand rows, so collecting them before the
+    /// first block reached the client would make memory a function of the chain
+    /// size and would delay noticing a disconnect until the whole step had been
+    /// encoded. Asserted by counting how many blocks arrive before the step
+    /// finishes, at a block width of two.
+    #[actix_web::test]
+    async fn test_a_binary_step_emits_blocks_as_they_fill() {
+        let parameters = reference_parameters();
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
+        let row = match tape.row(0) {
+            Some(row) => row,
+            None => panic!("the tape must have a first row"),
+        };
+        let chains = match snapshot_of(&parameters, &tape, 0) {
+            Some(snapshot) => snapshot,
+            None => panic!("step zero must produce chains"),
+        };
+
+        let mut writer = match Writer::new(
+            Format::Packed,
+            Dataset::OptionChains,
+            GreekLevel::None,
+            &parameters,
+            2,
+        ) {
+            Ok(writer) => writer,
+            Err(error) => panic!("the writer must build: {error}"),
+        };
+
+        let mut blocks = 0_usize;
+        match writer.rows(
+            &parameters,
+            0,
+            row,
+            Some(StepChains::Replayed(&chains)),
+            &mut |_chunk| {
+                blocks += 1;
+                Delivery::Sent
+            },
+        ) {
+            Ok(Delivery::Sent) => {}
+            other => panic!("the rows must be delivered, got {other:?}"),
+        }
+
+        assert!(
+            blocks > 1,
+            "one step must produce several blocks at a width of two, got {blocks}"
+        );
+    }
+
+    /// A disconnect stops the step at the block it happened on.
+    #[actix_web::test]
+    async fn test_a_disconnect_stops_a_binary_step_immediately() {
+        let parameters = reference_parameters();
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
+        let row = match tape.row(0) {
+            Some(row) => row,
+            None => panic!("the tape must have a first row"),
+        };
+        let chains = match snapshot_of(&parameters, &tape, 0) {
+            Some(snapshot) => snapshot,
+            None => panic!("step zero must produce chains"),
+        };
+
+        let mut writer = match Writer::new(
+            Format::Packed,
+            Dataset::OptionChains,
+            GreekLevel::None,
+            &parameters,
+            2,
+        ) {
+            Ok(writer) => writer,
+            Err(error) => panic!("the writer must build: {error}"),
+        };
+
+        let mut delivered = 0_usize;
+        let outcome = writer.rows(
+            &parameters,
+            0,
+            row,
+            Some(StepChains::Replayed(&chains)),
+            &mut |_chunk| {
+                delivered += 1;
+                Delivery::ClientGone
+            },
+        );
+
+        match outcome {
+            Ok(Delivery::ClientGone) => assert_eq!(
+                delivered, 1,
+                "the step must stop at the first refused block, not encode the rest"
+            ),
+            other => panic!("a gone client must be reported, got {other:?}"),
+        }
     }
 
     /// A row's cell types are the ones the schema declares, for every dataset

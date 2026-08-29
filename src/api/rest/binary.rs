@@ -44,16 +44,26 @@
 //! requirement rather than a nicety.
 //!
 //! ```text
-//! file        := header block*
+//! file        := header block* footer
 //! header      := "OCSP" u32:version u32:block_rows
 //!                u32:dictionary_count dictionary_entry*
 //!                u32:column_count column_desc*
 //!                pad to 8
-//! dict_entry  := u32:len utf8:value            (the rule ids, sorted)
+//! dict_entry  := u32:len utf8:value            (the symbol, then the rule ids)
 //! column_desc := u32:name_len utf8:name u8:type_code u8:nullable pad to 4
 //! block       := u32:row_count pad to 8 column_payload*
 //! payload     := [validity bitmap if nullable, padded to 8] values, padded to 8
+//! footer      := u32:0xFFFFFFFF pad to 8 u64:total_rows
 //! ```
+//!
+//! **The footer is required, and a decoder must check it.** A block's row count
+//! can never be `0xFFFFFFFF`, so that value is what tells a reader the blocks
+//! have ended; the `u64` after it is the total number of rows the writer
+//! emitted. A document that ends without the sentinel was TRUNCATED and must be
+//! rejected rather than read as a shorter tape — the response is a 200 whose
+//! header goes out before the first byte is produced, so a dropped connection
+//! is otherwise indistinguishable from a smaller export. A row count that
+//! disagrees with the blocks is the same error.
 //!
 //! Type codes: `0` = `f64`, `1` = `i64`, `2` = timestamp in nanoseconds since
 //! the epoch (`i64`), `3` = a dictionary index into the header's entries
@@ -322,11 +332,132 @@ pub(super) fn timestamp_nanos(instant: DateTime<Utc>) -> i64 {
 /// The same shape, in the same order, as the module's `csv_rows` produces as
 /// strings — deliberately built from the same view types rather than from a
 /// second traversal, so the encodings cannot disagree about what a row is.
+/// Whether a row visitor wants more rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowFlow {
+    /// Keep going.
+    Continue,
+    /// Stop here: the client is gone, and nothing further is worth encoding.
+    Stop,
+}
+
+/// Feeds one step's rows to a visitor, ONE AT A TIME.
+///
+/// The reason this is a visitor rather than a `Vec`: a step of the widest
+/// dataset can carry `OCS_MAX_SNAPSHOT_CONTRACTS` rows, and materialising them
+/// all before the first block is written would make an export's memory a
+/// function of the chain size rather than of the block width, and would delay
+/// noticing a disconnected client until the whole step had been encoded.
+///
 /// # Errors
 ///
 /// Returns [`ChainError::Internal`] when a chain carries a label this
 /// simulation's schedule does not name, which would make the binary `labels`
-/// column disagree with the text one.
+/// column disagree with the text one, and whatever the visitor returns.
+pub(super) fn visit_typed_rows<F>(
+    schema: &BinarySchema,
+    dataset: Dataset,
+    level: GreekLevel,
+    step: usize,
+    simulated_at: DateTime<Utc>,
+    row: &FactorRow,
+    chains: Option<super::export::StepChains<'_>>,
+    visit: &mut F,
+) -> Result<RowFlow, ChainError>
+where
+    F: FnMut(Vec<Cell>) -> Result<RowFlow, ChainError>,
+{
+    let step_cell = Cell::I64(i64::try_from(step).unwrap_or(i64::MAX));
+    let instant = Cell::Timestamp(timestamp_nanos(simulated_at));
+    let symbol = Cell::Dictionary(schema.symbol_index());
+
+    match dataset {
+        Dataset::Underlying => visit(vec![
+            step_cell,
+            instant,
+            symbol,
+            Cell::F64(Some(row.spot.to_f64())),
+        ]),
+        Dataset::Volatility => visit(vec![
+            step_cell,
+            instant,
+            symbol,
+            Cell::F64(Some(row.base_volatility.to_f64())),
+        ]),
+        Dataset::OptionChains => {
+            let Some(chains) = chains else {
+                return Ok(RowFlow::Continue);
+            };
+            for expiration in chains.expirations() {
+                let expires_at = Cell::Timestamp(timestamp_nanos(expiration.expires_at));
+                let labels = Cell::LabelMask(schema.label_mask(expiration.labels)?);
+                for quote in expiration.quotes.quotes() {
+                    let mut cells = vec![
+                        step_cell,
+                        instant,
+                        symbol,
+                        expires_at,
+                        labels,
+                        Cell::F64(Some(expiration.days_to_expiration)),
+                        Cell::F64(Some(quote.strike)),
+                        Cell::F64(Some(quote.implied_volatility)),
+                        Cell::F64(quote.call_bid),
+                        Cell::F64(quote.call_ask),
+                        Cell::F64(quote.call_mid),
+                        Cell::F64(quote.call_delta),
+                        Cell::F64(quote.put_bid),
+                        Cell::F64(quote.put_ask),
+                        Cell::F64(quote.put_mid),
+                        Cell::F64(quote.put_delta),
+                        Cell::F64(quote.gamma),
+                    ];
+                    if level.wants_greeks() {
+                        for value in [
+                            quote.call_greeks.theta,
+                            quote.put_greeks.theta,
+                            quote.call_greeks.vega,
+                            quote.put_greeks.vega,
+                            quote.call_greeks.rho,
+                            quote.put_greeks.rho,
+                            quote.call_greeks.rho_d,
+                            quote.put_greeks.rho_d,
+                        ] {
+                            cells.push(Cell::F64(value));
+                        }
+                    }
+                    if matches!(level, GreekLevel::All) {
+                        for value in [
+                            quote.call_greeks.gamma,
+                            quote.put_greeks.gamma,
+                            quote.call_greeks.alpha,
+                            quote.put_greeks.alpha,
+                            quote.call_greeks.vanna,
+                            quote.put_greeks.vanna,
+                            quote.call_greeks.vomma,
+                            quote.put_greeks.vomma,
+                            quote.call_greeks.veta,
+                            quote.put_greeks.veta,
+                            quote.call_greeks.charm,
+                            quote.put_greeks.charm,
+                            quote.call_greeks.color,
+                            quote.put_greeks.color,
+                        ] {
+                            cells.push(Cell::F64(value));
+                        }
+                    }
+                    if visit(cells)? == RowFlow::Stop {
+                        return Ok(RowFlow::Stop);
+                    }
+                }
+            }
+            Ok(RowFlow::Continue)
+        }
+    }
+}
+
+/// The same rows, collected. Test-only: the serving path visits them one at a
+/// time so that neither memory nor cancellation latency scales with a step.
+#[cfg(test)]
 pub(super) fn typed_rows(
     schema: &BinarySchema,
     dataset: Dataset,
@@ -486,21 +617,37 @@ impl PackedWriter {
         Ok(out)
     }
 
-    /// Buffers rows, returning the blocks they completed.
+    /// Buffers ONE row, returning a block only when that row completed one.
+    ///
+    /// Row at a time on purpose: it is what keeps the writer's footprint at one
+    /// block regardless of how many rows a step carries, and it lets the caller
+    /// hand a finished block to the client before encoding the next one, so a
+    /// disconnect is noticed within a block rather than within a step.
     ///
     /// # Errors
     ///
     /// Returns [`ChainError::Internal`] when a block's row count does not fit
     /// the layout's `u32`.
-    pub(super) fn push(&mut self, rows: Vec<Vec<Cell>>) -> Result<Vec<Vec<u8>>, ChainError> {
-        self.buffered.extend(rows);
+    pub(super) fn push_row(&mut self, row: Vec<Cell>) -> Result<Option<Vec<u8>>, ChainError> {
+        self.buffered.push(row);
+        if self.buffered.len() < self.block_rows {
+            return Ok(None);
+        }
 
+        let block = std::mem::take(&mut self.buffered);
+        self.written = self.written.saturating_add(block.len());
+        Ok(Some(self.encode_block(&block)?))
+    }
+
+    /// The same, for a batch of rows. Test-only: the serving path pushes one
+    /// row at a time so a step never sits in memory.
+    #[cfg(test)]
+    pub(super) fn push(&mut self, rows: Vec<Vec<Cell>>) -> Result<Vec<Vec<u8>>, ChainError> {
         let mut blocks = Vec::new();
-        while self.buffered.len() >= self.block_rows {
-            let rest = self.buffered.split_off(self.block_rows);
-            let block = std::mem::replace(&mut self.buffered, rest);
-            self.written = self.written.saturating_add(block.len());
-            blocks.push(self.encode_block(&block)?);
+        for row in rows {
+            if let Some(block) = self.push_row(row)? {
+                blocks.push(block);
+            }
         }
         Ok(blocks)
     }
