@@ -915,6 +915,79 @@ mod tests {
         );
     }
 
+    /// The spread model is accepted over HTTP and echoed back verbatim.
+    ///
+    /// Both halves matter: `CreateSimulationRequest` denies unknown fields, so
+    /// this is what proves the new coefficients are actually part of the wire
+    /// contract, and the echo is what lets a client replay a run.
+    #[actix_web::test]
+    async fn test_the_spread_model_is_accepted_and_echoed() {
+        let app = v2_service!();
+
+        let mut request_body = reference_body();
+        match request_body.as_object_mut() {
+            Some(map) => {
+                map.insert("spread_proportional".to_string(), json!(0.02));
+                map.insert("spread_moneyness_widening".to_string(), json!(0.5));
+                map.insert("spread_tenor_widening".to_string(), json!(0.1));
+                map.insert("spread_tick".to_string(), json!(0.05));
+            }
+            None => panic!("the reference body must be an object"),
+        }
+
+        let request = actix_test::TestRequest::post()
+            .uri("/api/v2/simulations")
+            .set_json(request_body)
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body: Value = actix_test::read_body_json(response).await;
+        let parameters = match body.get("parameters") {
+            Some(parameters) => parameters,
+            None => panic!("the response must echo its parameters: {body}"),
+        };
+        for (field, expected) in [
+            ("spread", json!(0.02)),
+            ("spread_proportional", json!(0.02)),
+            ("spread_moneyness_widening", json!(0.5)),
+            ("spread_tenor_widening", json!(0.1)),
+            ("spread_tick", json!(0.05)),
+        ] {
+            assert_eq!(
+                parameters.get(field),
+                Some(&expected),
+                "the echo must carry {field}: {parameters}"
+            );
+        }
+    }
+
+    /// A spread coefficient outside its range is a typed 400 naming the field.
+    #[actix_web::test]
+    async fn test_an_out_of_range_spread_coefficient_is_a_typed_400() {
+        let app = v2_service!();
+
+        let mut request_body = reference_body();
+        match request_body.as_object_mut() {
+            Some(map) => map.insert("spread_proportional".to_string(), json!(-0.01)),
+            None => panic!("the reference body must be an object"),
+        };
+
+        let request = actix_test::TestRequest::post()
+            .uri("/api/v2/simulations")
+            .set_json(request_body)
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(
+            body.get("field"),
+            Some(&json!("spread_proportional")),
+            "the rejection must name the field: {body}"
+        );
+    }
+
     /// The echoed schedules are normalised — ordered by rule id.
     #[actix_web::test]
     async fn test_the_echoed_schedules_are_normalised() {

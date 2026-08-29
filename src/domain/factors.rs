@@ -70,9 +70,8 @@
 //! is pinned by a test. ADR 0001 §8 records the contract.
 
 use crate::domain::Walker;
-use crate::domain::simulator::{
-    DEFAULT_CHAIN_SIZE, DEFAULT_SKEW_SLOPE, DEFAULT_SMILE_CURVE, DEFAULT_SPREAD,
-};
+use crate::domain::simulator::{DEFAULT_CHAIN_SIZE, DEFAULT_SKEW_SLOPE, DEFAULT_SMILE_CURVE};
+use crate::domain::spread::SpreadModel;
 use crate::session::{SimulationMethod, SimulationParametersV2};
 use crate::utils::ChainError;
 use chrono::{DateTime, Utc};
@@ -942,9 +941,7 @@ fn at_step(step: Option<usize>) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`ChainError::Internal`] when the default spread is not a valid
-/// `Positive` — unreachable, it is a compile-time constant — or when upstream
-/// cannot build the chain.
+/// Returns [`ChainError::Internal`] when upstream cannot build the chain.
 pub(crate) fn build_chain(
     parameters: &SimulationParametersV2,
     spot: Positive,
@@ -955,12 +952,22 @@ pub(crate) fn build_chain(
     let chain_size = parameters.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE);
     let skew_slope = parameters.skew_slope.unwrap_or(DEFAULT_SKEW_SLOPE);
     let smile_curve = parameters.smile_curve.unwrap_or(DEFAULT_SMILE_CURVE);
-    let spread = match parameters.spread {
-        Some(spread) => spread,
-        None => Positive::new_decimal(DEFAULT_SPREAD).map_err(|e| {
-            ChainError::Internal(format!("the default spread is not a valid Positive: {e}"))
-        })?,
-    };
+    // The spread model, not one scalar. Read once per chain: every coefficient
+    // is fixed for a simulation's lifetime, and only the contract varies.
+    let spread_model = SpreadModel::from_parameters(parameters);
+    // Propagated, not defaulted: this now feeds a PRICED quantity (the tenor
+    // term), and silently reading zero days would narrow every spread to its
+    // floor. It is infallible for the `Days` variant every caller passes, and
+    // the `DateTime` variant reads the wall clock, which a served quote must
+    // not depend on.
+    let days_to_expiration = expiration
+        .get_days()
+        .map_err(|e| {
+            ChainError::Internal(format!(
+                "the chain's days to expiration are unavailable: {e}"
+            ))
+        })?
+        .to_dec();
 
     let price_params = OptionDataPriceParams::new(
         Some(Box::new(spot)),
@@ -991,15 +998,25 @@ pub(crate) fn build_chain(
         parameters.strike_interval,
         skew_slope,
         smile_curve,
-        spread,
+        // ZERO, and the widening happens below instead. Upstream's
+        // `apply_spread` sets bid, ask AND mid to `None` when `mid <= spread`
+        // (OptionStratLib#439, fixed upstream but not in the published 0.20
+        // this builds against), so handing it the real spread would erase the
+        // cheap wings before anything here could quote them. With no spread it
+        // leaves each mid alone, which is what the model needs to work from.
+        Positive::ZERO,
         2,
         price_params,
         volatility,
     )
     .with_greek_snapshots(greek_snapshots);
 
-    OptionChain::build_chain(&build_params)
-        .map_err(|e| ChainError::Internal(format!("Failed to build the option chain: {e}")))
+    let mut chain = OptionChain::build_chain(&build_params)
+        .map_err(|e| ChainError::Internal(format!("Failed to build the option chain: {e}")))?;
+
+    spread_model.apply(&mut chain, days_to_expiration);
+
+    Ok(chain)
 }
 
 /// Builds the single option chain that seeds the walk.
@@ -1066,6 +1083,10 @@ mod tests {
             skew_slope: None,
             smile_curve: None,
             spread: Some(0.02),
+            spread_proportional: None,
+            spread_moneyness_widening: None,
+            spread_tenor_widening: None,
+            spread_tick: None,
             seed: Some(42),
         }
     }
@@ -1404,6 +1425,279 @@ mod tests {
             chain.iter().count() > 0,
             "the lowest volatility above the floor must still quote a strike"
         );
+    }
+
+    // ---- the per-contract spread model (issue #80) ------------------------
+
+    /// Two contracts of one chain carry DIFFERENT absolute spreads.
+    ///
+    /// The property a single scalar cannot express, and the reason the model
+    /// exists: a dear in-the-money call and a five-cent wing do not cost the
+    /// same to cross.
+    #[test]
+    fn test_two_contracts_of_one_chain_carry_different_spreads() {
+        let mut request = request(4, brownian(0.2), 0.2);
+        request.chain_size = Some(12);
+        request.spread = Some(0.02);
+        request.spread_proportional = Some(0.02);
+        request.spread_moneyness_widening = Some(0.5);
+        let chain = built_chain(&parameters(request));
+
+        let spreads: Vec<Decimal> = chain
+            .iter()
+            .filter_map(|contract| match (contract.call_bid, contract.call_ask) {
+                (Some(bid), Some(ask)) => Some(ask.to_dec() - bid.to_dec()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(spreads.len() > 2, "the chain must quote several strikes");
+        let first = spreads[0];
+        assert!(
+            spreads.iter().any(|spread| *spread != first),
+            "every contract carries the same spread: {spreads:?}"
+        );
+    }
+
+    /// Contracts cheaper than the spread are quoted, where they used to vanish.
+    ///
+    /// The assertion is on the COUNT, deliberately. "Every contract with a mid
+    /// has a bid" passes on the old code too, because the old code cleared the
+    /// mid along with the quote: the erased contracts were skipped rather than
+    /// caught. What actually moved is how many contracts are quoted at all.
+    #[test]
+    fn test_contracts_cheaper_than_the_spread_are_quoted() {
+        let mut request = request(4, brownian(0.2), 0.2);
+        request.chain_size = Some(30);
+        // A spread far above the cheap wings' mid, which is the configuration
+        // that used to erase them.
+        request.spread = Some(5.0);
+        let chain = built_chain(&parameters(request));
+
+        let quoted = chain
+            .iter()
+            .filter(|contract| contract.call_bid.is_some() && contract.call_ask.is_some())
+            .count();
+        // What the old path would have kept: only the contracts worth strictly
+        // more than the whole spread.
+        let above_the_spread = chain
+            .iter()
+            .filter(|contract| {
+                contract
+                    .call_middle
+                    .is_some_and(|mid| mid.to_dec() > dec!(5))
+            })
+            .count();
+
+        assert!(above_the_spread > 0, "the chain must quote dear contracts");
+        assert!(
+            quoted > above_the_spread,
+            "the cheap wings must be quoted too: {quoted} quoted, {above_the_spread} above the spread"
+        );
+
+        for contract in chain.iter() {
+            if contract.call_middle.is_some() {
+                assert!(
+                    contract.call_bid.is_some() && contract.call_ask.is_some(),
+                    "a call with a mid must be quoted: {contract:?}"
+                );
+            }
+            if contract.put_middle.is_some() {
+                assert!(
+                    contract.put_bid.is_some() && contract.put_ask.is_some(),
+                    "a put with a mid must be quoted: {contract:?}"
+                );
+            }
+        }
+    }
+
+    /// A far out-of-the-money wing at one day to expiry is still quoted.
+    ///
+    /// The exact case that broke: at 1 DTE the far wings are worth cents, so a
+    /// two-cent spread erased them. The furthest strike of all can be worth
+    /// less than a tick, and it is quoted `0.00 / 0.01` rather than bid a penny
+    /// it is not worth — marking a worthless wing at the tick is the same bias,
+    /// in the same direction, that the model exists to remove.
+    #[test]
+    fn test_a_far_wing_at_one_day_is_still_quoted() {
+        let mut request = request(4, brownian(0.2), 0.2);
+        request.chain_size = Some(40);
+        request.spread = Some(0.02);
+        let parameters = parameters(request);
+        let chain = match build_chain(
+            &parameters,
+            pos_or_panic!(5000.0),
+            pos_or_panic!(0.2),
+            ExpirationDate::Days(pos_or_panic!(1.0)),
+            false,
+        ) {
+            Ok(chain) => chain,
+            Err(error) => panic!("a one-day chain must build: {error}"),
+        };
+
+        // The LAST strike of the chain, not the last one that happens to carry
+        // a mid: picking the latter would select a contract the old code kept
+        // anyway, and the test would pass without the fix.
+        let wing = match chain.iter().last() {
+            Some(contract) => contract,
+            None => panic!("the chain must carry a highest strike"),
+        };
+
+        assert!(
+            wing.call_middle.is_some(),
+            "the furthest strike must still be priced: {wing:?}"
+        );
+        match (wing.call_bid, wing.call_ask, wing.call_middle) {
+            (Some(bid), Some(ask), Some(mid)) => {
+                assert!(
+                    ask >= pos_or_panic!(0.01),
+                    "the wing must be offered at or above the tick, got {ask}"
+                );
+                assert!(bid <= ask, "and the book must not be crossed");
+                assert!(
+                    bid.to_dec() <= mid.to_dec().round_dp(2),
+                    "a wing must not be bid above what it is worth: {bid} for a mid of {mid}"
+                );
+            }
+            other => panic!("the far wing must still be quoted, got {other:?}"),
+        }
+
+        // Every wing still worth a tick IS bid a tick: only sub-tick contracts
+        // quote a zero bid, and they quote it rather than disappearing.
+        for contract in chain.iter() {
+            let (Some(mid), Some(bid)) = (contract.call_middle, contract.call_bid) else {
+                continue;
+            };
+            if mid.to_dec() >= dec!(0.01) {
+                assert!(
+                    bid >= pos_or_panic!(0.01),
+                    "a contract worth {mid} must be bid at least a tick, got {bid}"
+                );
+            }
+        }
+    }
+
+    /// A cheap contract's spread is a LARGER fraction of its price than a dear
+    /// contract's, once the proportional term is on.
+    #[test]
+    fn test_a_cheap_contract_pays_more_in_relative_terms() {
+        let mut request = request(4, brownian(0.2), 0.2);
+        request.chain_size = Some(20);
+        request.spread = Some(0.02);
+        request.spread_proportional = Some(0.05);
+        let chain = built_chain(&parameters(request));
+
+        let mut quotes: Vec<(Decimal, Decimal)> = chain
+            .iter()
+            .filter_map(|contract| {
+                match (contract.call_bid, contract.call_ask, contract.call_middle) {
+                    (Some(bid), Some(ask), Some(mid)) if mid.to_dec() > Decimal::ZERO => {
+                        Some((mid.to_dec(), ask.to_dec() - bid.to_dec()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        quotes.sort_by_key(|quote| quote.0);
+        assert!(
+            quotes.len() > 1,
+            "the chain must quote at least two contracts"
+        );
+
+        let (cheap_mid, cheap_spread) = quotes[0];
+        let (dear_mid, dear_spread) = quotes[quotes.len() - 1];
+
+        assert!(
+            dear_spread > cheap_spread,
+            "the dear contract costs more to cross in absolute terms"
+        );
+        assert!(
+            cheap_spread / cheap_mid > dear_spread / dear_mid,
+            "and the cheap one more in relative terms: {cheap_spread}/{cheap_mid} vs {dear_spread}/{dear_mid}"
+        );
+    }
+
+    /// A request carrying only the legacy scalar quotes exactly as it did.
+    ///
+    /// "As it did" means, for every contract upstream would have kept, the
+    /// arithmetic upstream applied: half the spread each way around the mid,
+    /// rounded to two places. The contracts upstream would have ERASED are the
+    /// documented divergence and are asserted separately.
+    #[test]
+    fn test_the_legacy_scalar_reproduces_the_old_quotes() {
+        let mut request = request(4, brownian(0.2), 0.2);
+        request.chain_size = Some(20);
+        request.spread = Some(0.02);
+        let chain = built_chain(&parameters(request));
+
+        let spread = dec!(0.02);
+        let half = spread / Decimal::TWO;
+        let mut compared = 0;
+
+        for contract in chain.iter() {
+            let (Some(mid), Some(bid), Some(ask)) =
+                (contract.call_middle, contract.call_bid, contract.call_ask)
+            else {
+                continue;
+            };
+            // Upstream keeps a quote only above the full spread; below it the
+            // service now floors the bid instead of withdrawing.
+            if mid.to_dec() <= spread {
+                continue;
+            }
+
+            assert_eq!(
+                ask.to_dec(),
+                (mid.to_dec() + half).round_dp(2),
+                "the ask must be upstream's, at strike {}",
+                contract.strike_price
+            );
+            assert_eq!(
+                bid.to_dec(),
+                (mid.to_dec() - half).round_dp(2),
+                "the bid must be upstream's, at strike {}",
+                contract.strike_price
+            );
+            compared += 1;
+        }
+
+        assert!(compared > 0, "the chain must contain a comparable quote");
+    }
+
+    /// The same parameters and seed still produce the same quotes.
+    ///
+    /// The model is a pure function of the contract, so it cannot move the
+    /// tape; this pins that it does not move the CHAIN either.
+    #[test]
+    fn test_the_model_is_deterministic() {
+        let mut request = request(4, brownian(0.2), 0.2);
+        request.chain_size = Some(10);
+        request.spread_proportional = Some(0.03);
+        request.spread_moneyness_widening = Some(0.4);
+        request.spread_tenor_widening = Some(0.1);
+        let parameters = parameters(request);
+
+        let first = built_chain(&parameters);
+        let second = built_chain(&parameters);
+
+        assert_eq!(
+            first.options, second.options,
+            "two builds of one configuration must quote identically"
+        );
+    }
+
+    /// Builds a chain at the reference spot, volatility and tenor.
+    fn built_chain(parameters: &SimulationParametersV2) -> OptionChain {
+        match build_chain(
+            parameters,
+            pos_or_panic!(5000.0),
+            pos_or_panic!(0.2),
+            ExpirationDate::Days(pos_or_panic!(30.0)),
+            false,
+        ) {
+            Ok(chain) => chain,
+            Err(error) => panic!("the chain must build: {error}"),
+        }
     }
 
     fn parameters(request: CreateSimulationRequest) -> SimulationParametersV2 {

@@ -93,9 +93,33 @@ pub struct CreateSimulationRequest {
     /// Curvature of the volatility smile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smile_curve: Option<f64>,
-    /// Bid-ask spread factor.
+    /// The constant term of the spread model, applied to every contract. On
+    /// its own — which is how every request that predates the model reads — it
+    /// IS the whole model, exactly as before: one absolute bid-ask spread. A
+    /// value below `spread_tick` is raised to it, since a width narrower than
+    /// the smallest quotable increment cannot be quoted. Default: `0.01`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
+    /// How much of a contract's mid price is added to its spread, so a dearer
+    /// contract costs more to cross in absolute terms and a cheap wing more in
+    /// relative terms. Must not be negative. Default: `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_proportional: Option<f64>,
+    /// How fast the spread widens away from the money, per unit of
+    /// `|ln(strike / underlying)|`. Logarithmic so a dollar of distance means
+    /// the same at a strike of 20 and of 2000. Must not be negative.
+    /// Default: `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_moneyness_widening: Option<f64>,
+    /// How fast the spread widens with time to expiry, per `sqrt(years)`. Must
+    /// not be negative. Default: `0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_tenor_widening: Option<f64>,
+    /// The smallest quotable increment. Every bid is floored at it rather than
+    /// withdrawn, so a contract that has a mid always has a two-sided quote.
+    /// Must be greater than zero. Default: `0.01`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_tick: Option<f64>,
     /// RNG seed. When omitted one is generated and returned as the effective
     /// seed, exactly as in v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]

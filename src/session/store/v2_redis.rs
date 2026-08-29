@@ -549,6 +549,10 @@ mod live_tests {
             skew_slope: None,
             smile_curve: None,
             spread: Some(0.02),
+            spread_proportional: None,
+            spread_moneyness_widening: None,
+            spread_tenor_widening: None,
+            spread_tick: None,
             seed: Some(seed),
         };
 

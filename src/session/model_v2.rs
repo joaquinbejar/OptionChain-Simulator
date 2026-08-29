@@ -22,10 +22,12 @@ use crate::api::rest::limits::{MAX_CHAIN_SIZE, MAX_STEPS, strikes_per_chain};
 use crate::api::rest::models::validate_walk_type;
 use crate::api::rest::requests_v2::CreateSimulationRequest;
 use crate::api::rest::validation::{
-    decimal_field, positive_field, strictly_positive_field, symbol_field, time_frame_field,
+    bounded_decimal_field, decimal_field, positive_field, strictly_positive_field, symbol_field,
+    time_frame_field,
 };
 use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, tzdb_version};
 use crate::domain::simulator::DEFAULT_CHAIN_SIZE;
+use crate::domain::spread::{MAX_PROPORTIONAL, MAX_TICK, MAX_WIDENING};
 use crate::infrastructure::max_snapshot_contracts;
 use crate::session::model::{SessionState, SimulationMethod};
 use crate::utils::ChainError;
@@ -145,6 +147,30 @@ fn reject_zero(field: &str, value: Positive) -> Result<(), ChainError> {
     Ok(())
 }
 
+/// Rejects a spread coefficient above the cap the request path applies.
+///
+/// The cap is declared as an `f64` beside the model, so it is converted here
+/// rather than duplicated as a `Decimal`: one definition, and a conversion that
+/// cannot silently disagree with it.
+fn reject_above_cap(field: &str, value: Decimal, maximum: f64) -> Result<(), ChainError> {
+    let Ok(maximum) = Decimal::try_from(maximum) else {
+        // Unreachable: every cap is a small literal. A cap that cannot be
+        // represented is not a bound anything can be checked against, so the
+        // value is refused rather than admitted unchecked.
+        return Err(ChainError::Validation {
+            field: field.to_string(),
+            reason: "the configured maximum is not representable".to_string(),
+        });
+    };
+    if value > maximum {
+        return Err(ChainError::Validation {
+            field: field.to_string(),
+            reason: format!("must not exceed {maximum}, got {value}"),
+        });
+    }
+    Ok(())
+}
+
 /// Validates an explicitly-supplied step interval.
 fn validate_step_interval_seconds(seconds: u64) -> Result<u64, ChainError> {
     if !(MIN_STEP_INTERVAL_SECONDS..=MAX_STEP_INTERVAL_SECONDS).contains(&seconds) {
@@ -243,8 +269,26 @@ pub struct SimulationParametersV2 {
     pub skew_slope: Option<Decimal>,
     /// Curvature of the volatility smile.
     pub smile_curve: Option<Decimal>,
-    /// Bid-ask spread factor.
+    /// The constant term of the spread model, and the whole of it when no
+    /// widening coefficient is set. The field predates the model and keeps its
+    /// meaning: one absolute spread, applied to every contract.
     pub spread: Option<Positive>,
+    /// How much of a contract's mid price is added to its spread. Zero when
+    /// absent, which is what makes an untouched request behave as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_proportional: Option<Decimal>,
+    /// How fast the spread widens away from the money, per unit of
+    /// `|ln(strike / underlying)|`. Zero when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_moneyness_widening: Option<Decimal>,
+    /// How fast the spread widens with time to expiry, per `sqrt(years)`. Zero
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_tenor_widening: Option<Decimal>,
+    /// The smallest quotable increment, and the floor under every bid. One cent
+    /// when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_tick: Option<Positive>,
     /// The effective RNG seed. Non-optional: a v2 simulation is always
     /// reproducible, so the seed is resolved at conversion and never `None`.
     pub seed: u64,
@@ -285,6 +329,14 @@ struct SimulationParametersV2Wire {
     skew_slope: Option<Decimal>,
     smile_curve: Option<Decimal>,
     spread: Option<Positive>,
+    #[serde(default)]
+    spread_proportional: Option<Decimal>,
+    #[serde(default)]
+    spread_moneyness_widening: Option<Decimal>,
+    #[serde(default)]
+    spread_tenor_widening: Option<Decimal>,
+    #[serde(default)]
+    spread_tick: Option<Positive>,
     seed: u64,
 }
 
@@ -310,6 +362,10 @@ impl TryFrom<SimulationParametersV2Wire> for SimulationParametersV2 {
             skew_slope: wire.skew_slope,
             smile_curve: wire.smile_curve,
             spread: wire.spread,
+            spread_proportional: wire.spread_proportional,
+            spread_moneyness_widening: wire.spread_moneyness_widening,
+            spread_tenor_widening: wire.spread_tenor_widening,
+            spread_tick: wire.spread_tick,
             seed: wire.seed,
         };
         parameters.validate()?;
@@ -376,6 +432,45 @@ impl SimulationParametersV2 {
         }
         if let Some(strike_interval) = self.strike_interval {
             reject_zero("strike_interval", strike_interval)?;
+        }
+        // The spread model, BOTH bounds, exactly as the request path applies
+        // them. A stored `spread_tick` of zero silently disables the floor that
+        // keeps a wing quotable; a stored negative coefficient — which
+        // `Decimal` admits — would narrow a quote away from the money; and a
+        // stored coefficient above its cap would price a chain the REST
+        // boundary refuses to create. Redis is an outer layer, so a document
+        // that never passed through a request must clear the same bar.
+        if let Some(tick) = self.spread_tick {
+            reject_zero("spread_tick", tick)?;
+            reject_above_cap("spread_tick", tick.to_dec(), MAX_TICK)?;
+        }
+        for (field, value, maximum) in [
+            (
+                "spread_proportional",
+                self.spread_proportional,
+                MAX_PROPORTIONAL,
+            ),
+            (
+                "spread_moneyness_widening",
+                self.spread_moneyness_widening,
+                MAX_WIDENING,
+            ),
+            (
+                "spread_tenor_widening",
+                self.spread_tenor_widening,
+                MAX_WIDENING,
+            ),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            if value < Decimal::ZERO {
+                return Err(ChainError::Validation {
+                    field: field.to_string(),
+                    reason: format!("must not be negative, got {value}"),
+                });
+            }
+            reject_above_cap(field, value, maximum)?;
         }
         validate_walk_type(&self.method)?;
 
@@ -626,6 +721,48 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
             spread: request
                 .spread
                 .map(|value| positive_field("spread", value))
+                .transpose()?,
+            // The widening coefficients are rates, not prices: zero is the
+            // documented default and a negative one would NARROW a quote away
+            // from the money, which is not a market anyone trades.
+            // Bounded above as well as below. The caps are economic — a
+            // proportional term of 1 means the spread IS the mid — and they
+            // also keep the model's arithmetic inside `Decimal`'s range for any
+            // price a chain can carry, which matters because `Decimal`
+            // multiplication panics on overflow.
+            spread_proportional: request
+                .spread_proportional
+                .map(|value| {
+                    bounded_decimal_field("spread_proportional", value, 0.0, MAX_PROPORTIONAL)
+                })
+                .transpose()?,
+            spread_moneyness_widening: request
+                .spread_moneyness_widening
+                .map(|value| {
+                    bounded_decimal_field("spread_moneyness_widening", value, 0.0, MAX_WIDENING)
+                })
+                .transpose()?,
+            spread_tenor_widening: request
+                .spread_tenor_widening
+                .map(|value| {
+                    bounded_decimal_field("spread_tenor_widening", value, 0.0, MAX_WIDENING)
+                })
+                .transpose()?,
+            // Strictly positive: a tick of zero is not an increment, and it is
+            // the floor every bid is held above. Bounded above for the same
+            // reason a tick of a thousand dollars is not a tick.
+            spread_tick: request
+                .spread_tick
+                .map(|value| {
+                    let tick = strictly_positive_field("spread_tick", value)?;
+                    if value > MAX_TICK {
+                        return Err(ChainError::Validation {
+                            field: "spread_tick".to_string(),
+                            reason: format!("must not exceed {MAX_TICK}, got {value}"),
+                        });
+                    }
+                    Ok(tick)
+                })
                 .transpose()?,
             seed: request.seed.unwrap_or_else(|| rand::rng().random()),
         };
@@ -948,6 +1085,10 @@ mod tests {
             skew_slope: Some(-0.2),
             smile_curve: Some(0.4),
             spread: Some(0.02),
+            spread_proportional: None,
+            spread_moneyness_widening: None,
+            spread_tenor_widening: None,
+            spread_tick: None,
             seed: Some(42),
         }
     }
@@ -1303,6 +1444,193 @@ mod tests {
         match serde_json::from_str::<SimulationParametersV2>(&json) {
             Ok(round_tripped) => assert_eq!(round_tripped, parameters),
             Err(error) => panic!("must deserialize: {error}"),
+        }
+    }
+
+    /// A simulation created WITH a spread model round-trips through the store.
+    ///
+    /// The outer fields skip serializing when absent and the wire struct denies
+    /// unknown ones, so a field present on one and missing from the other would
+    /// produce a document that writes fine and can never be read back. With the
+    /// reference request every coefficient is `None`, which is exactly the case
+    /// that would not catch it.
+    #[test]
+    fn test_stored_parameters_keep_the_spread_model() {
+        let mut request = reference_request();
+        request.spread = Some(0.03);
+        request.spread_proportional = Some(0.02);
+        request.spread_moneyness_widening = Some(0.5);
+        request.spread_tenor_widening = Some(0.1);
+        request.spread_tick = Some(0.05);
+        let parameters = parameters(request);
+
+        let json = match serde_json::to_string(&parameters) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+        match serde_json::from_str::<SimulationParametersV2>(&json) {
+            Ok(loaded) => {
+                assert_eq!(loaded, parameters);
+                assert_eq!(loaded.spread_proportional, Some(dec!(0.02)));
+                assert_eq!(loaded.spread_tick, Some(pos_or_panic!(0.05)));
+            }
+            Err(error) => panic!("a simulation with a spread model must reload: {error}"),
+        }
+    }
+
+    /// A stored document with an impossible spread model is refused on load.
+    ///
+    /// Redis is an outer layer: a hand-edited `spread_tick` of zero would
+    /// silently disable the floor that keeps a wing quotable.
+    #[test]
+    fn test_stored_parameters_reject_an_impossible_spread_model() {
+        let parameters = parameters(reference_request());
+        let json = match serde_json::to_value(&parameters) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.insert("spread_tick".to_string(), serde_json::json!("0"));
+                serde_json::Value::Object(map)
+            }
+            other => panic!("the parameters must serialize to an object, got {other:?}"),
+        };
+
+        match serde_json::from_value::<SimulationParametersV2>(json) {
+            Ok(loaded) => panic!("a zero tick must be refused, got {loaded:?}"),
+            Err(error) => assert!(
+                error.to_string().contains("spread_tick"),
+                "the failure must name the field: {error}"
+            ),
+        }
+    }
+
+    /// A stored coefficient above its cap is refused on load.
+    ///
+    /// Redis is an outer layer: a document that never passed through a request
+    /// must clear the same bar, or a hand-edited one prices a chain the REST
+    /// boundary would refuse to create.
+    #[test]
+    fn test_stored_parameters_reject_a_coefficient_above_its_cap() {
+        let parameters = parameters(reference_request());
+
+        for (field, over_cap) in [
+            ("spread_proportional", MAX_PROPORTIONAL + 1.0),
+            ("spread_moneyness_widening", MAX_WIDENING + 1.0),
+            ("spread_tenor_widening", MAX_WIDENING + 1.0),
+            ("spread_tick", MAX_TICK + 1.0),
+        ] {
+            let json = match serde_json::to_value(&parameters) {
+                Ok(serde_json::Value::Object(mut map)) => {
+                    map.insert(field.to_string(), serde_json::json!(over_cap.to_string()));
+                    serde_json::Value::Object(map)
+                }
+                other => panic!("the parameters must serialize to an object, got {other:?}"),
+            };
+
+            match serde_json::from_value::<SimulationParametersV2>(json) {
+                Ok(loaded) => panic!("{field} above its cap must be refused, got {loaded:?}"),
+                Err(error) => assert!(
+                    error.to_string().contains(field),
+                    "the failure must name {field}: {error}"
+                ),
+            }
+        }
+    }
+
+    /// A coefficient exactly at its cap still loads.
+    ///
+    /// The bound is inclusive on both paths, so the stored check cannot be
+    /// stricter than the request that produced the document.
+    #[test]
+    fn test_stored_parameters_accept_a_coefficient_at_its_cap() {
+        let mut request = reference_request();
+        request.spread_proportional = Some(MAX_PROPORTIONAL);
+        request.spread_moneyness_widening = Some(MAX_WIDENING);
+        request.spread_tick = Some(MAX_TICK);
+        let parameters = parameters(request);
+
+        let json = match serde_json::to_string(&parameters) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+        match serde_json::from_str::<SimulationParametersV2>(&json) {
+            Ok(loaded) => assert_eq!(loaded, parameters),
+            Err(error) => panic!("a document at the cap must load: {error}"),
+        }
+    }
+
+    /// A document written before the spread model still loads.
+    ///
+    /// The four coefficients are `#[serde(default)]`, so a simulation stored by
+    /// an older binary keeps deserializing and reads as the single scalar it
+    /// was created with. Losing that would strand every live simulation on a
+    /// deploy.
+    #[test]
+    fn test_stored_parameters_without_the_spread_model_still_load() {
+        let parameters = parameters(reference_request());
+        let json = match serde_json::to_value(&parameters) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                for field in [
+                    "spread_proportional",
+                    "spread_moneyness_widening",
+                    "spread_tenor_widening",
+                    "spread_tick",
+                ] {
+                    map.remove(field);
+                }
+                serde_json::Value::Object(map)
+            }
+            other => panic!("the parameters must serialize to an object, got {other:?}"),
+        };
+
+        match serde_json::from_value::<SimulationParametersV2>(json) {
+            Ok(loaded) => {
+                assert_eq!(loaded.spread, parameters.spread, "the scalar survives");
+                assert_eq!(loaded.spread_proportional, None);
+                assert_eq!(loaded.spread_moneyness_widening, None);
+                assert_eq!(loaded.spread_tenor_widening, None);
+                assert_eq!(loaded.spread_tick, None);
+            }
+            Err(error) => panic!("an older document must still load: {error}"),
+        }
+    }
+
+    /// The spread coefficients are bounded at the boundary, both ways.
+    ///
+    /// A negative widening term would NARROW a quote away from the money, a
+    /// tick of zero is not an increment, and an unbounded coefficient would
+    /// reach `Decimal`'s range against a large mid.
+    #[test]
+    fn test_an_out_of_range_spread_coefficient_is_refused() {
+        for (field, mutate) in [
+            (
+                "spread_proportional",
+                (|request: &mut CreateSimulationRequest| request.spread_proportional = Some(-0.01))
+                    as fn(&mut CreateSimulationRequest),
+            ),
+            ("spread_moneyness_widening", |request| {
+                request.spread_moneyness_widening = Some(-0.5)
+            }),
+            ("spread_tenor_widening", |request| {
+                request.spread_tenor_widening = Some(-0.2)
+            }),
+            ("spread_tick", |request| request.spread_tick = Some(0.0)),
+            ("spread_proportional", |request| {
+                request.spread_proportional = Some(MAX_PROPORTIONAL + 1.0)
+            }),
+            ("spread_moneyness_widening", |request| {
+                request.spread_moneyness_widening = Some(MAX_WIDENING + 1.0)
+            }),
+            ("spread_tick", |request| {
+                request.spread_tick = Some(MAX_TICK + 1.0)
+            }),
+        ] {
+            let mut request = reference_request();
+            mutate(&mut request);
+
+            match SimulationParametersV2::try_from(request) {
+                Ok(parameters) => panic!("{field} must be refused, got {parameters:?}"),
+                Err(ChainError::Validation { field: named, .. }) => assert_eq!(named, field),
+                Err(error) => panic!("expected a validation failure for {field}, got {error:?}"),
+            }
         }
     }
 

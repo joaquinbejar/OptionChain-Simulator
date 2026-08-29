@@ -474,7 +474,9 @@ Invariants a reviewer can check:
 > **time frame**, **timezone**, **calendar version**, **IANA tzdb version**,
 > **normalised schedules**, and market and chain parameters (`symbol`, `steps`,
 > `initial_price`, `volatility`, `risk_free_rate`, `dividend_yield`, `method`,
-> `chain_size`, `strike_interval`, `skew_slope`, `smile_curve`, `spread`).
+> `chain_size`, `strike_interval`, `skew_slope`, `smile_curve`, and the spread
+> model: `spread`, `spread_proportional`, `spread_moneyness_widening`,
+> `spread_tenor_widening`, `spread_tick`).
 
 That list is exhaustive and is meant to be checkable. All of it is resolved once
 at creation, persisted, and echoed in the creation and session responses — so a
@@ -1037,6 +1039,10 @@ last-Friday monthlies, all expiring at 17:00 America/New_York.
   "skew_slope": -0.2,
   "smile_curve": 0.4,
   "spread": 0.02,
+  "spread_proportional": 0.01,
+  "spread_moneyness_widening": 0.5,
+  "spread_tenor_widening": 0.1,
+  "spread_tick": 0.01,
   "seed": 42
 }
 ```
@@ -1075,7 +1081,11 @@ last-Friday monthlies, all expiring at 17:00 America/New_York.
     "strike_interval": 25.0,
     "skew_slope": -0.2,
     "smile_curve": 0.4,
-    "spread": 0.02
+    "spread": 0.02,
+    "spread_proportional": 0.01,
+    "spread_moneyness_widening": 0.5,
+    "spread_tenor_widening": 0.1,
+    "spread_tick": 0.01
   }
 }
 ```

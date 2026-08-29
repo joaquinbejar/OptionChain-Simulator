@@ -134,9 +134,21 @@ pub struct SimulationParametersResponse {
     /// Curvature of the volatility smile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smile_curve: Option<f64>,
-    /// Bid-ask spread factor.
+    /// The constant term of the spread model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
+    /// The proportional term of the spread model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_proportional: Option<f64>,
+    /// The moneyness term of the spread model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_moneyness_widening: Option<f64>,
+    /// The tenor term of the spread model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_tenor_widening: Option<f64>,
+    /// The tick every quote is rounded and floored to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spread_tick: Option<f64>,
 }
 
 /// A simulation's metadata, with no market data attached.
@@ -338,6 +350,16 @@ impl From<&SessionV2> for SimulationParametersResponse {
             skew_slope: parameters.skew_slope.and_then(|value| value.to_f64()),
             smile_curve: parameters.smile_curve.and_then(|value| value.to_f64()),
             spread: parameters.spread.map(|value| value.to_f64()),
+            spread_proportional: parameters
+                .spread_proportional
+                .and_then(|value| value.to_f64()),
+            spread_moneyness_widening: parameters
+                .spread_moneyness_widening
+                .and_then(|value| value.to_f64()),
+            spread_tenor_widening: parameters
+                .spread_tenor_widening
+                .and_then(|value| value.to_f64()),
+            spread_tick: parameters.spread_tick.map(|value| value.to_f64()),
         }
     }
 }
