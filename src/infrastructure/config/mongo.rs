@@ -25,16 +25,21 @@ impl Default for MongoDBConfig {
             // Blank is unset, everywhere (issue #83): a blank `MONGODB_URI`
             // is a knob someone commented out, not a request to connect to the
             // empty string.
+            // The URI carries credentials inside it, so it is taken verbatim:
+            // trimming it could change the password it embeds.
             uri: super::read_var("MONGODB_URI")
                 .unwrap_or_else(|| "mongodb://admin:password@localhost:27017".to_string()),
             database: super::read_var("MONGODB_DATABASE")
+                .map(|database| database.trim().to_string())
                 .unwrap_or_else(|| "optionchain_simulator".to_string()),
             steps_collection: super::read_var("MONGODB_STEPS_COLLECTION")
+                .map(|collection| collection.trim().to_string())
                 .unwrap_or_else(|| "steps".to_string()),
             events_collection: super::read_var("MONGODB_EVENTS_COLLECTION")
+                .map(|collection| collection.trim().to_string())
                 .unwrap_or_else(|| "events".to_string()),
             timeout: super::read_var("MONGODB_TIMEOUT")
-                .and_then(|s| s.parse::<u64>().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(30),
         }
     }

@@ -284,8 +284,14 @@ need no changes.
 
 **A blank value is an unset value.** `KNOB=` and `KNOB="   "` are read
 exactly as if the line were absent, and the documented default applies, so a
-knob is switched off by commenting it out rather than by emptying it. The
-rule holds for every variable the service reads, credentials included.
+knob is switched off by commenting it out rather than by emptying it.
+
+One variable is exempt: `CLICKHOUSE_PASSWORD`, where an empty value is a
+real configuration — a stock `default` user has no password — so a present
+variable is taken as written and only an absent one falls back. Values are
+never trimmed either: whitespace decides only whether a value is blank, and
+a credential written with a leading space keeps it. Numbers and host names
+are trimmed where they are parsed.
 
 Every environment variable the service reads is documented in
 `.env.example` with its default and accepted range. Two families, with

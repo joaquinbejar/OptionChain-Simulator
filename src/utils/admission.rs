@@ -41,7 +41,7 @@ static PRICING_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| {
     let raw = super::env::read_var("OCS_MAX_CONCURRENT_PRICING_JOBS");
     let configured = raw
         .as_deref()
-        .and_then(|raw| raw.parse::<usize>().ok())
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|permits| *permits >= 1)
         .unwrap_or_else(|| {
             // Only a value that was actually written and is unusable warrants a

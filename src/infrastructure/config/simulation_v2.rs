@@ -253,7 +253,10 @@ fn parse_secs(
         return Ok(default);
     };
 
-    let seconds = raw.parse::<u64>().map_err(|_| invalid(variable, raw))?;
+    let seconds = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| invalid(variable, raw))?;
     if seconds == 0 {
         return Err(ChainError::Validation {
             field: variable.to_string(),
@@ -289,7 +292,10 @@ fn parse_bounded(
         return Ok(default);
     };
 
-    let value = raw.parse::<usize>().map_err(|_| invalid(variable, raw))?;
+    let value = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| invalid(variable, raw))?;
     if value == 0 {
         return Err(ChainError::Validation {
             field: variable.to_string(),

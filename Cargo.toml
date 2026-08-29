@@ -2,10 +2,12 @@
 name = "optionchain_simulator"
 version = "0.2.0"
 edition = "2024"
-# Declared because the dependency bump moved it: actix-web 4.15 and redis 1.6
-# both require 1.88. Without this a consumer on an older toolchain gets a
-# failure inside a dependency rather than a clear message about this crate.
-rust-version = "1.88"
+# The maximum `rust-version` across the RESOLVED graph, not the highest direct
+# dependency: clickhouse 0.15.1, nalgebra 0.35, statrs 0.19.1 and wide 1.7 all
+# require 1.89, so declaring 1.88 would fail inside a dependency instead of
+# saying clearly that this crate needs a newer toolchain. Re-derive it after a
+# bump with `cargo metadata` over the resolved packages' rust_version.
+rust-version = "1.89"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "OptionChain-Simulator is a lightweight REST API service that simulates an evolving option chain with every request. It is designed for developers building or testing trading systems, backtesters, and visual tools that depend on option data streams but want to avoid relying on live data feeds."
 license = "MIT"

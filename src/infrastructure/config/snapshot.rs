@@ -227,7 +227,10 @@ fn parse_bounded_usize(
         return Ok(default);
     };
 
-    let value = raw.parse::<usize>().map_err(|_| invalid(variable, raw))?;
+    let value = raw
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| invalid(variable, raw))?;
     if value == 0 {
         return Err(zero(variable));
     }
@@ -248,7 +251,10 @@ fn parse_bounded_u64(
         return Ok(default);
     };
 
-    let value = raw.parse::<u64>().map_err(|_| invalid(variable, raw))?;
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| invalid(variable, raw))?;
     if value == 0 {
         return Err(zero(variable));
     }
@@ -269,7 +275,10 @@ fn parse_bounded_u32(
         return Ok(default);
     };
 
-    let value = raw.parse::<u32>().map_err(|_| invalid(variable, raw))?;
+    let value = raw
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| invalid(variable, raw))?;
     if value == 0 {
         return Err(zero(variable));
     }

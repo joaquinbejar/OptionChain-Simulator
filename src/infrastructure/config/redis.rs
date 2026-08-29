@@ -88,18 +88,23 @@ impl RedisConfig {
 
 impl Default for RedisConfig {
     fn default() -> Self {
+        // Trimmed at the call site: these are numbers, so surrounding
+        // whitespace is noise. The credentials below are not trimmed at all.
         let port = super::read_var("REDIS_PORT")
-            .and_then(|s| s.parse::<u16>().ok())
+            .and_then(|s| s.trim().parse::<u16>().ok())
             .unwrap_or(6379);
 
         let database = super::read_var("REDIS_DB")
-            .and_then(|s| s.parse::<u8>().ok())
+            .and_then(|s| s.trim().parse::<u8>().ok())
             .unwrap_or(0);
 
-        // Blank is unset, which is the whole point of issue #83: `REDIS_USER=`
-        // and `REDIS_PASSWORD=` used to become `Some("")` and build
+        // Blank is unset HERE, unlike ClickHouse: `REDIS_USER=` and
+        // `REDIS_PASSWORD=` used to become `Some("")` and build
         // `redis://:@host`, an AUTH attempt with an empty password against a
-        // server that has none.
+        // server that has none. An empty Redis credential asks for exactly what
+        // an absent one does, so nothing is expressible only through the blank
+        // form and the failure mode is real. Untrimmed, like every credential:
+        // whatever a present, non-blank value says is what gets sent.
         let username = super::read_var("REDIS_USER");
         let password = super::read_var("REDIS_PASSWORD");
 
@@ -107,7 +112,9 @@ impl Default for RedisConfig {
         let connect_timeout = parse_timeout_secs("REDIS_CONNECT_TIMEOUT", 5);
 
         Self {
-            host: super::read_var("REDIS_HOST").unwrap_or_else(|| "localhost".to_string()),
+            host: super::read_var("REDIS_HOST")
+                .map(|host| host.trim().to_string())
+                .unwrap_or_else(|| "localhost".to_string()),
             port,
             username,
             password,

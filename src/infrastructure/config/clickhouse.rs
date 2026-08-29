@@ -54,29 +54,35 @@ impl Default for ClickHouseConfig {
     /// # Returns
     /// A new instance of the struct with properly initialized fields.
     fn default() -> Self {
+        // Trimmed HERE, not in the reader: a port is a number, so surrounding
+        // whitespace is noise, while the credentials below are opaque bytes
+        // where it is not.
         let port = super::read_var("CLICKHOUSE_PORT")
-            .and_then(|s| s.parse::<u16>().ok())
+            .and_then(|s| s.trim().parse::<u16>().ok())
             .unwrap_or(8123);
 
         Self {
-            host: super::read_var("CLICKHOUSE_HOST").unwrap_or_else(|| "localhost".to_string()),
+            host: super::read_var("CLICKHOUSE_HOST")
+                .map(|host| host.trim().to_string())
+                .unwrap_or_else(|| "localhost".to_string()),
             port,
-            // Credentials included: a blank one is unset, not an empty
-            // credential (issue #83).
-            //
-            // CONSEQUENCE, stated because it is a real trade: an EMPTY
-            // ClickHouse password is no longer expressible through the
-            // environment. `CLICKHOUSE_PASSWORD=` used to be the only way to
-            // say "this user has no password", which is how a stock
-            // ClickHouse `default` user is configured; it now falls back to
-            // the default below. The rule is applied uniformly on purpose —
-            // the alternative is one variable in the whole service behaving
-            // differently from the rest — and a password-less deployment sets
-            // the field directly through `ClickHouseConfig`, which is public.
+            // Credentials read through `read_secret`, NOT `read_var`: the
+            // blank-is-unset rule does not apply to them, because an empty
+            // ClickHouse password is a real configuration. A stock `default`
+            // user has none, and `CLICKHOUSE_PASSWORD=` is the only way to say
+            // so through the environment. They are also never trimmed: a
+            // credential's surrounding whitespace is part of the credential,
+            // and nothing here can tell that it is not.
+            // The USER follows the ordinary rule: an empty ClickHouse user is
+            // not a configuration any server accepts, so a blank one is a knob
+            // someone commented out. Untrimmed all the same, since a user name
+            // is not this module's to reinterpret.
             username: super::read_var("CLICKHOUSE_USER").unwrap_or_else(|| "admin".to_string()),
-            password: super::read_var("CLICKHOUSE_PASSWORD")
+            password: super::read_secret("CLICKHOUSE_PASSWORD")
                 .unwrap_or_else(|| "password".to_string()),
-            database: super::read_var("CLICKHOUSE_DB").unwrap_or_else(|| "default".to_string()),
+            database: super::read_var("CLICKHOUSE_DB")
+                .map(|database| database.trim().to_string())
+                .unwrap_or_else(|| "default".to_string()),
         }
     }
 }
@@ -141,9 +147,11 @@ mod tests {
             let config = ClickHouseConfig::default();
             assert_eq!(config.host, "localhost", "blank {blank:?}");
             assert_eq!(config.username, "admin");
-            assert_eq!(config.password, "password");
             assert_eq!(config.database, "default");
             assert_eq!(config.port, 8123);
+            // The PASSWORD is the documented exception: a present variable is
+            // a credential, empty included, so it does not fall back here.
+            assert_eq!(config.password, blank, "blank {blank:?}");
         }
 
         for name in [
