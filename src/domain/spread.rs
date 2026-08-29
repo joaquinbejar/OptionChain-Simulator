@@ -194,7 +194,14 @@ impl SpreadModel {
         }
 
         if !self.tenor_widening.is_zero() && days_to_expiration > Decimal::ZERO {
-            let years = days_to_expiration / DAYS_PER_YEAR;
+            // `checked_div`, like every other operator on this path. `Decimal`
+            // division keeps the full precision it can and rounds the result at
+            // 28 significant digits, which is far below the two decimal places
+            // a quote is finally rounded to, so the policy here is simply "do
+            // not lose the term to a panic".
+            let Some(years) = days_to_expiration.checked_div(DAYS_PER_YEAR) else {
+                return self.tick;
+            };
             let Some(widened) = years
                 .sqrt()
                 .and_then(|root| self.tenor_widening.checked_mul(root))
@@ -266,20 +273,30 @@ impl SpreadModel {
     /// present, and worth what it is worth.
     #[must_use]
     fn quote_around(&self, mid: Positive, spread: Positive) -> (Positive, Positive) {
-        let half = spread.to_dec() / Decimal::TWO;
         let mid = mid.to_dec();
 
-        // Checked, for the same reason `spread_for` is: both terms are derived
-        // from client input, and `Add` panics on overflow. An unquotable price
-        // keeps the mid it had rather than taking the request down.
+        // Every operator on this path is checked, and every one of them can be
+        // reached from a request: the spread carries a client coefficient and
+        // the mid carries a client price. Halving is exact for any
+        // representable spread — dividing by two adds one digit, and `Decimal`
+        // carries 28 — so the rounding policy is the one the whole module
+        // already states: nothing is rounded until `round_quote` takes the
+        // quote to two places. A term that cannot be computed degrades to the
+        // untouched mid rather than taking the request down.
+        let half = spread
+            .to_dec()
+            .checked_div(Decimal::TWO)
+            .unwrap_or(Decimal::ZERO);
+
         let ask = match mid.checked_add(half) {
             Some(value) => round_quote(value).max(self.tick),
             None => round_quote(mid).max(self.tick),
         };
         let floor = self.tick.min(round_quote(mid));
-        let bid = round_quote((mid - half).max(Decimal::ZERO))
-            .max(floor)
-            .min(ask);
+        let bid = match mid.checked_sub(half) {
+            Some(value) => round_quote(value.max(Decimal::ZERO)).max(floor).min(ask),
+            None => floor.min(ask),
+        };
 
         (bid, ask)
     }
@@ -581,6 +598,31 @@ mod tests {
 
         assert_eq!(bid, Positive::ZERO, "a third of a cent is not worth a cent");
         assert!(ask >= pos_or_panic!(0.01));
+    }
+
+    /// A quote is placed without a raw operator anywhere on the path.
+    ///
+    /// The mid and the spread both come from a request, and every `Decimal`
+    /// operator panics on overflow, so the extremes have to produce a quote
+    /// rather than a crash.
+    #[test]
+    fn test_an_extreme_quote_does_not_panic() {
+        let model = SpreadModel::from_parameters(&parameters());
+
+        for (mid, spread) in [
+            (Positive::ZERO, pos_or_panic!(0.01)),
+            (pos_or_panic!(0.003), pos_or_panic!(0.01)),
+            (
+                match Positive::new_decimal(Decimal::MAX) {
+                    Ok(mid) => mid,
+                    Err(error) => panic!("the fixture must be positive: {error}"),
+                },
+                pos_or_panic!(0.5),
+            ),
+        ] {
+            let (bid, ask) = model.quote_around(mid, spread);
+            assert!(bid <= ask, "the book must never cross: {bid} / {ask}");
+        }
     }
 
     /// An absurd coefficient degrades to the tick instead of panicking.

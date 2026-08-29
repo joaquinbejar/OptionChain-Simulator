@@ -147,6 +147,30 @@ fn reject_zero(field: &str, value: Positive) -> Result<(), ChainError> {
     Ok(())
 }
 
+/// Rejects a spread coefficient above the cap the request path applies.
+///
+/// The cap is declared as an `f64` beside the model, so it is converted here
+/// rather than duplicated as a `Decimal`: one definition, and a conversion that
+/// cannot silently disagree with it.
+fn reject_above_cap(field: &str, value: Decimal, maximum: f64) -> Result<(), ChainError> {
+    let Ok(maximum) = Decimal::try_from(maximum) else {
+        // Unreachable: every cap is a small literal. A cap that cannot be
+        // represented is not a bound anything can be checked against, so the
+        // value is refused rather than admitted unchecked.
+        return Err(ChainError::Validation {
+            field: field.to_string(),
+            reason: "the configured maximum is not representable".to_string(),
+        });
+    };
+    if value > maximum {
+        return Err(ChainError::Validation {
+            field: field.to_string(),
+            reason: format!("must not exceed {maximum}, got {value}"),
+        });
+    }
+    Ok(())
+}
+
 /// Validates an explicitly-supplied step interval.
 fn validate_step_interval_seconds(seconds: u64) -> Result<u64, ChainError> {
     if !(MIN_STEP_INTERVAL_SECONDS..=MAX_STEP_INTERVAL_SECONDS).contains(&seconds) {
@@ -409,26 +433,44 @@ impl SimulationParametersV2 {
         if let Some(strike_interval) = self.strike_interval {
             reject_zero("strike_interval", strike_interval)?;
         }
-        // The spread model, for the same reason: a stored `spread_tick` of zero
-        // silently disables the floor that keeps a wing quotable, and a stored
-        // negative coefficient — which `Decimal` admits and the request path
-        // refuses — would narrow a quote away from the money.
+        // The spread model, BOTH bounds, exactly as the request path applies
+        // them. A stored `spread_tick` of zero silently disables the floor that
+        // keeps a wing quotable; a stored negative coefficient — which
+        // `Decimal` admits — would narrow a quote away from the money; and a
+        // stored coefficient above its cap would price a chain the REST
+        // boundary refuses to create. Redis is an outer layer, so a document
+        // that never passed through a request must clear the same bar.
         if let Some(tick) = self.spread_tick {
             reject_zero("spread_tick", tick)?;
+            reject_above_cap("spread_tick", tick.to_dec(), MAX_TICK)?;
         }
-        for (field, value) in [
-            ("spread_proportional", self.spread_proportional),
-            ("spread_moneyness_widening", self.spread_moneyness_widening),
-            ("spread_tenor_widening", self.spread_tenor_widening),
+        for (field, value, maximum) in [
+            (
+                "spread_proportional",
+                self.spread_proportional,
+                MAX_PROPORTIONAL,
+            ),
+            (
+                "spread_moneyness_widening",
+                self.spread_moneyness_widening,
+                MAX_WIDENING,
+            ),
+            (
+                "spread_tenor_widening",
+                self.spread_tenor_widening,
+                MAX_WIDENING,
+            ),
         ] {
-            if let Some(value) = value
-                && value < Decimal::ZERO
-            {
+            let Some(value) = value else {
+                continue;
+            };
+            if value < Decimal::ZERO {
                 return Err(ChainError::Validation {
                     field: field.to_string(),
                     reason: format!("must not be negative, got {value}"),
                 });
             }
+            reject_above_cap(field, value, maximum)?;
         }
         validate_walk_type(&self.method)?;
 
@@ -1457,6 +1499,61 @@ mod tests {
                 error.to_string().contains("spread_tick"),
                 "the failure must name the field: {error}"
             ),
+        }
+    }
+
+    /// A stored coefficient above its cap is refused on load.
+    ///
+    /// Redis is an outer layer: a document that never passed through a request
+    /// must clear the same bar, or a hand-edited one prices a chain the REST
+    /// boundary would refuse to create.
+    #[test]
+    fn test_stored_parameters_reject_a_coefficient_above_its_cap() {
+        let parameters = parameters(reference_request());
+
+        for (field, over_cap) in [
+            ("spread_proportional", MAX_PROPORTIONAL + 1.0),
+            ("spread_moneyness_widening", MAX_WIDENING + 1.0),
+            ("spread_tenor_widening", MAX_WIDENING + 1.0),
+            ("spread_tick", MAX_TICK + 1.0),
+        ] {
+            let json = match serde_json::to_value(&parameters) {
+                Ok(serde_json::Value::Object(mut map)) => {
+                    map.insert(field.to_string(), serde_json::json!(over_cap.to_string()));
+                    serde_json::Value::Object(map)
+                }
+                other => panic!("the parameters must serialize to an object, got {other:?}"),
+            };
+
+            match serde_json::from_value::<SimulationParametersV2>(json) {
+                Ok(loaded) => panic!("{field} above its cap must be refused, got {loaded:?}"),
+                Err(error) => assert!(
+                    error.to_string().contains(field),
+                    "the failure must name {field}: {error}"
+                ),
+            }
+        }
+    }
+
+    /// A coefficient exactly at its cap still loads.
+    ///
+    /// The bound is inclusive on both paths, so the stored check cannot be
+    /// stricter than the request that produced the document.
+    #[test]
+    fn test_stored_parameters_accept_a_coefficient_at_its_cap() {
+        let mut request = reference_request();
+        request.spread_proportional = Some(MAX_PROPORTIONAL);
+        request.spread_moneyness_widening = Some(MAX_WIDENING);
+        request.spread_tick = Some(MAX_TICK);
+        let parameters = parameters(request);
+
+        let json = match serde_json::to_string(&parameters) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+        match serde_json::from_str::<SimulationParametersV2>(&json) {
+            Ok(loaded) => assert_eq!(loaded, parameters),
+            Err(error) => panic!("a document at the cap must load: {error}"),
         }
     }
 
