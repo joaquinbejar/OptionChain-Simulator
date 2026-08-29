@@ -19,10 +19,17 @@
 //!
 //! # What reaches the response body
 //!
-//! A probe's explanation is rendered into an unauthenticated 503 body, so it is
-//! redacted and length-bounded HERE, once, rather than in each probe: a
-//! contract that every implementor has to remember is one a future implementor
-//! will forget.
+//! A FIXED CATEGORY, and nothing else. `/ready` is unauthenticated, so a
+//! driver's own words must not reach it: a server message can carry internal
+//! host names, database paths, TLS file paths, query text and tokens in forms
+//! no redaction routine knows to look for, and redacting URL userinfo covers
+//! only the shape it was written for.
+//!
+//! A report therefore carries [`ProbeFailure`], which has exactly two values —
+//! the dependency did not answer, or it did not answer in time — and both are
+//! facts this module owns rather than text it parsed. The driver's explanation
+//! stays inside the process, credential-redacted and length-bounded, in the
+//! transition log.
 
 use crate::infrastructure::config::redact_userinfo;
 use crate::infrastructure::{MongoDBRepository, RedisClient, SimulationSnapshotRepository};
@@ -47,20 +54,45 @@ pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// payload.
 pub(crate) const MAX_DETAIL_CHARS: usize = 200;
 
+/// Why a dependency did not answer, in terms safe to publish.
+///
+/// An allowlist, deliberately small: each value is decided by WHICH branch of
+/// the probe fired, never by inspecting what a server said. Adding a value
+/// means deciding, once and in the open, that the new fact is safe to tell an
+/// unauthenticated caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeFailure {
+    /// It refused, failed, or could not be reached at all.
+    Unreachable,
+    /// It did not answer inside the probe's bound.
+    TimedOut,
+}
+
+impl ProbeFailure {
+    /// The public wording, which is the whole of what a caller learns.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeFailure::Unreachable => "unreachable",
+            ProbeFailure::TimedOut => "timed_out",
+        }
+    }
+}
+
 /// One dependency's answer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DependencyReport {
     /// What was probed: `redis`, `mongodb` or `clickhouse`.
     pub name: &'static str,
-    /// Why it did not answer, absent when it did. Already redacted and bounded.
-    pub error: Option<String>,
+    /// Why it did not answer, absent when it did. A category, never a message.
+    pub failure: Option<ProbeFailure>,
 }
 
 impl DependencyReport {
     /// Whether this dependency answered.
     #[must_use]
     pub fn is_up(&self) -> bool {
-        self.error.is_none()
+        self.failure.is_none()
     }
 }
 
@@ -177,21 +209,31 @@ impl Readiness {
     /// Bounded: a hung dependency costs one timeout for the whole call, not one
     /// per dependency, and does not stop the others from being reported.
     pub async fn evaluate(&self) -> Vec<DependencyReport> {
-        let reports = join_all(self.probes.iter().map(|probe| async move {
+        let answers = join_all(self.probes.iter().map(|probe| async move {
             let name = probe.name();
-            let error = match tokio::time::timeout(PROBE_TIMEOUT, probe.check()).await {
-                Ok(Ok(())) => None,
-                Ok(Err(detail)) => Some(bound_detail(&redact_userinfo(&detail))),
-                Err(_) => Some(format!(
-                    "did not answer within {}s",
-                    PROBE_TIMEOUT.as_secs()
-                )),
-            };
-            DependencyReport { name, error }
+            // The category comes from which arm fired, and the driver's own
+            // words go no further than the internal log beside it.
+            match tokio::time::timeout(PROBE_TIMEOUT, probe.check()).await {
+                Ok(Ok(())) => (name, None, None),
+                Ok(Err(detail)) => (
+                    name,
+                    Some(ProbeFailure::Unreachable),
+                    Some(bound_detail(&redact_userinfo(&detail))),
+                ),
+                Err(_) => (name, Some(ProbeFailure::TimedOut), None),
+            }
         }))
         .await;
 
-        self.log_transition(&reports);
+        let reports: Vec<DependencyReport> = answers
+            .iter()
+            .map(|(name, failure, _)| DependencyReport {
+                name,
+                failure: *failure,
+            })
+            .collect();
+
+        self.log_transition(&answers);
         reports
     }
 
@@ -200,8 +242,8 @@ impl Readiness {
     /// The endpoint is polled forever by design, so logging every failure would
     /// emit a line per dependency every few seconds for as long as an outage
     /// lasts, which is what teaches an operator to filter the log.
-    fn log_transition(&self, reports: &[DependencyReport]) {
-        let ready = reports.iter().all(DependencyReport::is_up);
+    fn log_transition(&self, answers: &[(&'static str, Option<ProbeFailure>, Option<String>)]) {
+        let ready = answers.iter().all(|(_, failure, _)| failure.is_none());
         if self.last_logged_ready.swap(ready, Ordering::SeqCst) == ready {
             return;
         }
@@ -211,10 +253,13 @@ impl Readiness {
             return;
         }
 
-        for report in reports.iter().filter(|report| !report.is_up()) {
+        // The one place a driver's explanation is kept, and it never leaves the
+        // process. Redacted and bounded even here: logs get shipped.
+        for (name, failure, detail) in answers.iter().filter(|(_, failure, _)| failure.is_some()) {
             warn!(
-                dependency = report.name,
-                detail = report.error.as_deref().unwrap_or(""),
+                dependency = name,
+                reason = failure.map_or("", ProbeFailure::as_str),
+                detail = detail.as_deref().unwrap_or(""),
                 "a dependency stopped answering; this instance is not ready"
             );
         }
@@ -406,7 +451,7 @@ mod tests {
         let reports = readiness.evaluate().await;
 
         match reports.iter().find(|report| report.name == "redis") {
-            Some(redis) => assert_eq!(redis.error.as_deref(), Some("connection refused")),
+            Some(redis) => assert_eq!(redis.failure, Some(ProbeFailure::Unreachable)),
             None => panic!("the failing dependency must be reported: {reports:?}"),
         }
         match reports.iter().find(|report| report.name == "mongodb") {
@@ -439,8 +484,8 @@ mod tests {
 
         match reports.iter().find(|report| report.name == "stalled") {
             Some(stalled) => assert_eq!(
-                stalled.error.as_deref(),
-                Some("did not answer within 2s"),
+                stalled.failure,
+                Some(ProbeFailure::TimedOut),
                 "the report says it timed out, not that it refused"
             ),
             None => panic!("the hung dependency must be reported: {reports:?}"),
@@ -451,59 +496,54 @@ mod tests {
         }
     }
 
-    /// Credentials never reach a report, whatever a probe returns.
+    /// A driver's own words never reach a report, whatever a probe returns.
     ///
-    /// The 503 body is unauthenticated, and a driver error echoes the
-    /// connection URI it was given.
+    /// The report is what an unauthenticated 503 is rendered from, so the only
+    /// thing it may carry is the category. A server message can name internal
+    /// hosts, paths, queries and tokens that no redaction routine reliably
+    /// recognises, which is why none of it is published rather than published
+    /// after a scrub.
     #[tokio::test]
-    async fn test_a_failure_detail_is_redacted() {
-        let readiness = Readiness::new(vec![Arc::new(Switch::failing_with(
-            "redis",
+    async fn test_a_report_carries_no_driver_text() {
+        let leaky = "IO error: redis://admin:hunter2@10.0.0.7:6379/prod?tls_cert=/etc/ssl/k.pem";
+        let readiness = Readiness::new(vec![Arc::new(Switch::failing_with("redis", leaky))]);
+
+        let reports = readiness.evaluate().await;
+
+        assert_eq!(reports[0].failure, Some(ProbeFailure::Unreachable));
+        let rendered = format!("{reports:?}");
+        for secret in ["hunter2", "10.0.0.7", "/etc/ssl/k.pem", "prod"] {
+            assert!(
+                !rendered.contains(secret),
+                "the report leaked {secret:?}: {rendered}"
+            );
+        }
+    }
+
+    /// The two public categories are the whole vocabulary.
+    #[tokio::test]
+    async fn test_the_public_vocabulary_is_two_words() {
+        assert_eq!(ProbeFailure::Unreachable.as_str(), "unreachable");
+        assert_eq!(ProbeFailure::TimedOut.as_str(), "timed_out");
+    }
+
+    /// The internal detail is redacted and bounded before it is logged.
+    ///
+    /// It never reaches a response, but logs get shipped, so the sanitiser
+    /// still runs over it.
+    #[tokio::test]
+    async fn test_the_internal_detail_is_sanitised() {
+        let redacted = bound_detail(&crate::infrastructure::config::redact_userinfo(
             "IO error: redis://admin:hunter2@redis:6379 refused",
-        ))]);
+        ));
+        assert!(!redacted.contains("hunter2"), "the password survived");
+        assert!(redacted.contains("refused"), "the reason was lost");
 
-        let reports = readiness.evaluate().await;
+        let long = bound_detail(&"x".repeat(MAX_DETAIL_CHARS * 5));
+        assert_eq!(long.chars().count(), MAX_DETAIL_CHARS + 3);
+        assert!(long.ends_with("..."));
 
-        match reports[0].error.as_deref() {
-            Some(detail) => {
-                assert!(
-                    !detail.contains("hunter2"),
-                    "the password survived: {detail}"
-                );
-                assert!(detail.contains("refused"), "the reason was lost: {detail}");
-            }
-            None => panic!("the probe failed and must say so: {reports:?}"),
-        }
-    }
-
-    /// An unbounded server exception is trimmed before it becomes a body.
-    #[tokio::test]
-    async fn test_a_long_failure_detail_is_bounded() {
-        let readiness = Readiness::new(vec![Arc::new(Switch::failing_with(
-            "clickhouse",
-            &"x".repeat(MAX_DETAIL_CHARS * 5),
-        ))]);
-
-        let reports = readiness.evaluate().await;
-
-        match reports[0].error.as_deref() {
-            Some(detail) => {
-                assert_eq!(detail.chars().count(), MAX_DETAIL_CHARS + 3);
-                assert!(detail.ends_with("..."));
-            }
-            None => panic!("the probe failed and must say so: {reports:?}"),
-        }
-    }
-
-    /// A detail that fits is left exactly as it is.
-    #[tokio::test]
-    async fn test_a_short_failure_detail_is_untouched() {
-        let readiness = Readiness::new(vec![Arc::new(Switch::new("redis", false))]);
-
-        assert_eq!(
-            readiness.evaluate().await[0].error.as_deref(),
-            Some("connection refused")
-        );
+        assert_eq!(bound_detail("connection refused"), "connection refused");
     }
 
     /// With nothing configured to check, an instance is ready.

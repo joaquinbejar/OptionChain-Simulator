@@ -36,7 +36,8 @@ pub use config::snapshot::{
     DEFAULT_SNAPSHOT_RETENTION_DAYS, SnapshotPersistenceConfig,
 };
 pub use health::{
-    DependencyProbe, DependencyReport, MongoDbProbe, Readiness, RedisProbe, WarehouseProbe,
+    DependencyProbe, DependencyReport, MongoDbProbe, ProbeFailure, Readiness, RedisProbe,
+    WarehouseProbe,
 };
 pub use redis::RedisClient;
 pub use repositories::historical_repo::ClickHouseHistoricalRepository;

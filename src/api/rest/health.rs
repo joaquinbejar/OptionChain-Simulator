@@ -87,10 +87,15 @@ pub struct DependencyStatus {
     pub name: String,
     /// Whether it answered.
     pub status: DependencyState,
-    /// Why it did not, absent when it did. Redacted and length-bounded before
-    /// it gets here, since this body is unauthenticated.
+    /// Why it did not, absent when it did.
+    ///
+    /// A FIXED category — `unreachable` or `timed_out` — never a driver's own
+    /// words. This body is unauthenticated, and a server message can carry
+    /// internal host names, file paths, query text and tokens that no redaction
+    /// routine reliably recognises. The full explanation stays in the service's
+    /// log.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
+    pub reason: Option<String>,
 }
 
 impl DependencyStatus {
@@ -110,7 +115,7 @@ impl From<&DependencyReport> for DependencyStatus {
             } else {
                 DependencyState::Down
             },
-            detail: report.error.clone(),
+            reason: report.failure.map(|failure| failure.as_str().to_string()),
         }
     }
 }
@@ -301,7 +306,7 @@ mod tests {
             vec!["redis", "mongodb", "clickhouse"],
             "the order is the one the probes were registered in"
         );
-        assert!(body.dependencies.iter().all(|d| d.detail.is_none()));
+        assert!(body.dependencies.iter().all(|d| d.reason.is_none()));
     }
 
     /// A failing dependency is named, and the healthy ones are still reported.
@@ -333,7 +338,9 @@ mod tests {
         {
             Some(redis) => {
                 assert_eq!(redis.status, DependencyState::Down);
-                assert_eq!(redis.detail.as_deref(), Some("connection refused"));
+                // The category, not the probe's own words: the body is
+                // unauthenticated.
+                assert_eq!(redis.reason.as_deref(), Some("unreachable"));
             }
             None => panic!("the failing dependency must be in the body: {body:?}"),
         }

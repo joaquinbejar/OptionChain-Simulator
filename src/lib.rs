@@ -191,9 +191,12 @@
 //! Redis hiccup can never get a healthy instance restarted. `/ready` says this
 //! instance can take work, and it asks: Redis and MongoDB always, ClickHouse
 //! when snapshot persistence is enabled, each under a 2-second bound and all of
-//! them at once. A 503 body names every dependency and why the failing ones
-//! failed, credential-redacted. Nothing is cached, so an instance whose Redis
-//! came back reports itself ready again without a restart.
+//! them at once. A 503 body names every dependency and, for the failing ones, a
+//! fixed category: `unreachable` or `timed_out`. Never a driver's own words —
+//! the endpoint is unauthenticated, and a server message can carry internal
+//! hosts, paths and tokens no redaction reliably recognises, so the full
+//! explanation stays in the service's log. Nothing is cached, so an instance
+//! whose Redis came back reports itself ready again without a restart.
 //!
 //! Both are unversioned, unauthenticated, and excluded from the request
 //! metrics: an orchestrator polling forever would otherwise add a constant to
