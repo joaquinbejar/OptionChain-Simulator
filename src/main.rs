@@ -60,15 +60,15 @@
 
 use optionchain_simulator::api::{ListenOn, start_server};
 use optionchain_simulator::infrastructure::{
-    ClickHouseSnapshotRepository, LogLevel, MetricsCollector, RedisClient, RedisConfig,
-    SimulationV2Config, init_mongodb, resolve_log_level_from_env,
+    ClickHouseSnapshotRepository, MetricsCollector, RedisClient, RedisConfig, SimulationV2Config,
+    init_mongodb, resolve_log_level_from_env,
 };
 use optionchain_simulator::session::{
     InRedisSessionStore, InRedisSimulationStore, SessionManager, SimulationManager,
 };
 use optionstratlib::utils::setup_logger_with_level;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 /// The `main` function is the entry point of the application using the Actix Web server framework.
 /// It initializes the logger, sets up the session management with Redis as the backend, and starts the HTTP server.
@@ -127,14 +127,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "unrecognised LOGLEVEL; using the default"
         );
     }
-    // Emitted AT the resolved level, not at INFO: the operator who just set
-    // `LOGLEVEL=WARN` is exactly the one who wants to see that it took, and an
-    // INFO line would be suppressed by the very setting it reports.
-    match log_level.level {
-        LogLevel::Error => error!(level = %log_level.level, "Log level resolved from LOGLEVEL"),
-        LogLevel::Warn => warn!(level = %log_level.level, "Log level resolved from LOGLEVEL"),
-        _ => info!(level = %log_level.level, "Log level resolved from LOGLEVEL"),
-    }
+    // INFO, whatever the resolved level is. Confirming a healthy configuration
+    // at WARN or ERROR would file an incident on every restart of a service
+    // that is working exactly as configured, and an operator who filters at
+    // those severities is filtering precisely to not see this. Only the
+    // rejected-value branch above is a real problem, and it warns.
+    //
+    // The consequence is deliberate: with `LOGLEVEL=WARN` or above this line is
+    // suppressed. That is the setting doing its job, and the level is
+    // observable without it — every subsequent line is emitted at the level it
+    // resolved to.
+    info!(level = %log_level.level, "Log level resolved from LOGLEVEL");
 
     // Create a session store
     let redis_config = RedisConfig::default();
