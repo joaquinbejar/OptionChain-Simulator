@@ -50,7 +50,8 @@
 //! backtest harness cache a download and know it is still current.
 
 use crate::api::rest::binary::{
-    BinarySchema, CellType, PackedWriter, RowFlow, ensure_label_capacity, visit_typed_rows,
+    BinarySchema, CellType, PackedWriter, RowContext, RowFlow, ensure_label_capacity,
+    visit_typed_rows,
 };
 use crate::api::rest::error::map_error;
 use crate::api::rest::greeks::GreekLevel;
@@ -1303,24 +1304,24 @@ impl Writer {
                 // mutably: the schema is a handful of small vectors, next to
                 // nothing beside pricing a chain.
                 let schema = writer.schema().clone();
-                let flow = visit_typed_rows(
-                    &schema,
-                    *dataset,
-                    *level,
+                let context = RowContext {
+                    schema: &schema,
+                    dataset: *dataset,
+                    level: *level,
                     step,
-                    row.simulated_at,
+                    simulated_at: row.simulated_at,
                     row,
                     chains,
-                    &mut |cells| {
-                        let Some(block) = writer.push_row(cells)? else {
-                            return Ok(RowFlow::Continue);
-                        };
-                        if emit(block) == Delivery::ClientGone {
-                            return Ok(RowFlow::Stop);
-                        }
-                        Ok(RowFlow::Continue)
-                    },
-                )?;
+                };
+                let flow = visit_typed_rows(&context, &mut |cells| {
+                    let Some(block) = writer.push_row(cells)? else {
+                        return Ok(RowFlow::Continue);
+                    };
+                    if emit(block) == Delivery::ClientGone {
+                        return Ok(RowFlow::Stop);
+                    }
+                    Ok(RowFlow::Continue)
+                })?;
                 Ok(match flow {
                     RowFlow::Continue => Delivery::Sent,
                     RowFlow::Stop => Delivery::ClientGone,
@@ -1336,24 +1337,24 @@ impl Writer {
                 // mutably: the schema is a handful of small vectors, next to
                 // nothing beside pricing a chain.
                 let schema = writer.schema().clone();
-                let flow = visit_typed_rows(
-                    &schema,
-                    *dataset,
-                    *level,
+                let context = RowContext {
+                    schema: &schema,
+                    dataset: *dataset,
+                    level: *level,
                     step,
-                    row.simulated_at,
+                    simulated_at: row.simulated_at,
                     row,
                     chains,
-                    &mut |cells| {
-                        let Some(batch) = writer.push_row(cells)? else {
-                            return Ok(RowFlow::Continue);
-                        };
-                        if emit(batch) == Delivery::ClientGone {
-                            return Ok(RowFlow::Stop);
-                        }
-                        Ok(RowFlow::Continue)
-                    },
-                )?;
+                };
+                let flow = visit_typed_rows(&context, &mut |cells| {
+                    let Some(batch) = writer.push_row(cells)? else {
+                        return Ok(RowFlow::Continue);
+                    };
+                    if emit(batch) == Delivery::ClientGone {
+                        return Ok(RowFlow::Stop);
+                    }
+                    Ok(RowFlow::Continue)
+                })?;
                 Ok(match flow {
                     RowFlow::Continue => Delivery::Sent,
                     RowFlow::Stop => Delivery::ClientGone,
@@ -2335,15 +2336,16 @@ mod tests {
         ] {
             for level in [GreekLevel::None, GreekLevel::First, GreekLevel::All] {
                 let schema = BinarySchema::new(dataset, level, &parameters);
-                let rows = match crate::api::rest::binary::typed_rows(
-                    &schema,
+                let context = crate::api::rest::binary::RowContext {
+                    schema: &schema,
                     dataset,
                     level,
-                    0,
-                    row.simulated_at,
+                    step: 0,
+                    simulated_at: row.simulated_at,
                     row,
-                    Some(StepChains::Replayed(&chains)),
-                ) {
+                    chains: Some(StepChains::Replayed(&chains)),
+                };
+                let rows = match crate::api::rest::binary::typed_rows(&context) {
                     Ok(rows) => rows,
                     Err(error) => panic!("{dataset:?} at {level:?} must encode: {error}"),
                 };

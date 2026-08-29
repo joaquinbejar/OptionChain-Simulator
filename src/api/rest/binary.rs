@@ -332,6 +332,28 @@ pub(super) fn timestamp_nanos(instant: DateTime<Utc>) -> i64 {
 /// The same shape, in the same order, as the module's `csv_rows` produces as
 /// strings — deliberately built from the same view types rather than from a
 /// second traversal, so the encodings cannot disagree about what a row is.
+/// Everything one step's rows are built from.
+///
+/// Grouped rather than passed as seven parameters: they are one thing — the
+/// step being encoded — and they travel together to both the visitor and the
+/// collecting helper beside it.
+pub(super) struct RowContext<'a> {
+    /// The columns being written, and the dictionary behind them.
+    pub(super) schema: &'a BinarySchema,
+    /// Which dataset the rows belong to.
+    pub(super) dataset: Dataset,
+    /// How much of the greek set the rows carry.
+    pub(super) level: GreekLevel,
+    /// The step index.
+    pub(super) step: usize,
+    /// The simulated instant of the step.
+    pub(super) simulated_at: DateTime<Utc>,
+    /// The factor row the step was priced from.
+    pub(super) row: &'a FactorRow,
+    /// The step's chains, absent for the datasets that carry none.
+    pub(super) chains: Option<super::export::StepChains<'a>>,
+}
+
 /// Whether a row visitor wants more rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RowFlow {
@@ -355,20 +377,24 @@ pub(super) enum RowFlow {
 /// simulation's schedule does not name, which would make the binary `labels`
 /// column disagree with the text one, and whatever the visitor returns.
 pub(super) fn visit_typed_rows<F>(
-    schema: &BinarySchema,
-    dataset: Dataset,
-    level: GreekLevel,
-    step: usize,
-    simulated_at: DateTime<Utc>,
-    row: &FactorRow,
-    chains: Option<super::export::StepChains<'_>>,
+    context: &RowContext<'_>,
     visit: &mut F,
 ) -> Result<RowFlow, ChainError>
 where
     F: FnMut(Vec<Cell>) -> Result<RowFlow, ChainError>,
 {
-    let step_cell = Cell::I64(i64::try_from(step).unwrap_or(i64::MAX));
-    let instant = Cell::Timestamp(timestamp_nanos(simulated_at));
+    let RowContext {
+        schema,
+        dataset,
+        level,
+        step,
+        simulated_at,
+        row,
+        chains,
+    } = context;
+
+    let step_cell = Cell::I64(i64::try_from(*step).unwrap_or(i64::MAX));
+    let instant = Cell::Timestamp(timestamp_nanos(*simulated_at));
     let symbol = Cell::Dictionary(schema.symbol_index());
 
     match dataset {
@@ -455,103 +481,19 @@ where
     }
 }
 
-/// The same rows, collected. Test-only: the serving path visits them one at a
-/// time so that neither memory nor cancellation latency scales with a step.
+/// The same rows, collected.
+///
+/// Test-only, and written over the visitor rather than beside it: two copies of
+/// the row builder would be two things to keep in step, and only one of them
+/// would be the one that ships.
 #[cfg(test)]
-pub(super) fn typed_rows(
-    schema: &BinarySchema,
-    dataset: Dataset,
-    level: GreekLevel,
-    step: usize,
-    simulated_at: DateTime<Utc>,
-    row: &FactorRow,
-    chains: Option<super::export::StepChains<'_>>,
-) -> Result<Vec<Vec<Cell>>, ChainError> {
-    let step_cell = Cell::I64(i64::try_from(step).unwrap_or(i64::MAX));
-    let instant = Cell::Timestamp(timestamp_nanos(simulated_at));
-    let symbol = Cell::Dictionary(schema.symbol_index());
-
-    Ok(match dataset {
-        Dataset::Underlying => vec![vec![
-            step_cell,
-            instant,
-            symbol,
-            Cell::F64(Some(row.spot.to_f64())),
-        ]],
-        Dataset::Volatility => vec![vec![
-            step_cell,
-            instant,
-            symbol,
-            Cell::F64(Some(row.base_volatility.to_f64())),
-        ]],
-        Dataset::OptionChains => {
-            let Some(chains) = chains else {
-                return Ok(Vec::new());
-            };
-            let mut rows = Vec::new();
-            for expiration in chains.expirations() {
-                let expires_at = Cell::Timestamp(timestamp_nanos(expiration.expires_at));
-                let labels = Cell::LabelMask(schema.label_mask(expiration.labels)?);
-                for quote in expiration.quotes.quotes() {
-                    let mut cells = vec![
-                        step_cell,
-                        instant,
-                        symbol,
-                        expires_at,
-                        labels,
-                        Cell::F64(Some(expiration.days_to_expiration)),
-                        Cell::F64(Some(quote.strike)),
-                        Cell::F64(Some(quote.implied_volatility)),
-                        Cell::F64(quote.call_bid),
-                        Cell::F64(quote.call_ask),
-                        Cell::F64(quote.call_mid),
-                        Cell::F64(quote.call_delta),
-                        Cell::F64(quote.put_bid),
-                        Cell::F64(quote.put_ask),
-                        Cell::F64(quote.put_mid),
-                        Cell::F64(quote.put_delta),
-                        Cell::F64(quote.gamma),
-                    ];
-                    if level.wants_greeks() {
-                        for value in [
-                            quote.call_greeks.theta,
-                            quote.put_greeks.theta,
-                            quote.call_greeks.vega,
-                            quote.put_greeks.vega,
-                            quote.call_greeks.rho,
-                            quote.put_greeks.rho,
-                            quote.call_greeks.rho_d,
-                            quote.put_greeks.rho_d,
-                        ] {
-                            cells.push(Cell::F64(value));
-                        }
-                    }
-                    if matches!(level, GreekLevel::All) {
-                        for value in [
-                            quote.call_greeks.gamma,
-                            quote.put_greeks.gamma,
-                            quote.call_greeks.alpha,
-                            quote.put_greeks.alpha,
-                            quote.call_greeks.vanna,
-                            quote.put_greeks.vanna,
-                            quote.call_greeks.vomma,
-                            quote.put_greeks.vomma,
-                            quote.call_greeks.veta,
-                            quote.put_greeks.veta,
-                            quote.call_greeks.charm,
-                            quote.put_greeks.charm,
-                            quote.call_greeks.color,
-                            quote.put_greeks.color,
-                        ] {
-                            cells.push(Cell::F64(value));
-                        }
-                    }
-                    rows.push(cells);
-                }
-            }
-            rows
-        }
-    })
+pub(super) fn typed_rows(context: &RowContext<'_>) -> Result<Vec<Vec<Cell>>, ChainError> {
+    let mut rows = Vec::new();
+    visit_typed_rows(context, &mut |cells| {
+        rows.push(cells);
+        Ok(RowFlow::Continue)
+    })?;
+    Ok(rows)
 }
 
 /// Encodes `packed` blocks.
