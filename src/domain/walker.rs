@@ -6,14 +6,16 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-use rust_decimal::{Decimal, MathematicalOps};
+use rust_decimal::{Decimal, MathematicalOps, RoundingStrategy};
 use std::sync::{Arc, Mutex};
 
 /// Checked `Decimal` addition, tagged with the operation that overflowed.
 ///
-/// optionstratlib keeps `d_add` / `d_sub` / `d_mul` / `d_exp` crate-private,
+/// optionstratlib keeps `d_add` / `d_sub` / `d_mul` / `d_div` / `d_exp`
+/// crate-private,
 /// so a mirror that wants the same panic-free kernels has to carry its own.
-/// These four are byte-for-byte equivalents: the same `checked_*` call, the
+/// These five are the complete mirror of the set the walk kernels use, and
+/// byte-for-byte equivalents: the same `checked_*` call, the
 /// same `DecimalError::Overflow { operation, lhs, rhs }` on failure, and the
 /// same value on success — which is what keeps a seeded tape identical
 /// across the change.
@@ -33,6 +35,33 @@ fn d_mul(lhs: Decimal, rhs: Decimal, op: &'static str) -> Result<Decimal, Decima
     lhs.checked_mul(rhs)
         .ok_or_else(|| DecimalError::overflow(op, lhs, rhs))
 }
+
+/// Checked `Decimal` division with banker's rounding at scale 28.
+///
+/// The rounding is not decoration: upstream re-rounds every quotient with
+/// [`RoundingStrategy::MidpointNearestEven`] at
+/// [`DIV_DEFAULT_SCALE`] so a long chain of divisions does
+/// not accumulate bias in one direction, and a mirror that skipped it would
+/// drift from upstream the first time a kernel divides by something other than
+/// a constant. See [`d_add`] for what these helpers are.
+///
+/// # Errors
+///
+/// [`DecimalError::ArithmeticError`] when `rhs` is zero, and
+/// [`DecimalError::Overflow`] when the quotient is not representable.
+fn d_div(lhs: Decimal, rhs: Decimal, op: &'static str) -> Result<Decimal, DecimalError> {
+    if rhs.is_zero() {
+        return Err(DecimalError::arithmetic_error(op, "division by zero"));
+    }
+    let raw = lhs
+        .checked_div(rhs)
+        .ok_or_else(|| DecimalError::overflow(op, lhs, rhs))?;
+    Ok(raw.round_dp_with_strategy(DIV_DEFAULT_SCALE, RoundingStrategy::MidpointNearestEven))
+}
+
+/// The scale every mirrored division rounds its quotient to, matching
+/// upstream's `DIV_DEFAULT_SCALE`.
+const DIV_DEFAULT_SCALE: u32 = 28;
 
 /// Checked `Decimal` exponential. See [`d_add`].
 ///
@@ -315,12 +344,11 @@ impl Walker {
                     )?
                     .max(Decimal::ZERO);
 
-                    let avg_variance =
-                        d_add(variance, variance_new, "simulation::heston::avg_variance")?
-                            .checked_div(Decimal::TWO)
-                            .ok_or_else(|| {
-                                SimulationError::walk_error("Heston: avg variance division failed")
-                            })?;
+                    let avg_variance = d_div(
+                        d_add(variance, variance_new, "simulation::heston::avg_variance")?,
+                        Decimal::TWO,
+                        "simulation::heston::avg_variance",
+                    )?;
                     let avg_variance_sqrt = avg_variance.sqrt().ok_or_else(|| {
                         SimulationError::walk_error("Heston: sqrt(avg_variance) failed (overflow)")
                     })?;
@@ -933,6 +961,34 @@ mod tests {
                 jump_volatility: pos_or_panic!(0.1),
             },
             walker: Box::new(Walker::new_with_seed(1)),
+        }
+    }
+
+    /// The mirrored division carries upstream's semantics, not just its name.
+    #[test]
+    fn test_the_mirrored_division_matches_upstream_semantics() {
+        // A zero divisor is an arithmetic error, never a panic and never an
+        // overflow, and it names the operation that hit it.
+        match d_div(Decimal::ONE, Decimal::ZERO, "test::zero") {
+            Ok(value) => panic!("division by zero must fail, got {value}"),
+            Err(error) => {
+                let rendered = error.to_string();
+                assert!(rendered.contains("test::zero"), "{rendered}");
+                assert!(rendered.contains("division by zero"), "{rendered}");
+            }
+        }
+
+        // The quotient is re-rounded at scale 28 with banker's rounding, which
+        // is what keeps a long chain of divisions from drifting one way.
+        match d_div(Decimal::ONE, dec!(3), "test::third") {
+            Ok(value) => assert!(value.scale() <= 28, "scale {} too wide", value.scale()),
+            Err(error) => panic!("a representable quotient must divide: {error}"),
+        }
+
+        // An ordinary division is exactly that.
+        match d_div(dec!(7.5), Decimal::TWO, "test::half") {
+            Ok(value) => assert_eq!(value, dec!(3.75)),
+            Err(error) => panic!("must divide: {error}"),
         }
     }
 
