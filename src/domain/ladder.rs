@@ -43,7 +43,7 @@
 //! provide. Widen the ladder at creation, with `chain_size`, rather than at step
 //! time.
 
-use crate::session::SimulationParametersV2;
+use crate::session::{ExpirationSchedule, SimulationParametersV2};
 use crate::utils::ChainError;
 use positive::Positive;
 use rust_decimal::Decimal;
@@ -171,7 +171,8 @@ impl PinnedLadder {
     /// upstream: the distance in intervals from the spot's at-the-money strike
     /// to whichever pinned strike is furthest from it.
     ///
-    /// `maximum` is the widening [`max_pinned_width`] allows: the smaller of
+    /// `maximum` is the ceiling [`resolve_pinned_ceiling`] fixed at creation
+    /// and the parameters carry: the smaller of
     /// the simulation's own snapshot budget and the absolute ceiling
     /// [`MAX_PINNED_WIDTH`]. A pinned step must not be able to price more
     /// contracts than the configuration was validated for, nor a wider chain
@@ -350,12 +351,12 @@ pub(crate) fn at_the_money(
 /// retroactively break simulations already running, and raising it must not
 /// license the domain to price a wider chain than this.
 ///
-/// It is a ceiling, never the bound on its own; [`max_pinned_width`] takes it
+/// It is a ceiling, never the bound on its own; [`resolve_pinned_ceiling`] takes it
 /// together with the simulation's snapshot budget and keeps whichever is
 /// smaller.
 pub(crate) const MAX_PINNED_WIDTH: usize = 500;
 
-/// The widest chain a pinned step may ask upstream for.
+/// The widest chain a pinned step may ask upstream for, resolved ONCE.
 ///
 /// A pinned step builds wide enough to REACH its ladder and then filters, so
 /// the widening is work the client never asked for and the request caps never
@@ -371,17 +372,20 @@ pub(crate) const MAX_PINNED_WIDTH: usize = 500;
 /// And [`MAX_PINNED_WIDTH`], because that budget is a SERVICE-WIDE cap rather
 /// than a per-simulation one. At its default a single-expiration schedule
 /// divides 200 000 contracts by one, which would license a widening of 99 999
-/// strikes per side; a bound that large is not a bound. The absolute ceiling is
-/// what keeps the widening in the region a client could have asked for
-/// directly.
+/// strikes per side; a bound that large is not a bound.
+///
+/// This is called at CREATION, and the result is stored on the parameters. It
+/// must not be called per step: `max_snapshot_contracts()` is a process-global
+/// read, so a step-time call would make how far a pinned tape gets depend on
+/// the instance serving it, and the same seed could then run to completion on
+/// one deployment and refuse at step k on another (issue #109).
 ///
 /// # Errors
 ///
 /// Returns [`ChainError::Validation`] when the schedule's expiration count
 /// overflows, which the creation path also refuses.
-pub(crate) fn max_pinned_width(parameters: &SimulationParametersV2) -> Result<usize, ChainError> {
-    let expirations = parameters
-        .schedule
+pub(crate) fn resolve_pinned_ceiling(schedule: &ExpirationSchedule) -> Result<usize, ChainError> {
+    let expirations = schedule
         .rules()
         .iter()
         .try_fold(0usize, |total, rule| {
@@ -398,7 +402,7 @@ pub(crate) fn max_pinned_width(parameters: &SimulationParametersV2) -> Result<us
     ))
 }
 
-/// The widening [`max_pinned_width`] allows for a given cap and expiration
+/// The widening [`resolve_pinned_ceiling`] allows for a given cap and expiration
 /// count, split out from the environment so both sides of the minimum can be
 /// exercised: the process-wide cap is resolved once in a `OnceLock`, so a test
 /// that could only call the public entry point would be stuck with whatever
@@ -687,25 +691,58 @@ mod tests {
         assert_eq!(pinned_width_for(200_000, 0), MAX_PINNED_WIDTH);
     }
 
-    /// The parameters entry point agrees with the pure core it delegates to.
+    /// The creation-time resolver agrees with the pure core it delegates to,
+    /// and the parameters carry what it resolved.
     #[test]
-    fn test_the_widening_ceiling_comes_from_the_snapshot_budget() {
+    fn test_the_ceiling_is_resolved_once_and_carried() {
         let parameters = parameters(5000.0, 25.0, 2);
         let cap = crate::infrastructure::max_snapshot_contracts();
 
-        let width = match max_pinned_width(&parameters) {
+        // One expiration in this schedule, so the whole per-snapshot budget is
+        // one chain and the `2n + 1` grid must fit inside it.
+        let resolved = match resolve_pinned_ceiling(&parameters.schedule) {
             Ok(width) => width,
             Err(error) => panic!("the budget must resolve: {error}"),
         };
-
-        // One expiration in this schedule, so the whole per-snapshot budget is
-        // one chain and the `2n + 1` grid must fit inside it.
-        assert_eq!(width, pinned_width_for(cap, 1));
-        assert!(width * 2 < cap, "{width} strikes per side exceeds {cap}");
+        assert_eq!(resolved, pinned_width_for(cap, 1));
         assert!(
-            width <= MAX_PINNED_WIDTH,
-            "{width} strikes per side exceeds the {MAX_PINNED_WIDTH} ceiling"
+            resolved * 2 < cap,
+            "{resolved} strikes per side exceeds {cap}"
         );
+        assert!(
+            resolved <= MAX_PINNED_WIDTH,
+            "{resolved} strikes per side exceeds the {MAX_PINNED_WIDTH} ceiling"
+        );
+
+        // And the request conversion stored exactly that.
+        assert_eq!(parameters.pinned_width_ceiling, resolved);
+    }
+
+    /// The stored ceiling is what a step obeys, whatever this instance would
+    /// resolve now. A session created under a tighter cap keeps refusing the
+    /// widening that cap forbade, on any instance that later serves it.
+    #[test]
+    fn test_a_step_obeys_the_stored_ceiling_not_the_environment() {
+        let mut parameters = parameters(5000.0, 25.0, 2);
+        parameters.strike_ladder = StrikeLadder::Pinned;
+        parameters.pinned_width_ceiling = 3;
+
+        let ladder = match PinnedLadder::resolve(&parameters) {
+            Ok(ladder) => ladder,
+            Err(error) => panic!("the ladder must resolve: {error}"),
+        };
+
+        // Two intervals of drift needs six strikes per side, past the three the
+        // simulation was created under, even though this instance's own budget
+        // would allow far more.
+        match ladder.width_from(pos_or_panic!(5100.0), parameters.pinned_width_ceiling) {
+            Ok(width) => panic!("the stored ceiling must bind, got {width}"),
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "strike_ladder");
+                assert!(reason.contains("past the 3"), "{reason}");
+            }
+            Err(error) => panic!("expected a validation failure, got {error:?}"),
+        }
     }
 
     /// A pinned ladder needs an explicit interval, and says so.

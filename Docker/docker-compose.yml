@@ -49,7 +49,7 @@ version: '3.8'
 services:
   # Redis service configuration
   redis:
-    image: redis:8.10.0@sha256:344e3945a0b431c8ff1eecd58c5573538126bd756f02fc7e218ddf1fc2546366
+    image: redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-password}
     volumes:
       - redis-data:/data
@@ -70,7 +70,7 @@ services:
 
   # MongoDB service configuration
   mongodb:
-    image: mongo:8.0.29@sha256:de267922bc1153d923f5c9dc429f21c11faf18299080c1ce04d6d6007097fb06
+    image: mongo:8.2.12@sha256:e0ce8c35124d4a9f9785532d1f268f39e9728ffa1cb38f46fa482436424c4bd3
     volumes:
       - mongodb-data:/data/db
       - mongodb-config:/data/configdb
@@ -92,7 +92,7 @@ services:
         delay: 5s
 
   clickhouse:
-    image: clickhouse/clickhouse-server:26.3.17.110@sha256:2ef11bbe2e44ab7022f37ff3019b3f2125ed09e919ea6194660be6130b7ca4b7
+    image: clickhouse/clickhouse-server:26.8.1.2041-alpine@sha256:fd037d424da807c1b36517f3ff6c739286c60a34c928279c229fc1faa0cadaa8
     environment:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
@@ -111,7 +111,7 @@ services:
     # Published by .github/workflows/docker-publish.yml on every Cargo.toml
     # version bump, or by `make docker-push` from a workstation. Bump the
     # default tag in the same PR that bumps the crate version.
-    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.1}
+    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.14}
     deploy:
       replicas: 2
       restart_policy:
