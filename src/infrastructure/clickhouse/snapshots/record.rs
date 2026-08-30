@@ -73,10 +73,11 @@ use uuid::Uuid;
 ///   than pricing it as absent (OptionStratLib#487). Upstream reads a missing
 ///   side as "this strike does not quote" and stopped extending the ladder
 ///   there, so a chain built near expiry with wings a few percent out of the
-///   money carried FEWER strikes than `chain_size` asked for: 23 instead of 41
-///   at a spot of 5100 with a 25-point interval at 0.3125 days. The strike set
-///   of those steps therefore changes under the same coordinates, for rolling
-///   ladders as much as for pinned ones.
+///   money carried FEWER strikes than `chain_size` asked for. Measured with
+///   this crate's own defaults at a spot of 5100 with a 25-point interval:
+///   26 strikes instead of 41 at 0.3125 days, and 10 instead of 21 at 0.05
+///   days. The strike set of those steps therefore changes under the same
+///   coordinates, for rolling ladders as much as for pinned ones.
 pub const CURRENT_SNAPSHOT_GENERATION: u64 = 4;
 
 /// The namespace every deterministic `snapshot_id` is derived under.

@@ -335,10 +335,13 @@ response and survives a store round trip, and a document written before the
 field reads as `rolling`.
 
 **A pinned ladder does not follow a large move.** If the spot leaves the
-pinned range the chain is all calls or all puts, which is correct and
-informative: a simulation that silently invented new strikes would not be
-the closed world the setting exists to provide. Widen the ladder at
-creation, with `chain_size`, rather than at step time.
+pinned range every quoted strike ends up on one side of the money — each
+contract still carries both a call and a put, but they are all deep in or
+deep out. That is correct and informative: a simulation that silently
+invented new strikes would not be the closed world the setting exists to
+provide. Widen the ladder at creation, with `chain_size`, rather than at
+step time. A spot that drifts further than the service will widen for is a
+`400` naming `strike_ladder` rather than a silently shorter chain.
 
 `/api/v1/chain` is untouched, model and all: it is frozen, and its chains
 come from a different upstream path.
