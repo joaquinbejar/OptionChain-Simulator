@@ -136,6 +136,19 @@ pub struct SimulationParametersResponse {
     pub smile_curve: Option<f64>,
     /// Which strikes the simulation quotes: `rolling` or `pinned`.
     pub strike_ladder: StrikeLadder,
+    /// How far a pinned ladder may make a step widen the chain, in strikes per
+    /// side, resolved once at creation.
+    ///
+    /// Echoed because it is a replay input like the seed: it decides the first
+    /// step at which a pinned simulation refuses a drift, so a replay that
+    /// resolved a different one is a different tape boundary. A client
+    /// recreating a run on another instance can compare this value and know
+    /// whether the boundary moved, rather than discovering it at step k.
+    ///
+    /// It is not accepted on a request. The number bounds what the service
+    /// will build on a client's behalf, so letting a client raise it would
+    /// turn a resource guard into a suggestion.
+    pub pinned_width_ceiling: usize,
     /// The constant term of the spread model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spread: Option<f64>,
@@ -352,6 +365,7 @@ impl From<&SessionV2> for SimulationParametersResponse {
             skew_slope: parameters.skew_slope.and_then(|value| value.to_f64()),
             smile_curve: parameters.smile_curve.and_then(|value| value.to_f64()),
             strike_ladder: parameters.strike_ladder,
+            pinned_width_ceiling: parameters.pinned_width_ceiling,
             spread: parameters.spread.map(|value| value.to_f64()),
             spread_proportional: parameters
                 .spread_proportional
