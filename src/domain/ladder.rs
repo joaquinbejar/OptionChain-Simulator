@@ -423,10 +423,12 @@ mod tests {
         );
     }
 
-    /// A ladder wide enough to reach zero stops at the last positive strike.
+    /// A ladder never carries a strike at or below zero.
     #[test]
     fn test_the_ladder_never_reaches_a_zero_strike() {
-        let ladder = ladder_of(50.0, 25.0, 4);
+        // Two below an anchor of 50 reaches exactly zero, which `checked_sub`
+        // refuses, so the ladder stops at 25.
+        let ladder = ladder_of(50.0, 25.0, 2);
 
         assert!(
             ladder
@@ -437,6 +439,49 @@ mod tests {
             ladder.strikes()
         );
         assert!(ladder.strikes().contains(&pos_or_panic!(25.0)));
+    }
+
+    /// A ladder that reaches past its anchor is refused at creation.
+    ///
+    /// Upstream stops building a chain once the offset passes the anchor, so
+    /// those strikes would never exist to be filtered to. The measured case:
+    /// an initial price of 100 with a 5-point interval and a chain size of 25
+    /// asks for strikes down to 5, and upstream builds only to 200 on the way
+    /// up.
+    #[test]
+    fn test_a_ladder_reaching_past_the_anchor_is_refused() {
+        match ensure_ladder_fits(pos_or_panic!(100.0), pos_or_panic!(5.0), 25) {
+            Ok(()) => panic!("a ladder wider than its anchor must be refused"),
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "chain_size");
+                assert!(reason.contains("never exist"), "{reason}");
+            }
+            Err(error) => panic!("expected a validation failure, got {error:?}"),
+        }
+
+        // One that fits is accepted, including the exact boundary.
+        match ensure_ladder_fits(pos_or_panic!(100.0), pos_or_panic!(5.0), 20) {
+            Ok(()) => {}
+            Err(error) => panic!("a ladder that ends at the anchor must fit: {error}"),
+        }
+    }
+
+    /// The overflow guards hold on a ladder no grid can lay out.
+    ///
+    /// `strike_interval` is client input with no upper bound, and both
+    /// `Positive` and `Decimal` panic on overflow.
+    #[test]
+    fn test_an_unrepresentable_grid_is_refused_rather_than_panicking() {
+        let huge = match Positive::new_decimal(Decimal::MAX / Decimal::TWO) {
+            Ok(value) => value,
+            Err(error) => panic!("the fixture must be positive: {error}"),
+        };
+
+        match ensure_ladder_fits(huge, huge, 500) {
+            Ok(()) => panic!("a grid this wide cannot be laid out"),
+            Err(ChainError::Validation { .. }) => {}
+            Err(error) => panic!("expected a validation failure, got {error:?}"),
+        }
     }
 
     /// The width a chain needs grows with the distance the spot has moved.
@@ -463,11 +508,14 @@ mod tests {
 
         match ladder.width_from(pos_or_panic!(9000.0), 10) {
             Ok(width) => panic!("a spot 160 intervals away must not resolve, got {width}"),
-            Err(ChainError::Internal(message)) => assert!(
-                message.contains("left the range"),
-                "the failure must explain: {message}"
-            ),
-            Err(error) => panic!("expected an internal failure, got {error:?}"),
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "strike_ladder");
+                assert!(
+                    reason.contains("pinned at creation"),
+                    "the failure must explain: {reason}"
+                );
+            }
+            Err(error) => panic!("expected a validation failure, got {error:?}"),
         }
     }
 
@@ -481,7 +529,7 @@ mod tests {
             Ok(ladder) => panic!("a ladder with no grid must not resolve, got {ladder:?}"),
             Err(ChainError::Validation { field, reason }) => {
                 assert_eq!(field, "strike_interval");
-                assert!(reason.contains("per expiration"), "{reason}");
+                assert!(reason.contains("varies the chain size"), "{reason}");
             }
             Err(error) => panic!("expected a validation failure, got {error:?}"),
         }

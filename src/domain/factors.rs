@@ -1013,12 +1013,15 @@ pub(crate) fn build_chain(
         parameters.strike_interval,
         skew_slope,
         smile_curve,
-        // ZERO, and the widening happens below instead. Upstream's
-        // `apply_spread` sets bid, ask AND mid to `None` when `mid <= spread`
-        // (OptionStratLib#439, fixed upstream but not in the published 0.20
-        // this builds against), so handing it the real spread would erase the
-        // cheap wings before anything here could quote them. With no spread it
-        // leaves each mid alone, which is what the model needs to work from.
+        // ZERO, and the widening happens below instead. The spread model here
+        // is per contract, so a single scalar handed to upstream would be the
+        // wrong number for every strike but one; asking for no spread leaves
+        // each mid untouched, which is what the model works from.
+        //
+        // It also used to be load-bearing against OptionStratLib#439, where
+        // `apply_spread` withdrew a quote whose mid fell below the spread.
+        // That is fixed as of 0.21.1, which this pins, so the zero is now
+        // about owning the widening rather than about avoiding an erasure.
         Positive::ZERO,
         2,
         price_params,

@@ -559,9 +559,10 @@ mod tests {
     use super::*;
     use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
     use crate::api::rest::requests_v2::CreateSimulationRequest;
-    use crate::domain::ladder::StrikeLadder;
+    use crate::domain::ladder::{PinnedLadder, StrikeLadder};
     use crate::session::{ExpiryRule, ExpiryRuleKind};
     use chrono::{TimeZone, Weekday};
+    use rust_decimal_macros::dec;
 
     /// ADR 0001 §14's reference configuration: one rolling 0DTE, three
     /// Monday/Wednesday/Friday weeklies, twelve last-Friday monthlies, all at
@@ -1049,7 +1050,17 @@ mod tests {
         let parameters = parameters(created);
         let tape = tape(&parameters);
 
-        let mut expected: Option<Vec<String>> = None;
+        // The ladder the simulation pinned, resolved from its own parameters:
+        // comparing every step against the FIRST one would pass on a chain
+        // that lost the same wings at every step, which is the failure this
+        // test exists to catch.
+        let ladder = match PinnedLadder::resolve(&parameters) {
+            Ok(ladder) => ladder,
+            Err(error) => panic!("the ladder must resolve: {error}"),
+        };
+        let expected: Vec<String> = ladder.strikes().iter().map(ToString::to_string).collect();
+        assert_eq!(expected.len(), 13, "a half-width of six is 13 strikes");
+
         let mut spots = Vec::new();
 
         for step in 0..tape.len() {
@@ -1063,24 +1074,49 @@ mod tests {
                     .map(|contract| contract.strike_price.to_string())
                     .collect();
 
-                match &expected {
-                    None => expected = Some(strikes),
-                    Some(expected) => assert_eq!(
-                        &strikes, expected,
-                        "step {step} quotes a different strike set"
-                    ),
-                }
+                assert_eq!(
+                    strikes, expected,
+                    "step {step} does not quote the ladder the simulation pinned"
+                );
             }
         }
 
-        // The property is only worth asserting if the spot actually moved:
-        // a walk that stood still would keep any ladder intact.
+        // The property only means something if the spot moved far enough that
+        // a rolling ladder would have dropped a strike, which is half the
+        // ladder's own width: six strikes at 25 points is 150.
         let lowest = spots.iter().copied().fold(Positive::MAX, Positive::min);
         let highest = spots.iter().copied().fold(Positive::ZERO, Positive::max);
         assert!(
-            highest > lowest,
-            "the fixture must move the underlying, got {lowest} to {highest}"
+            highest.to_dec() - lowest.to_dec() > dec!(150),
+            "the fixture must move the underlying past the ladder's half-width, \
+             got {lowest} to {highest}"
         );
+    }
+
+    /// A pinned simulation reproduces its tape under the same seed.
+    ///
+    /// The ladder is a pure function of stored parameters, so it cannot move a
+    /// price path; this pins that the whole snapshot, quotes included, is the
+    /// same on a second run.
+    #[test]
+    fn test_a_pinned_simulation_reproduces_its_tape() {
+        let mut created = request(6, reference_schedules());
+        created.chain_size = Some(6);
+        created.strike_interval = Some(25.0);
+        created.strike_ladder = Some(StrikeLadder::Pinned);
+
+        let first_parameters = parameters(created.clone());
+        let second_parameters = parameters(created);
+        let first_tape = tape(&first_parameters);
+        let second_tape = tape(&second_parameters);
+
+        for step in 0..first_tape.len() {
+            assert_eq!(
+                snapshot(&first_parameters, &first_tape, step),
+                snapshot(&second_parameters, &second_tape, step),
+                "step {step} diverged under the same seed"
+            );
+        }
     }
 
     /// A different seed produces a different snapshot tape.

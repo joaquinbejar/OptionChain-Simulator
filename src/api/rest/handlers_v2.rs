@@ -127,7 +127,9 @@ fn parse_id(raw: &str) -> Result<Uuid, ChainError> {
         across steps needs. A pinned simulation must supply `strike_interval`, because \
         without one the interval is derived per expiration and there is no fixed grid to \
         pin, and a pinned ladder does not follow a large move: if the spot leaves its range \
-        the chain becomes all calls or all puts rather than inventing new strikes.",
+        every quoted strike ends up on one side of the money rather than the simulation \
+        inventing new ones, and a spot that drifts further than the service will widen for \
+        is a 400 naming strike_ladder.",
     request_body = CreateSimulationRequest,
     responses(
         (status = 201, description = "Simulation created", body = SimulationResponse),
