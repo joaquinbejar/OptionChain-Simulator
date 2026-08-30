@@ -70,7 +70,7 @@
 //! is pinned by a test. ADR 0001 §8 records the contract.
 
 use crate::domain::Walker;
-use crate::domain::ladder::{MAX_PINNED_WIDTH, PinnedLadder};
+use crate::domain::ladder::{PinnedLadder, max_pinned_width};
 use crate::domain::simulator::{DEFAULT_CHAIN_SIZE, DEFAULT_SKEW_SLOPE, DEFAULT_SMILE_CURVE};
 use crate::domain::spread::SpreadModel;
 use crate::session::{SimulationMethod, SimulationParametersV2};
@@ -962,7 +962,11 @@ pub(crate) fn build_chain(
     };
 
     let chain_size = match &pinned {
-        Some(ladder) => ladder.width_from(spot, MAX_PINNED_WIDTH)?,
+        // The ceiling is this simulation's own snapshot budget, not a constant:
+        // a configuration validated for a handful of contracts per snapshot
+        // must not price a thousand strikes per expiration because its spot
+        // drifted.
+        Some(ladder) => ladder.width_from(spot, max_pinned_width(parameters)?)?,
         None => parameters.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE),
     };
     let skew_slope = parameters.skew_slope.unwrap_or(DEFAULT_SKEW_SLOPE);

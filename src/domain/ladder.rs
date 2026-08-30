@@ -51,21 +51,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use utoipa::ToSchema;
 
-/// How far a pinned ladder may sit from the spot before a step refuses.
-///
-/// A pinned step asks upstream for a chain wide enough to REACH the pinned
-/// strikes from wherever the underlying is now, so this bounds the widening
-/// rather than the ladder: a simulation whose spot has drifted this many
-/// intervals from where it started would have the service price a thousand
-/// strikes to serve thirteen.
-///
-/// It lives here rather than being read from the request caps because it is
-/// not a request size. `OCS_MAX_CHAIN_SIZE` bounds what a client may ask for;
-/// this bounds what the domain will build on its behalf, and tying the two
-/// together would make lowering the request cap silently break simulations
-/// already running.
-pub(crate) const MAX_PINNED_WIDTH: usize = 500;
-
 /// Which strikes a simulation quotes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "snake_case")]
@@ -186,17 +171,43 @@ impl PinnedLadder {
     /// upstream: the distance in intervals from the spot's at-the-money strike
     /// to whichever pinned strike is furthest from it.
     ///
+    /// `maximum` is the widening the simulation's own snapshot budget allows,
+    /// derived by [`max_pinned_width`] from the same numbers
+    /// `validate_snapshot_work` checked at creation. A pinned step must not be
+    /// able to price more contracts than the configuration was validated for
+    /// simply because the underlying drifted.
+    ///
     /// # Errors
     ///
-    /// Returns [`ChainError::Validation`] naming `strike_ladder` when that
-    /// distance exceeds [`MAX_PINNED_WIDTH`]. Reaching it takes a spot that has
+    /// Returns [`ChainError::Validation`] naming `strike_ladder` when the spot
+    /// has fallen so far that its chain would be anchored at a strike of zero,
+    /// and when the distance exceeds `maximum`. Reaching it takes a spot that has
     /// moved that many intervals from where the simulation started, and quoting
     /// a subset of the pinned ladder would silently break the guarantee the
     /// ladder exists to make. It is a validation failure rather than an
     /// internal one because it is a foreseeable consequence of the
     /// configuration the client chose, and the message says which.
     pub(crate) fn width_from(&self, spot: Positive, maximum: usize) -> Result<usize, ChainError> {
-        let centre = at_the_money(spot, self.interval)?.to_dec();
+        let anchor = at_the_money(spot, self.interval)?;
+
+        // A spot below half the interval anchors at zero, and upstream refuses
+        // to build a chain around a strike of zero. Caught HERE, before
+        // anything is priced: the same failure raised during a build reaches
+        // an export after its 200 and its prologue have gone out, which leaves
+        // the client a truncated file rather than a rejection.
+        if anchor == Positive::ZERO {
+            return Err(ChainError::Validation {
+                field: "strike_ladder".to_string(),
+                reason: format!(
+                    "the underlying has fallen to {spot}, below half the {} interval this \
+                     simulation pinned, so its chain would have to be built around a strike of \
+                     zero; a pinned ladder cannot follow a move that far",
+                    self.interval
+                ),
+            });
+        }
+
+        let centre = anchor.to_dec();
         let interval = self.interval.to_dec();
 
         let mut widest = 0_usize;
@@ -322,6 +333,47 @@ pub(crate) fn at_the_money(
     };
 
     Positive::new_decimal(rounded).map_err(|_| unrepresentable())
+}
+
+/// The widest chain a pinned step may ask upstream for.
+///
+/// A pinned step builds wide enough to REACH its ladder and then filters, so
+/// the widening is work the client never asked for and the request caps never
+/// saw. Bounding it by a constant of its own would let a simulation validated
+/// for a handful of contracts per snapshot price a thousand strikes per
+/// expiration once its spot drifted.
+///
+/// The bound is therefore the simulation's own budget, computed from the same
+/// numbers `SimulationParametersV2::validate_snapshot_work` checked at
+/// creation: the per-snapshot contract cap divided by the expirations the
+/// schedule can carry, back through the `2n + 1` grid to a half-width.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Validation`] when the schedule's expiration count
+/// overflows, which the creation path also refuses.
+pub(crate) fn max_pinned_width(parameters: &SimulationParametersV2) -> Result<usize, ChainError> {
+    let expirations = parameters
+        .schedule
+        .rules()
+        .iter()
+        .try_fold(0usize, |total, rule| {
+            total.checked_add(rule.target_count().get())
+        })
+        .ok_or_else(|| ChainError::Validation {
+            field: "schedules".to_string(),
+            reason: "the requested expiration counts overflow".to_string(),
+        })?;
+
+    let cap = crate::infrastructure::max_snapshot_contracts();
+    // A schedule with no rules cannot produce a chain, so the width is
+    // irrelevant; one is the smallest answer that is not zero.
+    let strikes = cap.checked_div(expirations.max(1)).unwrap_or(cap);
+
+    // `strikes` covers `2n + 1`, so the half-width is what upstream calls
+    // `chain_size`. At least one, or a pinned ladder of a single strike could
+    // never be reached.
+    Ok(strikes.saturating_sub(1).checked_div(2).unwrap_or(0).max(1))
 }
 
 /// Refuses a pinned ladder whose lowest strike upstream cannot build.
@@ -517,6 +569,51 @@ mod tests {
             }
             Err(error) => panic!("expected a validation failure, got {error:?}"),
         }
+    }
+
+    /// A spot below half the interval anchors at zero, which upstream cannot
+    /// build a chain around. It has to fail as a validation error here, before
+    /// pricing, rather than as an internal one halfway through an export.
+    #[test]
+    fn test_a_spot_below_half_the_interval_is_refused() {
+        let ladder = ladder_of(5000.0, 25.0, 2);
+
+        match ladder.width_from(pos_or_panic!(0.01), usize::MAX) {
+            Ok(width) => panic!("a spot under the grid must not resolve, got {width}"),
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "strike_ladder");
+                assert!(
+                    reason.contains("strike of zero"),
+                    "the failure must say why: {reason}"
+                );
+            }
+            Err(error) => panic!("expected a validation failure, got {error:?}"),
+        }
+
+        // Half an interval is the first spot that anchors on the grid.
+        match ladder.width_from(pos_or_panic!(12.5), usize::MAX) {
+            Ok(width) => assert_eq!(width, 201),
+            Err(error) => panic!("the first quotable spot must resolve: {error}"),
+        }
+    }
+
+    /// The widening ceiling is the simulation's own snapshot budget, so a
+    /// pinned step cannot price more contracts than the configuration was
+    /// validated for.
+    #[test]
+    fn test_the_widening_ceiling_comes_from_the_snapshot_budget() {
+        let parameters = parameters(5000.0, 25.0, 2);
+
+        let width = match max_pinned_width(&parameters) {
+            Ok(width) => width,
+            Err(error) => panic!("the budget must resolve: {error}"),
+        };
+
+        // One expiration, so the whole per-snapshot budget is one chain: the
+        // `2n + 1` grid must fit inside it.
+        let cap = crate::infrastructure::max_snapshot_contracts();
+        assert!(width * 2 < cap, "{width} strikes per side exceeds {cap}");
+        assert!(width >= 1, "a ladder of one strike must stay reachable");
     }
 
     /// A pinned ladder needs an explicit interval, and says so.
