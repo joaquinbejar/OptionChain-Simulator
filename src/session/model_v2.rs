@@ -299,6 +299,19 @@ pub struct SimulationParametersV2 {
     /// The effective RNG seed. Non-optional: a v2 simulation is always
     /// reproducible, so the seed is resolved at conversion and never `None`.
     pub seed: u64,
+    /// How far a pinned ladder may make a step widen the chain it asks
+    /// upstream for, in strikes per side.
+    ///
+    /// Resolved ONCE, at creation, from the per-snapshot contract cap and this
+    /// simulation's own schedule, exactly as the effective seed is resolved
+    /// once and then carried. The domain reads it from here rather than from
+    /// the environment, so a session keeps the ceiling it was created under for
+    /// its whole life: the same parameters and seed then reach the same step on
+    /// any instance, whatever an operator has since done to
+    /// `OCS_MAX_SNAPSHOT_CONTRACTS`.
+    ///
+    /// A `rolling` simulation carries it too and never consults it.
+    pub pinned_width_ceiling: usize,
 }
 
 /// The deserialization shape of [`SimulationParametersV2`].
@@ -347,12 +360,23 @@ struct SimulationParametersV2Wire {
     #[serde(default)]
     spread_tick: Option<Positive>,
     seed: u64,
+    /// Absent in a document written before the ceiling was stored. Such a
+    /// session is resolved once here, on load, which is the ceiling it would
+    /// have had, and keeps it from then on.
+    #[serde(default)]
+    pinned_width_ceiling: Option<usize>,
 }
 
 impl TryFrom<SimulationParametersV2Wire> for SimulationParametersV2 {
     type Error = ChainError;
 
     fn try_from(wire: SimulationParametersV2Wire) -> Result<Self, Self::Error> {
+        // A document written before the ceiling was stored resolves it once,
+        // here, and carries it from then on.
+        let pinned_width_ceiling = match wire.pinned_width_ceiling {
+            Some(ceiling) => ceiling,
+            None => crate::domain::resolve_pinned_ceiling(&wire.schedule)?,
+        };
         let parameters = Self {
             symbol: wire.symbol,
             steps: wire.steps,
@@ -377,6 +401,7 @@ impl TryFrom<SimulationParametersV2Wire> for SimulationParametersV2 {
             spread_tenor_widening: wire.spread_tenor_widening,
             spread_tick: wire.spread_tick,
             seed: wire.seed,
+            pinned_width_ceiling,
         };
         parameters.validate()?;
         Ok(parameters)
@@ -725,6 +750,10 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
             request.schedules,
         )?;
 
+        // The pinned widening ceiling is resolved here, once, from the cap
+        // this instance runs and this simulation's own schedule, and stored.
+        let pinned_width_ceiling = crate::domain::resolve_pinned_ceiling(&schedule)?;
+
         let parameters = Self {
             symbol: request.symbol,
             steps: request.steps,
@@ -756,6 +785,7 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
                 .map(|value| positive_field("spread", value))
                 .transpose()?,
             strike_ladder: request.strike_ladder.unwrap_or_default(),
+            pinned_width_ceiling,
             // The widening coefficients are rates, not prices: zero is the
             // documented default and a negative one would NARROW a quote away
             // from the money, which is not a market anyone trades.
@@ -1620,6 +1650,49 @@ mod tests {
                 "an older document must read as the behaviour it was written under"
             ),
             Err(error) => panic!("an older document must still load: {error}"),
+        }
+    }
+
+    /// A document written before the ceiling was stored still loads, and gets
+    /// the ceiling it would have had, resolved once on the way in.
+    #[test]
+    fn test_stored_parameters_without_a_pinned_ceiling_still_load() {
+        let parameters = parameters(reference_request());
+        let json = match serde_json::to_value(&parameters) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                assert!(
+                    map.remove("pinned_width_ceiling").is_some(),
+                    "the ceiling must be part of the stored shape"
+                );
+                serde_json::Value::Object(map)
+            }
+            other => panic!("the parameters must serialize to an object, got {other:?}"),
+        };
+
+        match serde_json::from_value::<SimulationParametersV2>(json) {
+            Ok(loaded) => assert_eq!(
+                loaded.pinned_width_ceiling, parameters.pinned_width_ceiling,
+                "an older document must read as the ceiling it would have had"
+            ),
+            Err(error) => panic!("an older document must still load: {error}"),
+        }
+    }
+
+    /// A stored ceiling survives the round trip rather than being re-resolved,
+    /// which is the whole point: a session created under a tighter cap keeps
+    /// that ceiling on an instance whose own cap is wider.
+    #[test]
+    fn test_a_stored_pinned_ceiling_survives_the_round_trip() {
+        let mut parameters = parameters(reference_request());
+        parameters.pinned_width_ceiling = 7;
+
+        let json = match serde_json::to_string(&parameters) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+        match serde_json::from_str::<SimulationParametersV2>(&json) {
+            Ok(loaded) => assert_eq!(loaded.pinned_width_ceiling, 7),
+            Err(error) => panic!("must deserialize: {error}"),
         }
     }
 
