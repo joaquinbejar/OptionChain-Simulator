@@ -51,6 +51,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use utoipa::ToSchema;
 
+/// How far a pinned ladder may sit from the spot before a step refuses.
+///
+/// A pinned step asks upstream for a chain wide enough to REACH the pinned
+/// strikes from wherever the underlying is now, so this bounds the widening
+/// rather than the ladder: a simulation whose spot has drifted this many
+/// intervals from where it started would have the service price a thousand
+/// strikes to serve thirteen.
+///
+/// It lives here rather than being read from the request caps because it is
+/// not a request size. `OCS_MAX_CHAIN_SIZE` bounds what a client may ask for;
+/// this bounds what the domain will build on its behalf, and tying the two
+/// together would make lowering the request cap silently break simulations
+/// already running.
+pub(crate) const MAX_PINNED_WIDTH: usize = 500;
+
 /// Which strikes a simulation quotes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "snake_case")]
@@ -102,7 +117,9 @@ impl PinnedLadder {
             return Err(ChainError::Validation {
                 field: "strike_interval".to_string(),
                 reason: "a pinned strike ladder needs an explicit strike_interval: without one \
-                         the interval is derived per expiration and there is no fixed grid to pin"
+                         upstream derives the interval from the expiration AND the chain size, \
+                         and the pinned path varies the chain size per step, so the grid would \
+                         move under the ladder it is meant to hold still"
                     .to_string(),
             });
         };
@@ -110,20 +127,44 @@ impl PinnedLadder {
         let chain_size = parameters
             .chain_size
             .unwrap_or(crate::domain::simulator::DEFAULT_CHAIN_SIZE);
-        let centre = at_the_money(parameters.initial_price, interval);
+        let centre = at_the_money(parameters.initial_price, interval)?;
 
+        // A centre of zero is not a strike, and every offset above it would be
+        // a ladder hanging off nothing. It happens when the initial price is
+        // below half an interval, which is a configuration to refuse rather
+        // than to round away.
+        if centre == Positive::ZERO {
+            return Err(ChainError::Validation {
+                field: "strike_interval".to_string(),
+                reason: format!(
+                    "an interval of {interval} rounds an initial price of {} to a strike of \
+                     zero, so there is no ladder to pin",
+                    parameters.initial_price
+                ),
+            });
+        }
+
+        // Checked throughout: `strike_interval` is client input with no upper
+        // bound, and both `Positive`'s operators and `Decimal`'s panic on
+        // overflow. Upstream's own loop guards the same multiplication and
+        // addition; the mirror keeps the guards rather than only the maths.
         let mut strikes = BTreeSet::new();
         strikes.insert(centre);
         for step in 1..=chain_size {
-            let offset = interval * Decimal::from(step as u64);
-            if let Ok(upper) = Positive::new_decimal(centre.to_dec() + offset.to_dec()) {
-                strikes.insert(upper);
-            }
-            // A strike at or below zero is not a contract; upstream stops
-            // extending downwards at the same point.
-            let lower = centre.to_dec() - offset.to_dec();
-            if lower > Decimal::ZERO
-                && let Ok(lower) = Positive::new_decimal(lower)
+            let offset = interval
+                .checked_mul_dec(Decimal::from(step))
+                .map_err(|error| ladder_overflow(interval, step, &error.to_string()))?;
+
+            let upper = centre
+                .checked_add(&offset)
+                .map_err(|error| ladder_overflow(interval, step, &error.to_string()))?;
+            strikes.insert(upper);
+
+            // A strike at or below zero is not a contract, and upstream stops
+            // extending downwards at the same point. `checked_sub` refuses to
+            // go negative, which is exactly that rule.
+            if let Ok(lower) = centre.checked_sub(&offset)
+                && lower > Positive::ZERO
             {
                 strikes.insert(lower);
             }
@@ -147,14 +188,15 @@ impl PinnedLadder {
     ///
     /// # Errors
     ///
-    /// Returns [`ChainError::Internal`] when that distance exceeds `maximum`.
-    /// Reaching it takes a spot that has moved `maximum` intervals away from
-    /// where the simulation started — hundreds of percent for any ordinary
-    /// configuration — and quoting a subset of the pinned ladder would silently
-    /// break the guarantee the ladder exists to make, so it fails loudly
-    /// instead.
+    /// Returns [`ChainError::Validation`] naming `strike_ladder` when that
+    /// distance exceeds [`MAX_PINNED_WIDTH`]. Reaching it takes a spot that has
+    /// moved that many intervals from where the simulation started, and quoting
+    /// a subset of the pinned ladder would silently break the guarantee the
+    /// ladder exists to make. It is a validation failure rather than an
+    /// internal one because it is a foreseeable consequence of the
+    /// configuration the client chose, and the message says which.
     pub(crate) fn width_from(&self, spot: Positive, maximum: usize) -> Result<usize, ChainError> {
-        let centre = at_the_money(spot, self.interval).to_dec();
+        let centre = at_the_money(spot, self.interval)?.to_dec();
         let interval = self.interval.to_dec();
 
         let mut widest = 0_usize;
@@ -164,34 +206,73 @@ impl PinnedLadder {
                 .checked_div(interval)
                 .map(|steps| steps.ceil())
                 .and_then(|steps| usize::try_from(steps).ok())
-                .ok_or_else(|| {
-                    ChainError::Internal(format!(
+                .ok_or_else(|| ChainError::Validation {
+                    field: "strike_ladder".to_string(),
+                    reason: format!(
                         "the pinned strike {strike} is unreachable from a spot of {spot}"
-                    ))
+                    ),
                 })?;
             widest = widest.max(steps);
         }
 
         if widest > maximum {
-            return Err(ChainError::Internal(format!(
-                "a pinned ladder {widest} strikes from the spot exceeds the {maximum} a chain may \
-                 carry; the underlying has left the range this simulation pinned at creation"
-            )));
+            return Err(ChainError::Validation {
+                field: "strike_ladder".to_string(),
+                reason: format!(
+                    "the underlying has moved {widest} strikes from the ladder this simulation \
+                     pinned at creation, past the {maximum} a chain may carry; a pinned ladder \
+                     does not follow a move that far, so widen it at creation with chain_size"
+                ),
+            });
         }
         Ok(widest)
     }
 
-    /// Drops from a built chain every strike this ladder does not name.
+    /// Drops from a built chain every strike this ladder does not name, and
+    /// refuses a chain that did not carry them all.
     ///
-    /// The chain was built wide enough to contain all of them, so what is left
-    /// is exactly the pinned set, priced by upstream at the current spot.
-    pub(crate) fn keep_pinned(&self, chain: &mut optionstratlib::chains::chain::OptionChain) {
+    /// The chain is built wide enough to contain the whole pinned set, but
+    /// "wide enough" is a request: upstream stops extending its ladder for
+    /// reasons of its own — a strike that would fall at or below zero, a
+    /// genuine pricing failure on both wings — and a filter cannot tell a
+    /// missing strike from one it dropped. Returning a partial ladder silently
+    /// would reproduce the exact hole this feature exists to close, so a short
+    /// chain is an error naming what is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Internal`] when a pinned strike is not in the
+    /// built chain.
+    pub(crate) fn keep_pinned(
+        &self,
+        chain: &mut optionstratlib::chains::chain::OptionChain,
+    ) -> Result<(), ChainError> {
         let strikes = &self.strikes;
         let contracts = std::mem::take(&mut chain.options);
         chain.options = contracts
             .into_iter()
             .filter(|contract| strikes.contains(&contract.strike_price))
             .collect();
+
+        if chain.options.len() == strikes.len() {
+            return Ok(());
+        }
+
+        let present: BTreeSet<Positive> = chain
+            .options
+            .iter()
+            .map(|contract| contract.strike_price)
+            .collect();
+        let missing: Vec<String> = strikes
+            .iter()
+            .filter(|strike| !present.contains(strike))
+            .map(ToString::to_string)
+            .collect();
+
+        Err(ChainError::Internal(format!(
+            "the pinned ladder is incomplete: the chain built at this step does not carry {}",
+            missing.join(", ")
+        )))
     }
 }
 
@@ -202,32 +283,100 @@ impl PinnedLadder {
 /// mirrored rather than guessed, and
 /// `test_the_mirrored_anchor_matches_upstream` pins the two together by
 /// building a real chain and reading the strike upstream chose.
-#[must_use]
-pub(crate) fn at_the_money(underlying: Positive, interval: Positive) -> Positive {
+/// # Errors
+///
+/// Returns [`ChainError::Validation`] naming `strike_interval` when the
+/// rounding cannot be represented. `Decimal`'s operators panic on overflow and
+/// the interval is unbounded client input, so every step is checked; upstream
+/// guards the same arithmetic in its own loop.
+pub(crate) fn at_the_money(
+    underlying: Positive,
+    interval: Positive,
+) -> Result<Positive, ChainError> {
     if interval == Positive::ZERO {
-        return underlying;
+        return Ok(underlying);
     }
 
     let price = underlying.to_dec();
     let interval = interval.to_dec();
-    let Some(remainder) = price.checked_rem(interval) else {
-        return underlying;
+    let unrepresentable = || ChainError::Validation {
+        field: "strike_interval".to_string(),
+        reason: format!("an interval of {interval} cannot anchor a ladder at {underlying}"),
     };
-    let base = price - remainder;
 
-    let rounded = if remainder + remainder >= interval {
-        base + interval
+    let remainder = price.checked_rem(interval).ok_or_else(unrepresentable)?;
+    let base = price.checked_sub(remainder).ok_or_else(unrepresentable)?;
+
+    // Upstream compares the remainder against HALF the interval; mirrored in
+    // that form rather than as `remainder + remainder >= interval`, which is
+    // algebraically the same but parts company where the half is not
+    // representable at 28 decimal places.
+    let half = interval
+        .checked_div(Decimal::TWO)
+        .ok_or_else(unrepresentable)?;
+    let rounds_up = remainder >= half;
+    let rounded = if rounds_up {
+        base.checked_add(interval).ok_or_else(unrepresentable)?
     } else {
         base
     };
-    Positive::new_decimal(rounded).unwrap_or(underlying)
+
+    Positive::new_decimal(rounded).map_err(|_| unrepresentable())
+}
+
+/// Refuses a pinned ladder whose lowest strike upstream cannot build.
+///
+/// Upstream stops extending a chain downwards once the offset passes the
+/// at-the-money strike, so a ladder wider than the spot itself is one whose far
+/// strikes are never created: at an initial price of 100 with a 5-point
+/// interval, a `chain_size` of 25 asks for strikes down to 5 and back up to
+/// 225, and upstream builds only as far as 200. Filtering cannot recover what
+/// was never built, so the combination is refused AT CREATION rather than
+/// failing on the first step of a simulation the client already has.
+///
+/// # Errors
+///
+/// Returns [`ChainError::Validation`] naming `chain_size` when the ladder
+/// reaches past the anchor, and whatever [`at_the_money`] returns when the grid
+/// itself is unrepresentable.
+pub(crate) fn ensure_ladder_fits(
+    initial_price: Positive,
+    interval: Positive,
+    chain_size: usize,
+) -> Result<(), ChainError> {
+    let anchor = at_the_money(initial_price, interval)?;
+    let reach = interval
+        .checked_mul_dec(Decimal::from(chain_size))
+        .map_err(|error| ladder_overflow(interval, chain_size, &error.to_string()))?;
+
+    if reach > anchor {
+        return Err(ChainError::Validation {
+            field: "chain_size".to_string(),
+            reason: format!(
+                "a pinned ladder of {chain_size} strikes at an interval of {interval} reaches \
+                 {reach} below an anchor of {anchor}, and upstream stops building a chain once \
+                 the offset passes the anchor, so the lowest strikes would never exist; lower \
+                 chain_size or the interval"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The failure a ladder that cannot be laid out on the grid produces.
+fn ladder_overflow(interval: Positive, step: usize, detail: &str) -> ChainError {
+    ChainError::Validation {
+        field: "strike_interval".to_string(),
+        reason: format!(
+            "an interval of {interval} cannot reach strike {step} of the pinned ladder: {detail}"
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use positive::pos_or_panic;
-    use rust_decimal_macros::dec;
 
     /// The anchor rounds to the nearest multiple, halves up.
     #[test]
@@ -241,21 +390,20 @@ mod tests {
             (5012.5, 5025.0),
             (5012.49, 5000.0),
         ] {
-            assert_eq!(
-                at_the_money(pos_or_panic!(underlying), interval),
-                pos_or_panic!(expected),
-                "for {underlying}"
-            );
+            match at_the_money(pos_or_panic!(underlying), interval) {
+                Ok(anchor) => assert_eq!(anchor, pos_or_panic!(expected), "for {underlying}"),
+                Err(error) => panic!("{underlying} must anchor: {error}"),
+            }
         }
     }
 
     /// A zero interval leaves the price alone rather than dividing by it.
     #[test]
     fn test_a_zero_interval_is_not_a_grid() {
-        assert_eq!(
-            at_the_money(pos_or_panic!(5000.0), Positive::ZERO),
-            pos_or_panic!(5000.0)
-        );
+        match at_the_money(pos_or_panic!(5000.0), Positive::ZERO) {
+            Ok(anchor) => assert_eq!(anchor, pos_or_panic!(5000.0)),
+            Err(error) => panic!("a zero interval must not fail: {error}"),
+        }
     }
 
     /// The ladder is the grid around the initial price, `2n + 1` wide.
@@ -458,12 +606,13 @@ mod tests {
                 chain.iter().map(|contract| contract.strike_price).collect();
             let middle = strikes[strikes.len() / 2];
 
-            assert_eq!(
-                at_the_money(pos_or_panic!(spot), interval),
-                middle,
-                "the mirror disagrees with upstream at a spot of {spot}: {strikes:?}"
-            );
+            match at_the_money(pos_or_panic!(spot), interval) {
+                Ok(anchor) => assert_eq!(
+                    anchor, middle,
+                    "the mirror disagrees with upstream at a spot of {spot}: {strikes:?}"
+                ),
+                Err(error) => panic!("the anchor must resolve at {spot}: {error}"),
+            }
         }
-        let _ = dec!(0);
     }
 }

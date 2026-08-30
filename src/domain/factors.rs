@@ -69,9 +69,8 @@
 //! two agree algebraically but not in the last `Decimal` digits. The tolerance
 //! is pinned by a test. ADR 0001 §8 records the contract.
 
-use crate::api::rest::limits::MAX_CHAIN_SIZE;
 use crate::domain::Walker;
-use crate::domain::ladder::PinnedLadder;
+use crate::domain::ladder::{MAX_PINNED_WIDTH, PinnedLadder};
 use crate::domain::simulator::{DEFAULT_CHAIN_SIZE, DEFAULT_SKEW_SLOPE, DEFAULT_SMILE_CURVE};
 use crate::domain::spread::SpreadModel;
 use crate::session::{SimulationMethod, SimulationParametersV2};
@@ -963,7 +962,7 @@ pub(crate) fn build_chain(
     };
 
     let chain_size = match &pinned {
-        Some(ladder) => ladder.width_from(spot, *MAX_CHAIN_SIZE)?,
+        Some(ladder) => ladder.width_from(spot, MAX_PINNED_WIDTH)?,
         None => parameters.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE),
     };
     let skew_slope = parameters.skew_slope.unwrap_or(DEFAULT_SKEW_SLOPE);
@@ -1034,7 +1033,7 @@ pub(crate) fn build_chain(
     // strikes exist only to reach the pinned ones and nothing should pay to
     // quote them.
     if let Some(ladder) = &pinned {
-        ladder.keep_pinned(&mut chain);
+        ladder.keep_pinned(&mut chain)?;
     }
 
     spread_model.apply(&mut chain, days_to_expiration);

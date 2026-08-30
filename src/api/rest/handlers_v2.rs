@@ -117,7 +117,17 @@ fn parse_id(raw: &str) -> Result<Uuid, ChainError> {
     description = "Create a deterministic rolling multi-expiration simulation. Resolves the \
         effective seed, simulated start and step interval once, and returns them with the \
         normalised schedules — together they are everything needed to replay the run. The \
-        configuration is immutable: changing any of it means creating a new simulation.",
+        configuration is immutable: changing any of it means creating a new simulation. \
+        `strike_ladder` decides which strikes the simulation quotes and is the one choice \
+        worth making deliberately: `rolling`, the default, rebuilds the ladder around the \
+        underlying at every step, so the quoted strikes stay near the money and a contract \
+        can leave the chain as the spot moves; `pinned` fixes the ladder at creation from \
+        `initial_price`, `chain_size` and `strike_interval`, so a contract quoted once is \
+        quoted for the simulation's whole life, which is what a client holding a position \
+        across steps needs. A pinned simulation must supply `strike_interval`, because \
+        without one the interval is derived per expiration and there is no fixed grid to \
+        pin, and a pinned ladder does not follow a large move: if the spot leaves its range \
+        the chain becomes all calls or all puts rather than inventing new strikes.",
     request_body = CreateSimulationRequest,
     responses(
         (status = 201, description = "Simulation created", body = SimulationResponse),
@@ -960,6 +970,119 @@ mod tests {
                 "the echo must carry {field}: {parameters}"
             );
         }
+    }
+
+    /// The strike ladder is accepted over HTTP and echoed back.
+    ///
+    /// `CreateSimulationRequest` denies unknown fields, so this is what proves
+    /// `strike_ladder` is part of the wire contract rather than only of the
+    /// stored shape, and the echo is what lets a client replay the run.
+    #[actix_web::test]
+    async fn test_the_strike_ladder_is_accepted_and_echoed() {
+        let app = v2_service!();
+
+        let mut request_body = reference_body();
+        match request_body.as_object_mut() {
+            Some(map) => {
+                map.insert("strike_ladder".to_string(), json!("pinned"));
+                // A pinned ladder needs an explicit grid, and one narrow enough
+                // that upstream can build every strike of it.
+                map.insert("strike_interval".to_string(), json!(25.0));
+                map.insert("chain_size".to_string(), json!(3));
+            }
+            None => panic!("the reference body must be an object"),
+        }
+
+        let request = actix_test::TestRequest::post()
+            .uri("/api/v2/simulations")
+            .set_json(request_body)
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(
+            body.get("parameters").and_then(|p| p.get("strike_ladder")),
+            Some(&json!("pinned")),
+            "the echo must carry the ladder: {body}"
+        );
+    }
+
+    /// A request that says nothing gets the ladder the service always had.
+    #[actix_web::test]
+    async fn test_the_strike_ladder_defaults_to_rolling() {
+        let app = v2_service!();
+        let body = create!(app);
+
+        assert_eq!(
+            body.get("parameters").and_then(|p| p.get("strike_ladder")),
+            Some(&json!("rolling")),
+            "an untouched request must read as rolling: {body}"
+        );
+    }
+
+    /// A pinned ladder without a grid is a typed 400 naming the field.
+    #[actix_web::test]
+    async fn test_a_pinned_ladder_without_an_interval_is_a_typed_400() {
+        let app = v2_service!();
+
+        let mut request_body = reference_body();
+        match request_body.as_object_mut() {
+            Some(map) => {
+                map.insert("strike_ladder".to_string(), json!("pinned"));
+                map.remove("strike_interval");
+            }
+            None => panic!("the reference body must be an object"),
+        }
+
+        let request = actix_test::TestRequest::post()
+            .uri("/api/v2/simulations")
+            .set_json(request_body)
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(
+            body.get("field"),
+            Some(&json!("strike_interval")),
+            "the rejection must name the field: {body}"
+        );
+    }
+
+    /// A pinned ladder wider than the spot is refused at creation.
+    ///
+    /// Upstream stops building a chain once the offset passes the anchor, so
+    /// those strikes would never exist; refusing here beats failing on the
+    /// first step of a simulation the client already holds.
+    #[actix_web::test]
+    async fn test_a_pinned_ladder_wider_than_the_spot_is_refused() {
+        let app = v2_service!();
+
+        let mut request_body = reference_body();
+        match request_body.as_object_mut() {
+            Some(map) => {
+                map.insert("strike_ladder".to_string(), json!("pinned"));
+                map.insert("initial_price".to_string(), json!(100.0));
+                map.insert("strike_interval".to_string(), json!(5.0));
+                map.insert("chain_size".to_string(), json!(25));
+            }
+            None => panic!("the reference body must be an object"),
+        }
+
+        let request = actix_test::TestRequest::post()
+            .uri("/api/v2/simulations")
+            .set_json(request_body)
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body: Value = actix_test::read_body_json(response).await;
+        assert_eq!(
+            body.get("field"),
+            Some(&json!("chain_size")),
+            "the rejection must name what to lower: {body}"
+        );
     }
 
     /// A spread coefficient outside its range is a typed 400 naming the field.

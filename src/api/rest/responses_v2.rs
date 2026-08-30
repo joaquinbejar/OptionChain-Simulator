@@ -18,9 +18,8 @@
 //! changes between two otherwise-identical replays.
 
 use crate::api::rest::greeks::{GreekLevel, GreeksResponse, greeks_for};
-use crate::domain::ladder::StrikeLadder;
 use crate::domain::series::SeriesSnapshot;
-use crate::session::{ExpiryRule, ExpiryRuleKind, SessionV2};
+use crate::session::{ExpiryRule, ExpiryRuleKind, SessionV2, StrikeLadder};
 use chrono::{DateTime, SecondsFormat, Utc};
 use optionstratlib::chains::OptionData;
 use rust_decimal::Decimal;
@@ -136,7 +135,6 @@ pub struct SimulationParametersResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smile_curve: Option<f64>,
     /// Which strikes the simulation quotes: `rolling` or `pinned`.
-    #[schema(value_type = String)]
     pub strike_ladder: StrikeLadder,
     /// The constant term of the spread model.
     #[serde(default, skip_serializing_if = "Option::is_none")]

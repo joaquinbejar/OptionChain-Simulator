@@ -75,6 +75,10 @@ mod state_handler;
 mod store;
 
 pub use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, ExpiryRule, ExpiryRuleKind};
+// The strike ladder a v2 simulation quotes. Re-exported beside the schedule
+// rules and for the same reason: a consumer that can see it on
+// `CreateSimulationRequest` must be able to name it to build one.
+pub use crate::domain::ladder::StrikeLadder;
 pub use manager::SessionManager;
 pub use manager_v2::SimulationManager;
 pub use model::{Session, SessionState, SimulationMethod, SimulationParameters};

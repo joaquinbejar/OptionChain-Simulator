@@ -30,6 +30,7 @@ use utoipa::OpenApi;
             crate::api::rest::requests_v2::CreateSimulationRequest,
             crate::api::rest::responses_v2::SimulationResponse,
             crate::api::rest::responses_v2::SimulationParametersResponse,
+            crate::session::StrikeLadder,
             crate::api::rest::responses_v2::ScheduleRuleResponse,
             crate::api::rest::responses_v2::SnapshotResponse,
             crate::api::rest::responses_v2::ExpiryChainResponse,

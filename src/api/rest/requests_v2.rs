@@ -10,8 +10,8 @@
 //! (`crate::session::model_v2`).
 
 use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
-use crate::domain::ladder::StrikeLadder;
 use crate::session::ExpiryRule;
+use crate::session::StrikeLadder;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -106,7 +106,6 @@ pub struct CreateSimulationRequest {
     /// `strike_interval`: without it the interval is derived per expiration and
     /// there is no fixed grid to pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<String>)]
     pub strike_ladder: Option<StrikeLadder>,
     /// The constant term of the spread model, applied to every contract. On
     /// its own — which is how every request that predates the model reads — it

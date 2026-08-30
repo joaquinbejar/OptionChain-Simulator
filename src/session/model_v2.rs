@@ -26,7 +26,7 @@ use crate::api::rest::validation::{
     time_frame_field,
 };
 use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, tzdb_version};
-use crate::domain::ladder::StrikeLadder;
+use crate::domain::ladder::{StrikeLadder, ensure_ladder_fits};
 use crate::domain::simulator::DEFAULT_CHAIN_SIZE;
 use crate::domain::spread::{MAX_PROPORTIONAL, MAX_TICK, MAX_WIDENING};
 use crate::infrastructure::max_snapshot_contracts;
@@ -448,11 +448,23 @@ impl SimulationParametersV2 {
         // expiration: there would be no single ladder to pin. Refused at the
         // boundary rather than resolved to some arbitrary expiration's
         // interval, which would be a number nobody asked for.
-        if self.strike_ladder.is_pinned() && self.strike_interval.is_none() {
-            return Err(ChainError::Validation {
-                field: "strike_interval".to_string(),
-                reason: "a pinned strike_ladder requires an explicit strike_interval".to_string(),
-            });
+        if self.strike_ladder.is_pinned() {
+            let Some(interval) = self.strike_interval else {
+                return Err(ChainError::Validation {
+                    field: "strike_interval".to_string(),
+                    reason: "a pinned strike_ladder requires an explicit strike_interval"
+                        .to_string(),
+                });
+            };
+            // And the ladder has to be one upstream can actually build: it
+            // stops extending downwards past the anchor, so a ladder wider
+            // than the spot loses its lowest strikes. Refused here rather than
+            // on the first step of a simulation the client already holds.
+            ensure_ladder_fits(
+                self.initial_price,
+                interval,
+                self.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE),
+            )?;
         }
         // The spread model, BOTH bounds, exactly as the request path applies
         // them. A stored `spread_tick` of zero silently disables the floor that

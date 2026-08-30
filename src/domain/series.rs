@@ -1035,16 +1035,12 @@ mod tests {
     /// exactly the strikes the simulation pinned at creation. A position opened
     /// at step 0 can therefore be marked at every later step.
     ///
-    /// IGNORED, and the reason is the open question on the issue. Within about
-    /// a day of an expiration upstream stops extending its ladder: a wing
-    /// priced at exactly zero makes `some_price_is_none` true on both ends and
-    /// the build loop breaks, so the far strikes do not exist to be filtered
-    /// to. Measured at a spot of 5100 with a width of 10 and a 25-point
-    /// interval: 21 strikes at 1 day, 11 at 0.05 days, 5 at 0.01 days. No
-    /// widening fixes it, because the contracts are never created. Closing this
-    /// needs a decision recorded on #91 — see the PR discussion.
+    /// This needed an upstream fix to pass. Until optionstratlib 0.21.1 a wing
+    /// worth nothing was priced as ABSENT rather than as zero, and
+    /// `build_chain` reads a missing side as "this wing does not quote", so the
+    /// ladder stopped before reaching the far pinned strikes and there was
+    /// nothing to filter to (OptionStratLib#487).
     #[test]
-    #[ignore = "blocked: upstream truncates its ladder near expiry, see issue #91"]
     fn test_a_pinned_simulation_keeps_its_strikes_for_every_step() {
         let mut created = request(40, reference_schedules());
         created.chain_size = Some(6);
