@@ -14,6 +14,24 @@
 use examples_integration::{Response, ServiceClient, Simulation, reference_request, service};
 use serde::Deserialize;
 
+/// One case in the rejection table: what to send, and what the service must
+/// answer. A struct rather than a tuple so each column is named at the point
+/// it is written, which matters when a table has nine rows.
+struct Case {
+    /// What this case is, for the failure message.
+    what: &'static str,
+    /// The HTTP method.
+    method: &'static str,
+    /// The path, built from a live simulation where the case needs one.
+    path: String,
+    /// The request body, for the cases that carry one.
+    body: Option<serde_json::Value>,
+    /// The status the service must answer.
+    status: u16,
+    /// The field it must name, or empty where the service does not know one.
+    field: &'static str,
+}
+
 /// The documented rejection body.
 #[derive(Debug, Deserialize)]
 struct Rejection {
@@ -102,118 +120,122 @@ fn test_the_v2_rejection_contract_names_its_field() {
         }
     };
 
-    // (case, method, path, body, expected status, expected field)
-    let cases: Vec<(&str, &str, String, Option<serde_json::Value>, u16, &str)> = vec![
-        (
-            "a malformed id",
-            "GET",
-            "/api/v2/simulations/not-a-uuid".to_string(),
-            None,
-            400,
-            "id",
-        ),
-        (
+    let cases = vec![
+        Case {
+            what: "a malformed id",
+            method: "GET",
+            path: "/api/v2/simulations/not-a-uuid".to_string(),
+            body: None,
+            status: 400,
+            field: "id",
+        },
+        Case {
             // The service names the field it can act on: `from_step` is the
             // one that exceeds, so that is what a client has to change.
-            "a reversed range",
-            "GET",
-            simulation.path("/export?dataset=underlying&format=csv&from_step=3&to_step=1"),
-            None,
-            400,
-            "from_step",
-        ),
-        (
-            "an unknown greek level",
-            "GET",
-            simulation.path("/snapshot?greeks=everything"),
-            None,
-            400,
-            "greeks",
-        ),
-        (
-            "an unknown query parameter",
-            "GET",
-            simulation.path("/snapshot?greek=first_order"),
-            None,
-            400,
-            "greek",
-        ),
-        (
-            "steps below one",
-            "POST",
-            "/api/v2/simulations".to_string(),
-            Some(request_with("steps", serde_json::json!(0))),
-            400,
-            "steps",
-        ),
-        (
-            "a non-positive initial price",
-            "POST",
-            "/api/v2/simulations".to_string(),
-            Some(request_with("initial_price", serde_json::json!(0.0))),
-            400,
-            "initial_price",
-        ),
-        (
-            "a non-positive volatility",
-            "POST",
-            "/api/v2/simulations".to_string(),
-            Some(request_with("volatility", serde_json::json!(0.0))),
-            400,
-            "volatility",
-        ),
-        (
-            "a zero step interval",
-            "POST",
-            "/api/v2/simulations".to_string(),
-            Some(request_with("step_interval_seconds", serde_json::json!(0))),
-            400,
-            "step_interval_seconds",
-        ),
-        (
-            "an unknown body key",
-            "POST",
-            "/api/v2/simulations".to_string(),
-            Some(request_with("stepss", serde_json::json!(4))),
-            400,
-            "",
-        ),
+            what: "a reversed range",
+            method: "GET",
+            path: simulation.path("/export?dataset=underlying&format=csv&from_step=3&to_step=1"),
+            body: None,
+            status: 400,
+            field: "from_step",
+        },
+        Case {
+            what: "an unknown greek level",
+            method: "GET",
+            path: simulation.path("/snapshot?greeks=everything"),
+            body: None,
+            status: 400,
+            field: "greeks",
+        },
+        Case {
+            what: "an unknown query parameter",
+            method: "GET",
+            path: simulation.path("/snapshot?greek=first_order"),
+            body: None,
+            status: 400,
+            field: "greek",
+        },
+        Case {
+            what: "steps below one",
+            method: "POST",
+            path: "/api/v2/simulations".to_string(),
+            body: Some(request_with("steps", serde_json::json!(0))),
+            status: 400,
+            field: "steps",
+        },
+        Case {
+            what: "a non-positive initial price",
+            method: "POST",
+            path: "/api/v2/simulations".to_string(),
+            body: Some(request_with("initial_price", serde_json::json!(0.0))),
+            status: 400,
+            field: "initial_price",
+        },
+        Case {
+            what: "a non-positive volatility",
+            method: "POST",
+            path: "/api/v2/simulations".to_string(),
+            body: Some(request_with("volatility", serde_json::json!(0.0))),
+            status: 400,
+            field: "volatility",
+        },
+        Case {
+            what: "a zero step interval",
+            method: "POST",
+            path: "/api/v2/simulations".to_string(),
+            body: Some(request_with("step_interval_seconds", serde_json::json!(0))),
+            status: 400,
+            field: "step_interval_seconds",
+        },
+        Case {
+            what: "an unknown body key",
+            method: "POST",
+            path: "/api/v2/simulations".to_string(),
+            body: Some(request_with("stepss", serde_json::json!(4))),
+            status: 400,
+            field: "",
+        },
     ];
 
     let mut exercised = 0_usize;
-    for (case, method, path, body, status, field) in cases {
-        let response = match client.request(
+    for case in cases {
+        let Case {
+            what,
             method,
-            &path,
-            body.as_ref().map(|b| b.to_string()).as_deref(),
-        ) {
+            path,
+            body,
+            status,
+            field,
+        } = case;
+        let rendered_body = body.map(|body| body.to_string());
+        let response = match client.request(method, &path, rendered_body.as_deref()) {
             Ok(response) => response,
-            Err(error) => panic!("{case}: {error}"),
+            Err(error) => panic!("{what}: {error}"),
         };
 
         // A deployment older than the route answers 404 for the path itself;
         // that is a lag to report, not a contract failure.
         if response.status == 404 && !path.contains("not-a-uuid") {
-            println!("SKIP: {case} is not deployed here ({path})");
+            println!("SKIP: {what} is not deployed here ({path})");
             continue;
         }
 
-        let rejection = rejection(&client, case, &response);
+        let rejection = rejection(&client, what, &response);
         assert_eq!(
             response.status, status,
-            "{case} must answer {status}, got {} with {}",
+            "{what} must answer {status}, got {} with {}",
             response.status, rejection.error
         );
         if !field.is_empty() {
             assert_eq!(
                 rejection.field, field,
-                "{case} must name {field}, named {:?} with {}",
+                "{what} must name {field}, named {:?} with {}",
                 rejection.field, rejection.error
             );
         }
         assert!(
             !rejection.error.is_empty(),
-            "{case} must explain itself, not answer an empty message"
+            "{what} must explain itself, not answer an empty message"
         );
         exercised += 1;
     }
