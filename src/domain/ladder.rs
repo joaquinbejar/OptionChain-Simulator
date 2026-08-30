@@ -171,11 +171,12 @@ impl PinnedLadder {
     /// upstream: the distance in intervals from the spot's at-the-money strike
     /// to whichever pinned strike is furthest from it.
     ///
-    /// `maximum` is the widening the simulation's own snapshot budget allows,
-    /// derived by [`max_pinned_width`] from the same numbers
-    /// `validate_snapshot_work` checked at creation. A pinned step must not be
-    /// able to price more contracts than the configuration was validated for
-    /// simply because the underlying drifted.
+    /// `maximum` is the widening [`max_pinned_width`] allows: the smaller of
+    /// the simulation's own snapshot budget and the absolute ceiling
+    /// [`MAX_PINNED_WIDTH`]. A pinned step must not be able to price more
+    /// contracts than the configuration was validated for, nor a wider chain
+    /// than a client could have requested, simply because the underlying
+    /// drifted.
     ///
     /// # Errors
     ///
@@ -232,7 +233,11 @@ impl PinnedLadder {
                 reason: format!(
                     "the underlying has moved {widest} strikes from the ladder this simulation \
                      pinned at creation, past the {maximum} a chain may carry; a pinned ladder \
-                     does not follow a move that far, so widen it at creation with chain_size"
+                     does not follow a move that far, and widening chain_size cannot help \
+                     because a wider ladder puts its far strikes further still from this spot; \
+                     create the simulation with a smaller chain_size, around an initial_price \
+                     nearer where the underlying trades, or with the rolling ladder, which \
+                     re-centres on every step"
                 ),
             });
         }
@@ -335,18 +340,40 @@ pub(crate) fn at_the_money(
     Positive::new_decimal(rounded).map_err(|_| unrepresentable())
 }
 
+/// The absolute ceiling on the widening a pinned step may ask for.
+///
+/// This is the widest chain any client is allowed to REQUEST
+/// (`OCS_MAX_CHAIN_SIZE`'s default), reused as the ceiling on the widening the
+/// service performs on a client's behalf. The two are different quantities and
+/// only the coincidence of the number is shared, so it lives here rather than
+/// being read from the request caps: lowering the request cap must not
+/// retroactively break simulations already running, and raising it must not
+/// license the domain to price a wider chain than this.
+///
+/// It is a ceiling, never the bound on its own; [`max_pinned_width`] takes it
+/// together with the simulation's snapshot budget and keeps whichever is
+/// smaller.
+pub(crate) const MAX_PINNED_WIDTH: usize = 500;
+
 /// The widest chain a pinned step may ask upstream for.
 ///
 /// A pinned step builds wide enough to REACH its ladder and then filters, so
 /// the widening is work the client never asked for and the request caps never
-/// saw. Bounding it by a constant of its own would let a simulation validated
-/// for a handful of contracts per snapshot price a thousand strikes per
-/// expiration once its spot drifted.
+/// saw. Two separate things have to bound it, and the answer is the smaller:
 ///
-/// The bound is therefore the simulation's own budget, computed from the same
-/// numbers `SimulationParametersV2::validate_snapshot_work` checked at
-/// creation: the per-snapshot contract cap divided by the expirations the
-/// schedule can carry, back through the `2n + 1` grid to a half-width.
+/// The simulation's own snapshot budget, computed from the same numbers
+/// `SimulationParametersV2::validate_snapshot_work` checked at creation: the
+/// per-snapshot contract cap divided by the expirations the schedule can carry,
+/// back through the `2n + 1` grid to a half-width. Without this, a
+/// configuration validated for a handful of contracts per snapshot could price
+/// far more of them once its spot drifted.
+///
+/// And [`MAX_PINNED_WIDTH`], because that budget is a SERVICE-WIDE cap rather
+/// than a per-simulation one. At its default a single-expiration schedule
+/// divides 200 000 contracts by one, which would license a widening of 99 999
+/// strikes per side; a bound that large is not a bound. The absolute ceiling is
+/// what keeps the widening in the region a client could have asked for
+/// directly.
 ///
 /// # Errors
 ///
@@ -365,15 +392,40 @@ pub(crate) fn max_pinned_width(parameters: &SimulationParametersV2) -> Result<us
             reason: "the requested expiration counts overflow".to_string(),
         })?;
 
-    let cap = crate::infrastructure::max_snapshot_contracts();
-    // A schedule with no rules cannot produce a chain, so the width is
-    // irrelevant; one is the smallest answer that is not zero.
-    let strikes = cap.checked_div(expirations.max(1)).unwrap_or(cap);
+    Ok(pinned_width_for(
+        crate::infrastructure::max_snapshot_contracts(),
+        expirations,
+    ))
+}
 
-    // `strikes` covers `2n + 1`, so the half-width is what upstream calls
-    // `chain_size`. At least one, or a pinned ladder of a single strike could
-    // never be reached.
-    Ok(strikes.saturating_sub(1).checked_div(2).unwrap_or(0).max(1))
+/// The widening [`max_pinned_width`] allows for a given cap and expiration
+/// count, split out from the environment so both sides of the minimum can be
+/// exercised: the process-wide cap is resolved once in a `OnceLock`, so a test
+/// that could only call the public entry point would be stuck with whatever
+/// the deployment happens to configure.
+fn pinned_width_for(cap: usize, expirations: usize) -> usize {
+    // A schedule with no rules cannot produce a chain, so the divisor is
+    // irrelevant; one keeps the division defined.
+    let divisor = if expirations == 0 { 1 } else { expirations };
+    let strikes = cap.checked_div(divisor).unwrap_or(cap);
+
+    // `strikes` covers the whole `2n + 1` grid, so the half-width is what
+    // upstream calls `chain_size`. The subtraction is checked rather than
+    // saturating, which `rules/global_rules.md` forbids: a budget of zero or
+    // one strike is a real answer of zero, stated deliberately, and
+    // `width_from` then refuses a ladder that cannot fit rather than the
+    // arithmetic quietly rounding up past the budget it came from.
+    //
+    // Written as a match rather than `checked_sub(1).unwrap_or(0)` because
+    // clippy's `manual_saturating_arithmetic` rewrites that form back into
+    // `saturating_sub` under `make pre-push`, which is the very call the rule
+    // forbids. The match says the same thing and survives the autofix.
+    let budget = match strikes.checked_sub(1) {
+        Some(grid) => grid.checked_div(2).unwrap_or(0),
+        None => 0,
+    };
+
+    budget.min(MAX_PINNED_WIDTH)
 }
 
 /// Refuses a pinned ladder whose lowest strike upstream cannot build.
@@ -566,6 +618,18 @@ mod tests {
                     reason.contains("pinned at creation"),
                     "the failure must explain: {reason}"
                 );
+                // Widening is the one remedy that cannot work, since a wider
+                // ladder puts its far strikes further from this spot still.
+                assert!(
+                    reason.contains("widening chain_size cannot help"),
+                    "the failure must rule out the wrong remedy: {reason}"
+                );
+                assert!(
+                    reason.contains("smaller chain_size")
+                        && reason.contains("initial_price")
+                        && reason.contains("rolling"),
+                    "the failure must name a remedy that works: {reason}"
+                );
             }
             Err(error) => panic!("expected a validation failure, got {error:?}"),
         }
@@ -597,23 +661,51 @@ mod tests {
         }
     }
 
-    /// The widening ceiling is the simulation's own snapshot budget, so a
-    /// pinned step cannot price more contracts than the configuration was
-    /// validated for.
+    /// The widening ceiling is the smaller of the simulation's snapshot budget
+    /// and the absolute ceiling, and both sides of that minimum bind.
+    #[test]
+    fn test_the_widening_ceiling_is_the_smaller_of_both_bounds() {
+        // The service-wide cap is not a bound on its own. At its default a
+        // single-expiration schedule divides 200 000 contracts by one, which
+        // would license 99 999 strikes per side; the absolute ceiling is what
+        // holds. Remove the `min` and this assertion fails.
+        assert_eq!(pinned_width_for(200_000, 1), MAX_PINNED_WIDTH);
+
+        // Split across enough expirations, the budget is the tighter of the
+        // two and the ceiling stops binding. Remove the budget term and this
+        // one fails.
+        assert_eq!(pinned_width_for(200_000, 400), 249);
+        assert_eq!(pinned_width_for(101, 1), 50);
+
+        // A budget too small to carry even a three-strike chain answers zero
+        // rather than rounding itself up past the budget it came from.
+        assert_eq!(pinned_width_for(2, 1), 0);
+        assert_eq!(pinned_width_for(1, 1), 0);
+        assert_eq!(pinned_width_for(0, 1), 0);
+
+        // And a schedule with no rules still divides.
+        assert_eq!(pinned_width_for(200_000, 0), MAX_PINNED_WIDTH);
+    }
+
+    /// The parameters entry point agrees with the pure core it delegates to.
     #[test]
     fn test_the_widening_ceiling_comes_from_the_snapshot_budget() {
         let parameters = parameters(5000.0, 25.0, 2);
+        let cap = crate::infrastructure::max_snapshot_contracts();
 
         let width = match max_pinned_width(&parameters) {
             Ok(width) => width,
             Err(error) => panic!("the budget must resolve: {error}"),
         };
 
-        // One expiration, so the whole per-snapshot budget is one chain: the
-        // `2n + 1` grid must fit inside it.
-        let cap = crate::infrastructure::max_snapshot_contracts();
+        // One expiration in this schedule, so the whole per-snapshot budget is
+        // one chain and the `2n + 1` grid must fit inside it.
+        assert_eq!(width, pinned_width_for(cap, 1));
         assert!(width * 2 < cap, "{width} strikes per side exceeds {cap}");
-        assert!(width >= 1, "a ladder of one strike must stay reachable");
+        assert!(
+            width <= MAX_PINNED_WIDTH,
+            "{width} strikes per side exceeds the {MAX_PINNED_WIDTH} ceiling"
+        );
     }
 
     /// A pinned ladder needs an explicit interval, and says so.
