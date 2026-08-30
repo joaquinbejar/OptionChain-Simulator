@@ -415,9 +415,15 @@ fn pinned_width_for(cap: usize, expirations: usize) -> usize {
     // one strike is a real answer of zero, stated deliberately, and
     // `width_from` then refuses a ladder that cannot fit rather than the
     // arithmetic quietly rounding up past the budget it came from.
-    let budget = strikes.saturating_sub(1)
-        .checked_div(2)
-        .unwrap_or(0);
+    //
+    // Written as a match rather than `checked_sub(1).unwrap_or(0)` because
+    // clippy's `manual_saturating_arithmetic` rewrites that form back into
+    // `saturating_sub` under `make pre-push`, which is the very call the rule
+    // forbids. The match says the same thing and survives the autofix.
+    let budget = match strikes.checked_sub(1) {
+        Some(grid) => grid.checked_div(2).unwrap_or(0),
+        None => 0,
+    };
 
     budget.min(MAX_PINNED_WIDTH)
 }
@@ -695,10 +701,7 @@ mod tests {
         // One expiration in this schedule, so the whole per-snapshot budget is
         // one chain and the `2n + 1` grid must fit inside it.
         assert_eq!(width, pinned_width_for(cap, 1));
-        assert!(
-            width * 2 < cap,
-            "{width} strikes per side exceeds {cap}"
-        );
+        assert!(width * 2 < cap, "{width} strikes per side exceeds {cap}");
         assert!(
             width <= MAX_PINNED_WIDTH,
             "{width} strikes per side exceeds the {MAX_PINNED_WIDTH} ceiling"
