@@ -49,22 +49,55 @@ fn parse_timeout_secs(var: &str, default: u64) -> u64 {
     }
 }
 
+/// Percent-encodes one credential for the URL's userinfo section.
+///
+/// Everything outside RFC 3986's `unreserved` set is encoded, which is wider
+/// than the minimum the grammar demands: `sub-delims` and `:` are legal in
+/// userinfo unencoded, but encoding them costs nothing and removes every
+/// question about where the section ends. `%` is escaped along with the rest,
+/// so a password that legitimately contains `%40` becomes `%2540` and cannot
+/// decode back to `@`.
+///
+/// A credential of letters, digits, `-`, `.`, `_` or `~` passes through
+/// untouched, so a URL that works today is byte-identical after this.
+#[must_use]
+fn encode_userinfo(raw: &str) -> String {
+    let mut encoded = String::with_capacity(raw.len());
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            // Uppercase hex, as RFC 3986 recommends for what a producer emits.
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 impl RedisConfig {
     pub(crate) fn url(&self) -> String {
         // Start building the URL
         let mut url = String::from("redis://");
 
         // Add credentials if either username or password is present
+        //
+        // PERCENT-ENCODED, both of them. Interpolated verbatim, a credential
+        // carrying a URL delimiter builds a URL that is WRONG rather than one
+        // that fails: a `/` moves what the driver reads as the database index,
+        // a `#` truncates the rest, and a `@` moves where the credentials are
+        // taken to end. The resolved fields stay unencoded, so a caller reading
+        // `RedisConfig.password` still sees what the operator set.
         if self.username.is_some() || self.password.is_some() {
             // Add username if present, otherwise an empty string
             if let Some(username) = &self.username {
-                url.push_str(username);
+                url.push_str(&encode_userinfo(username));
             }
 
             // Add password with colon prefix if present
             if let Some(password) = &self.password {
                 url.push(':');
-                url.push_str(password);
+                url.push_str(&encode_userinfo(password));
             }
 
             // Add the @ separator after credentials
@@ -239,10 +272,9 @@ mod tests {
             "a real password must reach the config untouched"
         );
 
-        // That it also reaches the URL is asserted with a plain password on
-        // purpose. `url()` does no percent-encoding, so asserting the
-        // punctuated one round-trips through the URL would freeze that gap as
-        // intended behaviour rather than leave it a known one.
+        // And that it reaches the URL, now percent-encoded: the punctuated
+        // password round-trips through a real parse in
+        // `test_a_punctuated_credential_round_trips_through_the_url`.
         set_var("REDIS_PASSWORD", "s3cret");
         let config = RedisConfig::default();
         assert!(
@@ -493,6 +525,151 @@ mod tests {
         );
     }
 
+    /// The credentials a URL parses back to, or `None` when the driver
+    /// refuses it.
+    ///
+    /// A real parse by the driver that will consume this URL, so the assertion
+    /// is about what Redis receives rather than about the string this module
+    /// produced. Both halves: the username is encoded too, and a driver that
+    /// stopped decoding usernames would leave a password-only assertion green.
+    fn credentials_of(url: &str) -> Option<(Option<String>, Option<String>)> {
+        let client = redis::Client::open(url).ok()?;
+        let settings = client.get_connection_info().redis_settings();
+        Some((
+            settings.username().map(ToString::to_string),
+            settings.password().map(ToString::to_string),
+        ))
+    }
+
+    /// A credential full of delimiters parses back to exactly itself.
+    ///
+    /// Every one of these characters means something in a URL: `/` moves the
+    /// database index, `#` truncates the rest, `?` opens a query, `@` moves
+    /// where the credentials end, `:` splits user from password, a space is not
+    /// allowed at all, and `%` is what an encoder must escape first or a
+    /// literal `%40` decodes to `@`.
+    #[test]
+    fn test_a_punctuated_credential_round_trips_through_the_url() {
+        for password in [
+            "s3cr:t@pass",
+            "p/secret",
+            "with#hash",
+            "with?query",
+            "with space",
+            "100%pure",
+            "everything: /#?@% and more",
+        ] {
+            // The same punctuation in BOTH slots: the username goes through
+            // the same encoder and the same decode on the driver's side.
+            let config = RedisConfig {
+                host: "localhost".to_string(),
+                port: 6379,
+                username: Some(password.to_string()),
+                password: Some(password.to_string()),
+                database: 0,
+                timeout: 30,
+                connect_timeout: 5,
+            };
+
+            assert_eq!(
+                credentials_of(&config.url()),
+                Some((Some(password.to_string()), Some(password.to_string()))),
+                "{password:?} did not survive the URL: {}",
+                config.url()
+            );
+        }
+    }
+
+    /// A `/` in a credential does not move the database index.
+    ///
+    /// The failure that motivated the issue: unencoded, `p/secret` ends the
+    /// authority early and the driver reads a database that nobody configured.
+    #[test]
+    fn test_a_slash_in_a_credential_leaves_the_database_alone() {
+        let config = RedisConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            username: None,
+            password: Some("p/7/secret".to_string()),
+            database: 3,
+            timeout: 30,
+            connect_timeout: 5,
+        };
+
+        let client = match redis::Client::open(config.url()) {
+            Ok(client) => client,
+            Err(error) => panic!("the URL must parse: {error}, url {}", config.url()),
+        };
+        let info = client.get_connection_info();
+
+        assert_eq!(
+            info.redis_settings().db(),
+            3,
+            "the configured database must survive"
+        );
+        assert_eq!(info.redis_settings().password(), Some("p/7/secret"));
+    }
+
+    /// An unreserved credential produces the URL it produced before.
+    ///
+    /// The encoding must be invisible to everything already working: letters,
+    /// digits, `-`, `.`, `_` and `~` pass through untouched.
+    #[test]
+    fn test_an_unreserved_credential_is_untouched() {
+        let config = RedisConfig {
+            host: "redis.internal".to_string(),
+            port: 6380,
+            username: Some("admin".to_string()),
+            password: Some("s3cret-pass.word_v2~1".to_string()),
+            database: 2,
+            timeout: 30,
+            connect_timeout: 5,
+        };
+
+        assert_eq!(
+            config.url(),
+            "redis://admin:s3cret-pass.word_v2~1@redis.internal:6380/2"
+        );
+    }
+
+    /// The encoder escapes what it must, and nothing else.
+    #[test]
+    fn test_the_encoder_escapes_only_the_reserved() {
+        assert_eq!(encode_userinfo("aZ09-._~"), "aZ09-._~");
+        assert_eq!(encode_userinfo("a/b"), "a%2Fb");
+        assert_eq!(encode_userinfo("a@b"), "a%40b");
+        assert_eq!(encode_userinfo("a:b"), "a%3Ab");
+        assert_eq!(encode_userinfo("a b"), "a%20b");
+        // `%` first: otherwise a literal %40 in a password would decode to @.
+        assert_eq!(encode_userinfo("%40"), "%2540");
+        // Multi-byte characters are encoded per UTF-8 byte.
+        assert_eq!(encode_userinfo("ñ"), "%C3%B1");
+    }
+
+    /// A punctuated credential still cannot leak through the redaction.
+    ///
+    /// Encoding removes every `@` from the credential, so the last `@` in the
+    /// URL is the real separator and `redact_userinfo` cannot be walked past it.
+    #[test]
+    fn test_the_redaction_covers_the_encoded_form() {
+        let config = RedisConfig {
+            host: "localhost".to_string(),
+            port: 6379,
+            username: Some("adm@in".to_string()),
+            password: Some("p@ss/word".to_string()),
+            database: 0,
+            timeout: 30,
+            connect_timeout: 5,
+        };
+
+        let redacted = crate::infrastructure::config::redact_userinfo(&config.url());
+
+        assert_eq!(
+            redacted, "redis://***@localhost:6379",
+            "nothing of either credential may survive"
+        );
+    }
+
     #[test]
     fn test_display_and_debug_redact_delimiter_passwords() {
         // Display/Debug are built from fields, so passwords containing URL
@@ -512,8 +689,13 @@ mod tests {
             assert!(!display.contains(pw), "Display leaked {pw:?}: {display}");
             assert!(!debug.contains(pw), "Debug leaked {pw:?}: {debug}");
             assert!(display.contains("***@"));
-            // The connection URL still carries the real credential.
-            assert!(config.url().contains(pw));
+            // The URL still carries the credential, percent-encoded, which is
+            // what makes the last `@` the real separator for the redaction.
+            assert_eq!(
+                credentials_of(&config.url()),
+                Some((Some("user".to_string()), Some(pw.to_string()))),
+                "the URL must parse back to the credential"
+            );
         }
     }
 
@@ -541,7 +723,8 @@ mod tests {
         assert!(debug.contains("***"));
 
         // The connection URL must still carry the real credentials so the
-        // connection path keeps working.
+        // connection path keeps working. Alphanumerics and `-` are unreserved,
+        // so these two appear verbatim.
         assert!(config.url().contains("s3ntinel-pw"));
         assert!(config.url().contains("admin"));
     }

@@ -32,10 +32,13 @@ pub(crate) use crate::utils::env::{read_secret, read_var};
 /// next whitespace (or end of string); if it contains an `@`, everything
 /// between `://` and its LAST `@` is treated as credentials and replaced with
 /// `***`. Bounding by the last `@` is deliberately CONSERVATIVE: a raw
-/// credential may contain `/`, `:`, or `@` (RedisConfig::url and env-provided
-/// URIs embed them verbatim), so the scan prefers over-redacting a legitimate
-/// path `@` (`scheme://host/some@path` → `scheme://***@path`) to ever leaking
-/// a password fragment. Credentials containing whitespace cannot be recovered
+/// credential may contain `/`, `:`, or `@`, which an operator-supplied URI such
+/// as `MONGODB_URI` embeds verbatim, so the scan prefers over-redacting a
+/// legitimate path `@` (`scheme://host/some@path` → `scheme://***@path`) to
+/// ever leaking a password fragment. `RedisConfig::url` percent-encodes its own
+/// userinfo (issue #87), so for the URL this service builds the last `@` IS the
+/// separator and the conservative rule is load-bearing only for the URIs it was
+/// handed. Credentials containing whitespace cannot be recovered
 /// from mid-text scanning; whole-string values should use [`redact_uri`].
 pub(crate) fn redact_userinfo(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
