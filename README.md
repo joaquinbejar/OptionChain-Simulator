@@ -464,6 +464,25 @@ from the effective parameters, so it costs latency and nothing else. The
 sweep publishes `v2_simulations_expired_total`, and the caches publish
 `v2_tape_cache_size` and `v2_snapshot_cache_size`.
 
+### Testing against a deployment
+
+The default suite is hermetic: `LOGLEVEL=WARN cargo test --workspace`
+passes with no Redis, no MongoDB and no ClickHouse running, and opens no
+socket. It covers the code, and not the thing an operator runs: a service
+on a port, behind a container, with those three behind it.
+
+`examples/integration` covers that. It talks to the service named by
+`OCS_INTEGRATION_BASE_URL` over HTTP, scheme and port included, and every
+test in it SKIPS when the variable is unset or blank, which is why it can
+live in the workspace without costing the hermetic suite anything. Run it
+with `make test-integration`.
+
+Two things follow from testing a DEPLOYMENT rather than a build. A deployed
+service can be older than the working tree, so the suite reports the
+version it found and skips a feature that is not deployed yet rather than
+failing it. And it is shared, so every test deletes the simulations it
+creates, including when it fails.
+
 ### Exporting a tape
 
 `GET /api/v2/simulations/{id}/export?dataset=…&format=…&from_step=&to_step=`
