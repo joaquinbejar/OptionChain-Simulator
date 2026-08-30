@@ -16,7 +16,7 @@
 //! written with a leading space is a different credential and this module
 //! cannot tell one variable's meaning from another's. And it does not cover an
 //! opaque credential whose empty form is meaningful, which is what
-//! [`read_secret`] is for.
+//! [`read_secret`](crate::utils::env::read_secret) is for.
 //!
 //! This module sits in `utils` rather than in `infrastructure::config` so that
 //! every layer can hold the rule, including `utils::admission`, which reads a

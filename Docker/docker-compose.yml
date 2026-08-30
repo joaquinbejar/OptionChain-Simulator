@@ -113,7 +113,7 @@ services:
     # default tag in the same PR that bumps the crate version.
     image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.0}
     deploy:
-      replicas: 1
+      replicas: 2
       restart_policy:
         condition: any
         delay: 5s

@@ -559,8 +559,10 @@ mod tests {
     use super::*;
     use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
     use crate::api::rest::requests_v2::CreateSimulationRequest;
+    use crate::domain::ladder::{PinnedLadder, StrikeLadder};
     use crate::session::{ExpiryRule, ExpiryRuleKind};
     use chrono::{TimeZone, Weekday};
+    use rust_decimal_macros::dec;
 
     /// ADR 0001 §14's reference configuration: one rolling 0DTE, three
     /// Monday/Wednesday/Friday weeklies, twelve last-Friday monthlies, all at
@@ -643,6 +645,7 @@ mod tests {
             skew_slope: None,
             smile_curve: None,
             spread: Some(0.02),
+            strike_ladder: Default::default(),
             spread_proportional: None,
             spread_moneyness_widening: None,
             spread_tenor_widening: None,
@@ -1014,6 +1017,96 @@ mod tests {
     fn test_same_seed_produces_an_identical_snapshot_tape() {
         let first_parameters = parameters(request(6, reference_schedules()));
         let second_parameters = parameters(request(6, reference_schedules()));
+        let first_tape = tape(&first_parameters);
+        let second_tape = tape(&second_parameters);
+
+        for step in 0..first_tape.len() {
+            assert_eq!(
+                snapshot(&first_parameters, &first_tape, step),
+                snapshot(&second_parameters, &second_tape, step),
+                "step {step} diverged under the same seed"
+            );
+        }
+    }
+
+    /// A pinned simulation quotes one strike set for its whole life.
+    ///
+    /// The end-to-end form of issue #91's criterion: walked over enough steps
+    /// for the underlying to move, every snapshot of every expiration carries
+    /// exactly the strikes the simulation pinned at creation. A position opened
+    /// at step 0 can therefore be marked at every later step.
+    ///
+    /// This needed an upstream fix to pass. Until optionstratlib 0.21.1 a wing
+    /// worth nothing was priced as ABSENT rather than as zero, and
+    /// `build_chain` reads a missing side as "this wing does not quote", so the
+    /// ladder stopped before reaching the far pinned strikes and there was
+    /// nothing to filter to (OptionStratLib#487).
+    #[test]
+    fn test_a_pinned_simulation_keeps_its_strikes_for_every_step() {
+        let mut created = request(40, reference_schedules());
+        created.chain_size = Some(6);
+        created.strike_interval = Some(25.0);
+        created.strike_ladder = Some(StrikeLadder::Pinned);
+        let parameters = parameters(created);
+        let tape = tape(&parameters);
+
+        // The ladder the simulation pinned, resolved from its own parameters:
+        // comparing every step against the FIRST one would pass on a chain
+        // that lost the same wings at every step, which is the failure this
+        // test exists to catch.
+        let ladder = match PinnedLadder::resolve(&parameters) {
+            Ok(ladder) => ladder,
+            Err(error) => panic!("the ladder must resolve: {error}"),
+        };
+        let expected: Vec<String> = ladder.strikes().iter().map(ToString::to_string).collect();
+        assert_eq!(expected.len(), 13, "a half-width of six is 13 strikes");
+
+        let mut spots = Vec::new();
+
+        for step in 0..tape.len() {
+            let snapshot = snapshot(&parameters, &tape, step);
+            spots.push(snapshot.spot);
+
+            for chain in &snapshot.chains {
+                let strikes: Vec<String> = chain
+                    .chain
+                    .iter()
+                    .map(|contract| contract.strike_price.to_string())
+                    .collect();
+
+                assert_eq!(
+                    strikes, expected,
+                    "step {step} does not quote the ladder the simulation pinned"
+                );
+            }
+        }
+
+        // The property only means something if the spot moved far enough that
+        // a rolling ladder would have dropped a strike, which is half the
+        // ladder's own width: six strikes at 25 points is 150.
+        let lowest = spots.iter().copied().fold(Positive::MAX, Positive::min);
+        let highest = spots.iter().copied().fold(Positive::ZERO, Positive::max);
+        assert!(
+            highest.to_dec() - lowest.to_dec() > dec!(150),
+            "the fixture must move the underlying past the ladder's half-width, \
+             got {lowest} to {highest}"
+        );
+    }
+
+    /// A pinned simulation reproduces its tape under the same seed.
+    ///
+    /// The ladder is a pure function of stored parameters, so it cannot move a
+    /// price path; this pins that the whole snapshot, quotes included, is the
+    /// same on a second run.
+    #[test]
+    fn test_a_pinned_simulation_reproduces_its_tape() {
+        let mut created = request(6, reference_schedules());
+        created.chain_size = Some(6);
+        created.strike_interval = Some(25.0);
+        created.strike_ladder = Some(StrikeLadder::Pinned);
+
+        let first_parameters = parameters(created.clone());
+        let second_parameters = parameters(created);
         let first_tape = tape(&first_parameters);
         let second_tape = tape(&second_parameters);
 

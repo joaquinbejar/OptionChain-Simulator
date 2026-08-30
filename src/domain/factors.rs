@@ -70,6 +70,7 @@
 //! is pinned by a test. ADR 0001 §8 records the contract.
 
 use crate::domain::Walker;
+use crate::domain::ladder::{PinnedLadder, max_pinned_width};
 use crate::domain::simulator::{DEFAULT_CHAIN_SIZE, DEFAULT_SKEW_SLOPE, DEFAULT_SMILE_CURVE};
 use crate::domain::spread::SpreadModel;
 use crate::session::{SimulationMethod, SimulationParametersV2};
@@ -949,7 +950,25 @@ pub(crate) fn build_chain(
     expiration: ExpirationDate,
     greek_snapshots: bool,
 ) -> Result<OptionChain, ChainError> {
-    let chain_size = parameters.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE);
+    // A pinned simulation quotes the ladder it fixed at creation, so the chain
+    // is built wide enough to REACH those strikes from wherever the spot is now
+    // and filtered down to them afterwards. Upstream anchors every ladder on
+    // the same interval grid, so the pinned strikes are always among the ones
+    // it builds. See `crate::domain::ladder`.
+    let pinned = if parameters.strike_ladder.is_pinned() {
+        Some(PinnedLadder::resolve(parameters)?)
+    } else {
+        None
+    };
+
+    let chain_size = match &pinned {
+        // The ceiling is this simulation's own snapshot budget, not a constant:
+        // a configuration validated for a handful of contracts per snapshot
+        // must not price a thousand strikes per expiration because its spot
+        // drifted.
+        Some(ladder) => ladder.width_from(spot, max_pinned_width(parameters)?)?,
+        None => parameters.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE),
+    };
     let skew_slope = parameters.skew_slope.unwrap_or(DEFAULT_SKEW_SLOPE);
     let smile_curve = parameters.smile_curve.unwrap_or(DEFAULT_SMILE_CURVE);
     // The spread model, not one scalar. Read once per chain: every coefficient
@@ -998,12 +1017,15 @@ pub(crate) fn build_chain(
         parameters.strike_interval,
         skew_slope,
         smile_curve,
-        // ZERO, and the widening happens below instead. Upstream's
-        // `apply_spread` sets bid, ask AND mid to `None` when `mid <= spread`
-        // (OptionStratLib#439, fixed upstream but not in the published 0.20
-        // this builds against), so handing it the real spread would erase the
-        // cheap wings before anything here could quote them. With no spread it
-        // leaves each mid alone, which is what the model needs to work from.
+        // ZERO, and the widening happens below instead. The spread model here
+        // is per contract, so a single scalar handed to upstream would be the
+        // wrong number for every strike but one; asking for no spread leaves
+        // each mid untouched, which is what the model works from.
+        //
+        // It also used to be load-bearing against OptionStratLib#439, where
+        // `apply_spread` withdrew a quote whose mid fell below the spread.
+        // That is fixed as of 0.21.1, which this pins, so the zero is now
+        // about owning the widening rather than about avoiding an erasure.
         Positive::ZERO,
         2,
         price_params,
@@ -1013,6 +1035,13 @@ pub(crate) fn build_chain(
 
     let mut chain = OptionChain::build_chain(&build_params)
         .map_err(|e| ChainError::Internal(format!("Failed to build the option chain: {e}")))?;
+
+    // Down to the pinned strikes, before the spread model runs: the widened
+    // strikes exist only to reach the pinned ones and nothing should pay to
+    // quote them.
+    if let Some(ladder) = &pinned {
+        ladder.keep_pinned(&mut chain)?;
+    }
 
     spread_model.apply(&mut chain, days_to_expiration);
 
@@ -1047,6 +1076,7 @@ mod tests {
     use super::*;
     use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
     use crate::api::rest::requests_v2::CreateSimulationRequest;
+    use crate::domain::ladder::StrikeLadder;
     use crate::session::{ExpiryRule, ExpiryRuleKind};
     use chrono::{TimeZone, Weekday};
     use optionstratlib::error::SimulationError;
@@ -1083,6 +1113,7 @@ mod tests {
             skew_slope: None,
             smile_curve: None,
             spread: Some(0.02),
+            strike_ladder: Default::default(),
             spread_proportional: None,
             spread_moneyness_widening: None,
             spread_tenor_widening: None,
@@ -1425,6 +1456,97 @@ mod tests {
             chain.iter().count() > 0,
             "the lowest volatility above the floor must still quote a strike"
         );
+    }
+
+    // ---- the strike ladder (issue #91) ------------------------------------
+
+    /// A pinned ladder quotes the same strikes however far the spot moves.
+    ///
+    /// The criterion the issue is about: a position opened at step 0 must still
+    /// have its contracts at step 499. Driven at spots that move well past the
+    /// pinned range in both directions, since that is precisely when a rolling
+    /// ladder drops the strikes a defined-risk structure needs.
+    #[test]
+    fn test_a_pinned_ladder_quotes_one_strike_set_at_every_spot() {
+        let mut request = request(4, brownian(0.2), 0.2);
+        request.chain_size = Some(6);
+        request.strike_interval = Some(25.0);
+        request.strike_ladder = Some(StrikeLadder::Pinned);
+        let parameters = parameters(request);
+
+        let expected = strike_set(&parameters, 5000.0);
+        assert_eq!(expected.len(), 13, "a half-width of six is 13 strikes");
+
+        for spot in [5000.0, 5004.95, 5013.54, 4800.0, 5400.0, 4000.0, 6500.0] {
+            assert_eq!(
+                strike_set(&parameters, spot),
+                expected,
+                "the pinned ladder moved at a spot of {spot}"
+            );
+        }
+    }
+
+    /// A rolling ladder does move, which is what the pinned one exists to fix.
+    ///
+    /// Without this the test above could pass on a ladder that never moves for
+    /// any configuration, and would be proving nothing.
+    #[test]
+    fn test_a_rolling_ladder_follows_the_spot() {
+        let mut request = request(4, brownian(0.2), 0.2);
+        request.chain_size = Some(6);
+        request.strike_interval = Some(25.0);
+        let parameters = parameters(request);
+
+        let at_the_start = strike_set(&parameters, 5000.0);
+        let after_a_move = strike_set(&parameters, 5013.54);
+
+        assert_ne!(
+            at_the_start, after_a_move,
+            "a rolling ladder must follow the spot, which is the reported bug"
+        );
+        assert_eq!(at_the_start.len(), after_a_move.len(), "the width is fixed");
+    }
+
+    /// A pinned chain carries the same prices a rolling one gives those strikes.
+    ///
+    /// Pinning decides WHICH contracts are quoted, never what they are worth:
+    /// the chain is built by upstream at the same spot either way, and the
+    /// pinned one is that chain with the other strikes removed.
+    #[test]
+    fn test_pinning_does_not_change_a_quote() {
+        let mut rolling = request(4, brownian(0.2), 0.2);
+        rolling.chain_size = Some(6);
+        rolling.strike_interval = Some(25.0);
+        let mut pinned = rolling.clone();
+        pinned.strike_ladder = Some(StrikeLadder::Pinned);
+
+        // At the starting spot the two ladders agree on the strike set, so
+        // every contract can be compared one to one.
+        let rolling = built_chain(&parameters(rolling));
+        let pinned = built_chain(&parameters(pinned));
+
+        assert_eq!(
+            rolling.options, pinned.options,
+            "pinning must not touch a price"
+        );
+    }
+
+    /// The strikes a chain quotes at one spot.
+    fn strike_set(parameters: &SimulationParametersV2, spot: f64) -> Vec<String> {
+        let chain = match build_chain(
+            parameters,
+            pos_or_panic!(spot),
+            pos_or_panic!(0.2),
+            ExpirationDate::Days(pos_or_panic!(30.0)),
+            false,
+        ) {
+            Ok(chain) => chain,
+            Err(error) => panic!("the chain must build at {spot}: {error}"),
+        };
+        chain
+            .iter()
+            .map(|contract| contract.strike_price.to_string())
+            .collect()
     }
 
     // ---- the per-contract spread model (issue #80) ------------------------

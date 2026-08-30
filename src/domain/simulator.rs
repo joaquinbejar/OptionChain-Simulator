@@ -850,6 +850,7 @@ mod tests {
             skew_slope: Some(-0.2),
             smile_curve: Some(0.5),
             spread: Some(0.01),
+            strike_ladder: Default::default(),
             spread_proportional: None,
             spread_moneyness_widening: None,
             spread_tenor_widening: None,

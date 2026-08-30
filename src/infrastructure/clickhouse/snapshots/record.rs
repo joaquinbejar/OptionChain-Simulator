@@ -69,7 +69,16 @@ use uuid::Uuid;
 ///   grid at the strike where the wings had been erased and now runs to the
 ///   full ladder. A simulation half-filed by an older binary would otherwise
 ///   hold two different tapes under one generation.
-pub const CURRENT_SNAPSHOT_GENERATION: u64 = 3;
+/// - `4` — optionstratlib 0.21.1 quotes an option worth nothing at zero rather
+///   than pricing it as absent (OptionStratLib#487). Upstream reads a missing
+///   side as "this strike does not quote" and stopped extending the ladder
+///   there, so a chain built near expiry with wings a few percent out of the
+///   money carried FEWER strikes than `chain_size` asked for. Measured with
+///   this crate's own defaults at a spot of 5100 with a 25-point interval:
+///   26 strikes instead of 41 at 0.3125 days, and 10 instead of 21 at 0.05
+///   days. The strike set of those steps therefore changes under the same
+///   coordinates, for rolling ladders as much as for pinned ones.
+pub const CURRENT_SNAPSHOT_GENERATION: u64 = 4;
 
 /// The namespace every deterministic `snapshot_id` is derived under.
 ///
@@ -591,7 +600,7 @@ mod tests {
 
         // Pinned so a bump is a deliberate edit here as well as there: the
         // generation is what keeps two tapes from sharing one coordinate.
-        assert_eq!(CURRENT_SNAPSHOT_GENERATION, 3);
+        assert_eq!(CURRENT_SNAPSHOT_GENERATION, 4);
         assert_eq!(
             record(simulation, CURRENT_SNAPSHOT_GENERATION, 0).snapshot_id(),
             snapshot_id(simulation, CURRENT_SNAPSHOT_GENERATION, 0)

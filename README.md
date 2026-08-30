@@ -299,8 +299,49 @@ rather than being marked up to a penny it is not worth.
   request that took the documented default — the quotes are unchanged.
 
 Persisted snapshots are therefore a new tape: `CURRENT_SNAPSHOT_GENERATION`
-is `3`, so rows written by an older binary stay addressable under generation
-`2` and are never mixed with these.
+is `4`, so rows written by an older binary stay addressable under the
+generation they were filed under and are never mixed with these. It moved
+again with optionstratlib 0.21.1, which quotes an option worth nothing at
+zero instead of pricing it as absent (OptionStratLib#487): upstream had
+stopped extending a ladder at a strike whose worthless side carried no
+price, so a chain near expiry held fewer strikes than `chain_size` asked
+for — 23 instead of 41 at a spot of 5100 with a 25-point interval at 0.3125
+days. That changes the strike set of those steps for rolling ladders as
+much as for pinned ones.
+
+#### The strike ladder can be pinned
+
+The ladder is rebuilt around the current underlying at every step, so the
+quoted strikes follow the spot and a contract quoted at step 0 can be gone
+by step 2: a move of 0.27 percent over two steps was enough to drop a
+strike. `chain_size` fixes how MANY strikes are quoted, never WHICH.
+
+For a client browsing a chain that is right. For one holding a position it
+is not: a leg opened at 4850 cannot be marked, closed or settled at a step
+where 4850 does not exist, and a defined-risk structure loses its furthest
+wings first, which are the legs that cap its risk.
+
+`strike_ladder` on the v2 create request chooses:
+
+| Value | Meaning |
+|-------|---------|
+| `rolling` | The default, and what the service always did. The ladder follows the spot, so the quoted strikes stay near the money and a contract can leave the chain. |
+| `pinned` | The ladder is fixed at creation from `initial_price`, `chain_size` and `strike_interval`. Every step quotes that same set, so a contract quoted once is quoted for the simulation's whole life. |
+
+A pinned simulation must supply `strike_interval`: without one the interval
+is derived per expiration and there is no fixed grid to pin, so the request
+is a `400` naming the field. The effective value is echoed in the simulation
+response and survives a store round trip, and a document written before the
+field reads as `rolling`.
+
+**A pinned ladder does not follow a large move.** If the spot leaves the
+pinned range every quoted strike ends up on one side of the money — each
+contract still carries both a call and a put, but they are all deep in or
+deep out. That is correct and informative: a simulation that silently
+invented new strikes would not be the closed world the setting exists to
+provide. Widen the ladder at creation, with `chain_size`, rather than at
+step time. A spot that drifts further than the service will widen for is a
+`400` naming `strike_ladder` rather than a silently shorter chain.
 
 `/api/v1/chain` is untouched, model and all: it is frozen, and its chains
 come from a different upstream path.

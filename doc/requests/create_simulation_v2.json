@@ -46,5 +46,6 @@
   "spread_moneyness_widening": 0.5,
   "spread_tenor_widening": 0.1,
   "spread_tick": 0.01,
+  "strike_ladder": "rolling",
   "seed": 42
 }
