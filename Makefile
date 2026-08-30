@@ -75,6 +75,18 @@ release:
 test:
 	LOGLEVEL=WARN cargo test
 
+# Run the integration tests against a DEPLOYED service.
+#
+# OCS_INTEGRATION_BASE_URL names it, scheme and port included. Without it every
+# test skips and says so, which is why this target is safe to run anywhere but
+# proves nothing until the variable is set. Where a deployment lives is an
+# operator's business and is never recorded in this repository.
+.PHONY: test-integration
+test-integration:
+	@test -n "$$OCS_INTEGRATION_BASE_URL" || \
+		echo "OCS_INTEGRATION_BASE_URL is unset: every integration test will skip"
+	LOGLEVEL=WARN cargo test -p examples_integration -- --nocapture
+
 # Format the code
 .PHONY: fmt
 fmt:
