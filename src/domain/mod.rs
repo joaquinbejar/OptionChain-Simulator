@@ -6,9 +6,5 @@ pub(crate) mod simulator;
 pub(crate) mod spread;
 mod walker;
 
-#[cfg(test)]
-mod golden_tape;
-
-pub(crate) use ladder::resolve_pinned_ceiling;
 pub use simulator::Simulator;
 pub(crate) use walker::Walker;
