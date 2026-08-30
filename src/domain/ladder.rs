@@ -171,11 +171,12 @@ impl PinnedLadder {
     /// upstream: the distance in intervals from the spot's at-the-money strike
     /// to whichever pinned strike is furthest from it.
     ///
-    /// `maximum` is the widening the simulation's own snapshot budget allows,
-    /// derived by [`max_pinned_width`] from the same numbers
-    /// `validate_snapshot_work` checked at creation. A pinned step must not be
-    /// able to price more contracts than the configuration was validated for
-    /// simply because the underlying drifted.
+    /// `maximum` is the widening [`max_pinned_width`] allows: the smaller of
+    /// the simulation's own snapshot budget and the absolute ceiling
+    /// [`MAX_PINNED_WIDTH`]. A pinned step must not be able to price more
+    /// contracts than the configuration was validated for, nor a wider chain
+    /// than a client could have requested, simply because the underlying
+    /// drifted.
     ///
     /// # Errors
     ///
@@ -335,18 +336,40 @@ pub(crate) fn at_the_money(
     Positive::new_decimal(rounded).map_err(|_| unrepresentable())
 }
 
+/// The absolute ceiling on the widening a pinned step may ask for.
+///
+/// This is the widest chain any client is allowed to REQUEST
+/// (`OCS_MAX_CHAIN_SIZE`'s default), reused as the ceiling on the widening the
+/// service performs on a client's behalf. The two are different quantities and
+/// only the coincidence of the number is shared, so it lives here rather than
+/// being read from the request caps: lowering the request cap must not
+/// retroactively break simulations already running, and raising it must not
+/// license the domain to price a wider chain than this.
+///
+/// It is a ceiling, never the bound on its own; [`max_pinned_width`] takes it
+/// together with the simulation's snapshot budget and keeps whichever is
+/// smaller.
+pub(crate) const MAX_PINNED_WIDTH: usize = 500;
+
 /// The widest chain a pinned step may ask upstream for.
 ///
 /// A pinned step builds wide enough to REACH its ladder and then filters, so
 /// the widening is work the client never asked for and the request caps never
-/// saw. Bounding it by a constant of its own would let a simulation validated
-/// for a handful of contracts per snapshot price a thousand strikes per
-/// expiration once its spot drifted.
+/// saw. Two separate things have to bound it, and the answer is the smaller:
 ///
-/// The bound is therefore the simulation's own budget, computed from the same
-/// numbers `SimulationParametersV2::validate_snapshot_work` checked at
-/// creation: the per-snapshot contract cap divided by the expirations the
-/// schedule can carry, back through the `2n + 1` grid to a half-width.
+/// The simulation's own snapshot budget, computed from the same numbers
+/// `SimulationParametersV2::validate_snapshot_work` checked at creation: the
+/// per-snapshot contract cap divided by the expirations the schedule can carry,
+/// back through the `2n + 1` grid to a half-width. Without this, a
+/// configuration validated for a handful of contracts per snapshot could price
+/// far more of them once its spot drifted.
+///
+/// And [`MAX_PINNED_WIDTH`], because that budget is a SERVICE-WIDE cap rather
+/// than a per-simulation one. At its default a single-expiration schedule
+/// divides 200 000 contracts by one, which would license a widening of 99 999
+/// strikes per side; a bound that large is not a bound. The absolute ceiling is
+/// what keeps the widening in the region a client could have asked for
+/// directly.
 ///
 /// # Errors
 ///
@@ -366,14 +389,18 @@ pub(crate) fn max_pinned_width(parameters: &SimulationParametersV2) -> Result<us
         })?;
 
     let cap = crate::infrastructure::max_snapshot_contracts();
-    // A schedule with no rules cannot produce a chain, so the width is
-    // irrelevant; one is the smallest answer that is not zero.
+    // A schedule with no rules cannot produce a chain, so the divisor is
+    // irrelevant; one keeps the division defined.
     let strikes = cap.checked_div(expirations.max(1)).unwrap_or(cap);
 
-    // `strikes` covers `2n + 1`, so the half-width is what upstream calls
-    // `chain_size`. At least one, or a pinned ladder of a single strike could
-    // never be reached.
-    Ok(strikes.saturating_sub(1).checked_div(2).unwrap_or(0).max(1))
+    // `strikes` covers the whole `2n + 1` grid, so the half-width is what
+    // upstream calls `chain_size`. No floor: a budget too small to carry even
+    // a three-strike chain must report a width of zero and let `width_from`
+    // refuse the ladder, rather than round itself up past the budget it came
+    // from.
+    let budget = strikes.saturating_sub(1).checked_div(2).unwrap_or(0);
+
+    Ok(budget.min(MAX_PINNED_WIDTH))
 }
 
 /// Refuses a pinned ladder whose lowest strike upstream cannot build.
