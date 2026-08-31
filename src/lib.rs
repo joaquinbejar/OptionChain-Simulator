@@ -671,9 +671,11 @@
 //!   advertises the format, so an image that could not serve it would refuse
 //!   its own contract (issue #148). `make release` therefore builds the feature
 //!   in, and the published image carries it, at about 1.2 MB of binary. Build
-//!   without it with `make release RELEASE_FEATURES=`; asking for
-//!   `format=arrow` then is a typed `400` naming the format, never a 500 and
-//!   never a silent fallback.
+//!   without it with `make release RELEASE_FEATURES=`, and such a build does
+//!   not advertise the format either: the `format` parameter's description is
+//!   selected by the same feature, so the document offers what the binary
+//!   reading it can serve. Asking for `format=arrow` there is a typed `400`
+//!   naming the format, never a 500 and never a silent fallback.
 //! - **`packed`** — a dependency-free columnar block format for the browser.
 //!   `Content-Type: application/octet-stream`, extension `ocsp`.
 //!

@@ -74,6 +74,61 @@ mod tests {
         );
     }
 
+    /// The document advertises the export formats THIS BUILD serves.
+    ///
+    /// `arrow` is a Cargo feature, so a build without it answers a request for
+    /// that format with a typed 400. A document that offered it anyway would be
+    /// a contract no client of that binary could follow, which is the defect
+    /// issue #148 fixed for the published image; this holds the other builds to
+    /// the same rule. Both branches are exercised, because CI runs the suite
+    /// with the feature and without it.
+    #[test]
+    fn test_the_document_advertises_only_the_formats_this_build_serves() {
+        let openapi = ApiDoc::openapi();
+        let document = match openapi.to_json() {
+            Ok(document) => document,
+            Err(error) => panic!("the document must render: {error}"),
+        };
+        let document: Value = match serde_json::from_str(&document) {
+            Ok(document) => document,
+            Err(error) => panic!("the document must parse: {error}"),
+        };
+
+        let parameters = document
+            .pointer("/paths/~1api~1v2~1simulations~1{id}~1export/get/parameters")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("the export path must declare its parameters"));
+        let format = parameters
+            .iter()
+            .find(|parameter| parameter.get("name").and_then(Value::as_str) == Some("format"))
+            .and_then(|parameter| parameter.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("the format parameter must describe itself"));
+
+        // The description opens with the alternatives, which is what a client
+        // and the integration suite both read.
+        let advertised = format.split('.').next().unwrap_or_default();
+        assert!(
+            advertised.contains("json")
+                && advertised.contains("csv")
+                && advertised.contains("packed"),
+            "the always-present formats must be advertised, the list is {advertised:?}"
+        );
+
+        let offers_arrow = advertised.contains("arrow");
+        assert_eq!(
+            offers_arrow,
+            cfg!(feature = "arrow-export"),
+            "this build {} arrow and the document {} it: {advertised:?}",
+            if cfg!(feature = "arrow-export") {
+                "serves"
+            } else {
+                "refuses"
+            },
+            if offers_arrow { "offers" } else { "omits" }
+        );
+    }
+
     /// Test paths are correctly defined in the OpenAPI specification
     #[test]
     fn test_openapi_paths() {

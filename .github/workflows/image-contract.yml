@@ -1,0 +1,89 @@
+# Runs the export contract against the IMAGE, not against a cargo build.
+#
+# The export tests describe what a deployment serves, and a deployment is the
+# published image. Nothing else in CI puts the two together: the hermetic suite
+# runs in-process with whatever features the job passes, and the replica
+# isolation job builds the image but only asks it about readiness. That gap is
+# how an image that advertised `format=arrow` and refused it shipped four times
+# (issue #148).
+#
+# So this builds the image the way the Dockerfile does and asks it for every
+# format its own OpenAPI document offers.
+name: Image contract (what the image serves)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/api/rest/export.rs"
+      - "src/api/rest/arrow_export.rs"
+      - "src/api/rest/binary.rs"
+      - "src/api/rest/swagger.rs"
+      - "examples/integration/**"
+      - "Cargo.toml"
+      - "Makefile"
+      - "Docker/Dockerfile"
+      - ".github/workflows/image-contract.yml"
+
+jobs:
+  serves-what-it-advertises:
+    name: The image serves every format it advertises
+    runs-on: ubuntu-latest
+
+    # The image needs both to boot: it exits rather than starting without them.
+    services:
+      redis:
+        image: redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
+        ports:
+          - 6379:6379
+      mongodb:
+        image: mongo:8.2.12@sha256:e0ce8c35124d4a9f9785532d1f268f39e9728ffa1cb38f46fa482436424c4bd3
+        ports:
+          - 27017:27017
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the image
+        run: docker build -f Docker/Dockerfile -t ocs-image-contract:ci .
+
+      - name: Start it over the service containers
+        run: |
+          set -euo pipefail
+          # Host networking so the container reaches the services on the
+          # runner's own loopback, which is where their ports are published.
+          docker run -d --name ocs-image-contract --network host \
+            -e OCS_BIND_ADDRESS=0.0.0.0 \
+            -e OCS_PORT=7070 \
+            -e REDIS_HOST=127.0.0.1 \
+            -e REDIS_PORT=6379 \
+            -e MONGODB_URI=mongodb://127.0.0.1:27017 \
+            -e MONGODB_DATABASE=optionchain_simulator \
+            -e LOGLEVEL=INFO \
+            ocs-image-contract:ci
+
+          for _ in $(seq 1 60); do
+            if curl -fsS -m 3 http://127.0.0.1:7070/ready >/dev/null 2>&1; then
+              echo "the image is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "the image never became ready" >&2
+          docker logs ocs-image-contract 2>&1 | tail -40 >&2
+          exit 1
+
+      # The whole export matrix, which includes the assertion that every
+      # advertised format is actually served. The client is built with all
+      # features so it can decode what the image produces.
+      - name: Ask it for every format it advertises
+        env:
+          OCS_INTEGRATION_BASE_URL: http://127.0.0.1:7070
+          LOGLEVEL: WARN
+        run: cargo test -p examples_integration --all-features --test exports -- --nocapture
+
+      - name: The image's own log, whatever happened
+        if: always()
+        run: docker logs ocs-image-contract 2>&1 | tail -40
