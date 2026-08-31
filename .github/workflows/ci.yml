@@ -53,23 +53,27 @@ jobs:
     name: Integration (live services)
     runs-on: ubuntu-latest
     services:
+      # Pinned by immutable digest, the same way the compose files are: a
+      # mutable tag can be republished, and a job testing different bytes from
+      # the ones a deployment runs proves nothing about that deployment.
+      #
       # Credentials must match the code's env-driven config defaults
       # (MONGODB_URI / REDIS_* / CLICKHOUSE_* in src/infrastructure/config/*),
       # so the ignored live tests authenticate successfully and can ASSERT
       # success instead of tolerating connection failures.
       mongodb:
-        image: mongo:8.2.12
+        image: mongo:8.2.12@sha256:e0ce8c35124d4a9f9785532d1f268f39e9728ffa1cb38f46fa482436424c4bd3
         env:
           MONGO_INITDB_ROOT_USERNAME: admin
           MONGO_INITDB_ROOT_PASSWORD: password
         ports:
           - 27017:27017
       redis:
-        image: redis:8.10.1-alpine
+        image: redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
         ports:
           - 6379:6379
       clickhouse:
-        image: clickhouse/clickhouse-server:26.8.1.2041-alpine
+        image: clickhouse/clickhouse-server:26.8.1.2041-alpine@sha256:fd037d424da807c1b36517f3ff6c739286c60a34c928279c229fc1faa0cadaa8
         env:
           CLICKHOUSE_USER: admin
           CLICKHOUSE_PASSWORD: password

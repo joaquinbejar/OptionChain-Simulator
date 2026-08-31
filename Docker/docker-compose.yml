@@ -70,6 +70,22 @@ services:
 
   # MongoDB service configuration
   mongodb:
+    # UPGRADING AN EXISTING DEPLOYMENT from the 8.0 line: MongoDB refuses to
+    # start on a data directory whose feature compatibility version is higher
+    # than the binary, and it will not jump an FCV on its own. The order is:
+    #
+    #   1. on the RUNNING 8.0 instance, confirm the FCV is 8.0
+    #      db.adminCommand({getParameter: 1, featureCompatibilityVersion: 1})
+    #   2. stop it, swap the image to this one, start it. The data directory
+    #      keeps FCV 8.0, which 8.2 serves happily, so this step is
+    #      reversible: putting the 8.0 image back still starts
+    #   3. once the deployment is trusted, raise it, which is the point of no
+    #      easy return
+    #      db.adminCommand({setFeatureCompatibilityVersion: "8.2", confirm: true})
+    #
+    # Verified on this exact digest against a persisted volume: 8.0.29 with
+    # FCV 8.0, binary swapped, 8.2.12 started, documents intact, FCV still 8.0,
+    # then raised to 8.2. A fresh volume needs none of this.
     image: mongo:8.2.12@sha256:e0ce8c35124d4a9f9785532d1f268f39e9728ffa1cb38f46fa482436424c4bd3
     volumes:
       - mongodb-data:/data/db
