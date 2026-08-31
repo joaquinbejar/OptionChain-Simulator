@@ -85,7 +85,7 @@ test:
 test-integration:
 	@test -n "$$OCS_INTEGRATION_BASE_URL" || \
 		echo "OCS_INTEGRATION_BASE_URL is unset: every integration test will skip"
-	LOGLEVEL=WARN cargo test -p examples_integration -- --nocapture
+	LOGLEVEL=WARN cargo test -p examples_integration --all-features -- --nocapture
 
 # Format the code
 .PHONY: fmt
