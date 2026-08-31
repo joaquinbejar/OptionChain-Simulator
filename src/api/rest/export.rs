@@ -37,17 +37,16 @@
 //! logs at `DEBUG`.
 //!
 //! Both sources go through one adapter ([`StepChains`]) that yields the same
-//! per-quote view, so a row carries the same values whichever side produced it,
-//! and the same bytes once issue #152 lands. The
+//! per-quote view, so a row is byte-identical whichever side produced it — the
+//! conversion there renders a value by its number rather than by the form it
+//! was stored in, which is what makes that true (issue #152). The
 //! factor row still comes from the tape either way: the underlying and
 //! volatility datasets are built from it, and it is cheap next to a chain.
 //!
 //! # Determinism
 //!
-//! Two exports of the same simulation are byte-identical where the steps come
-//! from the same source. With persistence on, one taken after the rows were
-//! filed can differ in the last digit of a rendered number from one taken
-//! before (issue #152); the values agree either way. Every value is a
+//! Two exports of the same simulation are byte-identical, including one taken
+//! before a tape's rows were filed and one taken after. Every value is a
 //! function of the effective parameters and the cursor, timestamps render as
 //! whole-second RFC 3339, and numbers use Rust's shortest round-trip
 //! formatting — no locale, no thousands separators. That is what lets a

@@ -646,16 +646,9 @@ streams a simulation's tape, which is what turns a
 walked-one-request-at-a-time simulation into something a backtester loads in
 one go. With persistence on it reads the steps the warehouse already holds,
 in windows, and replays the rest; with it off, or for a simulation nobody
-has walked, every step is replayed. Either source renders the same VALUES,
-row for row and column for column.
-
-It does not yet render the same BYTES. A value crosses the storage column's
-own scale on the way in and back, and the shortest rendering of the float
-that comes out can differ in the last digit from the one the replay
-produces, so an export taken after a tape's rows were filed can differ from
-the same export taken before (issue #152). Byte-identical repeats hold on a
-deployment with persistence off, which is the default; where it is on, treat
-the values as the contract until that issue lands.
+has walked, every step is replayed. Either source renders the same bytes,
+row for row and column for column, whether or not the tape's rows had been
+filed when the export was asked for.
 
 | Parameter | Values |
 |-----------|--------|
