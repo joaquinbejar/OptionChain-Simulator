@@ -100,13 +100,21 @@ probe() {
         curl -sS -i --max-time 5 "http://$target:$PORT$path" 2>/dev/null || true
 }
 
+# Both readers below print an empty value rather than failing when what they
+# look for is absent. Under `set -euo pipefail` a grep that matches nothing
+# fails the pipeline, and the assignment that captures it ends the run: the
+# retry loop would then abort on the first attempt that arrives before the
+# server does, which is every first attempt.
 status_code() {
-    printf '%s\n' "$1" | grep -oE '^HTTP/1\.[01] [0-9]{3}' | tail -1 | awk '{print $2}'
+    printf '%s\n' "$1" | awk '
+        toupper($1) ~ /^HTTP\/1\.[01]$/ { code = $2 }
+        END { print code }'
 }
 
 instance_id() {
-    printf '%s\n' "$1" | grep -i '^x-ocs-instance:' | tail -1 |
-        awk '{print $2}' | tr -d '\r'
+    printf '%s\n' "$1" | awk '
+        tolower($1) == "x-ocs-instance:" { id = $2 }
+        END { gsub(/\r/, "", id); print id }'
 }
 
 # The body alone, which is everything after the blank line the headers end
