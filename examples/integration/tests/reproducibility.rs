@@ -22,21 +22,43 @@ use examples_integration::{Response, ServiceClient, reference_request, service};
 /// How many steps each tape carries.
 const HORIZON: usize = 4;
 
+/// The simulated start every controlled pair shares.
+///
+/// Pinned rather than resolved from the wall clock, so that two simulations
+/// created a second apart are genuinely identical inputs.
+const PINNED_START: &str = "2026-01-05T14:30:00Z";
+
 /// A simulation that deletes itself.
 struct Live {
     client: ServiceClient,
     id: String,
     seed: u64,
+    /// The start the service RESOLVED, which a replay has to reuse rather than
+    /// resolve again.
+    effective_start: String,
 }
 
 impl Live {
     /// Creates a v2 simulation, optionally with an explicit seed, and reports
-    /// the seed it ended up with.
+    /// the seed and the effective start it ended up with.
     fn create(client: &ServiceClient, seed: Option<u64>) -> Option<Self> {
+        Self::create_at(client, seed, PINNED_START)
+    }
+
+    /// The same, with an explicit simulated start.
+    ///
+    /// `start_at` matters more than it looks. Without it the service resolves
+    /// one from the wall clock, so two "identical" simulations created either
+    /// side of a second boundary carry different `simulated_at` values: a
+    /// same-seed comparison could fail for a reason that has nothing to do
+    /// with the seed, and a different-seed control could pass on the timestamps
+    /// alone even if the seed were ignored entirely.
+    fn create_at(client: &ServiceClient, seed: Option<u64>, start_at: &str) -> Option<Self> {
         let mut request = reference_request("SPX");
         if let Some(object) = request.as_object_mut() {
             object.insert("steps".to_string(), serde_json::json!(HORIZON));
             object.insert("chain_size".to_string(), serde_json::json!(2));
+            object.insert("start_at".to_string(), serde_json::json!(start_at));
             match seed {
                 Some(seed) => object.insert("seed".to_string(), serde_json::json!(seed)),
                 None => object.remove("seed"),
@@ -67,19 +89,25 @@ impl Live {
             Some(id) => id.to_string(),
             None => panic!("a created simulation must carry an id: {body}"),
         };
-        let seed = match body
-            .get("parameters")
-            .and_then(|parameters| parameters.get("seed"))
-            .and_then(serde_json::Value::as_u64)
-        {
+        let parameters = match body.get("parameters") {
+            Some(parameters) => parameters.clone(),
+            None => panic!("a created simulation must echo its parameters: {body}"),
+        };
+        let seed = match parameters.get("seed").and_then(serde_json::Value::as_u64) {
             Some(seed) => seed,
             None => panic!("a created simulation must echo its effective seed: {body}"),
         };
+        let effective_start = parameters
+            .get("effective_start")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(PINNED_START)
+            .to_string();
 
         Some(Self {
             client: client.clone(),
             id,
             seed,
+            effective_start,
         })
     }
 
@@ -96,22 +124,56 @@ impl Live {
 impl Drop for Live {
     fn drop(&mut self) {
         let path = format!("/api/v2/simulations/{}", self.id);
-        if let Err(error) = self.client.delete(&path) {
-            println!("WARNING: could not delete simulation {}: {error}", self.id);
-        }
+        examples_integration::report_cleanup(&self.client, &path, &self.id);
     }
 }
 
 /// The market a snapshot describes, with everything that is not the market
-/// stripped out: identity, the cursor, and the wall-clock timestamps differ
-/// between two runs by construction and say nothing about the walk.
-fn market(snapshot: &serde_json::Value) -> serde_json::Value {
+/// stripped out: identity and the cursor differ between two runs by
+/// construction and say nothing about the walk.
+///
+/// Every key is REQUIRED. A snapshot that stopped carrying `chains` would
+/// otherwise make two same-seed runs compare equal on nothing, and let the
+/// different-seed control pass on `underlying` alone: the test would go green
+/// having compared no strike and no quote, which is the opposite of what issue
+/// #102 asks for.
+fn market(snapshot: &serde_json::Value, what: &str) -> serde_json::Value {
     let mut market = serde_json::Map::new();
-    for key in ["underlying", "chains", "simulated_at"] {
-        if let Some(value) = snapshot.get(key) {
-            market.insert(key.to_string(), value.clone());
+    for key in ["simulated_at", "underlying", "chains"] {
+        let value = snapshot
+            .get(key)
+            .unwrap_or_else(|| panic!("{what}: a snapshot must carry {key}: {snapshot}"));
+        market.insert(key.to_string(), value.clone());
+    }
+
+    // And the chains have to hold something: an empty list compares equal to
+    // another empty list.
+    let chains = market
+        .get("chains")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("{what}: chains must be a list: {snapshot}"));
+    assert!(
+        !chains.is_empty(),
+        "{what}: a snapshot must quote an expiration"
+    );
+    for chain in chains {
+        let contracts = chain
+            .get("contracts")
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("{what}: a chain must carry contracts: {chain}"));
+        assert!(!contracts.is_empty(), "{what}: a chain must quote strikes");
+        for contract in contracts {
+            assert!(
+                contract.get("strike").is_some(),
+                "{what}: a contract must carry its strike: {contract}"
+            );
+            assert!(
+                contract.get("call").is_some() || contract.get("put").is_some(),
+                "{what}: a contract must quote a side: {contract}"
+            );
         }
     }
+
     serde_json::Value::Object(market)
 }
 
@@ -146,7 +208,10 @@ fn walk_together(left: &Live, right: &Live, identical: bool) {
             Err(error) => panic!("{error}"),
         };
 
-        let (one, two) = (market(&one), market(&two));
+        let (one, two) = (
+            market(&one, &format!("step {step} of the first tape")),
+            market(&two, &format!("step {step} of the second tape")),
+        );
         if identical {
             assert_eq!(
                 one, two,
@@ -221,10 +286,19 @@ fn test_an_echoed_seed_replays_a_run_nobody_chose_a_seed_for() {
     };
     assert_ne!(original.seed, 0, "a generated seed must be a real one");
 
-    let Some(replay) = Live::create(&client, Some(original.seed)) else {
+    // Rebuilt from what the service RESOLVED, not only from the seed: the
+    // start it chose is as much a replay input as the seed it generated, and a
+    // replay that resolved its own would be a different simulation wearing the
+    // same seed.
+    let Some(replay) = Live::create_at(&client, Some(original.seed), &original.effective_start)
+    else {
         return;
     };
     assert_eq!(replay.seed, original.seed);
+    assert_eq!(
+        replay.effective_start, original.effective_start,
+        "a replay must start where the original was resolved to start"
+    );
     walk_together(&original, &replay, true);
 }
 
@@ -260,7 +334,7 @@ fn test_a_tape_walked_in_two_passes_matches_one_walked_straight_through() {
             Ok(body) => body,
             Err(error) => panic!("{error}"),
         };
-        expected.push(market(&body));
+        expected.push(market(&body, "the straight-through tape"));
     }
 
     // Read something else in between, so the second pass is not simply the
@@ -283,7 +357,7 @@ fn test_a_tape_walked_in_two_passes_matches_one_walked_straight_through() {
             Err(error) => panic!("{error}"),
         };
         assert_eq!(
-            &market(&body),
+            &market(&body, "the resumed tape"),
             expected,
             "step {step} changed when the walk was resumed rather than served in one pass"
         );
@@ -317,34 +391,43 @@ fn test_a_v1_session_reproduces_its_tape_under_the_same_seed() {
         })
     };
 
-    let create = |seed: u64| -> Option<String> {
-        match client.post("/api/v1/chain", &request(seed)) {
-            Ok(response) if response.status == 404 => {
-                println!("SKIP: this deployment does not serve /api/v1/chain");
-                None
-            }
-            Ok(response) => {
-                assert_eq!(
-                    response.status,
-                    201,
-                    "creating a v1 session must answer 201, got {}",
-                    response.text()
-                );
-                let body: serde_json::Value = match response.json("/api/v1/chain") {
-                    Ok(body) => body,
-                    Err(error) => panic!("{error}"),
-                };
-                body.get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            }
+    // v1 is the frozen, guaranteed route: a 404 here is a regression, not a
+    // deployment that predates it, and a 201 without an id is a broken
+    // contract. Only an unset base URL skips this test, and that happened
+    // above.
+    let create = |seed: u64| -> String {
+        let response = match client.post("/api/v1/chain", &request(seed)) {
+            Ok(response) => response,
+            Err(error) => panic!("creating a v1 session: {error}"),
+        };
+        assert_eq!(
+            response.status,
+            201,
+            "creating a v1 session must answer 201, got {} with {}",
+            response.status,
+            response.text()
+        );
+        let body: serde_json::Value = match response.json("/api/v1/chain") {
+            Ok(body) => body,
             Err(error) => panic!("{error}"),
+        };
+        match body.get("id").and_then(serde_json::Value::as_str) {
+            Some(id) => id.to_string(),
+            None => panic!("a created v1 session must carry an id: {body}"),
         }
     };
 
-    let (Some(left), Some(right)) = (create(11), create(11)) else {
-        return;
+    // Guarded as soon as each id exists, so a failing assertion below still
+    // deletes both sessions.
+    let first_session = V1Session {
+        client: client.clone(),
+        id: create(11),
     };
+    let second_session = V1Session {
+        client: client.clone(),
+        id: create(11),
+    };
+    let (left, right) = (first_session.id.clone(), second_session.id.clone());
 
     for step in 0..HORIZON {
         let mut markets = Vec::new();
@@ -383,8 +466,18 @@ fn test_a_v1_session_reproduces_its_tape_under_the_same_seed() {
             "step {step} differs between two v1 sessions created with the same seed"
         );
     }
+}
 
-    for id in [&left, &right] {
-        let _ = client.delete(&format!("/api/v1/chain?sessionid={id}"));
+/// A v1 session that deletes itself, guarded from the moment its id exists so
+/// a failing assertion cannot leak it.
+struct V1Session {
+    client: ServiceClient,
+    id: String,
+}
+
+impl Drop for V1Session {
+    fn drop(&mut self) {
+        let path = format!("/api/v1/chain?sessionid={}", self.id);
+        examples_integration::report_cleanup(&self.client, &path, &self.id);
     }
 }
