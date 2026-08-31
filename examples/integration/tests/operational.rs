@@ -9,7 +9,7 @@
 //!
 //! Skipped entirely when `OCS_INTEGRATION_BASE_URL` is unset.
 
-use examples_integration::service;
+use examples_integration::{instances_behind, service};
 
 /// The metrics the service documents and an operator's dashboard depends on.
 const DOCUMENTED_METRICS: [&str; 4] = [
@@ -70,12 +70,43 @@ fn test_metrics_expose_the_documented_counters_and_move() {
     // in this suite satisfy the assertion without these three requests being
     // recorded at all.
     let series = "api_requests_total{endpoint=\"/api/v1/chain\",method=\"GET\",status=\"404\"}";
-    let before = sample(&body, series).unwrap_or(0.0);
 
-    // Three requests that land on exactly that series: a well-formed id that
-    // cannot exist is a 404 from the v1 route.
+    // A counter belongs to the process that answers, and a deployment may run
+    // several behind one address. Two consequences shape everything below.
+    //
+    // Comparing one scrape with another is meaningless when they can come from
+    // different instances: the second can legitimately be LOWER. So the
+    // observation is the maximum over several scrapes, which is some
+    // instance's own count and only ever grows.
+    //
+    // And the traffic has to reach every instance, or the instance holding the
+    // maximum may not be the one that served it. Sending several requests per
+    // instance is what makes the maximum move.
+    // The instance count comes from the identity each response carries, which
+    // is exact rather than inferred. A deployment that does not report one
+    // cannot be attributed, and four requests is then the same conservative
+    // amount of traffic a single instance would need.
+    let instances = instances_behind(&client, 8).unwrap_or(1);
+    let requests = instances * 4;
+
+    let peak = |what: &str| -> f64 {
+        let mut peak = 0.0_f64;
+        for _ in 0..(instances * 4) {
+            match client.get("/metrics") {
+                Ok(response) => {
+                    if let Some(value) = sample(&response.text(), series) {
+                        peak = peak.max(value);
+                    }
+                }
+                Err(error) => panic!("{what}: {error}"),
+            }
+        }
+        peak
+    };
+
+    let before = peak("the first reading");
+
     let absent = "/api/v1/chain?sessionid=00000000-0000-4000-8000-000000000000";
-    let requests = 3;
     for _ in 0..requests {
         match client.get(absent) {
             Ok(response) => assert_eq!(
@@ -90,32 +121,23 @@ fn test_metrics_expose_the_documented_counters_and_move() {
         }
     }
 
-    let after = match client.get("/metrics") {
-        Ok(response) => sample(&response.text(), series).unwrap_or(0.0),
-        Err(error) => panic!("{error}"),
-    };
+    let after = peak("the second reading");
     let moved = after - before;
 
-    // A counter is per PROCESS, and a deployment may run several behind one
-    // address: this suite found exactly that, two replicas answering in turn,
-    // where three requests and the scrape after them land on whichever
-    // instance the balancer picked. So the assertion is what holds for one
-    // instance or many — the series moved, and by no more than the traffic
-    // this test generated — rather than an exact delta that only holds on a
-    // single-process deployment.
     assert!(
         moved >= 1.0,
-        "three requests moved {series} by {moved}; a served request must be counted somewhere"
+        "{requests} requests across {instances} instance(s) left the highest observed value of \
+         {series} at {after}, up from {before}; serving a request must be counted somewhere"
     );
     assert!(
-        moved <= f64::from(requests),
-        "{series} moved {moved} for {requests} requests, which is more traffic than this test \
+        moved <= f64::from(u32::try_from(requests).unwrap_or(u32::MAX)),
+        "{series} rose {moved} for {requests} requests, which is more traffic than this test \
          produced"
     );
-    if moved < f64::from(requests) {
+    if instances > 1 {
         println!(
-            "INFO: {series} moved {moved} for {requests} requests, so this deployment serves \
-             them from more than one process; a scrape sees one instance at a time"
+            "INFO: {instances} instances behind this address; the highest observed \
+             {series} rose {moved} for {requests} requests"
         );
     }
 }

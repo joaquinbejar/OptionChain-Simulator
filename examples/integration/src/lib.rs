@@ -616,6 +616,72 @@ pub fn report_cleanup(client: &ServiceClient, path: &str, what: &str) {
     }
 }
 
+/// The header every response of this service carries, naming the process that
+/// produced it.
+pub const INSTANCE_HEADER: &str = "x-ocs-instance";
+
+/// The variable naming the individual replicas, when an operator has them.
+///
+/// Comma-separated base URLs, one per instance, bypassing the balancer. Some
+/// contracts cannot be checked through a balanced address at all — "this
+/// replica answers for itself" needs a way to reach that replica — and this is
+/// how a test gets one. Unset, those tests skip and say why.
+pub const INSTANCE_URLS_VARIABLE: &str = "OCS_INTEGRATION_INSTANCE_URLS";
+
+/// The instance that produced a response, if it said.
+///
+/// A deployment predating the header answers `None`, which every caller treats
+/// as "cannot attribute" rather than as a failure.
+#[must_use]
+pub fn responding_instance(response: &Response) -> Option<String> {
+    response.header(INSTANCE_HEADER).map(str::to_string)
+}
+
+/// One client per replica, when `OCS_INTEGRATION_INSTANCE_URLS` names them.
+///
+/// # Panics
+///
+/// When the variable is set to something that is not a usable base URL, which
+/// is a configuration mistake rather than an absent deployment.
+#[must_use]
+pub fn instance_clients() -> Vec<ServiceClient> {
+    let Some(raw) = optionchain_simulator::utils::env::read_var(INSTANCE_URLS_VARIABLE) else {
+        return Vec::new();
+    };
+
+    raw.split(',')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| match ServiceClient::new(url) {
+            Ok(client) => client,
+            Err(error) => panic!("{INSTANCE_URLS_VARIABLE} names an unusable URL: {error}"),
+        })
+        .collect()
+}
+
+/// How many distinct processes answered `probes` requests.
+///
+/// Counted from the identity each response carries, which is exact: two
+/// responses with the same value came from one process and two values came
+/// from two. A deployment that predates the header reports `None`, and a
+/// caller then knows it cannot attribute rather than guessing from a counter.
+#[must_use]
+pub fn instances_behind(client: &ServiceClient, probes: usize) -> Option<usize> {
+    let mut seen = std::collections::BTreeSet::new();
+
+    for _ in 0..probes {
+        let response = match client.get("/health") {
+            Ok(response) => response,
+            Err(error) => panic!("{error}"),
+        };
+        // One unlabelled answer is enough to know this deployment cannot be
+        // attributed at all.
+        seen.insert(responding_instance(&response)?);
+    }
+
+    Some(seen.len().max(1))
+}
+
 /// A minimal v2 create request, as a starting point for a test that varies one
 /// thing about it.
 pub fn reference_request(symbol: &str) -> serde_json::Value {

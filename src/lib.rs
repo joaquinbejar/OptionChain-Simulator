@@ -523,6 +523,12 @@
 //! failing it. And it is shared, so every test deletes the simulations it
 //! creates, including when it fails.
 //!
+//! Every response carries `x-ocs-instance`, an opaque identity fixed for the
+//! life of the process, so an operator can tell which replica served a request
+//! and the suite can prove it exercised more than one rather than assuming it.
+//! `OCS_INTEGRATION_INSTANCE_URLS` names the replicas' own addresses for the
+//! checks that need a known one.
+//!
 //! The harness carries **no HTTP client dependency**: it speaks HTTP/1.1 over
 //! `std::net` itself. The consequence worth knowing before pointing it
 //! somewhere is that `OCS_INTEGRATION_BASE_URL` must be a plain `http://`

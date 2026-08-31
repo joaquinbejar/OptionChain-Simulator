@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::api::rest::health::PROBE_PATHS;
+use crate::api::rest::instance::InstanceHeader;
 use crate::api::rest::routes::configure_routes;
 use crate::infrastructure::{
     ListenOn, MetricsCollector, MetricsMiddleware, MongoDBRepository, Readiness,
@@ -66,6 +67,10 @@ pub async fn start_server(
             // The probe routes are excluded: an orchestrator polls them every
             // few seconds forever, and counting that constant would bury the
             // traffic the metrics exist to describe.
+            // Every response says which process produced it, probes and
+            // errors included: attribution is exactly what a replicated
+            // deployment lacks otherwise.
+            .wrap(InstanceHeader)
             .wrap(MetricsMiddleware::new(metrics_collector.clone()).excluding(&PROBE_PATHS))
             .configure(|cfg| {
                 configure_routes(
