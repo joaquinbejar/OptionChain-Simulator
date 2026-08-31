@@ -222,6 +222,44 @@ down. `Docker/docker-compose.yml` points its backend healthcheck at
 `/ready`, so `docker compose up -d` reports the service healthy only once it
 can actually serve.
 
+#### Metrics are per process
+
+`/metrics` serves the metrics of the INSTANCE that answers. That is what a
+Prometheus exposition is, and it is worth stating because this service is
+meant to run replicated: the numbers there are one instance's share of the
+traffic, never the deployment's total.
+
+So a replicated deployment is scraped **per replica**, each container its
+own target with its own `instance` label, and totals come from summing
+across that label. Scraping one load-balanced address instead returns
+whichever replica answered that scrape, which looks like this:
+
+```
+api_requests_total{endpoint="/metrics",method="GET",status="200"} 4
+api_requests_total{endpoint="/metrics",method="GET",status="200"} 8
+api_requests_total{endpoint="/metrics",method="GET",status="200"} 5
+api_requests_total{endpoint="/metrics",method="GET",status="200"} 9
+```
+
+Two replicas answering in turn. Prometheus reads every apparent drop as a
+counter reset, so `rate()` over such a series is not wrong so much as
+meaningless. A single scrape endpoint for a whole deployment is an
+aggregator's job, not something this service pretends to do.
+
+What aggregates and what does not depends on the kind of metric. Counters
+and histograms do, as `sum(rate(..))` across the instance label. Gauges do
+not: `active_sessions` is each process's own count, and a session created
+through one replica and deleted through another leaves the first replica's
+gauge untouched, as do reaps and restarts. The live-session total is a
+question for the store, not for a gauge.
+
+The same is true of anything else the process holds: the pricing admission
+semaphore bounds one instance (issue #135), and the tape and snapshot
+caches are per instance too (issue #136). None of that affects what a
+client is SERVED — the stores are shared and every write goes through an
+atomic Redis script — only how much work the deployment repeats and how its
+numbers must be read.
+
 **Step cursor semantics (serve-then-advance):** `current_step` is the 0-based index
 of the NEXT snapshot to serve. `POST /api/v1/chain/step` serves the snapshot at the
 cursor and then advances it, so a session with `steps = N` serves EXACTLY indices
