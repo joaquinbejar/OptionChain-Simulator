@@ -12,6 +12,7 @@
 use examples_integration::{ServiceClient, reference_request, service};
 use serde::Deserialize;
 use std::sync::mpsc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 
 /// The simulation envelope: identity, state, the CAS token and the cursor.
@@ -39,25 +40,21 @@ struct Created {
     parameters: Parameters,
 }
 
-/// The replay inputs a client has to record to reproduce a run.
-#[derive(Debug, Deserialize)]
-struct Parameters {
-    symbol: String,
-    steps: usize,
-    seed: u64,
-    effective_start: String,
-    step_interval_seconds: u64,
-    tzdb_version: String,
-    schedules: Vec<Schedule>,
-    chain_size: Option<usize>,
+/// The value at `key`, or a failure naming what was missing.
+fn field<'a>(parameters: &'a Parameters, key: &str) -> &'a serde_json::Value {
+    parameters
+        .get(key)
+        .unwrap_or_else(|| panic!("the echoed parameters must carry {key}: {parameters:?}"))
 }
 
-/// One normalised schedule rule.
-#[derive(Debug, Deserialize)]
-struct Schedule {
-    rule_id: String,
-    target_count: usize,
-}
+/// The replay inputs a client has to record to reproduce a run.
+///
+/// Deserialised as a raw object rather than a struct on purpose: a struct
+/// silently ignores every field it does not declare, so a subset of it stays
+/// green while `timezone`, `calendar` or the whole spread model disappears
+/// from the response. The assertions below name every key the contract
+/// promises, so a missing one fails.
+type Parameters = serde_json::Map<String, serde_json::Value>;
 
 /// A simulation that deletes itself.
 ///
@@ -73,10 +70,20 @@ impl Live {
     /// Creates a simulation with `steps` steps and a two-strike chain, kept
     /// small because the deployment is shared.
     fn create(client: &ServiceClient, steps: usize) -> Option<(Self, Created)> {
+        Self::create_with(client, steps, &reference_schedules())
+    }
+
+    /// Creates a simulation with an explicit schedule list.
+    fn create_with(
+        client: &ServiceClient,
+        steps: usize,
+        schedules: &serde_json::Value,
+    ) -> Option<(Self, Created)> {
         let mut request = reference_request("SPX");
         if let Some(object) = request.as_object_mut() {
             object.insert("steps".to_string(), serde_json::json!(steps));
             object.insert("chain_size".to_string(), serde_json::json!(2));
+            object.insert("schedules".to_string(), schedules.clone());
         }
 
         let response = match client.post("/api/v2/simulations", &request) {
@@ -147,10 +154,19 @@ impl Live {
 
 impl Drop for Live {
     fn drop(&mut self) {
-        if let Err(error) = self.client.delete(&self.path("")) {
-            println!("WARNING: could not delete simulation {}: {error}", self.id);
-        }
+        // `delete` answers Ok for a 401, a 405 or a 500, and counting those as
+        // cleanup leaks simulations onto a shared deployment.
+        examples_integration::report_cleanup(&self.client, &self.path(""), &self.id);
     }
+}
+
+/// Two rules, deliberately sent out of `rule_id` order and of different kinds,
+/// so the normalisation this contract promises has something to do.
+fn reference_schedules() -> serde_json::Value {
+    serde_json::json!([
+        {"rule_id": "zz_weeklies", "kind": "weekly", "target_count": 2, "weekdays": ["Mon", "Fri"]},
+        {"rule_id": "aa_dailies", "kind": "daily", "target_count": 1}
+    ])
 }
 
 /// Creating a simulation echoes every input a replay needs.
@@ -178,45 +194,69 @@ fn test_creating_a_simulation_echoes_every_replay_input() {
     );
 
     let parameters = &created.parameters;
-    assert_eq!(parameters.symbol, "SPX");
-    assert_eq!(parameters.steps, 3);
-    assert_eq!(
-        parameters.seed, 42,
-        "the seed the request set must come back"
+
+    // Every key the replay contract promises, asserted by name and by value.
+    // A struct with a subset of these would ignore a field that vanished, so
+    // each one is looked up explicitly and a missing key fails.
+    assert_eq!(field(parameters, "symbol"), "SPX");
+    assert_eq!(field(parameters, "steps"), 3);
+    assert_eq!(field(parameters, "seed"), 42);
+    assert_eq!(field(parameters, "timezone"), "America/New_York");
+    assert_eq!(field(parameters, "expiration_time"), "17:00:00");
+    assert_eq!(field(parameters, "time_frame"), "day");
+    assert_eq!(field(parameters, "initial_price"), 5000.0);
+    assert_eq!(field(parameters, "volatility"), 0.2);
+    assert_eq!(field(parameters, "risk_free_rate"), 0.05);
+    assert_eq!(field(parameters, "dividend_yield"), 0.0);
+    assert_eq!(field(parameters, "chain_size"), 2);
+    assert_eq!(field(parameters, "strike_interval"), 25.0);
+
+    // Resolved rather than sent, so the assertion is on shape: a replay needs
+    // them and cannot invent them.
+    assert!(
+        field(parameters, "effective_start")
+            .as_str()
+            .is_some_and(|start| start.ends_with('Z') && start.len() >= 20),
+        "the resolved start must come back as an instant: {parameters:?}"
     );
     assert!(
-        !parameters.effective_start.is_empty(),
-        "the resolved start must come back, since a replay needs it"
-    );
-    assert!(
-        parameters.step_interval_seconds > 0,
+        field(parameters, "step_interval_seconds")
+            .as_u64()
+            .is_some_and(|interval| interval > 0),
         "the resolved interval must come back"
     );
     assert!(
-        !parameters.tzdb_version.is_empty(),
+        field(parameters, "tzdb_version")
+            .as_str()
+            .is_some_and(|version| !version.is_empty()),
         "the tzdb release the expirations were resolved against must come back"
     );
-    assert_eq!(parameters.chain_size, Some(2));
-
-    // Normalisation is part of the replay contract: the rules come back
-    // sorted by rule id, whatever order they were sent in.
-    let ids: Vec<&str> = parameters
-        .schedules
-        .iter()
-        .map(|rule| rule.rule_id.as_str())
-        .collect();
-    let mut sorted = ids.clone();
-    sorted.sort_unstable();
-    assert_eq!(
-        ids, sorted,
-        "the normalised schedules must come back sorted"
+    assert!(
+        field(parameters, "calendar")
+            .as_str()
+            .is_some_and(|calendar| !calendar.is_empty()),
+        "the calendar must come back"
     );
     assert!(
-        parameters
-            .schedules
-            .iter()
-            .all(|rule| rule.target_count > 0),
-        "a normalised rule keeps its target count"
+        field(parameters, "method")
+            .get("GeometricBrownian")
+            .is_some(),
+        "the walk model must come back as sent: {:?}",
+        field(parameters, "method")
+    );
+
+    // Normalisation is part of the replay contract, and the request sent its
+    // two rules deliberately out of order, of different kinds, so sorting has
+    // something to do. The whole normalised list is compared, weekdays
+    // included: a rule that lost its weekdays would replay differently.
+    assert_eq!(
+        field(parameters, "schedules"),
+        &serde_json::json!([
+            {"rule_id": "aa_dailies", "kind": "daily", "target_count": 1},
+            {"rule_id": "zz_weeklies", "kind": "weekly", "target_count": 2,
+             "weekdays": ["Mon", "Fri"]}
+        ]),
+        "the normalised schedules must come back sorted by rule_id and complete"
     );
 
     // A simulation with no seed of its own is told which one it got.
@@ -235,9 +275,12 @@ fn test_creating_a_simulation_echoes_every_replay_input() {
                 client: client.clone(),
                 id: created.id.clone(),
             };
-            assert_ne!(
-                created.parameters.seed, 0,
-                "a generated seed must be a real one"
+            assert!(
+                field(&created.parameters, "seed")
+                    .as_u64()
+                    .is_some_and(|seed| seed != 0),
+                "a generated seed must be a real one: {:?}",
+                created.parameters.get("seed")
             );
             drop(generated);
         }
@@ -260,18 +303,37 @@ fn test_reading_and_peeking_leave_the_cursor_alone() {
     let before = live.envelope();
     assert_eq!(before.cursor.current_step, 0);
 
-    for _ in 0..2 {
+    // The bodies matter: stable metadata proves the cursor did not move, and
+    // says nothing about whether the same market came back. A service can
+    // reprice on every GET without touching the cursor, and that is exactly
+    // what a repeatable peek must not do.
+    let peek = || -> serde_json::Value {
         let path = live.path("/snapshot");
         match client.get(&path) {
-            Ok(response) => assert_eq!(
-                response.status,
-                200,
-                "a peek must answer 200, got {} with {}",
-                response.status,
-                response.text()
-            ),
+            Ok(response) => {
+                assert_eq!(
+                    response.status,
+                    200,
+                    "a peek must answer 200, got {} with {}",
+                    response.status,
+                    response.text()
+                );
+                match response.json::<serde_json::Value>(&path) {
+                    Ok(body) => body,
+                    Err(error) => panic!("{error}"),
+                }
+            }
             Err(error) => panic!("{error}"),
         }
+    };
+    let first = peek();
+    let second = peek();
+    for key in ["simulated_at", "underlying", "chains"] {
+        assert_eq!(
+            first.get(key),
+            second.get(key),
+            "peeking twice must return the same {key}"
+        );
     }
 
     let after = live.envelope();
@@ -284,6 +346,22 @@ fn test_reading_and_peeking_leave_the_cursor_alone() {
         "a read must not bump the compare-and-swap token"
     );
     assert_eq!(after.id, before.id);
+
+    // And the advance serves the market the peek showed, which is what makes
+    // a peek a preview rather than a different sample.
+    let served = live.step(None);
+    assert_eq!(served.status, 200, "{}", served.text());
+    let served: serde_json::Value = match served.json(&live.path("/step")) {
+        Ok(body) => body,
+        Err(error) => panic!("{error}"),
+    };
+    for key in ["simulated_at", "underlying", "chains"] {
+        assert_eq!(
+            served.get(key),
+            first.get(key),
+            "the advance must serve the {key} the peek showed"
+        );
+    }
 }
 
 /// The walk serves every step and then is gone.
@@ -385,70 +463,107 @@ fn test_a_stale_precondition_is_412_and_consumes_nothing() {
     );
 }
 
-/// Two advances fired at once: one wins, the other is `409`, and the cursor
-/// moves exactly once.
+/// Two advances fired at once: exactly one wins, the other is `409`, the
+/// cursor moves by one and the version by one.
 ///
 /// `409` means someone else committed first, which is a different fact from
-/// `412`, and conflating them would make a client retry the wrong way.
+/// `412`, and conflating them would make a client retry the wrong way. The two
+/// requests are released by a barrier so they genuinely overlap rather than
+/// happening to; a deployment that serialised them would move the cursor twice
+/// and is retried, because the contract this asserts is about contention and a
+/// run that never contended has not exercised it.
 #[test]
 fn test_two_concurrent_advances_leave_exactly_one_winner() {
     let Some(client) = service() else {
         return;
     };
-    let Some((live, _)) = Live::create(&client, 6) else {
+    let Some((live, _)) = Live::create(&client, 8) else {
         return;
     };
 
-    let before = live.envelope();
-    let (sender, receiver) = mpsc::channel();
+    let mut contended = false;
+    for attempt in 0..5 {
+        let before = live.envelope();
+        let barrier = Arc::new(Barrier::new(2));
+        let (sender, receiver) = mpsc::channel();
 
-    let mut handles = Vec::new();
-    for _ in 0..2 {
-        let client = client.clone();
-        let path = live.path("/step");
-        let sender = sender.clone();
-        handles.push(thread::spawn(move || {
-            let status = match client.request("POST", &path, None) {
-                Ok(response) => response.status,
-                Err(error) => panic!("advancing concurrently: {error}"),
-            };
-            let _ = sender.send(status);
-        }));
-    }
-    drop(sender);
-    for handle in handles {
-        if handle.join().is_err() {
-            panic!("a concurrent advance panicked");
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let client = client.clone();
+            let path = live.path("/step");
+            let sender = sender.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                // Both threads are ready before either sends, so the requests
+                // are in flight together rather than one after the other.
+                barrier.wait();
+                let status = match client.request("POST", &path, None) {
+                    Ok(response) => response.status,
+                    Err(error) => panic!("advancing concurrently: {error}"),
+                };
+                let _ = sender.send(status);
+            }));
         }
+        drop(sender);
+        for handle in handles {
+            if handle.join().is_err() {
+                panic!("a concurrent advance panicked");
+            }
+        }
+
+        let statuses: Vec<u16> = receiver.iter().collect();
+        assert_eq!(statuses.len(), 2, "both advances must answer");
+        assert!(
+            statuses
+                .iter()
+                .all(|status| *status == 200 || *status == 409),
+            "a contended advance answers 200 or 409, never anything else, got {statuses:?}"
+        );
+
+        let winners = statuses.iter().filter(|status| **status == 200).count();
+        let losers = statuses.iter().filter(|status| **status == 409).count();
+        let after = live.envelope();
+
+        if losers == 0 {
+            // Serialised rather than raced. The cursor arithmetic must still
+            // hold, and the attempt is repeated so the contract under test is
+            // actually exercised.
+            assert_eq!(
+                after.cursor.current_step - before.cursor.current_step,
+                winners,
+                "attempt {attempt} serialised, so the cursor must move once per winner"
+            );
+            println!("INFO: attempt {attempt} serialised, retrying for a real race");
+            continue;
+        }
+
+        assert_eq!(winners, 1, "exactly one advance may win, got {statuses:?}");
+        assert_eq!(
+            losers, 1,
+            "exactly one advance may conflict, got {statuses:?}"
+        );
+        assert_eq!(
+            after.cursor.current_step - before.cursor.current_step,
+            1,
+            "a contended step is consumed exactly once"
+        );
+        assert_eq!(
+            after.version - before.version,
+            1,
+            "one commit means one version, {} became {}",
+            before.version,
+            after.version
+        );
+        contended = true;
+        break;
     }
 
-    let statuses: Vec<u16> = receiver.iter().collect();
-    assert_eq!(statuses.len(), 2, "both advances must answer");
-
-    let winners = statuses.iter().filter(|status| **status == 200).count();
-    let losers = statuses.iter().filter(|status| **status == 409).count();
-    let after = live.envelope();
-    let moved = after.cursor.current_step - before.cursor.current_step;
-
-    // Two outcomes are correct. Either they raced and the store rejected the
-    // loser, or they serialised and both advanced; what must never happen is
-    // a 5xx, or a cursor that moved by something other than the number of
-    // successes.
     assert!(
-        statuses
-            .iter()
-            .all(|status| *status == 200 || *status == 409),
-        "concurrent advances must answer 200 or 409, got {statuses:?}"
+        contended,
+        "five barrier-synchronised attempts never contended, so the 409 path was not \
+         exercised; either the deployment serialises every advance or the race is not being \
+         created"
     );
-    assert_eq!(
-        moved, winners,
-        "the cursor must move exactly once per winner, {winners} won and {losers} lost,          cursor moved {moved}"
-    );
-    if losers > 0 {
-        println!("INFO: the two advances raced, {winners} won and {losers} got 409");
-    } else {
-        println!("INFO: the two advances serialised, both served and the cursor moved {moved}");
-    }
 }
 
 /// Deleting removes it, and the id stops resolving.
