@@ -1,15 +1,14 @@
-//! The export matrix: every dataset in every format the deployment offers.
+//! The export matrix: every dataset in every format the deployment ADVERTISES.
 //!
-//! The export is what a backtester actually consumes and it has the widest
-//! surface in the service: three datasets, up to four encodings, a step range
-//! and three greek levels. It also STREAMS, so its failure modes are the ones
-//! that only appear over a socket, truncation first among them.
+//! The export is what a backtester consumes and it has the widest surface in
+//! the service: three datasets, four encodings, a range and three greek
+//! levels. It also streams, so its failure modes are the ones that only appear
+//! over a socket.
 //!
-//! Formats are probed rather than assumed. A deployment built without the
-//! `arrow-export` feature refuses `arrow`, and an older one may not know
-//! `packed` at all; both are facts to report, not failures. What the suite
-//! guarantees is that everything the deployment DOES offer agrees with
-//! everything else it offers.
+//! Which formats are exercised comes from the deployment's own OpenAPI
+//! document rather than from probing and shrugging: a format the document
+//! advertises must work, or refuse with the typed error that says this build
+//! was compiled without it. Anything else is a regression, not a skip.
 //!
 //! Exports are kept small, three steps over a two-strike chain, because these
 //! run against a shared deployment and an export is the most expensive thing
@@ -17,7 +16,7 @@
 //!
 //! Skipped entirely when `OCS_INTEGRATION_BASE_URL` is unset.
 
-use examples_integration::{Response, ServiceClient, reference_request, service};
+use examples_integration::{Response, ServiceClient, packed, reference_request, service};
 
 /// Steps in every exported tape.
 const STEPS: usize = 3;
@@ -46,7 +45,7 @@ impl Exported {
             Err(error) => panic!("{error}"),
         };
         if response.status == 404 {
-            println!("SKIP: this deployment has no v2 API");
+            println!("SKIP: this deployment does not serve /api/v2/simulations");
             return None;
         }
         assert_eq!(
@@ -97,94 +96,295 @@ impl Exported {
 impl Drop for Exported {
     fn drop(&mut self) {
         let path = format!("/api/v2/simulations/{}", self.id);
-        if let Err(error) = self.client.delete(&path) {
-            println!("WARNING: could not delete simulation {}: {error}", self.id);
-        }
+        examples_integration::report_cleanup(&self.client, &path, &self.id);
     }
 }
 
-/// Which formats this deployment actually serves, probed once.
+/// The formats the deployment's OpenAPI document advertises, and for each,
+/// whether this build actually serves it.
+struct Offered {
+    /// Advertised and serving.
+    usable: Vec<String>,
+    /// Advertised but compiled out, with the reason the service gave.
+    absent: Vec<(String, String)>,
+}
+
+/// Reads the advertised formats from the deployment's own document, then
+/// establishes which of them this build serves.
 ///
-/// `json` and `csv` are the baseline every build has; `arrow` needs a feature
-/// that is off by default and `packed` postdates some deployments, so a 400 or
-/// a 404 for those means "not offered here" and is reported rather than failed.
-fn offered_formats(exported: &Exported) -> Vec<&'static str> {
-    let mut offered = Vec::new();
-    for format in ["json", "csv", "arrow", "packed"] {
+/// A format the document advertises may only be missing for one reason: the
+/// build was compiled without it, which the service says in a typed 400 naming
+/// `format`. Any other refusal is a regression, and a silent skip would hide
+/// it.
+fn offered_formats(client: &ServiceClient, exported: &Exported) -> Offered {
+    let document: serde_json::Value = match client.get("/api-docs/openapi.json") {
+        Ok(response) if response.status == 200 => match response.json("/api-docs/openapi.json") {
+            Ok(document) => document,
+            Err(error) => panic!("{error}"),
+        },
+        Ok(response) => panic!(
+            "the deployment must serve an OpenAPI document to drive this test, got {}",
+            response.status
+        ),
+        Err(error) => panic!("{error}"),
+    };
+
+    let description = document
+        .pointer("/paths/~1api~1v2~1simulations~1{id}~1export/get/parameters")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|parameters| {
+            parameters.iter().find(|parameter| {
+                parameter.get("name").and_then(|name| name.as_str()) == Some("format")
+            })
+        })
+        .and_then(|parameter| parameter.get("description"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("the document must describe the export format parameter"));
+
+    // The description opens with the alternatives, "json | csv | arrow |
+    // packed", which is the contract this suite has to hold the deployment to.
+    let advertised: Vec<String> = description
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .split('|')
+        .map(|format| format.trim().to_string())
+        .filter(|format| !format.is_empty() && format.chars().all(|c| c.is_ascii_lowercase()))
+        .collect();
+    assert!(
+        advertised.contains(&"json".to_string()) && advertised.contains(&"csv".to_string()),
+        "the document must advertise at least json and csv, it advertises {advertised:?}"
+    );
+
+    let mut usable = Vec::new();
+    let mut absent = Vec::new();
+    for format in advertised {
         let response = exported.export(&format!("dataset=underlying&format={format}"));
         match response.status {
-            200 => offered.push(format),
-            400 | 404 | 415 => println!(
-                "SKIP: this deployment does not offer the {format} encoding ({})",
-                response.status
-            ),
+            200 => usable.push(format),
+            400 => {
+                let body: serde_json::Value = match response.json("/export") {
+                    Ok(body) => body,
+                    Err(error) => panic!("a refusal must be the documented shape: {error}"),
+                };
+                let message = body
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                assert_eq!(
+                    body.get("field").and_then(serde_json::Value::as_str),
+                    Some("format"),
+                    "a refused format must name the format field: {body}"
+                );
+                assert!(
+                    message.contains("unavailable") || message.contains("feature"),
+                    "{format} is advertised, so the only acceptable refusal is one saying this \
+                     build was compiled without it; the service said {message:?}"
+                );
+                absent.push((format, message));
+            }
             other => panic!(
-                "probing the {format} encoding answered {other}: {}",
+                "{format} is advertised and answered {other}: {}",
                 response.text()
             ),
         }
     }
-    assert!(
-        offered.contains(&"json") && offered.contains(&"csv"),
-        "every build serves json and csv; this one offered {offered:?}"
-    );
-    offered
+
+    for (format, reason) in &absent {
+        println!("INFO: {format} is advertised but not built here: {reason}");
+    }
+    Offered { usable, absent }
 }
 
-/// The rows of a CSV export, header first.
-fn csv_rows(body: &str) -> Vec<Vec<String>> {
-    body.split("\r\n")
-        .filter(|line| !line.is_empty())
-        .map(|line| line.split(',').map(str::to_string).collect())
-        .collect()
+/// Parses an RFC 4180 document: CRLF-separated records, commas between
+/// fields, double quotes around a field that contains either, and a doubled
+/// quote for a literal one.
+fn parse_csv(body: &str, what: &str) -> Vec<Vec<String>> {
+    let mut records = Vec::new();
+    let mut record = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut characters = body.chars().peekable();
+
+    while let Some(character) = characters.next() {
+        match (quoted, character) {
+            (true, '"') => {
+                if characters.peek() == Some(&'"') {
+                    characters.next();
+                    field.push('"');
+                } else {
+                    quoted = false;
+                }
+            }
+            (true, other) => field.push(other),
+            (false, '"') => quoted = true,
+            (false, ',') => record.push(std::mem::take(&mut field)),
+            (false, '\r') => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+            }
+            (false, '\n') => {
+                record.push(std::mem::take(&mut field));
+                records.push(std::mem::take(&mut record));
+            }
+            (false, other) => field.push(other),
+        }
+    }
+    assert!(!quoted, "{what}: the csv ends inside a quoted field");
+    if !field.is_empty() || !record.is_empty() {
+        record.push(field);
+        records.push(record);
+    }
+    records
 }
 
-/// The rows of a JSON export, as objects.
-fn json_rows(body: &[u8], what: &str) -> Vec<serde_json::Map<String, serde_json::Value>> {
-    match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(serde_json::Value::Array(rows)) => rows
-            .into_iter()
-            .map(|row| match row {
-                serde_json::Value::Object(object) => object,
-                other => panic!("{what}: every json row must be an object, got {other}"),
-            })
-            .collect(),
-        Ok(other) => panic!("{what}: a json export must be a single array, got {other}"),
-        Err(error) => panic!("{what}: a json export must parse: {error}"),
+/// The header and the data rows of a CSV export, with every row required to
+/// carry exactly as many fields as the header declares.
+fn csv_table(body: &str, what: &str) -> (Vec<String>, Vec<Vec<String>>) {
+    let records = parse_csv(body, what);
+    let (header, rows) = match records.split_first() {
+        Some((header, rows)) => (header.clone(), rows.to_vec()),
+        None => panic!("{what}: a csv export must carry a header"),
+    };
+    for (index, row) in rows.iter().enumerate() {
+        assert_eq!(
+            row.len(),
+            header.len(),
+            "{what}: row {index} carries {} fields where the header declares {}: {row:?}",
+            row.len(),
+            header.len()
+        );
+    }
+    (header, rows)
+}
+
+/// Two rendered values are the same value.
+///
+/// Compared numerically when both parse as numbers, because `5000` and
+/// `5000.0` are the same price rendered by two encodings, and textually
+/// otherwise.
+fn same_value(left: &str, right: &str) -> bool {
+    match (left.parse::<f64>(), right.parse::<f64>()) {
+        (Ok(left), Ok(right)) => (left - right).abs() <= 1e-9 * left.abs().max(1.0),
+        _ => left == right,
     }
 }
 
-/// The row count a packed document declares in its footer.
-///
-/// The footer is what makes a truncated download detectable, so reading it is
-/// exactly the check a consumer must perform.
-fn packed_rows(body: &[u8], what: &str) -> u64 {
-    assert!(
-        body.len() >= 16,
-        "{what}: a packed document is at least a header and a footer, got {} bytes",
-        body.len()
+/// Compares a decoded table with the CSV one, column by column and row by row.
+fn assert_same_table(
+    what: &str,
+    csv_header: &[String],
+    csv_rows: &[Vec<String>],
+    header: &[String],
+    rows: &[Vec<String>],
+) {
+    assert_eq!(
+        header, csv_header,
+        "{what}: the columns differ from the csv ones"
     );
     assert_eq!(
-        &body[..4],
-        b"OCSP",
-        "{what}: a packed document starts with its magic"
+        rows.len(),
+        csv_rows.len(),
+        "{what}: {} rows against {} as csv",
+        rows.len(),
+        csv_rows.len()
     );
-
-    // footer := u32:0xFFFFFFFF pad to 8 u64:total_rows, so the sentinel sits
-    // 16 bytes from the end and the count in the last 8.
-    let sentinel = &body[body.len() - 16..body.len() - 12];
-    assert_eq!(
-        sentinel,
-        &u32::MAX.to_le_bytes(),
-        "{what}: the footer sentinel is missing, so the download was truncated"
-    );
-
-    let mut count = [0_u8; 8];
-    count.copy_from_slice(&body[body.len() - 8..]);
-    u64::from_le_bytes(count)
+    for (index, (row, csv_row)) in rows.iter().zip(csv_rows).enumerate() {
+        assert_eq!(
+            row.len(),
+            csv_row.len(),
+            "{what}: row {index} has {} values against {} as csv",
+            row.len(),
+            csv_row.len()
+        );
+        for (column, (value, csv_value)) in row.iter().zip(csv_row).enumerate() {
+            assert!(
+                same_value(value, csv_value),
+                "{what}: row {index} column {} is {value:?} and {csv_value:?} as csv",
+                csv_header.get(column).map_or("?", String::as_str)
+            );
+        }
+    }
 }
 
-/// Every dataset, in every offered format, carries the same rows.
+/// Decodes an Arrow IPC stream into the same shape, when this test was built
+/// with the feature that can.
+#[cfg(feature = "arrow-export")]
+fn arrow_table(bytes: &[u8], what: &str) -> (Vec<String>, Vec<Vec<String>>) {
+    use arrow::ipc::reader::StreamReader;
+
+    let reader = match StreamReader::try_new(std::io::Cursor::new(bytes.to_vec()), None) {
+        Ok(reader) => reader,
+        Err(error) => panic!("{what}: an arrow export must be a readable stream: {error}"),
+    };
+
+    let mut header: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for batch in reader {
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => panic!("{what}: an arrow batch must decode: {error}"),
+        };
+        if header.is_empty() {
+            header = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().to_string())
+                .collect();
+        }
+        for index in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(batch.num_columns());
+            for column in batch.columns() {
+                row.push(arrow_cell(column.as_ref(), index));
+            }
+            rows.push(row);
+        }
+    }
+    (header, rows)
+}
+
+/// Renders one Arrow cell the way the text encodings render it.
+#[cfg(feature = "arrow-export")]
+fn arrow_cell(column: &dyn arrow::array::Array, index: usize) -> String {
+    use arrow::array::{Float64Array, Int64Array, StringArray, TimestampNanosecondArray};
+    use arrow::datatypes::DataType;
+
+    if column.is_null(index) {
+        return String::new();
+    }
+    match column.data_type() {
+        DataType::Float64 => column
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .map(|values| values.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Int64 => column
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .map(|values| values.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Utf8 => column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .map(|values| values.value(index).to_string())
+            .unwrap_or_default(),
+        DataType::Timestamp(_, _) => column
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .and_then(|values| values.value_as_datetime(index))
+            .map(|value| format!("{}Z", value.format("%Y-%m-%dT%H:%M:%S")))
+            .unwrap_or_default(),
+        other => panic!("an arrow export carries an unexpected column type {other}"),
+    }
+}
+
+/// Every dataset carries the same rows and the same values in every format the
+/// deployment advertises and serves.
 #[test]
 fn test_every_dataset_agrees_across_every_offered_format() {
     let Some(client) = service() else {
@@ -193,17 +393,9 @@ fn test_every_dataset_agrees_across_every_offered_format() {
     let Some(exported) = Exported::create(&client) else {
         return;
     };
-    let formats = offered_formats(&exported);
+    let offered = offered_formats(&client, &exported);
 
     for dataset in DATASETS {
-        let json = exported.export(&format!("dataset={dataset}&format=json"));
-        assert_eq!(json.status, 200, "{dataset} as json: {}", json.text());
-        let json_rows = json_rows(&json.body, dataset);
-        assert!(
-            !json_rows.is_empty(),
-            "{dataset} must export at least one row for a walked tape"
-        );
-
         let csv = exported.export(&format!("dataset={dataset}&format=csv"));
         assert_eq!(csv.status, 200, "{dataset} as csv: {}", csv.text());
         let text = csv.text();
@@ -211,70 +403,116 @@ fn test_every_dataset_agrees_across_every_offered_format() {
             text.contains("\r\n"),
             "{dataset} as csv must use RFC 4180 CRLF endings"
         );
-        let rows = csv_rows(&text);
-        let (header, data) = match rows.split_first() {
-            Some((header, data)) => (header, data),
-            None => panic!("{dataset} as csv must carry a header"),
-        };
-        assert_eq!(
-            data.len(),
-            json_rows.len(),
-            "{dataset} exports {} rows as csv and {} as json",
-            data.len(),
-            json_rows.len()
+        let (csv_header, csv_rows) = csv_table(&text, dataset);
+        assert!(
+            !csv_rows.is_empty(),
+            "{dataset} must export rows for a walked tape"
         );
 
-        // Compared as parsed values rather than as text: the rendering of a
-        // number is not the contract, the number is.
-        for (index, (csv_row, json_row)) in data.iter().zip(&json_rows).enumerate() {
-            for (column, value) in header.iter().zip(csv_row) {
-                let Some(from_json) = json_row.get(column) else {
-                    continue;
-                };
-                let matches = match from_json {
-                    serde_json::Value::Number(number) => value.parse::<f64>().is_ok_and(|parsed| {
-                        (parsed - number.as_f64().unwrap_or(f64::NAN)).abs() < 1e-9
-                    }),
-                    serde_json::Value::String(text) => text == value,
-                    serde_json::Value::Null => value.is_empty(),
-                    // Anything else, a bool say, renders the same way in both
-                    // encodings, so its text is the comparison.
-                    other => serde_json::to_string(other)
-                        .is_ok_and(|rendered| rendered.trim_matches('"') == value),
+        // json: the same keys as the csv header, on every row, and the same
+        // values. A row with a missing key fails rather than being skipped.
+        let json = exported.export(&format!("dataset={dataset}&format=json"));
+        assert_eq!(json.status, 200, "{dataset} as json: {}", json.text());
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> =
+            match json.json(&format!("{dataset} as json")) {
+                Ok(rows) => rows,
+                Err(error) => panic!("a json export must be an array of objects: {error}"),
+            };
+        assert_eq!(
+            rows.len(),
+            csv_rows.len(),
+            "{dataset} exports {} rows as json against {} as csv",
+            rows.len(),
+            csv_rows.len()
+        );
+        for (index, (row, csv_row)) in rows.iter().zip(&csv_rows).enumerate() {
+            let mut keys: Vec<&String> = row.keys().collect();
+            keys.sort();
+            let mut expected: Vec<&String> = csv_header.iter().collect();
+            expected.sort();
+            assert_eq!(
+                keys, expected,
+                "{dataset} row {index} carries different keys from the csv header"
+            );
+            for (column, csv_value) in csv_header.iter().zip(csv_row) {
+                let value = match row.get(column) {
+                    Some(serde_json::Value::Null) => String::new(),
+                    Some(serde_json::Value::String(text)) => text.clone(),
+                    Some(other) => other.to_string(),
+                    None => unreachable!("the keys were compared above"),
                 };
                 assert!(
-                    matches,
-                    "{dataset} row {index} column {column} is {value:?} as csv and {from_json} \
-                     as json"
+                    same_value(&value, csv_value),
+                    "{dataset} row {index} column {column} is {value:?} as json and \
+                     {csv_value:?} as csv"
                 );
             }
         }
 
-        if formats.contains(&"packed") {
-            let packed = exported.export(&format!("dataset={dataset}&format=packed"));
-            assert_eq!(packed.status, 200, "{dataset} as packed: {}", packed.text());
-            let declared = packed_rows(&packed.body, dataset);
+        if offered.usable.iter().any(|format| format == "packed") {
+            let response = exported.export(&format!("dataset={dataset}&format=packed"));
             assert_eq!(
-                declared as usize,
-                json_rows.len(),
-                "{dataset} declares {declared} rows in its packed footer and exports {} as json",
-                json_rows.len()
+                response.status,
+                200,
+                "{dataset} as packed: {}",
+                response.text()
+            );
+            let document = match packed::decode(&response.body) {
+                Ok(document) => document,
+                Err(error) => panic!("{dataset} as packed must decode: {error}"),
+            };
+            assert!(
+                document.misaligned.is_empty(),
+                "{dataset} as packed has payloads at unaligned offsets {:?}, which makes a \
+                 zero-copy typed-array view throw",
+                document.misaligned
+            );
+            assert_eq!(
+                document.declared_rows as usize,
+                csv_rows.len(),
+                "{dataset} declares {} rows in its packed footer against {} as csv",
+                document.declared_rows,
+                csv_rows.len()
+            );
+            assert_same_table(
+                &format!("{dataset} as packed"),
+                &csv_header,
+                &csv_rows,
+                &document.columns,
+                &document.rows,
             );
         }
 
-        if formats.contains(&"arrow") {
-            let arrow = exported.export(&format!("dataset={dataset}&format=arrow"));
-            assert_eq!(arrow.status, 200, "{dataset} as arrow: {}", arrow.text());
-            assert!(
-                !arrow.body.is_empty(),
-                "{dataset} as arrow must carry a stream"
+        if offered.usable.iter().any(|format| format == "arrow") {
+            let response = exported.export(&format!("dataset={dataset}&format=arrow"));
+            assert_eq!(
+                response.status,
+                200,
+                "{dataset} as arrow: {}",
+                response.text()
+            );
+            #[cfg(feature = "arrow-export")]
+            {
+                let (header, rows) = arrow_table(&response.body, &format!("{dataset} as arrow"));
+                assert_same_table(
+                    &format!("{dataset} as arrow"),
+                    &csv_header,
+                    &csv_rows,
+                    &header,
+                    &rows,
+                );
+            }
+            #[cfg(not(feature = "arrow-export"))]
+            println!(
+                "INFO: {dataset} as arrow was served but not decoded; build this test with \
+                 --features arrow-export to compare its values"
             );
         }
     }
 }
 
-/// The same export twice is byte-identical, which is the endpoint's stated
-/// contract and what lets a consumer cache or checksum one.
+/// The same export twice is byte-identical, which is what lets a consumer
+/// cache or checksum one.
 #[test]
 fn test_the_same_export_twice_is_byte_identical() {
     let Some(client) = service() else {
@@ -283,10 +521,10 @@ fn test_the_same_export_twice_is_byte_identical() {
     let Some(exported) = Exported::create(&client) else {
         return;
     };
-    let formats = offered_formats(&exported);
+    let offered = offered_formats(&client, &exported);
 
     for dataset in DATASETS {
-        for format in &formats {
+        for format in &offered.usable {
             let query = format!("dataset={dataset}&format={format}");
             let first = exported.export(&query);
             let second = exported.export(&query);
@@ -300,8 +538,8 @@ fn test_the_same_export_twice_is_byte_identical() {
     }
 }
 
-/// A range selects the same rows in every format, and a bad one is a typed
-/// rejection in every format rather than an empty document.
+/// A range selects the same rows in every format, and the two ways to get one
+/// wrong are typed rejections naming the field at fault.
 #[test]
 fn test_a_range_selects_the_same_rows_in_every_format() {
     let Some(client) = service() else {
@@ -310,57 +548,126 @@ fn test_a_range_selects_the_same_rows_in_every_format() {
     let Some(exported) = Exported::create(&client) else {
         return;
     };
-    let formats = offered_formats(&exported);
+    let offered = offered_formats(&client, &exported);
 
+    // A valid range, decoded in every offered format and compared against the
+    // csv rows it selected.
     let ranged = "dataset=underlying&from_step=1&to_step=2";
-    let json = exported.export(&format!("{ranged}&format=json"));
-    assert_eq!(json.status, 200, "{}", json.text());
-    let expected = json_rows(&json.body, "underlying").len();
-    assert!(
-        expected > 0 && expected <= STEPS,
-        "a range of two steps must select between one and {STEPS} rows, got {expected}"
-    );
-
     let csv = exported.export(&format!("{ranged}&format=csv"));
-    assert_eq!(
-        csv_rows(&csv.text()).len() - 1,
-        expected,
-        "the same range must select the same rows as csv and as json"
+    assert_eq!(csv.status, 200, "{}", csv.text());
+    let text = csv.text();
+    let (csv_header, csv_rows) = csv_table(&text, "a ranged underlying export");
+    assert!(
+        !csv_rows.is_empty() && csv_rows.len() <= STEPS,
+        "a range of two steps must select between one and {STEPS} rows, got {}",
+        csv_rows.len()
     );
-
-    if formats.contains(&"packed") {
-        let packed = exported.export(&format!("{ranged}&format=packed"));
+    // And it selected the steps asked for, not just the right number of them.
+    if let Some(step) = csv_header.iter().position(|column| column == "step") {
+        let steps: Vec<&str> = csv_rows
+            .iter()
+            .filter_map(|row| row.get(step).map(String::as_str))
+            .collect();
         assert_eq!(
-            packed_rows(&packed.body, "a ranged underlying export") as usize,
-            expected,
-            "the same range must select the same rows as packed and as json"
+            steps,
+            vec!["1", "2"],
+            "the range must select exactly the steps it names"
         );
     }
 
-    // And a bad range is a rejection in EVERY format, never an empty document
-    // that a consumer would read as "no data".
-    for format in &formats {
-        let response = exported.export(&format!(
-            "dataset=underlying&format={format}&from_step=2&to_step=1"
-        ));
-        assert_eq!(
-            response.status,
-            400,
-            "an inverted range must be refused as {format}, got {} with {}",
-            response.status,
-            response.text()
-        );
-        let content_type = response.header("content-type").unwrap_or_default();
-        assert!(
-            content_type.contains("application/json"),
-            "a rejection is JSON whatever format was asked for, got {content_type:?}"
-        );
+    for format in &offered.usable {
+        let response = exported.export(&format!("{ranged}&format={format}"));
+        assert_eq!(response.status, 200, "{format}: {}", response.text());
+        match format.as_str() {
+            "csv" => {}
+            "json" => {
+                let rows: Vec<serde_json::Value> = match response.json("a ranged json export") {
+                    Ok(rows) => rows,
+                    Err(error) => panic!("{error}"),
+                };
+                assert_eq!(rows.len(), csv_rows.len(), "json selected different rows");
+            }
+            "packed" => {
+                let document = match packed::decode(&response.body) {
+                    Ok(document) => document,
+                    Err(error) => panic!("a ranged packed export must decode: {error}"),
+                };
+                assert_same_table(
+                    "a ranged packed export",
+                    &csv_header,
+                    &csv_rows,
+                    &document.columns,
+                    &document.rows,
+                );
+            }
+            "arrow" => {
+                #[cfg(feature = "arrow-export")]
+                {
+                    let (header, rows) = arrow_table(&response.body, "a ranged arrow export");
+                    assert_same_table(
+                        "a ranged arrow export",
+                        &csv_header,
+                        &csv_rows,
+                        &header,
+                        &rows,
+                    );
+                }
+            }
+            other => panic!("unhandled format {other}"),
+        }
+    }
+
+    // And both ways to get a range wrong are typed rejections, in EVERY
+    // format, naming the field a client can act on.
+    for format in &offered.usable {
+        for (what, query, field) in [
+            (
+                "an inverted range",
+                format!("dataset=underlying&format={format}&from_step=2&to_step=1"),
+                "from_step",
+            ),
+            (
+                "a range past the end of the tape",
+                format!("dataset=underlying&format={format}&from_step=0&to_step=99999"),
+                "to_step",
+            ),
+        ] {
+            let response = exported.export(&query);
+            assert_eq!(
+                response.status,
+                400,
+                "{what} must be refused as {format}, got {} with {}",
+                response.status,
+                response.text()
+            );
+            let content_type = response.header("content-type").unwrap_or_default();
+            assert!(
+                content_type.contains("application/json"),
+                "a rejection is JSON whatever format was asked for, got {content_type:?}"
+            );
+            let body: serde_json::Value = match response.json(&query) {
+                Ok(body) => body,
+                Err(error) => {
+                    panic!("{what} as {format} must answer the documented shape: {error}")
+                }
+            };
+            assert_eq!(
+                body.get("field").and_then(serde_json::Value::as_str),
+                Some(field),
+                "{what} as {format} must name {field}: {body}"
+            );
+            assert!(
+                body.get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| !message.is_empty()),
+                "{what} as {format} must explain itself: {body}"
+            );
+        }
     }
 }
 
 /// Each greek level's header is a PREFIX of the next, so a consumer written
-/// against `none` keeps reading the same columns in the same places when a
-/// richer level is requested.
+/// against `none` keeps reading the same columns in the same places.
 #[test]
 fn test_each_greek_level_extends_the_previous_one() {
     let Some(client) = service() else {
@@ -370,27 +677,18 @@ fn test_each_greek_level_extends_the_previous_one() {
         return;
     };
 
-    let header_for = |level: &str| -> Option<Vec<String>> {
+    let header_for = |level: &str| -> Vec<String> {
         let response = exported.export(&format!("dataset=option_chains&format=csv&greeks={level}"));
-        if response.status == 400 {
-            println!("SKIP: this deployment does not know the {level} greek level");
-            return None;
-        }
         assert_eq!(
             response.status,
             200,
             "the {level} greek level must export, got {}",
             response.text()
         );
-        csv_rows(&response.text()).first().cloned()
+        csv_table(&response.text(), &format!("the {level} greek level")).0
     };
 
-    let (Some(none), Some(first), Some(all)) =
-        (header_for("none"), header_for("first"), header_for("all"))
-    else {
-        return;
-    };
-
+    let (none, first, all) = (header_for("none"), header_for("first"), header_for("all"));
     assert!(
         first.starts_with(&none),
         "the first-order header must extend the none header, {none:?} then {first:?}"
@@ -405,11 +703,8 @@ fn test_each_greek_level_extends_the_previous_one() {
     );
 }
 
-/// A streamed export is complete: the last row of the tape is present, and it
+/// A streamed export is complete: the last row of the tape is present and
 /// carries every column the header declared.
-///
-/// Truncation is the failure mode a socket introduces and an in-process test
-/// cannot see.
 #[test]
 fn test_a_streamed_export_is_not_truncated() {
     let Some(client) = service() else {
@@ -422,33 +717,24 @@ fn test_a_streamed_export_is_not_truncated() {
     let response = exported.export("dataset=option_chains&format=csv&greeks=all");
     assert_eq!(response.status, 200, "{}", response.text());
     let text = response.text();
-    let rows = csv_rows(&text);
-    let (header, data) = match rows.split_first() {
-        Some((header, data)) => (header, data),
-        None => panic!("a csv export must carry a header"),
-    };
+    let (header, rows) = csv_table(&text, "a full greek export");
 
-    assert!(!data.is_empty(), "a walked tape must export rows");
+    assert!(!rows.is_empty(), "a walked tape must export rows");
     assert!(
         text.ends_with("\r\n"),
         "a complete csv export ends with a line terminator, so a cut stream is visible"
     );
 
-    let last = match data.last() {
+    let last = match rows.last() {
         Some(last) => last,
-        None => unreachable!("data was checked non-empty"),
+        None => unreachable!("rows was checked non-empty"),
     };
     assert_eq!(
         last.len(),
         header.len(),
-        "the last row must carry every column the header declares, which is what a truncated \
-         stream loses first"
+        "the last row must carry every column the header declares"
     );
-
-    // The last row belongs to the last step, so nothing at the end went
-    // missing.
-    let step_column = header.iter().position(|column| column == "step");
-    if let Some(index) = step_column {
+    if let Some(index) = header.iter().position(|column| column == "step") {
         let last_step: usize = match last.get(index).and_then(|value| value.parse().ok()) {
             Some(step) => step,
             None => panic!("the step column must carry a number, row was {last:?}"),
@@ -470,9 +756,9 @@ fn test_the_content_type_and_filename_match_the_format() {
     let Some(exported) = Exported::create(&client) else {
         return;
     };
-    let formats = offered_formats(&exported);
+    let offered = offered_formats(&client, &exported);
 
-    for format in &formats {
+    for format in &offered.usable {
         let response = exported.export(&format!("dataset=underlying&format={format}"));
         assert_eq!(response.status, 200);
 
@@ -480,11 +766,9 @@ fn test_the_content_type_and_filename_match_the_format() {
             .header("content-type")
             .unwrap_or_default()
             .to_string();
-        let expected_type = match *format {
+        let expected_type = match format.as_str() {
             "json" => "application/json",
             "csv" => "text/csv",
-            // Arrow has a registered media type of its own; only the packed
-            // format falls back to plain octets.
             "arrow" => "application/vnd.apache.arrow.stream",
             _ => "application/octet-stream",
         };
@@ -501,7 +785,7 @@ fn test_the_content_type_and_filename_match_the_format() {
             disposition.contains("attachment") && disposition.contains(&exported.id),
             "{format} must suggest a filename naming the simulation, got {disposition:?}"
         );
-        let expected_extension = match *format {
+        let expected_extension = match format.as_str() {
             "json" => ".json",
             "csv" => ".csv",
             "arrow" => ".arrow",
@@ -512,4 +796,9 @@ fn test_the_content_type_and_filename_match_the_format() {
             "{format} must suggest a {expected_extension} file, got {disposition:?}"
         );
     }
+
+    assert!(
+        offered.absent.len() < 4,
+        "no format at all is served by this deployment"
+    );
 }

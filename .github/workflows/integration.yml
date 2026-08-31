@@ -32,7 +32,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run the integration suite
-        run: cargo test -p examples_integration -- --nocapture
+        # --all-features turns on the arrow decoder, so an arrow export is
+        # compared value by value with the text ones rather than only fetched.
+        run: cargo test -p examples_integration --all-features -- --nocapture
         env:
           LOGLEVEL: WARN
           OCS_INTEGRATION_BASE_URL: ${{ inputs.base_url || vars.OCS_INTEGRATION_BASE_URL }}

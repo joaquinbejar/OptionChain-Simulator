@@ -41,6 +41,8 @@
 //! transfer encoding. It is deliberately small, and issue #117 proposes
 //! replacing it with `reqwest` if that dependency is ever approved.
 
+pub mod packed;
+
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};

@@ -4,8 +4,15 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# Decoding an Arrow export needs the same crate that writes one. Off by
+# default so the hermetic suite stays as light as the library's own default
+# build; the integration job turns it on.
+arrow-export = ["dep:arrow"]
+
 [dependencies]
 optionchain_simulator = { workspace = true }
+arrow = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
