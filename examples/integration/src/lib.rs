@@ -32,14 +32,31 @@
 //! report that something was not exercised; only a real disagreement with the
 //! contract is a failure.
 //!
-//! # No HTTP client dependency
+//! # No HTTP client dependency, decided rather than deferred
 //!
-//! `rules/global_rules.md` forbids adding a dependency without the owner's
-//! approval, and this workspace has no HTTP client. Rather than stall, the
-//! harness speaks HTTP/1.1 over [`std::net::TcpStream`] itself: enough of it
-//! to send a request with a JSON body and read a response, including chunked
-//! transfer encoding. It is deliberately small, and issue #117 proposes
-//! replacing it with `reqwest` if that dependency is ever approved.
+//! This harness speaks HTTP/1.1 over [`std::net::TcpStream`] itself: enough of
+//! it to send a request with a JSON body and read a response, chunked transfer
+//! encoding included. That is a **decision, recorded in issue #117**, not an
+//! accident: the workspace has no HTTP client, `rules/global_rules.md` forbids
+//! adding a dependency without the owner's approval, and the alternative on
+//! offer — `reqwest` — buys convenience this suite does not need.
+//!
+//! What the decision costs, in one place so nobody has to rediscover it:
+//!
+//! - **No HTTPS.** A TLS client is a dependency of its own, so a deployment
+//!   behind TLS cannot be tested from here. An `https://` base URL is refused
+//!   at construction with a message that says so, rather than failing later as
+//!   a protocol error.
+//! - **No connection reuse.** Every request opens a socket. That is fine for a
+//!   test suite and wasteful at the concurrency the endurance tests reach.
+//! - **A protocol reader to maintain**, which grows the first time a test needs
+//!   redirects, keep-alive, or a body read incrementally rather than whole.
+//!
+//! Reversing it is a small change and issue #117 records how: add `reqwest` to
+//! `[workspace.dependencies]` as `X.X`, depend on it from this crate alone
+//! (which is `publish = false`), and delete [`ServiceClient::request`]'s
+//! transport half. Everything above it is written against `Response`, not
+//! against the socket.
 
 pub mod packed;
 

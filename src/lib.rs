@@ -466,6 +466,13 @@
 //! failing it. And it is shared, so every test deletes the simulations it
 //! creates, including when it fails.
 //!
+//! The harness carries **no HTTP client dependency**: it speaks HTTP/1.1 over
+//! `std::net` itself. The consequence worth knowing before pointing it
+//! somewhere is that `OCS_INTEGRATION_BASE_URL` must be a plain `http://`
+//! address — a deployment behind TLS cannot be tested from here, and an
+//! `https://` URL is refused with a message saying why. Issue #117 records the
+//! decision and what reversing it would take.
+//!
 //! ## Exporting a tape
 //!
 //! `GET /api/v2/simulations/{id}/export?dataset=…&format=…&from_step=&to_step=`
