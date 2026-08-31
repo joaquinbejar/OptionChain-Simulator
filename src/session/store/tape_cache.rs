@@ -136,6 +136,40 @@ for _, member in ipairs(members) do
 end
 return dropped
 ";
+/// What asking for the right to build a tape produced.
+///
+/// A token rather than a bare `true`, because a claim that expired mid-build
+/// may already belong to another instance: releasing then has to prove it is
+/// giving back its OWN claim, or a slow builder deletes the new owner's key
+/// and a third instance walks in.
+#[derive(Debug)]
+pub enum BuildClaim {
+    /// This caller builds, and releases with this token.
+    Held(String),
+    /// Another instance is already building it.
+    Taken,
+    /// The cache could not answer. The caller builds, holding nothing.
+    Unclaimed,
+}
+
+/// Releases a build claim, but only if it is still this caller's.
+///
+/// `KEYS[1]` the claim key, `ARGV[1]` the token it was taken with. Returns 1
+/// when the claim was released and 0 when it had already expired or been
+/// taken by someone else.
+const RELEASE_CLAIM_SCRIPT: &str = r"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+";
+
+/// How long a build claim survives unreleased.
+///
+/// A ceiling on how long one instance's death can delay another's build, so it
+/// wants to be a little longer than the slowest build rather than as long as
+/// the tape lives. A tape of the maximum step count is seconds to walk.
+const BUILD_CLAIM_SECS: u64 = 120;
 
 /// A place to leave a built tape for the other instances.
 ///
@@ -162,6 +196,34 @@ pub trait SharedTapeCache: Send + Sync {
     /// the cache holds. Called with the id rather than a key because the
     /// parameters that built the key may already have been deleted.
     async fn forget_simulation(&self, id: &str);
+
+    /// Claims the right to build what `key` will hold.
+    ///
+    /// [`BuildClaim::Held`] means this caller builds. [`BuildClaim::Taken`]
+    /// means another instance is already building it, and the caller should
+    /// wait for the entry rather than start a second copy of the same work
+    /// (issue #137).
+    ///
+    /// The claim EXPIRES: an instance killed mid-build must not wedge the
+    /// others, so a claim nobody released is simply gone after a while and the
+    /// next caller to ask builds it.
+    ///
+    /// An implementation that cannot reach its store answers
+    /// [`BuildClaim::Unclaimed`]. Building twice is wasteful; not building is
+    /// a request that never answers.
+    async fn claim_build(&self, key: &str) -> BuildClaim;
+
+    /// Gives up a claim, whether the build succeeded or not.
+    ///
+    /// Releasing on failure matters as much as on success: a build that
+    /// errored must not make the other instances wait out the expiry for a
+    /// tape that was never written.
+    ///
+    /// `token` is what [`BuildClaim::Held`] returned, and the claim is
+    /// released only if it still holds that token: a build slower than the
+    /// expiry must not delete a claim that has since become another
+    /// instance's.
+    async fn release_build(&self, key: &str, token: &str);
 }
 
 /// The key a tape is stored under.
@@ -202,6 +264,9 @@ pub struct RedisTapeCache {
     /// shared cache too: an operator writes the number of tapes they are
     /// willing to keep, and gets that many rather than that many per replica.
     bound: usize,
+    /// Which instance this is, recorded in a claim so an operator reading
+    /// Redis can see who is building.
+    owner: Uuid,
 }
 
 impl RedisTapeCache {
@@ -222,6 +287,7 @@ impl RedisTapeCache {
             prefix: prefix.into(),
             ttl,
             bound: bound.max(1),
+            owner: Uuid::new_v4(),
         }
     }
 
@@ -310,6 +376,54 @@ impl SharedTapeCache for RedisTapeCache {
                 simulation_id = %id,
                 "the shared tapes of a gone simulation could not be dropped; they will expire"
             ),
+        }
+    }
+
+    async fn claim_build(&self, key: &str) -> BuildClaim {
+        let key = format!("{}build:{key}", self.prefix);
+        // The instance so an operator reading Redis can see who is building,
+        // and a fresh id per attempt so one instance's expired claim cannot be
+        // released by its own next one either.
+        let token = format!("{}:{}", self.owner, Uuid::new_v4());
+
+        match self
+            .client
+            .set_nx(&key, token.clone(), Some(BUILD_CLAIM_SECS))
+            .await
+        {
+            Ok(true) => {
+                debug!(%key, "claimed the build");
+                BuildClaim::Held(token)
+            }
+            Ok(false) => BuildClaim::Taken,
+            Err(error) => {
+                // Unreachable: build. A duplicated build costs CPU; a request
+                // waiting for a claim nobody can grant costs the client.
+                warn!(%error, %key, "the build claim could not be taken; building anyway");
+                BuildClaim::Unclaimed
+            }
+        }
+    }
+
+    async fn release_build(&self, key: &str, token: &str) {
+        let key = format!("{}build:{key}", self.prefix);
+        let mut conn = self.client.connection_manager();
+        let released: Result<i64, _> = redis::Script::new(RELEASE_CLAIM_SCRIPT)
+            .key(&key)
+            .arg(token)
+            .invoke_async(&mut conn)
+            .await;
+
+        match released {
+            Ok(1) => {}
+            // The claim expired and may already be another instance's, so
+            // there was nothing here to give back.
+            Ok(_) => debug!(%key, "a build claim had already expired when it was released"),
+            Err(error) => {
+                // It expires on its own, so this delays the next builder rather
+                // than blocking it.
+                warn!(%error, %key, "a build claim could not be released; it will expire");
+            }
         }
     }
 }
@@ -516,6 +630,77 @@ mod tests {
             }
         }
         let _: Result<i64, _> = cleanup.query_async(&mut client.connection_manager()).await;
+    }
+
+    /// A claim that expired belongs to whoever took it next, not to its
+    /// original holder.
+    ///
+    /// Two caches over one Redis, which is two instances. A builder slower
+    /// than the claim's expiry must not delete the claim that replaced its
+    /// own, or a third instance walks in and the deployment builds the same
+    /// tape three times. The expiry is simulated by deleting the key, because
+    /// waiting out the production window would make this a two-minute test.
+    #[tokio::test]
+    #[ignore = "requires a live Redis matching REDIS_*; run with -- --ignored"]
+    async fn test_an_expired_claim_is_not_released_by_its_old_holder() {
+        use crate::infrastructure::RedisConfig;
+
+        let client = match RedisClient::new(RedisConfig::default()).await {
+            Ok(client) => Arc::new(client),
+            Err(error) => panic!("this test needs a live Redis: {error}"),
+        };
+        let prefix = format!("test:tape:{}:", Uuid::new_v4());
+        let first = RedisTapeCache::new(
+            Arc::clone(&client),
+            prefix.clone(),
+            Duration::from_secs(60),
+            8,
+        );
+        let second = RedisTapeCache::new(
+            Arc::clone(&client),
+            prefix.clone(),
+            Duration::from_secs(60),
+            8,
+        );
+
+        let key = "generation:fingerprint:simulation";
+        let held = match first.claim_build(key).await {
+            BuildClaim::Held(token) => token,
+            other => panic!("the first claim must be granted: {other:?}"),
+        };
+        assert!(
+            matches!(second.claim_build(key).await, BuildClaim::Taken),
+            "a claim another instance holds must not be granted twice"
+        );
+
+        // The first instance is slow and its claim expires.
+        let _: Result<i64, _> = redis::cmd("DEL")
+            .arg(format!("{prefix}build:{key}"))
+            .query_async(&mut client.connection_manager())
+            .await;
+        let taken_over = match second.claim_build(key).await {
+            BuildClaim::Held(token) => token,
+            other => panic!("an expired claim must be grantable: {other:?}"),
+        };
+
+        // The slow builder finishes and gives back what it thinks is its own.
+        first.release_build(key, &held).await;
+        assert!(
+            matches!(first.claim_build(key).await, BuildClaim::Taken),
+            "a stale release deleted the claim its successor holds"
+        );
+
+        // The successor's own release does work.
+        second.release_build(key, &taken_over).await;
+        assert!(
+            matches!(first.claim_build(key).await, BuildClaim::Held(_)),
+            "a released claim must be grantable again"
+        );
+
+        let _: Result<i64, _> = redis::cmd("DEL")
+            .arg(format!("{prefix}build:{key}"))
+            .query_async(&mut client.connection_manager())
+            .await;
     }
 
     /// Two simulations never share a key, however alike their parameters are.

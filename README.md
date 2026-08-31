@@ -310,6 +310,13 @@ The snapshot cache is still per instance (issue #136's second item), which
 is a smaller loss: rebuilding a snapshot from a cached tape is far cheaper
 than building the tape.
 
+Only ONE instance builds a given tape. A build is claimed in the same
+Redis before it starts, so the coalescing that stops N concurrent readers
+of one process starting N identical builds now spans the deployment. The
+claim expires, and a waiter that does not see the tape in time builds it
+anyway: an instance killed mid-build costs a duplicated build rather than
+a request that never answers.
+
 **Step cursor semantics (serve-then-advance):** `current_step` is the 0-based index
 of the NEXT snapshot to serve. `POST /api/v1/chain/step` serves the snapshot at the
 cursor and then advances it, so a session with `steps = N` serves EXACTLY indices
