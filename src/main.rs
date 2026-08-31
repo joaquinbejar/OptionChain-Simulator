@@ -202,8 +202,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // costs a rebuild.
     // The pricing bound becomes the DEPLOYMENT's rather than this process's,
     // so an operator asking for four jobs gets four however many replicas run
-    // (issue #135). Installed before anything can serve, and every failure of
-    // it falls back to the per-process semaphore rather than to no bound.
+    // (issue #135). Installed before anything can serve; a gate that cannot be
+    // reached falls back to the per-process semaphore rather than to no bound,
+    // while a gate that is merely full makes the caller wait.
     let pricing_gate = Arc::new(RedisPricingGate::new(
         Arc::clone(&redis_client_v2),
         DEFAULT_PRICING_GATE_KEY,

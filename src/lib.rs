@@ -249,12 +249,23 @@
 //! released around the same work, so the number is what the DEPLOYMENT runs.
 //!
 //! The lease expires on its own, which is what stops a killed instance from
-//! holding one forever, and it is set well above the length of a pricing job so
-//! a running job cannot lose its lease to the sweep. A gate that cannot be
-//! reached, or a wait that runs out, falls back to the per-process semaphore:
-//! that is the bound the service always had, and pricing unbounded would be a
-//! worse answer to a Redis outage than pricing more concurrently than
-//! configured.
+//! holding one forever, and a job still running renews it, so the sweep cannot
+//! reap the lease of work that is still burning the CPU it was leased for. The
+//! clock the expiry is measured on is the Redis server's, because the whole
+//! point is that several machines order each other's leases and their own
+//! clocks do not agree well enough for that.
+//!
+//! A gate that is up and FULL makes the caller wait, cancellably, for as long
+//! as it takes. Falling back there would bypass the deployment-wide bound
+//! exactly under the sustained load it exists for. Only a gate that cannot be
+//! REACHED falls back to the per-process semaphore: that is the bound the
+//! service always had, and pricing unbounded would be a worse answer to a
+//! Redis outage than pricing more concurrently than configured.
+//!
+//! Both permits are held by a task that outlives the request, because a
+//! blocking job keeps running when the client that asked for it goes away.
+//! Releasing them on cancellation would leave that CPU work running outside
+//! the bound it was admitted under.
 //!
 //! ### Built tapes are shared
 //!
