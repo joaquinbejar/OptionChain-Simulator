@@ -67,19 +67,27 @@ pub const DEFAULT_TAPE_KEY_PREFIX: &str = "optionchain:tape:";
 /// interleave with another instance doing the same. Without it the bound would
 /// be advisory: two instances could each see room and both insert.
 ///
-/// `KEYS[1]` the recency index, `KEYS[2]` the tape's own key. `ARGV[1]` the
-/// encoded tape, `ARGV[2]` the TTL in seconds, `ARGV[3]` now, `ARGV[4]` how
-/// many tapes the deployment may hold.
+/// Recency is a counter this script increments rather than a clock reading.
+/// Two writes land in the same millisecond routinely, and tied scores make the
+/// eviction order lexicographic by key, which drops whichever key sorts first
+/// rather than the oldest. A counter also spares the ordering the clock skew
+/// between instances.
+///
+/// `KEYS[1]` the recency index, `KEYS[2]` the tape's own key, `KEYS[3]` the
+/// sequence. `ARGV[1]` the encoded tape, `ARGV[2]` the TTL in seconds,
+/// `ARGV[3]` how many tapes the deployment may hold.
 ///
 /// Victims are deleted by the names the index holds, whose slots are not
 /// declared as keys, so this wants a single Redis rather than a cluster. Every
 /// script in this crate makes the same assumption.
 const PUT_SCRIPT: &str = r"
 local ttl = tonumber(ARGV[2])
+local score = redis.call('INCR', KEYS[3])
+redis.call('EXPIRE', KEYS[3], ttl * 2)
 redis.call('SET', KEYS[2], ARGV[1], 'EX', ttl)
-redis.call('ZADD', KEYS[1], tonumber(ARGV[3]), KEYS[2])
+redis.call('ZADD', KEYS[1], score, KEYS[2])
 
-local excess = redis.call('ZCARD', KEYS[1]) - tonumber(ARGV[4])
+local excess = redis.call('ZCARD', KEYS[1]) - tonumber(ARGV[3])
 if excess > 0 then
   local victims = redis.call('ZRANGE', KEYS[1], 0, excess - 1)
   for _, victim in ipairs(victims) do
@@ -92,6 +100,21 @@ end
 
 redis.call('EXPIRE', KEYS[1], ttl * 2)
 return 1
+";
+
+/// Records that a tape was read, so the eviction above spares it.
+///
+/// Shares the sequence with the write, because a read and a write have to be
+/// orderable against each other for "least recently used" to mean anything.
+///
+/// `KEYS[1]` the recency index, `KEYS[2]` the tape's own key, `KEYS[3]` the
+/// sequence. `ARGV[1]` the TTL in seconds.
+const TOUCH_SCRIPT: &str = r"
+local ttl = tonumber(ARGV[1])
+local score = redis.call('INCR', KEYS[3])
+redis.call('EXPIRE', KEYS[3], ttl * 2)
+redis.call('ZADD', KEYS[1], score, KEYS[2])
+return score
 ";
 
 /// Drops every tape belonging to one simulation, index entries included.
@@ -207,19 +230,9 @@ impl RedisTapeCache {
         format!("{}index", self.prefix)
     }
 
-    /// Milliseconds since the epoch, or zero if the clock will not read.
-    ///
-    /// Only used to order entries against each other, so a clock problem costs
-    /// eviction order rather than correctness. Milliseconds rather than
-    /// seconds because several tapes are written within one second routinely,
-    /// and tied scores make the eviction order lexicographic by key, which is
-    /// to say arbitrary.
-    fn now_millis() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|since| u64::try_from(since.as_millis()).ok())
-            .unwrap_or(0)
+    /// The sequence the recency scores are drawn from, one per prefix.
+    fn sequence_key(&self) -> String {
+        format!("{}sequence", self.prefix)
     }
 }
 
@@ -234,11 +247,12 @@ impl SharedTapeCache for RedisTapeCache {
                     // Recency, or the eviction below would drop exactly the
                     // tapes the deployment is using.
                     let mut conn = self.client.connection_manager();
-                    let touched: Result<i64, _> = redis::cmd("ZADD")
-                        .arg(self.index_key())
-                        .arg(Self::now_millis())
-                        .arg(&key)
-                        .query_async(&mut conn)
+                    let touched: Result<i64, _> = redis::Script::new(TOUCH_SCRIPT)
+                        .key(self.index_key())
+                        .key(&key)
+                        .key(self.sequence_key())
+                        .arg(self.ttl.as_secs().max(1).to_string())
+                        .invoke_async(&mut conn)
                         .await;
                     if let Err(error) = touched {
                         warn!(%error, %key, "a tape's recency could not be recorded");
@@ -259,15 +273,14 @@ impl SharedTapeCache for RedisTapeCache {
     async fn put(&self, key: &str, encoded: &str) {
         let key = format!("{}{key}", self.prefix);
         let seconds = self.ttl.as_secs().max(1);
-        let now = Self::now_millis();
         let mut conn = self.client.connection_manager();
 
         let written: Result<i64, _> = redis::Script::new(PUT_SCRIPT)
             .key(self.index_key())
             .key(&key)
+            .key(self.sequence_key())
             .arg(encoded)
             .arg(seconds.to_string())
-            .arg(now.to_string())
             .arg(self.bound.to_string())
             .invoke_async(&mut conn)
             .await;
@@ -433,9 +446,76 @@ mod tests {
 
         let _: Result<i64, _> = redis::cmd("DEL")
             .arg(format!("{prefix}index"))
+            .arg(format!("{prefix}sequence"))
             .arg(format!("{prefix}a:1"))
             .query_async(&mut client.connection_manager())
             .await;
+    }
+
+    /// Recency must order every pair of operations, not most of them.
+    ///
+    /// The eviction reads the lowest score, and equal scores make that read
+    /// lexicographic by key rather than oldest-first. A clock ties whenever
+    /// two operations land in the same tick, which on a fast Redis is most of
+    /// them, so this asserts what the sequence guarantees and the clock did
+    /// not: consecutive operations are strictly increasing.
+    #[tokio::test]
+    #[ignore = "requires a live Redis matching REDIS_*; run with -- --ignored"]
+    async fn test_recency_strictly_orders_operations_written_back_to_back() {
+        use crate::infrastructure::RedisConfig;
+
+        let client = match RedisClient::new(RedisConfig::default()).await {
+            Ok(client) => Arc::new(client),
+            Err(error) => panic!("this test needs a live Redis: {error}"),
+        };
+        let prefix = format!("test:tape:{}:", Uuid::new_v4());
+        let cache = RedisTapeCache::new(
+            Arc::clone(&client),
+            prefix.clone(),
+            Duration::from_secs(60),
+            64,
+        );
+
+        let mut previous = f64::MIN;
+        for step in 0..32 {
+            let key = format!("k{step}:{step}");
+            cache.put(&key, "tape").await;
+            // A read has to be orderable against a write, or a tape read on
+            // one instance is evicted by a write on another.
+            let _ = cache.get(&key).await;
+
+            let score: Result<Option<f64>, _> = redis::cmd("ZSCORE")
+                .arg(format!("{prefix}index"))
+                .arg(format!("{prefix}{key}"))
+                .query_async(&mut client.connection_manager())
+                .await;
+            match score {
+                Ok(Some(score)) => {
+                    assert!(
+                        score > previous,
+                        "operation {step} scored {score}, which does not follow {previous}"
+                    );
+                    previous = score;
+                }
+                other => panic!("the index must score every written tape: {other:?}"),
+            }
+        }
+
+        let members: Result<Vec<String>, _> = redis::cmd("ZRANGE")
+            .arg(format!("{prefix}index"))
+            .arg(0)
+            .arg(-1)
+            .query_async(&mut client.connection_manager())
+            .await;
+        let mut cleanup = redis::cmd("DEL");
+        cleanup.arg(format!("{prefix}index"));
+        cleanup.arg(format!("{prefix}sequence"));
+        if let Ok(members) = members {
+            for member in members {
+                cleanup.arg(member);
+            }
+        }
+        let _: Result<i64, _> = cleanup.query_async(&mut client.connection_manager()).await;
     }
 
     /// Two simulations never share a key, however alike their parameters are.
