@@ -203,6 +203,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&redis_client_v2),
         DEFAULT_TAPE_KEY_PREFIX,
         Duration::from_secs(v2_config.retention_secs()),
+        // The same knob that bounds this instance's own map bounds the shared
+        // cache, so the number an operator writes is how many tapes the
+        // deployment keeps rather than how many each replica keeps.
+        v2_config.max_cached_tapes,
     ));
     // Snapshot persistence is opt-in (`OCS_SNAPSHOT_PERSISTENCE_ENABLED`). When
     // it is off the manager never learns the feature exists; when it is on, the

@@ -252,11 +252,21 @@
 //! whichever instance takes the next step.
 //!
 //! The in-process cache stays in front of it: a local hit costs nothing where
-//! a shared one costs a round trip. And every failure of the shared cache is a
-//! miss, never an error, so an unreachable Redis costs a rebuild rather than a
-//! failed request. The snapshot cache is still per instance (issue #136's
-//! second item), which is a smaller loss: rebuilding a snapshot from a cached
-//! tape is far cheaper than building the tape.
+//! a shared one costs a round trip, and `OCS_MAX_CACHED_TAPES` now bounds both
+//! — the deployment's shared cache as well as each instance's own map, with
+//! the least recently used evicted first and a deleted or reaped simulation
+//! taking its tape with it.
+//!
+//! A failure of the shared cache is a miss rather than an error, so a cache
+//! command that fails costs a rebuild and not a request. That promise is about
+//! the CACHE, not about Redis: the simulation itself is read from the same
+//! Redis first, so an outage fails there, before the cache is consulted at
+//! all. What degrades is the saving, not the service's dependence on its
+//! store.
+//!
+//! The snapshot cache is still per instance (issue #136's second item), which
+//! is a smaller loss: rebuilding a snapshot from a cached tape is far cheaper
+//! than building the tape.
 //!
 //! **Step cursor semantics (serve-then-advance):** `current_step` is the 0-based index
 //! of the NEXT snapshot to serve. `POST /api/v1/chain/step` serves the snapshot at the

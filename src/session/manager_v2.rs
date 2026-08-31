@@ -431,6 +431,7 @@ impl SimulationManager {
         // Evict regardless: a delete that found nothing may still be cleaning
         // up after a simulation the store expired on its own.
         self.evict(id);
+        self.forget_shared(id).await;
         Ok(deleted)
     }
 
@@ -447,6 +448,7 @@ impl SimulationManager {
         let expired = self.store.cleanup().await?;
         for id in &expired {
             self.evict(*id);
+            self.forget_shared(*id).await;
         }
         Ok(expired)
     }
@@ -650,6 +652,14 @@ impl SimulationManager {
             return Ok(tape);
         }
 
+        // The lookup above is a round trip, and another request in THIS
+        // process can finish and cache the tape while it is in flight. Without
+        // this recheck that caller would elect itself owner and rebuild a tape
+        // that is already warm.
+        if let Some(tape) = self.cached_tape(id) {
+            return Ok(tape);
+        }
+
         // Either this call owns the build or it waits on the one already
         // running. Decided under the lock, so two callers cannot both decide
         // they are the owner.
@@ -683,16 +693,15 @@ impl SimulationManager {
 
         let result = self.build_tape(simulation).await;
 
-        // Offer it to the other instances. After the local cache, so a failure
-        // here costs nothing this process needs, and before the broadcast, so
-        // a waiter that goes on to serve is not racing the write.
-        if let Ok(tape) = &result {
-            self.share_tape(simulation, tape).await;
-        }
-
         // Publish to whoever is waiting and stop being the owner, in that
         // order: a caller that subscribes after the removal misses the
         // broadcast, retries, and finds the tape in the cache.
+        //
+        // Before the shared write, deliberately. A slow Redis would otherwise
+        // hold every local waiter behind a round trip they do not need, and a
+        // cancellation during that await would leave this owner's entry in
+        // `builds` with nobody to publish it — waiters hanging on a tape that
+        // is already warm in this process.
         let sender = {
             let mut builds = match self.builds.lock() {
                 Ok(builds) => builds,
@@ -707,6 +716,13 @@ impl SimulationManager {
             };
             // An error means nobody was waiting, which is the common case.
             let _ = sender.send(published);
+        }
+
+        // Only now offer it to the other instances: this process is already
+        // served, so a slow or failing write costs the deployment a rebuild
+        // elsewhere and costs this request nothing.
+        if let Ok(tape) = &result {
+            self.share_tape(simulation, tape).await;
         }
 
         result
@@ -850,6 +866,17 @@ impl SimulationManager {
     }
 
     /// Drops everything cached for a simulation.
+    /// Drops what this simulation left in the shared cache.
+    ///
+    /// Separate from [`SimulationManager::evict`] because it is I/O and that
+    /// is not: the local eviction must stay callable from anywhere, including
+    /// a blocking task.
+    async fn forget_shared(&self, id: Uuid) {
+        if let Some(shared) = self.shared_tapes.as_ref() {
+            shared.forget_simulation(&id.to_string()).await;
+        }
+    }
+
     fn evict(&self, id: Uuid) {
         match self.tapes.lock() {
             Ok(mut tapes) => {
@@ -996,6 +1023,16 @@ mod tests {
                     .insert(key.to_string(), encoded.to_string()),
             };
         }
+
+        async fn forget_simulation(&self, id: &str) {
+            let suffix = format!(":{id}");
+            match self.entries.lock() {
+                Ok(mut entries) => entries.retain(|key, _| !key.ends_with(&suffix)),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .retain(|key, _| !key.ends_with(&suffix)),
+            }
+        }
     }
 
     /// A shared cache that is always down, which is what an unreachable Redis
@@ -1009,6 +1046,8 @@ mod tests {
         }
 
         async fn put(&self, _key: &str, _encoded: &str) {}
+
+        async fn forget_simulation(&self, _id: &str) {}
     }
 
     /// A warehouse that records what it was asked to file, and can be told to
@@ -1870,13 +1909,80 @@ mod tests {
             "a shared hit must still populate the local cache, or every step pays the round trip"
         );
 
-        // And the answer is the same market, which is the whole point of
-        // sharing rather than rebuilding.
+        // Step zero's spot is the initial price whatever the walk did, so
+        // comparing what both instances served proves nothing about the round
+        // trip. The stored tape itself is compared instead, every row of it,
+        // against one built directly from the same parameters: that is the
+        // same-seed identical-tape contract surviving encode and decode.
+        let stored = match shared.entries.lock() {
+            Ok(entries) => entries.values().next().cloned(),
+            Err(poisoned) => poisoned.into_inner().values().next().cloned(),
+        };
+        let stored = match stored {
+            Some(stored) => stored,
+            None => panic!("the tape must be in the shared cache to be compared"),
+        };
+        let decoded: FactorTape = match serde_json::from_str(&stored) {
+            Ok(decoded) => decoded,
+            Err(error) => panic!("a shared tape must decode: {error}"),
+        };
+        let built = match FactorTape::build(&created.parameters, &created.parameters.method) {
+            Ok(built) => built,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
         assert_eq!(
-            served_first.1.spot, served_second.1.spot,
-            "the two instances must describe the same step of the same walk"
+            decoded, built,
+            "the tape that came back from the shared cache is not the tape that was built"
         );
+
+        // And it is a tape with something in it: a walk that never moved would
+        // make the comparison above vacuous.
+        assert!(decoded.len() > 1, "the tape must cover its steps");
+        assert!(
+            decoded
+                .rows()
+                .iter()
+                .any(|row| row.spot != decoded.rows()[0].spot),
+            "the walk must move, or comparing it proves nothing"
+        );
+
+        // The step both instances described is the same one, which is what a
+        // client sees.
         assert_eq!(served_first.1.step, served_second.1.step);
+        assert_eq!(served_first.1.spot, served_second.1.spot);
+    }
+
+    /// A deleted simulation takes its shared tape with it.
+    ///
+    /// Without this the cache keeps a tape nobody can use until its TTL, which
+    /// on a busy deployment is most of what it holds.
+    #[tokio::test]
+    async fn test_deleting_a_simulation_drops_its_shared_tape() {
+        let store = Arc::new(InMemorySimulationStore::new());
+        let shared = Arc::new(SharedTapes::default());
+        let manager = SimulationManager::new(
+            Arc::clone(&store) as Arc<dyn SimulationStore>,
+            SimulationV2Config::default(),
+        )
+        .with_shared_tapes(Arc::clone(&shared) as Arc<dyn SharedTapeCache>);
+
+        let created = match manager.create(parameters(3)).await {
+            Ok(created) => created,
+            Err(error) => panic!("{error}"),
+        };
+        let _ = manager.peek(created.id).await;
+        assert_eq!(shared.keys().len(), 1, "the tape must be shared first");
+
+        match manager.delete(created.id).await {
+            Ok(deleted) => assert!(deleted, "the simulation must have been there"),
+            Err(error) => panic!("{error}"),
+        }
+
+        assert!(
+            shared.keys().is_empty(),
+            "the deleted simulation left {:?} behind in the shared cache",
+            shared.keys()
+        );
     }
 
     /// A shared cache that cannot be reached costs a rebuild, not a failure.
