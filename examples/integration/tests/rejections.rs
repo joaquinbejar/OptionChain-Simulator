@@ -396,12 +396,15 @@ fn test_the_v1_rejection_contract_is_a_400_that_explains_itself() {
         return;
     };
 
-    // What a live service answers TODAY, asserted exactly, so a change in
-    // either direction is visible rather than silently tolerated: the
-    // malformed case carries no `field` key at all and renders with an
-    // `Invalid State` prefix, and the missing one carries an empty field.
-    // Both are what issue #119 decides; when it is decided these expectations
-    // change with it, deliberately.
+    // What a live service answers, asserted exactly, so a change in either
+    // direction is visible rather than silently tolerated: the malformed case
+    // carries no `field` key at all and renders with an `Invalid State`
+    // prefix, and the missing one carries an empty field.
+    //
+    // Issue #119 DECIDED this rather than left it open: v1 is frozen on
+    // rendered values, so the shapes stay and are documented in the OpenAPI
+    // document and the crate docs instead. These assertions are therefore the
+    // contract now, not a snapshot of an accident.
     for (case, path, expects_field, prefix) in [
         (
             "a malformed session id",

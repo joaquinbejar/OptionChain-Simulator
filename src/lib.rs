@@ -447,6 +447,25 @@
 //! sweep publishes `v2_simulations_expired_total`, and the caches publish
 //! `v2_tape_cache_size` and `v2_snapshot_cache_size`.
 //!
+//! ## The rejection shapes, and where v1 and v2 differ
+//!
+//! Every 400 this service answers carries `error`. Most also carry `field`,
+//! naming the request field at fault, and that pair is what a generated client
+//! should expect. Two v1 cases do not, and they are documented rather than
+//! aligned because `/api/v1/chain` is frozen on RENDERED values, so changing an
+//! error body changes what an existing client parses (issue #119):
+//!
+//! | Case | v1 answers | v2 answers |
+//! |---|---|---|
+//! | a `sessionid` / `id` that is not a UUID | `{error}`, message prefixed `Invalid State`, **no `field` key** | `{error, field}` with `field` = `id` |
+//! | the id parameter missing entirely | `{error, field}` with `field` **empty** | `{error, field}` with `field` empty |
+//! | a body or query parameter out of range | `{error, field}` naming the field | `{error, field}` naming the field |
+//! | a resource that does not exist | `{error}`, 404 | `{error}`, 404 |
+//!
+//! The v2 surface is the one to write new clients against. A v1 client that
+//! matches on the `Invalid State` prefix is relying on a rendered value, which
+//! is exactly what v1 promises not to change.
+//!
 //! ## Testing against a deployment
 //!
 //! The default suite is hermetic: `LOGLEVEL=WARN cargo test --workspace`

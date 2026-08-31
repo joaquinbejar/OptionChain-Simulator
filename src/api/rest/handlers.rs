@@ -289,7 +289,7 @@ fn json_body(bytes: Vec<u8>) -> HttpResponse {
     ),
     responses(
         (status = 201, description = "Session created successfully", body = SessionResponse),
-        (status = 400, description = "Validation failed: a parameter was non-finite, out of range (e.g. negative price/volatility), or steps/chain_size exceeded the configured limits.", body = ValidationErrorResponse),
+        (status = 400, description = "Validation failed: a parameter was non-finite, out of range (e.g. negative price/volatility), or steps/chain_size exceeded the configured limits. The body is the typed `{error, field}` naming the offending field.", body = ValidationErrorResponse),
         (status = 409, description = "Session id already exists", body = ErrorResponse),
         (status = 500, description = "Internal server error")
     )
@@ -420,7 +420,7 @@ pub(crate) struct ChainQuery {
     ),
     responses(
         (status = 200, description = "Advanced one step; served snapshot returned", body = ChainResponse),
-        (status = 400, description = "Malformed session id, or an unknown `greeks` level. The unknown-level body is the typed `{error, field}` of ValidationErrorResponse with `field` = `greeks`; a malformed id carries `error` alone."),
+        (status = 400, description = "Malformed or missing `sessionid`, or an unknown `greeks` level. The unknown-level body is the typed `{error, field}` with `field` = `greeks`. A malformed `sessionid` carries `error` ALONE, with no `field` key, and its message is prefixed `Invalid State`; a missing `sessionid` carries `{error, field}` with `field` empty. Neither is a ValidationErrorResponse: v1 is frozen on rendered values, so these shapes differ from v2, which names `id`. See issue #119."),
         (status = 404, description = "Session not found"),
         (status = 409, description = "Concurrent modification: another request advanced or modified the session; retry"),
         (status = 410, description = "Simulation completed. No more steps available"),
@@ -543,7 +543,7 @@ pub(crate) async fn advance_step(
     ),
     responses(
         (status = 200, description = "Current snapshot returned (read-only; repeatable)", body = ChainResponse),
-        (status = 400, description = "Malformed session id, or an unknown `greeks` level. The unknown-level body is the typed `{error, field}` of ValidationErrorResponse with `field` = `greeks`; a malformed id carries `error` alone."),
+        (status = 400, description = "Malformed or missing `sessionid`, or an unknown `greeks` level. The unknown-level body is the typed `{error, field}` with `field` = `greeks`. A malformed `sessionid` carries `error` ALONE, with no `field` key, and its message is prefixed `Invalid State`; a missing `sessionid` carries `{error, field}` with `field` empty. Neither is a ValidationErrorResponse: v1 is frozen on rendered values, so these shapes differ from v2, which names `id`. See issue #119."),
         (status = 404, description = "Session not found"),
         (status = 410, description = "Session completed; no current step available"),
         (status = 500, description = "Internal server error")
@@ -612,7 +612,7 @@ pub(crate) async fn get_current_step(
     ),
     responses(
         (status = 200, description = "Session replaced", body = SessionResponse),
-        (status = 400, description = "Validation failed: a parameter was non-finite, out of range, or exceeded the configured limits.", body = ValidationErrorResponse),
+        (status = 400, description = "Validation failed: a parameter was non-finite, out of range, or exceeded the configured limits, OR the `sessionid` could not be read. A parameter failure carries the typed `{error, field}`. A malformed `sessionid` carries `error` ALONE, with no `field` key, and its message is prefixed `Invalid State`; a missing `sessionid` carries `{error, field}` with `field` empty. Neither is a ValidationErrorResponse: v1 is frozen on rendered values, so these shapes differ from v2, which names `id`. See issue #119.", body = ValidationErrorResponse),
         (status = 404, description = "Session not found"),
         (status = 409, description = "Concurrent modification: another request advanced or modified the session; retry"),
         (status = 500, description = "Internal server error")
@@ -726,7 +726,7 @@ pub(crate) async fn replace_session(
     responses(
         (status = 200, description = "Session updated", body = SessionResponse),
         (status = 404, description = "Session not found"),
-        (status = 400, description = "Validation failed: a supplied parameter was non-finite, out of range, or exceeded the configured limits.", body = ValidationErrorResponse),
+        (status = 400, description = "Validation failed: a supplied parameter was non-finite, out of range, or exceeded the configured limits, OR the `sessionid` could not be read. A parameter failure carries the typed `{error, field}`. A malformed `sessionid` carries `error` ALONE, with no `field` key, and its message is prefixed `Invalid State`; a missing `sessionid` carries `{error, field}` with `field` empty. Neither is a ValidationErrorResponse: v1 is frozen on rendered values, so these shapes differ from v2, which names `id`. See issue #119.", body = ValidationErrorResponse),
         (status = 409, description = "Concurrent modification: another request advanced or modified the session; retry"),
         (status = 500, description = "Internal server error")
     )
@@ -838,6 +838,7 @@ pub(crate) async fn update_session(
     ),
     responses(
         (status = 200, description = "Session deleted", body = String),
+        (status = 400, description = "The `sessionid` could not be read. A malformed `sessionid` carries `error` ALONE, with no `field` key, and its message is prefixed `Invalid State`; a missing `sessionid` carries `{error, field}` with `field` empty. Neither is a ValidationErrorResponse: v1 is frozen on rendered values, so these shapes differ from v2, which names `id`. See issue #119.", body = ErrorResponse),
         (status = 404, description = "Session not found"),
         (status = 500, description = "Internal server error")
     )
