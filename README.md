@@ -253,11 +253,36 @@ through one replica and deleted through another leaves the first replica's
 gauge untouched, as do reaps and restarts. The live-session total is a
 question for the store, not for a gauge.
 
-The same is true of anything else the process holds: the pricing admission
-semaphore bounds one instance (issue #135). None of that affects what a
-client is SERVED — the stores are shared and every write goes through an
-atomic Redis script — only how much work the deployment repeats and how its
-numbers must be read.
+What a client is SERVED never depends on which instance answers: the stores
+are shared and every write goes through an atomic Redis script. What is per
+process is how much work the deployment repeats and how its numbers must be
+read.
+
+#### The pricing bound is the deployment's
+
+`OCS_MAX_CONCURRENT_PRICING_JOBS` used to bound one process, so two replicas
+ran twice the configured jobs and an operator learned it when the host
+saturated. The instances now hold leases in a shared Redis set, taken and
+released around the same work, so the number is what the DEPLOYMENT runs.
+
+The lease expires on its own, which is what stops a killed instance from
+holding one forever, and a job still running renews it, so the sweep cannot
+reap the lease of work that is still burning the CPU it was leased for. The
+clock the expiry is measured on is the Redis server's, because the whole
+point is that several machines order each other's leases and their own
+clocks do not agree well enough for that.
+
+A gate that is up and FULL makes the caller wait, cancellably, for as long
+as it takes. Falling back there would bypass the deployment-wide bound
+exactly under the sustained load it exists for. Only a gate that cannot be
+REACHED falls back to the per-process semaphore: that is the bound the
+service always had, and pricing unbounded would be a worse answer to a
+Redis outage than pricing more concurrently than configured.
+
+Both permits are held by a task that outlives the request, because a
+blocking job keeps running when the client that asked for it goes away.
+Releasing them on cancellation would leave that CPU work running outside
+the bound it was admitted under.
 
 #### Built tapes are shared
 
