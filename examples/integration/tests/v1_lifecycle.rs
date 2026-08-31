@@ -37,12 +37,24 @@ struct Snapshot {
     underlying: String,
     price: f64,
     contracts: Vec<Contract>,
+    /// The cursor the snapshot itself reports, which is the public contract a
+    /// client reads to know where the walk is; comparing prices proves nothing
+    /// about it.
+    session_info: SessionInfo,
+}
+
+/// The cursor a snapshot carries.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct SessionInfo {
+    current_step: usize,
+    total_steps: usize,
 }
 
 /// One contract in a snapshot.
 #[derive(Debug, Deserialize)]
 struct Contract {
     strike: f64,
+    implied_volatility: Option<f64>,
 }
 
 /// A v1 session that deletes itself, so a failing test leaves nothing behind.
@@ -54,11 +66,7 @@ struct Session {
 impl Session {
     /// Creates a session with `steps` steps and a deliberately narrow chain,
     /// since these run against a shared deployment.
-    fn create(
-        client: &ServiceClient,
-        steps: usize,
-        seed: Option<u64>,
-    ) -> Option<(Self, SessionEnvelope)> {
+    fn create(client: &ServiceClient, steps: usize, seed: Option<u64>) -> (Self, SessionEnvelope) {
         let mut request = serde_json::json!({
             "symbol": "AAPL",
             "steps": steps,
@@ -80,10 +88,11 @@ impl Session {
             Ok(response) => response,
             Err(error) => panic!("creating a v1 session: {error}"),
         };
-        if response.status == 404 {
-            println!("SKIP: this deployment does not serve /api/v1/chain");
-            return None;
-        }
+        // No skip here on purpose. With the variable configured, a 404 on
+        // /api/v1/chain is precisely the route regression this suite exists to
+        // catch, and skipping on it would make every test in this file green
+        // the day the route stopped being mounted. The deployment's identity
+        // is established in deployment.rs before any of this runs.
         assert_eq!(
             response.status,
             201,
@@ -100,7 +109,7 @@ impl Session {
             client: client.clone(),
             id: envelope.id.clone(),
         };
-        Some((session, envelope))
+        (session, envelope)
     }
 
     /// The query every v1 verb takes.
@@ -128,9 +137,11 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Err(error) = self.client.delete(&self.query()) {
-            println!("WARNING: could not delete session {}: {error}", self.id);
-        }
+        // `delete` answers Ok for a 401, a 405 or a 500 too, and treating
+        // those as cleanup is how a shared deployment fills up. `report_cleanup`
+        // accepts only the documented successes and 404, and never panics,
+        // since this runs during unwinding.
+        examples_integration::report_cleanup(&self.client, &self.query(), &self.id);
     }
 }
 
@@ -142,9 +153,7 @@ fn test_creating_a_session_echoes_an_effective_seed() {
     let Some(client) = service() else {
         return;
     };
-    let Some((session, envelope)) = Session::create(&client, 3, None) else {
-        return;
-    };
+    let (session, envelope) = Session::create(&client, 3, None);
 
     assert_eq!(envelope.parameters.symbol, "AAPL");
     assert_eq!(envelope.total_steps, 3);
@@ -179,9 +188,7 @@ fn test_a_peek_is_repeatable_and_does_not_advance() {
     let Some(client) = service() else {
         return;
     };
-    let Some((session, _)) = Session::create(&client, 3, Some(42)) else {
-        return;
-    };
+    let (session, _) = Session::create(&client, 3, Some(42));
 
     let first = session.peek();
     let second = session.peek();
@@ -230,11 +237,21 @@ fn test_the_walk_serves_every_step_and_then_is_gone() {
         return;
     };
     let steps = 3;
-    let Some((session, _)) = Session::create(&client, steps, Some(7)) else {
-        return;
-    };
+    let (session, _) = Session::create(&client, steps, Some(7));
 
     for index in 0..steps {
+        // What the peek shows now is what the advance must serve: the cursor
+        // is at `index`, and the advance both serves that snapshot and moves
+        // the cursor past it.
+        let peeked: Snapshot = match session.peek().json("/api/v1/chain") {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(
+            peeked.session_info.current_step, index,
+            "before advance {index} the cursor must be at {index}"
+        );
+
         let response = session.step();
         assert_eq!(
             response.status,
@@ -251,6 +268,18 @@ fn test_the_walk_serves_every_step_and_then_is_gone() {
             !snapshot.contracts.is_empty(),
             "every served snapshot must quote contracts"
         );
+        assert_eq!(
+            snapshot.price, peeked.price,
+            "advance {index} must serve the market the peek showed"
+        );
+        assert_eq!(
+            snapshot.session_info.current_step,
+            index + 1,
+            "advance {index} must report the cursor AFTER serving, so {} rather than {}",
+            index + 1,
+            snapshot.session_info.current_step
+        );
+        assert_eq!(snapshot.session_info.total_steps, steps);
     }
 
     let past_the_end = session.step();
@@ -269,16 +298,29 @@ fn test_the_walk_serves_every_step_and_then_is_gone() {
     );
 }
 
-/// `PATCH` updates parameters and the change is visible in what the session
-/// reports; `PUT` replaces them wholesale.
+/// `PATCH` updates parameters and `PUT` replaces them, and both are visible in
+/// the NEXT snapshot rather than only in the envelope they answered with.
+///
+/// Both mutations happen after the walk has moved, because a mutation applied
+/// at step zero proves nothing about the reset, and asserting only the
+/// envelope would let a stale cached walk pass.
 #[test]
 fn test_updating_and_replacing_a_session_take_effect() {
     let Some(client) = service() else {
         return;
     };
-    let Some((session, created)) = Session::create(&client, 4, Some(11)) else {
-        return;
+    let (session, created) = Session::create(&client, 4, Some(11));
+
+    // Move first, so the reset the mutation performs is observable.
+    assert_eq!(session.step().status, 200);
+    let advanced: Snapshot = match session.peek().json("/api/v1/chain") {
+        Ok(snapshot) => snapshot,
+        Err(error) => panic!("{error}"),
     };
+    assert_eq!(
+        advanced.session_info.current_step, 1,
+        "the session must have advanced before the mutation"
+    );
 
     let patched: SessionEnvelope =
         match client.request("PATCH", &session.query(), Some(r#"{"volatility":0.35}"#)) {
@@ -298,9 +340,9 @@ fn test_updating_and_replacing_a_session_take_effect() {
             Err(error) => panic!("{error}"),
         };
 
-    assert_ne!(
-        patched.parameters.volatility, created.parameters.volatility,
-        "a patched parameter must actually change"
+    assert_eq!(
+        patched.id, created.id,
+        "PATCH must not create a new session"
     );
     assert!(
         (patched.parameters.volatility - 0.35).abs() < 1e-9,
@@ -308,9 +350,35 @@ fn test_updating_and_replacing_a_session_take_effect() {
         patched.parameters.volatility
     );
     assert_eq!(
-        patched.id, created.id,
-        "PATCH must not create a new session"
+        patched.current_step, 0,
+        "a patched session restarts its walk, so the cursor resets"
     );
+
+    // And the change reaches the market, not just the envelope. A stale cached
+    // walk would keep quoting the old volatility here.
+    let after_patch: Snapshot = match session.peek().json("/api/v1/chain") {
+        Ok(snapshot) => snapshot,
+        Err(error) => panic!("{error}"),
+    };
+    assert_eq!(
+        after_patch.session_info.current_step, 0,
+        "the snapshot must agree with the envelope about the reset"
+    );
+    let patched_volatility = after_patch
+        .contracts
+        .iter()
+        .find_map(|contract| contract.implied_volatility);
+    match patched_volatility {
+        Some(volatility) => assert!(
+            volatility > 0.3,
+            "the next snapshot must price on the patched volatility of 0.35, its implied \
+             volatility was {volatility}"
+        ),
+        None => panic!("a snapshot must carry an implied volatility to compare"),
+    }
+
+    // Advance again, so the replacement is also applied to a moved session.
+    assert_eq!(session.step().status, 200);
 
     let replacement = serde_json::json!({
         "symbol": "AAPL",
@@ -325,27 +393,41 @@ fn test_updating_and_replacing_a_session_take_effect() {
         "chain_size": 2,
         "strike_interval": 5.0
     });
-    match client.request("PUT", &session.query(), Some(&replacement.to_string())) {
-        Ok(response) => {
-            assert_eq!(
-                response.status,
-                200,
-                "PUT must answer 200, got {} with {}",
-                response.status,
-                response.text()
-            );
-            let replaced: SessionEnvelope = match response.json(&session.query()) {
-                Ok(envelope) => envelope,
-                Err(error) => panic!("{error}"),
-            };
-            assert_eq!(replaced.id, created.id, "PUT must not create a new session");
-            assert_eq!(
-                replaced.current_step, 0,
-                "a replaced session restarts its walk"
-            );
-        }
+    let replaced: SessionEnvelope =
+        match client.request("PUT", &session.query(), Some(&replacement.to_string())) {
+            Ok(response) => {
+                assert_eq!(
+                    response.status,
+                    200,
+                    "PUT must answer 200, got {} with {}",
+                    response.status,
+                    response.text()
+                );
+                match response.json(&session.query()) {
+                    Ok(envelope) => envelope,
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            Err(error) => panic!("{error}"),
+        };
+
+    assert_eq!(replaced.id, created.id, "PUT must not create a new session");
+    assert_eq!(
+        replaced.current_step, 0,
+        "a replaced session restarts its walk"
+    );
+
+    // The replacement values are what the next snapshot is built from.
+    let after_put: Snapshot = match session.peek().json("/api/v1/chain") {
+        Ok(snapshot) => snapshot,
         Err(error) => panic!("{error}"),
-    }
+    };
+    assert_eq!(after_put.session_info.current_step, 0);
+    assert!(
+        (after_put.price - 120.0).abs() < 1e-9,
+        "the next snapshot must start from the replacement's initial_price of 120, it was {}",
+        after_put.price
+    );
 }
 
 /// `DELETE` removes the session, and every verb answers 404 afterwards.
@@ -354,9 +436,7 @@ fn test_a_deleted_session_is_gone_for_every_verb() {
     let Some(client) = service() else {
         return;
     };
-    let Some((session, _)) = Session::create(&client, 2, Some(3)) else {
-        return;
-    };
+    let (session, _) = Session::create(&client, 2, Some(3));
 
     let query = session.query();
     let step = format!("/api/v1/chain/step?sessionid={}", session.id);
@@ -371,12 +451,31 @@ fn test_a_deleted_session_is_gone_for_every_verb() {
         Err(error) => panic!("{error}"),
     }
 
-    for (method, path) in [
-        ("GET", query.as_str()),
-        ("POST", step.as_str()),
-        ("DELETE", query.as_str()),
+    let replacement = serde_json::json!({
+        "symbol": "AAPL",
+        "steps": 2,
+        "initial_price": 100.0,
+        "days_to_expiration": 30.0,
+        "volatility": 0.2,
+        "risk_free_rate": 0.05,
+        "dividend_yield": 0.01,
+        "method": {"GeometricBrownian": {"dt": 0.004, "drift": 0.05, "volatility": 0.2}},
+        "time_frame": "Day",
+        "chain_size": 2,
+        "strike_interval": 5.0
+    })
+    .to_string();
+
+    // Every verb means every verb: a mutation route regressing to 200 or 500
+    // on a session that no longer exists is exactly as bad as a read doing it.
+    for (method, path, body) in [
+        ("GET", query.as_str(), None),
+        ("POST", step.as_str(), None),
+        ("PATCH", query.as_str(), Some(r#"{"volatility":0.3}"#)),
+        ("PUT", query.as_str(), Some(replacement.as_str())),
+        ("DELETE", query.as_str(), None),
     ] {
-        let response = match client.request(method, path, None) {
+        let response = match client.request(method, path, body) {
             Ok(response) => response,
             Err(error) => panic!("{method} {path}: {error}"),
         };
