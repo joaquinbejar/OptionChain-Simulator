@@ -129,8 +129,18 @@ services:
     # Published by .github/workflows/docker-publish.yml on every Cargo.toml
     # version bump, or by `make docker-push` from a workstation. Bump the
     # default tag in the same PR that bumps the crate version.
-    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.18}
+    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.19}
     deploy:
+      # More than one instance is the intended shape: session and simulation
+      # state lives in Redis and every write there is an atomic Lua script, so
+      # two instances cannot both commit the same step.
+      #
+      # What does NOT aggregate is what each process holds. `/metrics` serves
+      # the metrics of whichever replica answers, so scraping this published
+      # port gives one instance at a time and a counter that appears to reset;
+      # scrape each replica as its own target and sum across the instance
+      # label. The pricing admission cap (#135) and the tape and snapshot
+      # caches (#136) are per instance for the same reason.
       replicas: 2
       restart_policy:
         condition: any
