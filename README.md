@@ -228,6 +228,16 @@ itself ready again: an unchanged id is a process that was never restarted.
 CI runs it on a change to the probes, to what they probe, or to how the
 service is packaged.
 
+An exported value renders by NUMBER, not by how it was stored. A decimal is
+a mantissa and a scale, so one value has several forms, and the warehouse
+round trip changes the form: a value is scaled out to the column's
+twenty-eight decimals going in and comes back with its trailing zeros
+stripped. Converting either form straight to the wire's `f64` reads the
+mantissa and can land on adjacent floats, which made an export of a tape
+whose rows had been filed differ in a digit from the same tape replayed, and
+broke byte-identical repeats on a deployment with persistence on (issue
+##152). Every conversion in the export normalises first, so the two agree.
+
 Whether a deployment persists its snapshots is visible in the readiness
 body: the warehouse probe exists only when the manager has a warehouse, so
 a `clickhouse` dependency there is persistence being on. The integration
@@ -636,16 +646,9 @@ streams a simulation's tape, which is what turns a
 walked-one-request-at-a-time simulation into something a backtester loads in
 one go. With persistence on it reads the steps the warehouse already holds,
 in windows, and replays the rest; with it off, or for a simulation nobody
-has walked, every step is replayed. Either source renders the same VALUES,
-row for row and column for column.
-
-It does not yet render the same BYTES. A value crosses the storage column's
-own scale on the way in and back, and the shortest rendering of the float
-that comes out can differ in the last digit from the one the replay
-produces, so an export taken after a tape's rows were filed can differ from
-the same export taken before (issue #152). Byte-identical repeats hold on a
-deployment with persistence off, which is the default; where it is on, treat
-the values as the contract until that issue lands.
+has walked, every step is replayed. Either source renders the same bytes,
+row for row and column for column, whether or not the tape's rows had been
+filed when the export was asked for.
 
 | Parameter | Values |
 |-----------|--------|

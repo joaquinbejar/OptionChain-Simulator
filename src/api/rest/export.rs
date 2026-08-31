@@ -37,17 +37,16 @@
 //! logs at `DEBUG`.
 //!
 //! Both sources go through one adapter ([`StepChains`]) that yields the same
-//! per-quote view, so a row carries the same values whichever side produced it,
-//! and the same bytes once issue #152 lands. The
+//! per-quote view, so a row is byte-identical whichever side produced it — the
+//! conversion there renders a value by its number rather than by the form it
+//! was stored in, which is what makes that true (issue #152). The
 //! factor row still comes from the tape either way: the underlying and
 //! volatility datasets are built from it, and it is cheap next to a chain.
 //!
 //! # Determinism
 //!
-//! Two exports of the same simulation are byte-identical where the steps come
-//! from the same source. With persistence on, one taken after the rows were
-//! filed can differ in the last digit of a rendered number from one taken
-//! before (issue #152); the values agree either way. Every value is a
+//! Two exports of the same simulation are byte-identical, including one taken
+//! before a tape's rows were filed and one taken after. Every value is a
 //! function of the effective parameters and the cursor, timestamps render as
 //! whole-second RFC 3339, and numbers use Rust's shortest round-trip
 //! formatting — no locale, no thousands separators. That is what lets a
@@ -505,15 +504,15 @@ impl QuoteView {
     #[must_use]
     fn replayed(data: &OptionData) -> Self {
         Self {
-            strike: data.strike_price.to_f64(),
-            implied_volatility: data.implied_volatility.to_f64(),
-            call_bid: data.call_bid.map(|value| value.to_f64()),
-            call_ask: data.call_ask.map(|value| value.to_f64()),
-            call_mid: data.call_middle.map(|value| value.to_f64()),
+            strike: positive_to_f64(data.strike_price),
+            implied_volatility: positive_to_f64(data.implied_volatility),
+            call_bid: data.call_bid.map(positive_to_f64),
+            call_ask: data.call_ask.map(positive_to_f64),
+            call_mid: data.call_middle.map(positive_to_f64),
             call_delta: data.delta_call.and_then(decimal_to_f64),
-            put_bid: data.put_bid.map(|value| value.to_f64()),
-            put_ask: data.put_ask.map(|value| value.to_f64()),
-            put_mid: data.put_middle.map(|value| value.to_f64()),
+            put_bid: data.put_bid.map(positive_to_f64),
+            put_ask: data.put_ask.map(positive_to_f64),
+            put_mid: data.put_middle.map(positive_to_f64),
             put_delta: data.delta_put.and_then(decimal_to_f64),
             gamma: data.gamma.and_then(decimal_to_f64),
             call_greeks: GreeksView::of(data.greeks_call.as_ref()),
@@ -525,15 +524,15 @@ impl QuoteView {
     #[must_use]
     fn stored(row: &QuoteRow) -> Self {
         Self {
-            strike: row.strike.to_f64(),
-            implied_volatility: row.implied_volatility.to_f64(),
-            call_bid: row.call_bid.map(|value| value.to_f64()),
-            call_ask: row.call_ask.map(|value| value.to_f64()),
-            call_mid: row.call_mid.map(|value| value.to_f64()),
+            strike: positive_to_f64(row.strike),
+            implied_volatility: positive_to_f64(row.implied_volatility),
+            call_bid: row.call_bid.map(positive_to_f64),
+            call_ask: row.call_ask.map(positive_to_f64),
+            call_mid: row.call_mid.map(positive_to_f64),
             call_delta: row.delta_call.and_then(decimal_to_f64),
-            put_bid: row.put_bid.map(|value| value.to_f64()),
-            put_ask: row.put_ask.map(|value| value.to_f64()),
-            put_mid: row.put_mid.map(|value| value.to_f64()),
+            put_bid: row.put_bid.map(positive_to_f64),
+            put_ask: row.put_ask.map(positive_to_f64),
+            put_mid: row.put_mid.map(positive_to_f64),
             put_delta: row.delta_put.and_then(decimal_to_f64),
             gamma: row.gamma.and_then(decimal_to_f64),
             call_greeks: GreeksView::of(row.greeks_call.as_ref()),
@@ -615,7 +614,7 @@ impl<'a> StepChains<'a> {
             .flatten()
             .map(|chain| ExpirationView {
                 expires_at: chain.expires_at,
-                days_to_expiration: chain.days_to_expiration.to_f64(),
+                days_to_expiration: positive_to_f64(chain.days_to_expiration),
                 labels: &chain.labels,
                 quotes: QuoteSource::Replayed(&chain.chain),
             })
@@ -625,7 +624,7 @@ impl<'a> StepChains<'a> {
                     .flatten()
                     .map(|expiration| ExpirationView {
                         expires_at: expiration.expires_at,
-                        days_to_expiration: expiration.days_to_expiration.to_f64(),
+                        days_to_expiration: positive_to_f64(expiration.days_to_expiration),
                         labels: &expiration.labels,
                         quotes: QuoteSource::Stored(&expiration.quotes),
                     }),
@@ -1420,13 +1419,13 @@ fn json_rows(
             "step": step,
             "simulated_at": simulated_at,
             "symbol": symbol,
-            "price": row.spot.to_f64(),
+            "price": positive_to_f64(row.spot),
         })],
         Dataset::Volatility => vec![serde_json::json!({
             "step": step,
             "simulated_at": simulated_at,
             "symbol": symbol,
-            "base_volatility": row.base_volatility.to_f64(),
+            "base_volatility": positive_to_f64(row.base_volatility),
         })],
         Dataset::OptionChains => {
             let Some(chains) = chains else {
@@ -1554,13 +1553,13 @@ fn csv_rows(
             step.to_string(),
             simulated_at.to_string(),
             symbol.to_string(),
-            row.spot.to_f64().to_string(),
+            positive_to_f64(row.spot).to_string(),
         ]],
         Dataset::Volatility => vec![vec![
             step.to_string(),
             simulated_at.to_string(),
             symbol.to_string(),
-            row.base_volatility.to_f64().to_string(),
+            positive_to_f64(row.base_volatility).to_string(),
         ]],
         Dataset::OptionChains => {
             let Some(chains) = chains else {
@@ -1629,12 +1628,38 @@ fn csv_rows(
     }
 }
 
-/// Converts a decimal to the wire's `f64`.
+/// Converts a decimal to the wire's `f64`, by VALUE and not by representation.
+///
+/// The normalisation is the whole point. A `Decimal` is a mantissa and a scale,
+/// so one value has many forms — `0.5415620196854147` and the same number
+/// padded to twenty-eight decimals are equal and hold different mantissas — and
+/// `to_f64` reads the mantissa, so the two can land on adjacent floats. The
+/// warehouse round trip changes exactly that: a value is scaled out to the
+/// column's twenty-eight decimals on the way in and has its trailing zeros
+/// stripped on the way back.
+///
+/// Without this, the same tape exported after its rows were filed rendered a
+/// digit differently from the same tape replayed, and two exports of one
+/// simulation stopped being byte-identical (issue #152). Normalising first
+/// makes the rendering depend on the number, which is what a client compares.
 #[must_use]
 #[inline]
-fn decimal_to_f64(value: rust_decimal::Decimal) -> Option<f64> {
+pub(super) fn decimal_to_f64(value: rust_decimal::Decimal) -> Option<f64> {
     use rust_decimal::prelude::ToPrimitive;
-    value.to_f64()
+    value.normalize().to_f64()
+}
+
+/// Converts a positive value to the wire's `f64`, through [`decimal_to_f64`].
+///
+/// `Positive::to_f64` goes straight to the float and carries the scale
+/// sensitivity with it, so every conversion in this module goes through here
+/// instead.
+#[must_use]
+#[inline]
+pub(super) fn positive_to_f64(value: positive::Positive) -> f64 {
+    // A `Positive` is finite and in range by construction, so the fallback is
+    // unreachable; it is the value `to_f64` itself would have produced.
+    decimal_to_f64(value.to_dec()).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1647,6 +1672,161 @@ mod tests {
     use actix_web::http::StatusCode;
     use actix_web::test as actix_test;
     use serde_json::{Value, json};
+
+    /// A value renders the same however it was written down.
+    ///
+    /// The warehouse round trip preserves the number and not its form: a value
+    /// is scaled out to the column's twenty-eight decimals on the way in and
+    /// has its trailing zeros stripped on the way back, so the same quote
+    /// arrives with a different mantissa than the one that was priced.
+    /// `Decimal::to_f64` reads the mantissa, so without normalising, the two
+    /// land on adjacent floats and the export of a stored tape differs from
+    /// the export of a replayed one (issue #152).
+    #[test]
+    fn test_a_value_renders_the_same_whatever_scale_it_carries() {
+        use rust_decimal::Decimal;
+
+        let mut checked = 0_usize;
+        for numerator in 1..2_000_i128 {
+            // A long expansion, which is what a mid price computed from a
+            // quote actually looks like.
+            let priced = (Decimal::from(numerator) / Decimal::from(7_919)).normalize();
+            let shift = match 28_u32.checked_sub(priced.scale()) {
+                Some(shift) => shift,
+                None => continue,
+            };
+            let factor = match 10_i128.checked_pow(shift) {
+                Some(factor) => factor,
+                None => continue,
+            };
+            let mantissa = match priced.mantissa().checked_mul(factor) {
+                Some(mantissa) => mantissa,
+                None => continue,
+            };
+            // The same number as the storage column holds it.
+            let Ok(padded) = Decimal::try_from_i128_with_scale(mantissa, 28) else {
+                continue;
+            };
+            assert_eq!(priced, padded, "the two forms must be the same number");
+
+            let priced_rendered = decimal_to_f64(priced);
+            let padded_rendered = decimal_to_f64(padded);
+            assert_eq!(
+                priced_rendered.map(f64::to_bits),
+                padded_rendered.map(f64::to_bits),
+                "{priced} renders as {priced_rendered:?} priced and {padded_rendered:?} stored, \
+                 so an export of a filed tape would differ from the same tape replayed"
+            );
+            checked += 1;
+        }
+
+        assert!(
+            checked > 1_000,
+            "the case is only covered if the values actually exercised it, {checked} did"
+        );
+    }
+
+    /// A quote read back from the warehouse views exactly as the priced one.
+    ///
+    /// The end of the same defect, at the layer that matters: the priced side
+    /// goes through the REPLAYED adapter and the stored side through the
+    /// stored one, so a conversion that bypassed the canonical helper on
+    /// either would show here.
+    ///
+    /// The round trip is reproduced rather than called into — what the column
+    /// does to a value is scale it out and strip the zeros back off — and the
+    /// test first asserts that the two forms DO render differently through the
+    /// raw conversion, so it cannot pass by comparing a value that never
+    /// carried the problem.
+    #[test]
+    fn test_a_stored_quote_views_as_the_priced_one_does() {
+        use crate::infrastructure::QuoteRow;
+        use optionstratlib::chains::OptionData;
+        use positive::Positive;
+        use rust_decimal::Decimal;
+        use rust_decimal::prelude::ToPrimitive;
+
+        /// A `Positive` that keeps the decimal's own form, which is the point.
+        fn exactly(value: Decimal) -> Positive {
+            match Positive::new_decimal(value) {
+                Ok(value) => value,
+                Err(error) => panic!("the reference value must be positive: {error}"),
+            }
+        }
+
+        /// The form the pricing arithmetic hands over: the value carrying
+        /// trailing zeros, which is what a division or an average produces and
+        /// what the column then holds at its own scale.
+        fn as_priced(value: Decimal) -> Option<Decimal> {
+            let shift = 28_u32.checked_sub(value.scale())?;
+            let factor = 10_i128.checked_pow(shift)?;
+            let mantissa = value.mantissa().checked_mul(factor)?;
+            Decimal::try_from_i128_with_scale(mantissa, 28).ok()
+        }
+
+        // A value whose two forms render differently WITHOUT the canonical
+        // conversion. Searched rather than assumed, so this test keeps its
+        // teeth if the arithmetic below ever changes.
+        let mut reference = None;
+        for numerator in 1..4_000_i64 {
+            let Some(candidate) = Decimal::from(numerator).checked_div(Decimal::from(7_919_i64))
+            else {
+                continue;
+            };
+            // Stored: what the read gives back, with the trailing zeros gone.
+            let stored = candidate.normalize();
+            // Priced: the same number carrying them, which is the form the
+            // arithmetic produced before anything was written down.
+            let Some(priced) = as_priced(stored) else {
+                continue;
+            };
+            if priced.to_f64().map(f64::to_bits) != stored.to_f64().map(f64::to_bits) {
+                reference = Some((priced, stored));
+                break;
+            }
+        }
+        let Some((priced_mid, stored_mid)) = reference else {
+            panic!("no value renders differently by scale, so this test would prove nothing");
+        };
+        assert_eq!(
+            priced_mid, stored_mid,
+            "the round trip must preserve the value, or this test is about something else"
+        );
+
+        let strike = exactly(Decimal::from(5_000_i64));
+
+        // The priced side, through the adapter a replayed step uses.
+        let priced = OptionData {
+            strike_price: strike,
+            implied_volatility: exactly(priced_mid),
+            call_middle: Some(exactly(priced_mid)),
+            ..Default::default()
+        };
+        let replayed_view = QuoteView::replayed(&priced);
+
+        // The stored side, through the adapter a filed step uses.
+        let stored_view = QuoteView::stored(&QuoteRow::new(strike, exactly(stored_mid)).with_call(
+            None,
+            None,
+            Some(exactly(stored_mid)),
+            None,
+        ));
+
+        assert_eq!(
+            replayed_view.call_mid.map(f64::to_bits),
+            stored_view.call_mid.map(f64::to_bits),
+            "a mid that went through storage views as {:?} against {:?} replayed",
+            stored_view.call_mid,
+            replayed_view.call_mid
+        );
+        assert_eq!(
+            replayed_view.implied_volatility.to_bits(),
+            stored_view.implied_volatility.to_bits(),
+            "an implied volatility that went through storage views as {} against {} replayed",
+            stored_view.implied_volatility,
+            replayed_view.implied_volatility
+        );
+    }
 
     /// The reference configuration of ADR 0001 §14, trimmed to a few steps and
     /// a narrow ladder so a full option-chains export stays quick.

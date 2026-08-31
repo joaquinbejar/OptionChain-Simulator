@@ -77,7 +77,7 @@
 //! Validity bitmaps use Arrow's convention — LSB-first, `1` = valid — so the
 //! two decoders agree and a reader ports between them.
 
-use crate::api::rest::export::Dataset;
+use crate::api::rest::export::{Dataset, positive_to_f64};
 use crate::api::rest::greeks::GreekLevel;
 use crate::domain::factors::FactorRow;
 use crate::session::SimulationParametersV2;
@@ -402,13 +402,13 @@ where
             step_cell,
             instant,
             symbol,
-            Cell::F64(Some(row.spot.to_f64())),
+            Cell::F64(Some(positive_to_f64(row.spot))),
         ]),
         Dataset::Volatility => visit(vec![
             step_cell,
             instant,
             symbol,
-            Cell::F64(Some(row.base_volatility.to_f64())),
+            Cell::F64(Some(positive_to_f64(row.base_volatility))),
         ]),
         Dataset::OptionChains => {
             let Some(chains) = chains else {
@@ -903,6 +903,79 @@ pub(super) fn decode_packed(bytes: &[u8]) -> Result<(Vec<String>, Vec<Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A factor value renders the same in the binary formats as in the text
+    /// ones, whatever form it carries.
+    ///
+    /// The contract says packed and Arrow hold the same f64 values as JSON and
+    /// CSV. A spot straight from the walk carries trailing zeros where one read
+    /// back from the warehouse does not, and a raw conversion turns those two
+    /// forms of one number into adjacent floats (issue #152), so this module
+    /// has to convert the way the text path does rather than call `to_f64`
+    /// itself.
+    #[test]
+    fn test_a_padded_factor_value_binds_to_the_same_float_as_the_text_path() {
+        use rust_decimal::Decimal;
+        use rust_decimal::prelude::ToPrimitive;
+
+        // The two forms of one number, and a value where they part company
+        // without the canonical conversion.
+        let mut reference = None;
+        for numerator in 1..4_000_i64 {
+            let Some(candidate) = Decimal::from(numerator).checked_div(Decimal::from(7_919_i64))
+            else {
+                continue;
+            };
+            let stripped = candidate.normalize();
+            let Some(shift) = 28_u32.checked_sub(stripped.scale()) else {
+                continue;
+            };
+            let Some(factor) = 10_i128.checked_pow(shift) else {
+                continue;
+            };
+            let Some(mantissa) = stripped.mantissa().checked_mul(factor) else {
+                continue;
+            };
+            let Ok(padded) = Decimal::try_from_i128_with_scale(mantissa, 28) else {
+                continue;
+            };
+            if padded.to_f64().map(f64::to_bits) != stripped.to_f64().map(f64::to_bits) {
+                reference = Some((padded, stripped));
+                break;
+            }
+        }
+        let Some((padded, stripped)) = reference else {
+            panic!("no value renders differently by scale, so this test would prove nothing");
+        };
+
+        let padded = match positive::Positive::new_decimal(padded) {
+            Ok(value) => value,
+            Err(error) => panic!("the padded value must be positive: {error}"),
+        };
+        let stripped = match positive::Positive::new_decimal(stripped) {
+            Ok(value) => value,
+            Err(error) => panic!("the stripped value must be positive: {error}"),
+        };
+
+        assert_eq!(
+            positive_to_f64(padded).to_bits(),
+            positive_to_f64(stripped).to_bits(),
+            "the two forms of one number must bind to one float, {} against {}",
+            positive_to_f64(padded),
+            positive_to_f64(stripped)
+        );
+
+        // And the cell this module emits is that float, not the raw one.
+        let cell = Cell::F64(Some(positive_to_f64(padded)));
+        match cell {
+            Cell::F64(Some(value)) => assert_eq!(
+                value.to_bits(),
+                positive_to_f64(stripped).to_bits(),
+                "a binary cell must carry the canonical float"
+            ),
+            other => panic!("the cell must be a float, got {other:?}"),
+        }
+    }
 
     fn schema() -> BinarySchema {
         BinarySchema {
