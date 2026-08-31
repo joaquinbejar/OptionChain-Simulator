@@ -229,6 +229,13 @@
 //! meaningless. A single scrape endpoint for a whole deployment is an
 //! aggregator's job, not something this service pretends to do.
 //!
+//! What aggregates and what does not depends on the kind of metric. Counters
+//! and histograms do, as `sum(rate(..))` across the instance label. Gauges do
+//! not: `active_sessions` is each process's own count, and a session created
+//! through one replica and deleted through another leaves the first replica's
+//! gauge untouched, as do reaps and restarts. The live-session total is a
+//! question for the store, not for a gauge.
+//!
 //! The same is true of anything else the process holds: the pricing admission
 //! semaphore bounds one instance (issue #135), and the tape and snapshot
 //! caches are per instance too (issue #136). None of that affects what a

@@ -132,15 +132,18 @@ services:
     image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.19}
     deploy:
       # More than one instance is the intended shape: session and simulation
-      # state lives in Redis and every write there is an atomic Lua script, so
-      # two instances cannot both commit the same step.
+      # state lives in Redis, and the write that decides who advanced a
+      # session is a compare-and-swap in a Lua script, so two instances cannot
+      # both commit the same step.
       #
       # What does NOT aggregate is what each process holds. `/metrics` serves
       # the metrics of whichever replica answers, so scraping this published
-      # port gives one instance at a time and a counter that appears to reset;
-      # scrape each replica as its own target and sum across the instance
-      # label. The pricing admission cap (#135) and the tape and snapshot
-      # caches (#136) are per instance for the same reason.
+      # port gives one instance at a time and a counter that appears to reset.
+      # Scrape each replica as its own target: counters and histograms then
+      # aggregate as sum(rate(..)) across the instance label, while gauges
+      # such as active_sessions stay per instance and are not a deployment
+      # total under any aggregation. The pricing admission cap (#135) and the
+      # tape and snapshot caches (#136) are per instance for the same reason.
       replicas: 2
       restart_policy:
         condition: any

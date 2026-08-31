@@ -13,13 +13,28 @@ use std::sync::Arc;
 /// replica**, each as its own target with its own instance label. Scraping the
 /// balanced address instead returns whichever instance answered, so a counter
 /// appears to jump up and down between scrapes, Prometheus reads each drop as
-/// a counter reset, and every `rate()` over it is fiction. Summing across the
-/// instance label is what produces a deployment total.
+/// a counter reset, and every `rate()` over it is fiction.
+///
+/// How to aggregate depends on what the metric is, and only counters and
+/// histograms aggregate cleanly:
+///
+/// - **counters** (`api_requests_total`, `api_errors_total`,
+///   `session_creations_total`, the cache counters) and **histograms**
+///   (`api_request_duration_seconds`): take the rate per instance and sum, the
+///   usual `sum(rate(...))`. Summing raw counter values across restarts is not
+///   the same thing.
+/// - **gauges** (`active_sessions`, `simulation_cache_size`,
+///   `memory_usage_bytes`): each is that PROCESS's own view. `active_sessions`
+///   in particular is not a deployment total under any aggregation: a create
+///   served by one replica and a delete served by another leave the first
+///   replica's gauge untouched, and neither reaps nor restarts move it. Read
+///   them per instance; the authoritative live-session count is the store's,
+///   not a metric's.
 #[utoipa::path(
     get,
     path = "/metrics",
     responses(
-        (status = 200, description = "This instance's Prometheus metrics. Counters are PER PROCESS: a replicated deployment must be scraped per replica, each as its own target with an instance label, and totalled by summing across that label. Scraping a load-balanced address returns one instance at a time, which reads as a counter reset.", content_type = "text/plain")
+        (status = 200, description = "This instance's Prometheus metrics. Every series is PER PROCESS: a replicated deployment must be scraped per replica, each as its own target with an instance label. Counters and histograms aggregate as sum(rate(..)) across instances; gauges such as active_sessions do NOT, since a create and a delete served by different replicas leave each gauge partial. Scraping a load-balanced address returns one instance at a time, which reads as a counter reset.", content_type = "text/plain")
     )
 )]
 pub(crate) async fn metrics_endpoint(
