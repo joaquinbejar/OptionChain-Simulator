@@ -253,11 +253,25 @@ through one replica and deleted through another leaves the first replica's
 gauge untouched, as do reaps and restarts. The live-session total is a
 question for the store, not for a gauge.
 
-The same is true of anything else the process holds: the pricing admission
-semaphore bounds one instance (issue #135). None of that affects what a
-client is SERVED — the stores are shared and every write goes through an
-atomic Redis script — only how much work the deployment repeats and how its
-numbers must be read.
+What a client is SERVED never depends on which instance answers: the stores
+are shared and every write goes through an atomic Redis script. What is per
+process is how much work the deployment repeats and how its numbers must be
+read.
+
+#### The pricing bound is the deployment's
+
+`OCS_MAX_CONCURRENT_PRICING_JOBS` used to bound one process, so two replicas
+ran twice the configured jobs and an operator learned it when the host
+saturated. The instances now hold leases in a shared Redis set, taken and
+released around the same work, so the number is what the DEPLOYMENT runs.
+
+The lease expires on its own, which is what stops a killed instance from
+holding one forever, and it is set well above the length of a pricing job so
+a running job cannot lose its lease to the sweep. A gate that cannot be
+reached, or a wait that runs out, falls back to the per-process semaphore:
+that is the bound the service always had, and pricing unbounded would be a
+worse answer to a Redis outage than pricing more concurrently than
+configured.
 
 #### Built tapes are shared
 

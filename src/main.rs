@@ -67,14 +67,15 @@
 
 use optionchain_simulator::api::start_server;
 use optionchain_simulator::infrastructure::{
-    ClickHouseSnapshotRepository, DependencyProbe, MetricsCollector, MongoDbProbe, Readiness,
-    RedisClient, RedisConfig, RedisProbe, ServerConfig, SimulationV2Config, WarehouseProbe,
-    init_mongodb, resolve_log_level_from_env,
+    ClickHouseSnapshotRepository, DEFAULT_PRICING_GATE_KEY, DependencyProbe, MetricsCollector,
+    MongoDbProbe, Readiness, RedisClient, RedisConfig, RedisPricingGate, RedisProbe, ServerConfig,
+    SimulationV2Config, WarehouseProbe, init_mongodb, resolve_log_level_from_env,
 };
 use optionchain_simulator::session::{
     DEFAULT_TAPE_KEY_PREFIX, InRedisSessionStore, InRedisSimulationStore, RedisTapeCache,
     SessionManager, SimulationManager,
 };
+use optionchain_simulator::utils::admission::{configured_jobs, install_shared_gate};
 use optionstratlib::utils::setup_logger_with_level;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -199,6 +200,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (issue #136). The window matches the simulations': a tape that outlives
     // its simulation is memory nobody can use, and one that expires first
     // costs a rebuild.
+    // The pricing bound becomes the DEPLOYMENT's rather than this process's,
+    // so an operator asking for four jobs gets four however many replicas run
+    // (issue #135). Installed before anything can serve, and every failure of
+    // it falls back to the per-process semaphore rather than to no bound.
+    let pricing_gate = Arc::new(RedisPricingGate::new(
+        Arc::clone(&redis_client_v2),
+        DEFAULT_PRICING_GATE_KEY,
+        configured_jobs(),
+    ));
+    install_shared_gate(pricing_gate)?;
+
     let shared_tapes = Arc::new(RedisTapeCache::new(
         Arc::clone(&redis_client_v2),
         DEFAULT_TAPE_KEY_PREFIX,

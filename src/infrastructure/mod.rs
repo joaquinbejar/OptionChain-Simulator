@@ -2,6 +2,7 @@ mod clickhouse;
 mod config;
 pub mod health;
 mod mongodb;
+mod pricing_gate;
 mod redis;
 mod repositories;
 mod telemetry;
@@ -39,6 +40,7 @@ pub use health::{
     DependencyProbe, DependencyReport, MongoDbProbe, ProbeFailure, Readiness, RedisProbe,
     WarehouseProbe,
 };
+pub use pricing_gate::{DEFAULT_PRICING_GATE_KEY, RedisPricingGate};
 pub use redis::RedisClient;
 pub use repositories::historical_repo::ClickHouseHistoricalRepository;
 pub use repositories::mongo_repo::{MongoDBRepository, init_mongodb};
