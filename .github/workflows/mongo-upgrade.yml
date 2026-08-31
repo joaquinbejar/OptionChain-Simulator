@@ -1,21 +1,27 @@
 # Proves an existing MongoDB deployment survives the image bump this repo pins.
 #
 # Deliberately NOT on every push: it pulls two database images and runs them in
-# sequence, which is slow, and it has nothing to say about a change that does
-# not move the MongoDB pin. It runs when that pin moves, and on demand.
+# sequence, and it has nothing to say about a change that does not move the
+# MongoDB pin or touch the test itself.
 #
 # What it protects is the case the Integration job cannot see. That job starts
 # every service on an EMPTY volume, so it proves the new image runs; this one
 # starts the PREVIOUS image on a volume, writes a document, swaps the binary
-# underneath, and requires the document and the feature compatibility version
-# to survive before raising the FCV. See scripts/mongo_upgrade_test.sh.
+# underneath, rolls back to the old image on the touched directory, and only
+# then raises the feature compatibility version. See
+# scripts/mongo_upgrade_test.sh.
+#
+# Every value that comes from a GitHub context reaches the shell through `env`
+# and is read as a quoted variable. Interpolating one into the script body
+# would let a dispatch input carrying a newline or a command substitution run
+# as code rather than be read as an image reference.
 name: MongoDB upgrade (persisted volume)
 
 on:
   workflow_dispatch:
     inputs:
       from_image:
-        description: "The image an existing deployment is running, e.g. mongo:8.0.29"
+        description: "The image an existing deployment is running, e.g. mongo:8.0.29@sha256:..."
         required: false
         type: string
       to_image:
@@ -43,39 +49,101 @@ jobs:
           # compose change.
           fetch-depth: 0
 
-      - name: Decide whether the MongoDB pin moved
-        id: pin
+      - name: Decide what to upgrade
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          INPUT_FROM: ${{ inputs.from_image }}
         run: |
           set -euo pipefail
-          current=$(grep -oE 'image: mongo:[^ ]+' Docker/docker-compose.yml | head -1 | cut -d' ' -f2)
-          echo "current=$current" >> "$GITHUB_OUTPUT"
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "run=yes" >> "$GITHUB_OUTPUT"
-            echo "previous=${{ inputs.from_image }}" >> "$GITHUB_OUTPUT"
+          # A value reaching GITHUB_OUTPUT with a newline in it could forge a
+          # second output line, so every image reference is checked against the
+          # shape a reference actually has before it goes anywhere.
+          check_reference() {
+            case "$2" in
+              "") return 0 ;;
+              *) ;;
+            esac
+            if ! printf '%s' "$2" | grep -qE '^mongo:[A-Za-z0-9._-]+(@sha256:[a-f0-9]{64})?$'; then
+              echo "$1 is not a mongo image reference: $2" >&2
+              exit 1
+            fi
+          }
+
+          check_reference "the from_image input" "$INPUT_FROM"
+
+          current=$(grep -oE 'image: mongo:[^ ]+' Docker/docker-compose.yml | head -1 | cut -d' ' -f2 || true)
+          if [ -z "$current" ]; then
+            echo "Could not read the MongoDB pin from Docker/docker-compose.yml." >&2
+            echo "This gate cannot be skipped on a lookup failure: fix the parser or the file." >&2
+            exit 1
+          fi
+          check_reference "the pin in Docker/docker-compose.yml" "$current"
+          printf 'current=%s\n' "$current" >> "$GITHUB_OUTPUT"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            printf 'run=yes\n' >> "$GITHUB_OUTPUT"
+            printf 'previous=%s\n' "$INPUT_FROM" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          base="${{ github.event.pull_request.base.sha }}"
-          previous=$(git show "$base:Docker/docker-compose.yml" \
+          if [ -z "$BASE_SHA" ]; then
+            echo "No base commit to compare against; refusing to skip silently." >&2
+            exit 1
+          fi
+          previous=$(git show "$BASE_SHA:Docker/docker-compose.yml" \
             | grep -oE 'image: mongo:[^ ]+' | head -1 | cut -d' ' -f2 || true)
-          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          if [ -z "$previous" ]; then
+            echo "Could not read the MongoDB pin from the base commit $BASE_SHA." >&2
+            echo "An undiscoverable pin is a failure, not a skip: it would silently remove this gate." >&2
+            exit 1
+          fi
+          check_reference "the pin in the base commit" "$previous"
+          printf 'previous=%s\n' "$previous" >> "$GITHUB_OUTPUT"
 
-          if [ "$previous" = "$current" ] || [ -z "$previous" ]; then
-            echo "The MongoDB pin did not move ($current); nothing to prove."
-            echo "run=no" >> "$GITHUB_OUTPUT"
+          # The test itself changing is also a reason to run it: the pin has
+          # not moved, so the script's own defaults are what gets exercised.
+          if git diff --name-only "$BASE_SHA" HEAD \
+            | grep -qE '^(scripts/mongo_upgrade_test\.sh|\.github/workflows/mongo-upgrade\.yml)$'; then
+            echo "The upgrade test itself changed; running it against its documented default pair."
+            printf 'run=yes\n' >> "$GITHUB_OUTPUT"
+            printf 'use_defaults=yes\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$previous" = "$current" ]; then
+            echo "The MongoDB pin did not move ($current) and the test did not change."
+            printf 'run=no\n' >> "$GITHUB_OUTPUT"
           else
             echo "The MongoDB pin moved from $previous to $current."
-            echo "run=yes" >> "$GITHUB_OUTPUT"
+            printf 'run=yes\n' >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upgrade a persisted volume
-        if: steps.pin.outputs.run == 'yes'
+        if: steps.plan.outputs.run == 'yes'
+        env:
+          INPUT_FROM: ${{ inputs.from_image }}
+          INPUT_TO: ${{ inputs.to_image }}
+          INPUT_FCV: ${{ inputs.target_fcv }}
+          PLAN_PREVIOUS: ${{ steps.plan.outputs.previous }}
+          PLAN_CURRENT: ${{ steps.plan.outputs.current }}
+          USE_DEFAULTS: ${{ steps.plan.outputs.use_defaults }}
         run: |
           set -euo pipefail
-          from="${{ inputs.from_image || steps.pin.outputs.previous }}"
-          to="${{ inputs.to_image || steps.pin.outputs.current }}"
-          fcv="${{ inputs.target_fcv }}"
+
+          if [ "${USE_DEFAULTS:-}" = "yes" ]; then
+            # The script's own defaults are the documented pair, and they are
+            # what a change to the test has to be exercised against.
+            echo "Running the script with its documented defaults"
+            ./scripts/mongo_upgrade_test.sh
+            exit 0
+          fi
+
+          from="${INPUT_FROM:-$PLAN_PREVIOUS}"
+          to="${INPUT_TO:-$PLAN_CURRENT}"
+          fcv="${INPUT_FCV:-}"
 
           if [ -z "$fcv" ]; then
             # The FCV is the major.minor of the image being upgraded to, which
@@ -83,5 +151,5 @@ jobs:
             fcv=$(printf '%s' "$to" | sed -E 's/^mongo:([0-9]+\.[0-9]+).*/\1/')
           fi
 
-          echo "Upgrading $from to $to, raising the FCV to $fcv"
+          printf 'Upgrading %s to %s, raising the FCV to %s\n' "$from" "$to" "$fcv"
           ./scripts/mongo_upgrade_test.sh "$from" "$to" "$fcv"
