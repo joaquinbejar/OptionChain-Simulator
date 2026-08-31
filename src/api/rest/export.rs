@@ -807,6 +807,20 @@ impl Stream for RowStream {
     }
 }
 
+/// What the `format` query parameter accepts, IN THIS BUILD.
+///
+/// Two constants rather than one sentence, because the document must not
+/// advertise a format the binary reading it would refuse: `arrow` is a Cargo
+/// feature, and a build without it rejects the format with a typed 400 (issue
+/// #148). Selected by `cfg`, so the advertised list is whatever this binary
+/// actually serves.
+#[cfg(feature = "arrow-export")]
+const FORMAT_PARAMETER: &str = "json | csv | arrow | packed. The two binary encodings carry the same values as the text ones, in blocks of OCS_EXPORT_BLOCK_ROWS rows, with the same column names in the same order. Numeric columns are f64, exactly what json and csv render: binary is a faster route to the same numbers, NOT a route to the underlying Decimal(38, 28) precision. `arrow` is an Arrow IPC stream, carried by this build. `packed` is a dependency-free columnar block format with 8-byte aligned payloads, documented in the crate docs, whose `labels` column is a bitmask over the schedule's rule ids.";
+
+/// As [`FORMAT_PARAMETER`], for a build without the `arrow-export` feature.
+#[cfg(not(feature = "arrow-export"))]
+const FORMAT_PARAMETER: &str = "json | csv | packed. The two binary encodings carry the same values as the text ones, in blocks of OCS_EXPORT_BLOCK_ROWS rows, with the same column names in the same order. Numeric columns are f64, exactly what json and csv render: binary is a faster route to the same numbers, NOT a route to the underlying Decimal(38, 28) precision. `packed` is a dependency-free columnar block format with 8-byte aligned payloads, documented in the crate docs, whose `labels` column is a bitmask over the schedule's rule ids. This build carries no `arrow-export` feature, so it does not offer the Arrow IPC stream and answers a request for it with a 400 naming the format.";
+
 #[utoipa::path(
     get,
     path = "/api/v2/simulations/{id}/export",
@@ -825,7 +839,7 @@ impl Stream for RowStream {
     params(
         ("id" = String, Path, description = "The simulation's identifier"),
         ("dataset" = String, Query, description = "underlying | volatility | option_chains"),
-        ("format" = String, Query, description = "json | csv | arrow | packed. The two binary encodings carry the same values as the text ones, in blocks of OCS_EXPORT_BLOCK_ROWS rows, with the same column names in the same order. Numeric columns are f64, exactly what json and csv render: binary is a faster route to the same numbers, NOT a route to the underlying Decimal(38, 28) precision. `arrow` is an Arrow IPC stream and is available only when the service is built with the `arrow-export` feature; asking for it otherwise is a 400 naming the format. `packed` is a dependency-free columnar block format with 8-byte aligned payloads, documented in the crate docs, whose `labels` column is a bitmask over the schedule's rule ids."),
+        ("format" = String, Query, description = FORMAT_PARAMETER),
         ("from_step" = Option<usize>, Query, description = "First step, inclusive; defaults to 0"),
         ("to_step" = Option<usize>, Query, description = "Last step, inclusive; defaults to the final step"),
         ("greeks" = Option<String>, Query, description = "How much of the greek set the option_chains dataset carries: `none` (default), `first` (appends call_theta, put_theta, call_vega, put_vega, call_rho, put_rho, call_rho_d, put_rho_d) or `all` (appends seven more per style, gamma through color: fourteen columns). Each level's header is a PREFIX of the next, so raising it appends columns and never moves one. Values are per ONE LONG CONTRACT. Accepted but immaterial for the underlying and volatility datasets, which carry no chains. An unknown value is a 400")

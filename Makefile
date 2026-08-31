@@ -66,9 +66,19 @@ all: test fmt lint build
 build:
 	cargo build
 
+# Features the release binary carries, and therefore what the published image
+# serves (Docker/Dockerfile builds through this target).
+#
+# `arrow-export` is off by default in Cargo.toml because a library consumer
+# should not pay for the arrow dependency to use the crate. A DEPLOYMENT is the
+# opposite case: the OpenAPI document it serves advertises `format=arrow`, so an
+# image without the feature refuses a format its own contract offers (issue
+# #148). Override with `make release RELEASE_FEATURES=` to build without it.
+RELEASE_FEATURES ?= arrow-export
+
 .PHONY: release
 release:
-	cargo build --release
+	cargo build --release $(if $(RELEASE_FEATURES),--features "$(RELEASE_FEATURES)",)
 
 # Run tests
 .PHONY: test
