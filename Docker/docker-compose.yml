@@ -129,7 +129,7 @@ services:
     # Published by .github/workflows/docker-publish.yml on every Cargo.toml
     # version bump, or by `make docker-push` from a workstation. Bump the
     # default tag in the same PR that bumps the crate version.
-    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.20}
+    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.21}
     deploy:
       # More than one instance is the intended shape: session and simulation
       # state lives in Redis, and the write that decides who advanced a

@@ -27,7 +27,7 @@ use crate::domain::series::{SeriesBuilder, SeriesSnapshot, SnapshotCache};
 use crate::infrastructure::{SimulationSnapshotRepository, SimulationV2Config, SnapshotRecord};
 use crate::session::model::SessionState;
 use crate::session::snapshot_record::{snapshot_quote_count, snapshot_record};
-use crate::session::store::SimulationStore;
+use crate::session::store::{SharedTapeCache, SimulationStore, tape_key};
 use crate::session::{SessionV2, SimulationParametersV2};
 use crate::utils::ChainError;
 use std::collections::HashMap;
@@ -78,6 +78,18 @@ pub struct SimulationManager {
     /// rest wait on its result.
     snapshot_builds: Mutex<HashMap<SnapshotKey, SnapshotBuilds>>,
     snapshots: Arc<Mutex<SnapshotCache>>,
+    /// Where a built tape is left for the OTHER instances, when one is
+    /// configured.
+    ///
+    /// The local map above is the first level and stays: a hit there costs
+    /// nothing, where this costs a round trip. What it removes is the rebuild
+    /// a second instance would otherwise do for a tape its neighbour already
+    /// walked, which is the expensive half of serving a step (issue #136).
+    ///
+    /// `None` is a deployment with no shared cache configured, and every
+    /// failure of the shared one is treated as `None` for that call: a cache
+    /// that cannot be reached is a miss, never a failed request.
+    shared_tapes: Option<Arc<dyn SharedTapeCache>>,
     /// Where served snapshots are queued for filing, when the operator turned
     /// persistence on. `None` is the default and the whole feature is then
     /// absent from the serving path — no connection, no latency, no failure
@@ -142,8 +154,21 @@ impl SimulationManager {
                 config.max_cached_snapshots,
                 config.max_cached_snapshot_contracts,
             ))),
+            shared_tapes: None,
             warehouse: None,
         }
+    }
+
+    /// Shares built tapes with the other instances through `cache`.
+    ///
+    /// Opt-in for the same reason the warehouse is: a single-instance
+    /// deployment should not have to name the feature to not use it, and the
+    /// serving path should express "no shared cache" as a missing dependency
+    /// rather than as a flag it branches on.
+    #[must_use]
+    pub fn with_shared_tapes(mut self, cache: Arc<dyn SharedTapeCache>) -> Self {
+        self.shared_tapes = Some(cache);
+        self
     }
 
     /// Files every served snapshot in `warehouse`.
@@ -617,6 +642,14 @@ impl SimulationManager {
 
         let id = simulation.id;
 
+        // Another instance may already have walked this. Consulted before the
+        // build lock rather than after, so a hit costs one round trip instead
+        // of queueing behind a build that is about to be redundant.
+        if let Some(tape) = self.shared_tape(simulation).await {
+            Self::cache_tape(&self.tapes, self.config.max_cached_tapes, id, tape.clone());
+            return Ok(tape);
+        }
+
         // Either this call owns the build or it waits on the one already
         // running. Decided under the lock, so two callers cannot both decide
         // they are the owner.
@@ -649,6 +682,13 @@ impl SimulationManager {
         }
 
         let result = self.build_tape(simulation).await;
+
+        // Offer it to the other instances. After the local cache, so a failure
+        // here costs nothing this process needs, and before the broadcast, so
+        // a waiter that goes on to serve is not racing the write.
+        if let Ok(tape) = &result {
+            self.share_tape(simulation, tape).await;
+        }
 
         // Publish to whoever is waiting and stop being the owner, in that
         // order: a caller that subscribes after the removal misses the
@@ -699,6 +739,48 @@ impl SimulationManager {
         })
         .await
         .map_err(|e| ChainError::Internal(format!("the factor tape build did not finish: {e}")))?
+    }
+
+    /// The tape another instance left, decoded, or `None`.
+    ///
+    /// A stored document this build cannot decode is a miss, not an error: the
+    /// key carries the snapshot generation and a fingerprint of the
+    /// parameters, so it should not happen, and rebuilding is the answer that
+    /// still serves the request.
+    async fn shared_tape(&self, simulation: &SessionV2) -> Option<FactorTape> {
+        let shared = self.shared_tapes.as_ref()?;
+        let key = tape_key(simulation.id, &simulation.parameters);
+        let encoded = shared.get(&key).await?;
+
+        match serde_json::from_str::<FactorTape>(&encoded) {
+            Ok(tape) => Some(tape),
+            Err(error) => {
+                warn!(
+                    %error,
+                    simulation_id = %simulation.id,
+                    "a shared tape did not decode; rebuilding it"
+                );
+                None
+            }
+        }
+    }
+
+    /// Leaves a built tape where the other instances can find it.
+    async fn share_tape(&self, simulation: &SessionV2, tape: &FactorTape) {
+        let Some(shared) = self.shared_tapes.as_ref() else {
+            return;
+        };
+        match serde_json::to_string(tape) {
+            Ok(encoded) => {
+                let key = tape_key(simulation.id, &simulation.parameters);
+                shared.put(&key, &encoded).await;
+            }
+            Err(error) => warn!(
+                %error,
+                simulation_id = %simulation.id,
+                "a built tape did not encode; it stays local to this instance"
+            ),
+        }
     }
 
     /// Reads a cached tape, refreshing its recency.
@@ -863,6 +945,70 @@ mod tests {
             Arc::new(InMemorySimulationStore::new()),
             SimulationV2Config::default(),
         )
+    }
+
+    /// A shared tape cache in memory, standing in for Redis, that counts what
+    /// it was asked to do.
+    ///
+    /// The counts are the point: a manager that BUILT a tape always writes one,
+    /// so "no write" is how a test sees that the second instance did not
+    /// rebuild.
+    #[derive(Default)]
+    struct SharedTapes {
+        entries: Mutex<HashMap<String, String>>,
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    impl SharedTapes {
+        fn writes(&self) -> usize {
+            self.writes.load(Ordering::SeqCst)
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        fn keys(&self) -> Vec<String> {
+            match self.entries.lock() {
+                Ok(entries) => entries.keys().cloned().collect(),
+                Err(poisoned) => poisoned.into_inner().keys().cloned().collect(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SharedTapeCache for SharedTapes {
+        async fn get(&self, key: &str) -> Option<String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            match self.entries.lock() {
+                Ok(entries) => entries.get(key).cloned(),
+                Err(poisoned) => poisoned.into_inner().get(key).cloned(),
+            }
+        }
+
+        async fn put(&self, key: &str, encoded: &str) {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            match self.entries.lock() {
+                Ok(mut entries) => entries.insert(key.to_string(), encoded.to_string()),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .insert(key.to_string(), encoded.to_string()),
+            };
+        }
+    }
+
+    /// A shared cache that is always down, which is what an unreachable Redis
+    /// looks like from here.
+    struct BrokenTapes;
+
+    #[async_trait::async_trait]
+    impl SharedTapeCache for BrokenTapes {
+        async fn get(&self, _key: &str) -> Option<String> {
+            None
+        }
+
+        async fn put(&self, _key: &str, _encoded: &str) {}
     }
 
     /// A warehouse that records what it was asked to file, and can be told to
@@ -1660,6 +1806,133 @@ mod tests {
             manager.advance(missing).await,
             Err(ChainError::NotFound(_))
         ));
+    }
+
+    /// A second instance serves a step the first one built, without building
+    /// it again.
+    ///
+    /// Two managers over one store and one shared cache is what a replicated
+    /// deployment is, with the balancer's choice made explicit. The second
+    /// manager's local cache is empty, so a rebuild is the only alternative to
+    /// a shared hit — and a rebuild always writes, so the write count is what
+    /// distinguishes them.
+    #[tokio::test]
+    async fn test_a_second_instance_serves_a_tape_it_did_not_build() {
+        let store = Arc::new(InMemorySimulationStore::new());
+        let shared = Arc::new(SharedTapes::default());
+        let first = SimulationManager::new(
+            Arc::clone(&store) as Arc<dyn SimulationStore>,
+            SimulationV2Config::default(),
+        )
+        .with_shared_tapes(Arc::clone(&shared) as Arc<dyn SharedTapeCache>);
+        let second = SimulationManager::new(
+            Arc::clone(&store) as Arc<dyn SimulationStore>,
+            SimulationV2Config::default(),
+        )
+        .with_shared_tapes(Arc::clone(&shared) as Arc<dyn SharedTapeCache>);
+
+        let created = match first.create(parameters(4)).await {
+            Ok(created) => created,
+            Err(error) => panic!("the simulation must be created: {error}"),
+        };
+
+        // Peeked rather than advanced, so both instances describe the SAME
+        // step: an advance would move the shared cursor and the second
+        // instance would legitimately serve the next one.
+        let served_first = match first.peek(created.id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("the first instance must serve: {error}"),
+        };
+        assert_eq!(shared.writes(), 1, "building a tape must share it");
+        assert_eq!(
+            shared.keys().len(),
+            1,
+            "one simulation is one shared entry: {:?}",
+            shared.keys()
+        );
+
+        let writes_after_build = shared.writes();
+        let served_second = match second.peek(created.id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("the second instance must serve: {error}"),
+        };
+
+        assert_eq!(
+            shared.writes(),
+            writes_after_build,
+            "the second instance wrote a tape, so it built one rather than reading the shared \
+             one"
+        );
+        assert!(shared.reads() >= 1, "the second instance must have looked");
+        assert_eq!(
+            second.cached_tapes(),
+            1,
+            "a shared hit must still populate the local cache, or every step pays the round trip"
+        );
+
+        // And the answer is the same market, which is the whole point of
+        // sharing rather than rebuilding.
+        assert_eq!(
+            served_first.1.spot, served_second.1.spot,
+            "the two instances must describe the same step of the same walk"
+        );
+        assert_eq!(served_first.1.step, served_second.1.step);
+    }
+
+    /// A shared cache that cannot be reached costs a rebuild, not a failure.
+    #[tokio::test]
+    async fn test_an_unreachable_shared_cache_degrades_to_building() {
+        let store = Arc::new(InMemorySimulationStore::new());
+        let manager = SimulationManager::new(
+            Arc::clone(&store) as Arc<dyn SimulationStore>,
+            SimulationV2Config::default(),
+        )
+        .with_shared_tapes(Arc::new(BrokenTapes) as Arc<dyn SharedTapeCache>);
+
+        let created = match manager.create(parameters(3)).await {
+            Ok(created) => created,
+            Err(error) => panic!("the simulation must be created: {error}"),
+        };
+
+        for step in 0..3 {
+            match manager.advance(created.id).await {
+                Ok(_) => {}
+                Err(error) => panic!("step {step} must serve with the cache down: {error}"),
+            }
+        }
+    }
+
+    /// Two simulations, two entries: a shared cache must not let one tape be
+    /// served for another.
+    #[tokio::test]
+    async fn test_the_shared_cache_keys_each_simulation_separately() {
+        let store = Arc::new(InMemorySimulationStore::new());
+        let shared = Arc::new(SharedTapes::default());
+        let manager = SimulationManager::new(
+            Arc::clone(&store) as Arc<dyn SimulationStore>,
+            SimulationV2Config::default(),
+        )
+        .with_shared_tapes(Arc::clone(&shared) as Arc<dyn SharedTapeCache>);
+
+        let one = match manager.create(parameters(3)).await {
+            Ok(created) => created,
+            Err(error) => panic!("{error}"),
+        };
+        let two = match manager.create(parameters(3)).await {
+            Ok(created) => created,
+            Err(error) => panic!("{error}"),
+        };
+        assert_ne!(one.id, two.id);
+
+        let _ = manager.advance(one.id).await;
+        let _ = manager.advance(two.id).await;
+
+        assert_eq!(
+            shared.keys().len(),
+            2,
+            "two simulations must occupy two entries, whatever their parameters: {:?}",
+            shared.keys()
+        );
     }
 
     /// Cleanup expires idle simulations and evicts what they left cached.

@@ -254,11 +254,26 @@ gauge untouched, as do reaps and restarts. The live-session total is a
 question for the store, not for a gauge.
 
 The same is true of anything else the process holds: the pricing admission
-semaphore bounds one instance (issue #135), and the tape and snapshot
-caches are per instance too (issue #136). None of that affects what a
+semaphore bounds one instance (issue #135). None of that affects what a
 client is SERVED — the stores are shared and every write goes through an
 atomic Redis script — only how much work the deployment repeats and how its
 numbers must be read.
+
+#### Built tapes are shared
+
+The factor tape is the expensive thing to rebuild — it walks every step —
+and it is a pure function of the stored parameters and the seed. It is
+therefore written to Redis once built, under a key carrying the snapshot
+generation and a fingerprint of the parameters, and read from there by any
+instance that needs it. A deployment behind a balancer stops rebuilding on
+whichever instance takes the next step.
+
+The in-process cache stays in front of it: a local hit costs nothing where
+a shared one costs a round trip. And every failure of the shared cache is a
+miss, never an error, so an unreachable Redis costs a rebuild rather than a
+failed request. The snapshot cache is still per instance (issue #136's
+second item), which is a smaller loss: rebuilding a snapshot from a cached
+tape is far cheaper than building the tape.
 
 **Step cursor semantics (serve-then-advance):** `current_step` is the 0-based index
 of the NEXT snapshot to serve. `POST /api/v1/chain/step` serves the snapshot at the
