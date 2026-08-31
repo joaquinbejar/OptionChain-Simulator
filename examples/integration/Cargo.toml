@@ -1,0 +1,11 @@
+[package]
+name = "examples_integration"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+optionchain_simulator = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
