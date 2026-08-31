@@ -616,6 +616,61 @@ pub fn report_cleanup(client: &ServiceClient, path: &str, what: &str) {
     }
 }
 
+/// How many distinct processes answered `scrapes` scrapes of `/metrics`.
+///
+/// A counter is per process and only ever grows, so one instance produces a
+/// non-decreasing sequence of scrapes. N instances taking turns produce N such
+/// sequences INTERLEAVED, which reads as a series that keeps stepping
+/// backwards. The instance count is therefore the smallest number of
+/// non-decreasing sequences the observations can be split into, which is what
+/// the greedy pass below computes.
+///
+/// It is a lower bound: two instances that happen to hold the same value are
+/// indistinguishable from one. It never overcounts, which is what matters for
+/// a number this suite only reports.
+pub fn instances_behind(client: &ServiceClient, scrapes: usize) -> usize {
+    let series = "api_requests_total{endpoint=\"/metrics\",method=\"GET\",status=\"200\"}";
+    let mut observed = Vec::new();
+
+    for _ in 0..scrapes {
+        let body = match client.get("/metrics") {
+            Ok(response) => {
+                assert_eq!(response.status, 200, "/metrics must answer 200");
+                response.text()
+            }
+            Err(error) => panic!("{error}"),
+        };
+        if let Some(value) = body
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .find_map(|line| line.strip_prefix(series))
+            .and_then(|value| value.trim().parse::<i64>().ok())
+        {
+            observed.push(value);
+        }
+    }
+
+    if observed.is_empty() {
+        return 1;
+    }
+
+    // Greedy cover: each observation joins a sequence whose last value it does
+    // not go below, and starts a new one when none will take it.
+    let mut tails: Vec<i64> = Vec::new();
+    for value in observed {
+        match tails
+            .iter_mut()
+            .filter(|tail| **tail <= value)
+            .min_by_key(|tail| value - **tail)
+        {
+            Some(tail) => *tail = value,
+            None => tails.push(value),
+        }
+    }
+
+    tails.len().max(1)
+}
+
 /// A minimal v2 create request, as a starting point for a test that varies one
 /// thing about it.
 pub fn reference_request(symbol: &str) -> serde_json::Value {
