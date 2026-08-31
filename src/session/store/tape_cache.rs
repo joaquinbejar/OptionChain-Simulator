@@ -136,6 +136,12 @@ for _, member in ipairs(members) do
 end
 return dropped
 ";
+/// How long a build claim survives unreleased.
+///
+/// A ceiling on how long one instance's death can delay another's build, so it
+/// wants to be a little longer than the slowest build rather than as long as
+/// the tape lives. A tape of the maximum step count is seconds to walk.
+const BUILD_CLAIM_SECS: u64 = 120;
 
 /// A place to leave a built tape for the other instances.
 ///
@@ -162,6 +168,27 @@ pub trait SharedTapeCache: Send + Sync {
     /// the cache holds. Called with the id rather than a key because the
     /// parameters that built the key may already have been deleted.
     async fn forget_simulation(&self, id: &str);
+
+    /// Claims the right to build what `key` will hold.
+    ///
+    /// `true` means this caller builds. `false` means another instance is
+    /// already building it, and the caller should wait for the entry rather
+    /// than start a second copy of the same work (issue #137).
+    ///
+    /// The claim EXPIRES: an instance killed mid-build must not wedge the
+    /// others, so a claim nobody released is simply gone after a while and the
+    /// next caller to ask builds it.
+    ///
+    /// An implementation that cannot reach its store answers `true`. Building
+    /// twice is wasteful; not building is a request that never answers.
+    async fn claim_build(&self, key: &str) -> bool;
+
+    /// Gives up a claim, whether the build succeeded or not.
+    ///
+    /// Releasing on failure matters as much as on success: a build that
+    /// errored must not make the other instances wait out the expiry for a
+    /// tape that was never written.
+    async fn release_build(&self, key: &str);
 }
 
 /// The key a tape is stored under.
@@ -202,6 +229,9 @@ pub struct RedisTapeCache {
     /// shared cache too: an operator writes the number of tapes they are
     /// willing to keep, and gets that many rather than that many per replica.
     bound: usize,
+    /// Which instance this is, recorded in a claim so an operator reading
+    /// Redis can see who is building.
+    owner: Uuid,
 }
 
 impl RedisTapeCache {
@@ -222,6 +252,7 @@ impl RedisTapeCache {
             prefix: prefix.into(),
             ttl,
             bound: bound.max(1),
+            owner: Uuid::new_v4(),
         }
     }
 
@@ -310,6 +341,37 @@ impl SharedTapeCache for RedisTapeCache {
                 simulation_id = %id,
                 "the shared tapes of a gone simulation could not be dropped; they will expire"
             ),
+        }
+    }
+
+    async fn claim_build(&self, key: &str) -> bool {
+        let key = format!("{}build:{key}", self.prefix);
+        match self
+            .client
+            .set_nx(&key, self.owner.to_string(), Some(BUILD_CLAIM_SECS))
+            .await
+        {
+            Ok(claimed) => {
+                if claimed {
+                    debug!(%key, "claimed the build");
+                }
+                claimed
+            }
+            Err(error) => {
+                // Unreachable: build. A duplicated build costs CPU; a request
+                // waiting for a claim nobody can grant costs the client.
+                warn!(%error, %key, "the build claim could not be taken; building anyway");
+                true
+            }
+        }
+    }
+
+    async fn release_build(&self, key: &str) {
+        let key = format!("{}build:{key}", self.prefix);
+        if let Err(error) = self.client.delete(&key).await {
+            // It expires on its own, so this delays the next builder rather
+            // than blocking it.
+            warn!(%error, %key, "a build claim could not be released; it will expire");
         }
     }
 }
