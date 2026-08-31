@@ -211,6 +211,12 @@
 //! CI runs it on a change to the probes, to what they probe, or to how the
 //! service is packaged.
 //!
+//! Whether a deployment persists its snapshots is visible in the readiness
+//! body: the warehouse probe exists only when the manager has a warehouse, so
+//! a `clickhouse` dependency there is persistence being on. The integration
+//! suite reads it and says which of the two export paths a run exercises,
+//! rather than testing one and reporting as though it had covered both.
+//!
 //! Both are unversioned, unauthenticated, and excluded from the request
 //! metrics: an orchestrator polling forever would otherwise add a constant to
 //! every series and a flood of 503s to the error series while a dependency is
@@ -613,7 +619,16 @@
 //! walked-one-request-at-a-time simulation into something a backtester loads in
 //! one go. With persistence on it reads the steps the warehouse already holds,
 //! in windows, and replays the rest; with it off, or for a simulation nobody
-//! has walked, every step is replayed. Either source renders the same bytes.
+//! has walked, every step is replayed. Either source renders the same VALUES,
+//! row for row and column for column.
+//!
+//! It does not yet render the same BYTES. A value crosses the storage column's
+//! own scale on the way in and back, and the shortest rendering of the float
+//! that comes out can differ in the last digit from the one the replay
+//! produces, so an export taken after a tape's rows were filed can differ from
+//! the same export taken before (issue #152). Byte-identical repeats hold on a
+//! deployment with persistence off, which is the default; where it is on, treat
+//! the values as the contract until that issue lands.
 //!
 //! | Parameter | Values |
 //! |-----------|--------|

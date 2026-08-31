@@ -24,7 +24,9 @@
 
 use crate::domain::factors::FactorTape;
 use crate::domain::series::{SeriesBuilder, SeriesSnapshot, SnapshotCache};
-use crate::infrastructure::{SimulationSnapshotRepository, SimulationV2Config, SnapshotRecord};
+use crate::infrastructure::{
+    MetricsCollector, SimulationSnapshotRepository, SimulationV2Config, SnapshotRecord,
+};
 use crate::session::model::SessionState;
 use crate::session::snapshot_record::{snapshot_quote_count, snapshot_record};
 use crate::session::store::{BuildClaim, SharedTapeCache, SimulationStore, tape_key};
@@ -255,6 +257,12 @@ pub struct SimulationManager {
     /// without waiting out the production value, which is deliberately as long
     /// as the slowest build.
     shared_build_wait: Duration,
+    /// Where the count of filed rows is reported, when the binary wired it.
+    ///
+    /// Set before [`Self::with_warehouse`], which is what the writer task
+    /// captures. `None` in a test or a library caller that has no collector,
+    /// and the writer then files without counting.
+    snapshot_metrics: Option<Arc<MetricsCollector>>,
     /// Where served snapshots are queued for filing, when the operator turned
     /// persistence on. `None` is the default and the whole feature is then
     /// absent from the serving path — no connection, no latency, no failure
@@ -321,6 +329,7 @@ impl SimulationManager {
             ))),
             shared_tapes: None,
             shared_build_wait: SHARED_BUILD_WAIT,
+            snapshot_metrics: None,
             warehouse: None,
         }
     }
@@ -348,6 +357,23 @@ impl SimulationManager {
         self
     }
 
+    /// Reports filed rows to `metrics`.
+    ///
+    /// Call it BEFORE [`Self::with_warehouse`]: that method spawns the writer,
+    /// and the writer captures whatever this left behind. Separate from it
+    /// rather than a parameter of it, because the warehouse is wired by
+    /// library callers that have no collector and the signature is public.
+    ///
+    /// What it buys is a signal that does not exist otherwise: the write is
+    /// detached from the advance that produced it, so "the step was served"
+    /// says nothing about "the row is stored", and `v2_snapshot_rows_filed_total`
+    /// is how anything outside the process can tell (issue #149).
+    #[must_use]
+    pub fn with_snapshot_metrics(mut self, metrics: Arc<MetricsCollector>) -> Self {
+        self.snapshot_metrics = Some(metrics);
+        self
+    }
+
     /// Files every served snapshot in `warehouse`.
     ///
     /// Opt-in, and deliberately a separate constructor rather than an argument
@@ -360,6 +386,7 @@ impl SimulationManager {
         let queued_contracts = Arc::new(AtomicUsize::new(0));
         let writer_contracts = Arc::clone(&queued_contracts);
         let warehouse = Arc::clone(&repository);
+        let writer_metrics = self.snapshot_metrics.clone();
 
         // One writer, not one task per advance: the queue bounds what a slow
         // warehouse can accumulate, and serialising the writes means two steps
@@ -372,6 +399,14 @@ impl SimulationManager {
 
                 let result = warehouse.persist(record).await;
                 writer_contracts.fetch_sub(contracts, Ordering::SeqCst);
+
+                // Counted on the write that SUCCEEDED: a queue that never
+                // drains must not look like storage that is filling.
+                if result.is_ok()
+                    && let Some(metrics) = writer_metrics.as_ref()
+                {
+                    metrics.record_snapshot_rows_filed(contracts);
+                }
 
                 if let Err(error) = result {
                     warn!(
