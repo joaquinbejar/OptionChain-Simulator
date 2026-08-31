@@ -1,6 +1,6 @@
 [package]
 name = "optionchain_simulator"
-version = "0.2.17"
+version = "0.2.18"
 edition = "2024"
 # The maximum `rust-version` across the RESOLVED graph, not the highest direct
 # dependency: clickhouse 0.15.1, nalgebra 0.35, statrs 0.19.1 and wide 1.7 all
@@ -40,7 +40,6 @@ csv = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 actix-web = { workspace = true }
-actix-files = { workspace = true }
 redis = { workspace = true }
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
@@ -84,7 +83,6 @@ clickhouse = "0.15"
 tokio = { version = "1.53", features = ["full"] }
 async-trait = "0.1"
 actix-web = { version = "4.15", features = ["rustls"] }
-actix-files = "0.7"
 redis = { version = "1.6", features = ["tokio-comp", "connection-manager"] }
 # actix_extras is unavailable: optionstratlib enables utoipa/axum_extras,
 # and utoipa's framework extras are mutually exclusive
