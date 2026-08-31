@@ -1,6 +1,6 @@
 [package]
 name = "optionchain_simulator"
-version = "0.2.24"
+version = "0.2.25"
 edition = "2024"
 # The maximum `rust-version` across the RESOLVED graph, not the highest direct
 # dependency: clickhouse 0.15.1, nalgebra 0.35, statrs 0.19.1 and wide 1.7 all

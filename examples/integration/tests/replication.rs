@@ -363,6 +363,159 @@ fn test_an_export_is_byte_identical_across_instances() {
     }
 }
 
+/// The tape a client is served is one tape, whichever instances built it.
+///
+/// The baseline test above needs the replicas to be addressable one by one,
+/// which a deployment behind a single balanced address does not offer. This
+/// one gets the same guarantee out of the balancer itself: two simulations
+/// created under the same seed are walked step by step, the instance that
+/// served each answer is read from its header, and the run only counts when
+/// more than one instance actually answered.
+///
+/// That is what the shared tape cache and the cross-instance build claim
+/// promise: whoever walks the step, the market a client sees is the same. A
+/// single-instance deployment satisfies it trivially and says so rather than
+/// pretending to have proven it.
+#[test]
+fn test_a_tape_survives_being_walked_across_instances() {
+    let Some(client) = service() else {
+        return;
+    };
+
+    let (Some(first), Some(second)) = (
+        Live::create(&client, STEPS, 4_242),
+        Live::create(&client, STEPS, 4_242),
+    ) else {
+        return;
+    };
+
+    // Everything a client can compare. The identity fields are excluded on
+    // purpose: two simulations differ by id and by when they were created, and
+    // neither is part of the market.
+    let market = |body: &serde_json::Value| -> serde_json::Value {
+        let mut market = serde_json::Map::new();
+        for key in ["simulated_at", "underlying", "chains"] {
+            let value = body
+                .get(key)
+                .unwrap_or_else(|| panic!("a snapshot must carry {key}: {body}"));
+            market.insert(key.to_string(), value.clone());
+        }
+        serde_json::Value::Object(market)
+    };
+
+    let serve = |live: &Live| -> (serde_json::Value, Option<String>) {
+        let path = live.path("/step");
+        match client.request("POST", &path, None) {
+            Ok(response) => {
+                assert_eq!(
+                    response.status,
+                    200,
+                    "a step must serve: {}",
+                    response.text()
+                );
+                let instance = responding_instance(&response);
+                match response.json::<serde_json::Value>(&path) {
+                    Ok(body) => (market(&body), instance),
+                    Err(error) => panic!("{error}"),
+                }
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+
+    let mut instances = std::collections::BTreeSet::new();
+    for step in 0..STEPS {
+        let (left, left_instance) = serve(&first);
+        let (right, right_instance) = serve(&second);
+        for instance in [left_instance, right_instance].into_iter().flatten() {
+            instances.insert(instance);
+        }
+
+        assert_eq!(
+            left, right,
+            "step {step} differs between two runs of the same seed, so a step served by one \
+             instance does not match the same step served by another"
+        );
+    }
+
+    if instances.len() < 2 {
+        println!(
+            "INFO: {} instance answered these {STEPS} steps, so the walk stayed inside one \
+             process and the cross-instance half of this is untested here",
+            instances.len()
+        );
+    } else {
+        println!(
+            "INFO: {} instances served these {STEPS} steps and produced one tape",
+            instances.len()
+        );
+    }
+}
+
+/// Every answer says which instance produced it, including the ones that fail.
+///
+/// The attribution is what the tests above rest on, and what an operator reads
+/// to tell one replica's problem from the deployment's. A header that is only
+/// on the happy path would be missing exactly where it is needed, so the
+/// probes, the metrics, an export and a rejection are all checked.
+#[test]
+fn test_every_answer_names_the_instance_that_served_it() {
+    let Some(client) = service() else {
+        return;
+    };
+    let Some(live) = Live::create(&client, STEPS, 7) else {
+        return;
+    };
+
+    // Advanced once so the export below has a step to render.
+    match client.request("POST", &live.path("/step"), None) {
+        Ok(response) => assert_eq!(
+            response.status,
+            200,
+            "a step must serve: {}",
+            response.text()
+        ),
+        Err(error) => panic!("{error}"),
+    }
+
+    let cases: Vec<(&str, String)> = vec![
+        ("the liveness probe", "/health".to_string()),
+        ("the readiness probe", "/ready".to_string()),
+        ("the metrics", "/metrics".to_string()),
+        ("a simulation", live.path("")),
+        ("a snapshot", live.path("/snapshot")),
+        (
+            "an export",
+            format!("{}?dataset=underlying&format=csv", live.path("/export")),
+        ),
+        ("a rejection", "/api/v2/simulations/not-a-uuid".to_string()),
+        ("an unknown path", "/api/v9/nothing".to_string()),
+    ];
+
+    let mut instances = std::collections::BTreeSet::new();
+    for (case, path) in cases {
+        let response = match client.request("GET", &path, None) {
+            Ok(response) => response,
+            Err(error) => panic!("{case}: {error}"),
+        };
+        match responding_instance(&response) {
+            Some(instance) => {
+                instances.insert(instance);
+            }
+            None => panic!(
+                "{case} answered {} without naming the instance that served it, so nothing about \
+                 this deployment can be attributed to a replica",
+                response.status
+            ),
+        }
+    }
+
+    println!(
+        "INFO: every answer named its instance, {} of them across these paths",
+        instances.len()
+    );
+}
+
 /// Each replica answers readiness for ITSELF.
 ///
 /// Asked of every replica directly, which is the only way to see that a
