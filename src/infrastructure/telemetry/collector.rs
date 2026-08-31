@@ -35,6 +35,13 @@ pub struct MetricsCollector {
     v2_snapshot_cache_size: IntGauge,
     /// v2 simulations reaped by the retention sweep since startup.
     v2_simulations_expired: IntCounter,
+    /// Quote rows the warehouse has actually accepted.
+    ///
+    /// The write is detached from the advance that produced it, so "the step
+    /// was served" says nothing about "the row is stored". This is the only
+    /// signal from outside that it is, which is what lets a test wait for a
+    /// persisted row rather than assume one (issue #149).
+    v2_snapshot_rows_filed: IntCounter,
 
     // Resource metrics
     memory_usage: Gauge,
@@ -124,6 +131,11 @@ impl MetricsCollector {
             "Total number of v2 simulations reaped by the retention sweep",
         )?;
 
+        let v2_snapshot_rows_filed = IntCounter::new(
+            "v2_snapshot_rows_filed_total",
+            "Total number of quote rows the snapshot warehouse has accepted",
+        )?;
+
         // Create resource metrics
         let memory_usage = Gauge::new("memory_usage_bytes", "Current memory usage in bytes")?;
 
@@ -160,6 +172,7 @@ impl MetricsCollector {
         registry.register(Box::new(v2_tape_cache_size.clone()))?;
         registry.register(Box::new(v2_snapshot_cache_size.clone()))?;
         registry.register(Box::new(v2_simulations_expired.clone()))?;
+        registry.register(Box::new(v2_snapshot_rows_filed.clone()))?;
         registry.register(Box::new(memory_usage.clone()))?;
 
         // Register MongoDB metrics
@@ -183,6 +196,7 @@ impl MetricsCollector {
             v2_tape_cache_size,
             v2_snapshot_cache_size,
             v2_simulations_expired,
+            v2_snapshot_rows_filed,
             memory_usage,
             mongodb_insert_counter,
             mongodb_insert_duration,
@@ -279,6 +293,17 @@ impl MetricsCollector {
     /// tracks actual cache occupancy rather than a stale estimate.
     pub fn set_simulation_cache_size(&self, size: i64) {
         self.simulation_cache_size.set(size);
+    }
+
+    /// Records quote rows the warehouse accepted.
+    ///
+    /// Counted on the WRITE that succeeded, not on the advance that queued it:
+    /// a queue that never drains must not look like storage that is filling.
+    pub fn record_snapshot_rows_filed(&self, rows: usize) {
+        if rows == 0 {
+            return;
+        }
+        self.v2_snapshot_rows_filed.inc_by(rows as u64);
     }
 
     /// Records the current memory usage

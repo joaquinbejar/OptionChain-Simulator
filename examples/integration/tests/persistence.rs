@@ -25,13 +25,21 @@ use examples_integration::{Response, ServiceClient, reference_request, report_cl
 /// Steps in the tapes compared below.
 const STEPS: usize = 4;
 
-/// How long to let the warehouse queue drain before comparing, in attempts of
-/// a fifth of a second.
+/// How long to wait for the warehouse to accept a row, in attempts of a fifth
+/// of a second.
 ///
 /// The write is detached from the request that produced it — that is what
 /// keeps a degraded warehouse from delaying a response — so a step served is
 /// not a row stored yet.
 const SETTLE_ATTEMPTS: usize = 25;
+
+/// The counter that says rows have actually been filed.
+///
+/// Without waiting on it, the comparison below can pass before a single row
+/// reaches the warehouse: the export replays whatever is missing, so both
+/// sides would be replays and the test would be green without exercising
+/// storage at all.
+const FILED_ROWS_METRIC: &str = "v2_snapshot_rows_filed_total";
 
 /// Whether this deployment persists its snapshots.
 ///
@@ -60,6 +68,40 @@ fn persistence_is_on(client: &ServiceClient) -> Option<bool> {
     Some(dependencies.iter().any(|dependency| {
         dependency.get("name").and_then(serde_json::Value::as_str) == Some("clickhouse")
     }))
+}
+
+/// The highest `v2_snapshot_rows_filed_total` any instance reports.
+///
+/// The maximum rather than a sum: `/metrics` serves whichever replica answers,
+/// so a sum across scrapes would double-count one instance and a single scrape
+/// may miss the one that filed. `None` when the deployment does not publish
+/// the counter, which is a deployment older than the metric.
+fn filed_rows(client: &ServiceClient) -> Option<u64> {
+    let mut highest = None;
+    for _ in 0..4 {
+        let response = match client.get("/metrics") {
+            Ok(response) => response,
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(
+            response.status,
+            200,
+            "the metrics must serve: {}",
+            response.text()
+        );
+        for line in response.text().lines() {
+            let Some(rest) = line.strip_prefix(FILED_ROWS_METRIC) else {
+                continue;
+            };
+            let Some(value) = rest.split_whitespace().last() else {
+                continue;
+            };
+            if let Ok(value) = value.parse::<u64>() {
+                highest = Some(highest.map_or(value, |current: u64| current.max(value)));
+            }
+        }
+    }
+    highest
 }
 
 /// A simulation with a chosen seed that deletes itself.
@@ -202,9 +244,34 @@ fn test_a_stored_tape_exports_what_a_replayed_one_does() {
 
     // Only the first is walked. Its steps are what the warehouse has to file;
     // the second's tape exists only inside the export that asks for it.
+    let before = filed_rows(&client);
     served.walk();
 
-    let mut near_misses = 0_usize;
+    // Waiting for a ROW, not for a while. The export replays whatever storage
+    // does not have, so comparing before the writer has filed anything would
+    // compare two replays and pass without touching the warehouse, which is
+    // the false green this test exists to remove.
+    let mut filed = false;
+    for _ in 0..SETTLE_ATTEMPTS {
+        match (before, filed_rows(&client)) {
+            (Some(before), Some(now)) if now > before => {
+                filed = true;
+                break;
+            }
+            (None, _) | (_, None) => break,
+            _ => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    if !filed {
+        println!(
+            "SKIP: no instance reported {FILED_ROWS_METRIC} rising after a walked tape, so \
+             nothing here would be served from storage and the comparison would be two replays"
+        );
+        return;
+    }
+
     for dataset in ["underlying", "option_chains"] {
         let query = format!("dataset={dataset}&format=csv");
         let expected = fresh.export(&query);
@@ -215,27 +282,15 @@ fn test_a_stored_tape_exports_what_a_replayed_one_does() {
             expected.text()
         );
 
-        // The write is detached from the advance that caused it, so the rows
-        // may still be in the queue. Retried rather than slept on once: rows
-        // that arrive make the two agree, and a disagreement that survives the
-        // budget is the finding.
-        let mut stored_body = Vec::new();
-        let mut differences = Vec::new();
-        for _ in 0..SETTLE_ATTEMPTS {
-            let stored = served.export(&query);
-            assert_eq!(
-                stored.status,
-                200,
-                "a stored {dataset} export must serve: {}",
-                stored.text()
-            );
-            stored_body = stored.body.clone();
-            differences = compare(dataset, &stored_body, &expected.body);
-            if differences.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
+        let stored = served.export(&query);
+        assert_eq!(
+            stored.status,
+            200,
+            "a stored {dataset} export must serve: {}",
+            stored.text()
+        );
+        let stored_body = stored.body.clone();
+        let differences = compare(dataset, &stored_body, &expected.body);
 
         assert!(
             differences.is_empty(),
@@ -250,7 +305,6 @@ fn test_a_stored_tape_exports_what_a_replayed_one_does() {
             // a float on the way in and back. It is not a corrupted row, and
             // it is not nothing either: a consumer that diffs two exports of
             // the same tape sees a change that is not there.
-            near_misses += 1;
             println!(
                 "INFO: the {dataset} export agrees value by value but not byte for byte, {} bytes \
                  stored against {} replayed, which is issue #152",
@@ -260,12 +314,9 @@ fn test_a_stored_tape_exports_what_a_replayed_one_does() {
         }
     }
 
-    if near_misses == 0 {
-        println!(
-            "INFO: a stored tape and a replayed one export the same bytes for every dataset \
-             compared"
-        );
-    }
+    println!(
+        "INFO: a stored tape and a replayed one agree on every value in every dataset compared"
+    );
 }
 
 /// Every cell of two CSV exports, compared as values.

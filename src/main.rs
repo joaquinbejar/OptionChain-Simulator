@@ -237,7 +237,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(warehouse) => {
             warehouse.ensure_schema().await?;
             info!("v2 snapshot persistence is enabled");
-            simulation_manager = simulation_manager.with_warehouse(Arc::new(warehouse));
+            // The metrics BEFORE the warehouse: the writer the next call
+            // spawns is what reports the rows it files.
+            simulation_manager = simulation_manager
+                .with_snapshot_metrics(Arc::clone(&metrics_collector))
+                .with_warehouse(Arc::new(warehouse));
         }
         None => {
             info!("v2 snapshot persistence is disabled; snapshots are served from replay only");
