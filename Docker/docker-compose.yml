@@ -83,9 +83,11 @@ services:
     #      easy return
     #      db.adminCommand({setFeatureCompatibilityVersion: "8.2", confirm: true})
     #
-    # Verified on this exact digest against a persisted volume: 8.0.29 with
-    # FCV 8.0, binary swapped, 8.2.12 started, documents intact, FCV still 8.0,
-    # then raised to 8.2. A fresh volume needs none of this.
+    # That sequence is a test, not a paragraph: `make test-mongo-upgrade` runs
+    # it (scripts/mongo_upgrade_test.sh), and CI runs it automatically when
+    # this pin moves. Verified on this exact digest: 8.0.29 with FCV 8.0,
+    # binary swapped, 8.2.12 started, documents intact, FCV still 8.0, then
+    # raised to 8.2. A fresh volume needs none of this.
     image: mongo:8.2.12@sha256:e0ce8c35124d4a9f9785532d1f268f39e9728ffa1cb38f46fa482436424c4bd3
     volumes:
       - mongodb-data:/data/db
@@ -127,7 +129,7 @@ services:
     # Published by .github/workflows/docker-publish.yml on every Cargo.toml
     # version bump, or by `make docker-push` from a workstation. Bump the
     # default tag in the same PR that bumps the crate version.
-    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.16}
+    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.17}
     deploy:
       replicas: 2
       restart_policy:

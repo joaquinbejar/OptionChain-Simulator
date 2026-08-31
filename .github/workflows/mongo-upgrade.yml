@@ -1,0 +1,87 @@
+# Proves an existing MongoDB deployment survives the image bump this repo pins.
+#
+# Deliberately NOT on every push: it pulls two database images and runs them in
+# sequence, which is slow, and it has nothing to say about a change that does
+# not move the MongoDB pin. It runs when that pin moves, and on demand.
+#
+# What it protects is the case the Integration job cannot see. That job starts
+# every service on an EMPTY volume, so it proves the new image runs; this one
+# starts the PREVIOUS image on a volume, writes a document, swaps the binary
+# underneath, and requires the document and the feature compatibility version
+# to survive before raising the FCV. See scripts/mongo_upgrade_test.sh.
+name: MongoDB upgrade (persisted volume)
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_image:
+        description: "The image an existing deployment is running, e.g. mongo:8.0.29"
+        required: false
+        type: string
+      to_image:
+        description: "The image being upgraded to. Defaults to the pin in Docker/docker-compose.yml."
+        required: false
+        type: string
+      target_fcv:
+        description: "The feature compatibility version to raise to, e.g. 8.2"
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - "Docker/docker-compose.yml"
+      - "scripts/mongo_upgrade_test.sh"
+      - ".github/workflows/mongo-upgrade.yml"
+
+jobs:
+  upgrade:
+    name: Upgrade on a persisted volume
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base commit is needed to tell a MongoDB bump from any other
+          # compose change.
+          fetch-depth: 0
+
+      - name: Decide whether the MongoDB pin moved
+        id: pin
+        run: |
+          set -euo pipefail
+          current=$(grep -oE 'image: mongo:[^ ]+' Docker/docker-compose.yml | head -1 | cut -d' ' -f2)
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+            echo "previous=${{ inputs.from_image }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base="${{ github.event.pull_request.base.sha }}"
+          previous=$(git show "$base:Docker/docker-compose.yml" \
+            | grep -oE 'image: mongo:[^ ]+' | head -1 | cut -d' ' -f2 || true)
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+
+          if [ "$previous" = "$current" ] || [ -z "$previous" ]; then
+            echo "The MongoDB pin did not move ($current); nothing to prove."
+            echo "run=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "The MongoDB pin moved from $previous to $current."
+            echo "run=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upgrade a persisted volume
+        if: steps.pin.outputs.run == 'yes'
+        run: |
+          set -euo pipefail
+          from="${{ inputs.from_image || steps.pin.outputs.previous }}"
+          to="${{ inputs.to_image || steps.pin.outputs.current }}"
+          fcv="${{ inputs.target_fcv }}"
+
+          if [ -z "$fcv" ]; then
+            # The FCV is the major.minor of the image being upgraded to, which
+            # is what MongoDB accepts.
+            fcv=$(printf '%s' "$to" | sed -E 's/^mongo:([0-9]+\.[0-9]+).*/\1/')
+          fi
+
+          echo "Upgrading $from to $to, raising the FCV to $fcv"
+          ./scripts/mongo_upgrade_test.sh "$from" "$to" "$fcv"

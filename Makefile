@@ -87,6 +87,16 @@ test-integration:
 		echo "OCS_INTEGRATION_BASE_URL is unset: every integration test will skip"
 	LOGLEVEL=WARN cargo test -p examples_integration --all-features -- --nocapture
 
+# Prove an existing MongoDB deployment survives the image this repo pins.
+#
+# Starts the previous image on a volume, writes a document, swaps the binary
+# underneath, and requires the document and the FCV to survive before raising
+# it. Needs docker and pulls two database images, so it is not part of
+# `pre-push`; CI runs it when the MongoDB pin moves.
+.PHONY: test-mongo-upgrade
+test-mongo-upgrade:
+	./scripts/mongo_upgrade_test.sh
+
 # Format the code
 .PHONY: fmt
 fmt:
