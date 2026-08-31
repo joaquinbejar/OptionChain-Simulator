@@ -33,11 +33,14 @@ struct Case {
 }
 
 /// The documented rejection body.
+///
+/// `field` is an `Option` rather than a defaulted `String` on purpose: a body
+/// that omits the key and one that carries an empty string are different
+/// facts, and #119 is about exactly that difference on the v1 surface.
 #[derive(Debug, Deserialize)]
 struct Rejection {
     error: String,
-    #[serde(default)]
-    field: String,
+    field: Option<String>,
 }
 
 /// Reads a rejection body, asserting the things that hold for EVERY rejection
@@ -112,13 +115,45 @@ fn test_the_v2_rejection_contract_names_its_field() {
         return;
     };
 
+    // A deployment without the v2 API answers 404 for the route itself, which
+    // is the only creation failure that means "not deployed here". Anything
+    // else — a 500, a wrong success status, a body that will not decode — is a
+    // defect, and turning it into a green skip is how a suite quietly stops
+    // testing anything.
+    let probe = match client.post("/api/v2/simulations", &reference_request("SPX")) {
+        Ok(probe) => probe,
+        Err(error) => panic!("creating a simulation: {error}"),
+    };
+    if probe.status == 404 {
+        println!("SKIP: this deployment does not serve /api/v2/simulations");
+        return;
+    }
+    assert_eq!(
+        probe.status,
+        201,
+        "creating a simulation must answer 201, got {} with {}",
+        probe.status,
+        probe.text()
+    );
     let simulation = match Simulation::create(&client, &reference_request("SPX")) {
         Ok(simulation) => simulation,
-        Err(error) => {
-            println!("SKIP: this deployment has no usable v2 API: {error}");
-            return;
-        }
+        Err(error) => panic!("the v2 API is deployed, so creating a simulation must work: {error}"),
     };
+    // The probe created one too; delete it rather than leaving it behind.
+    if let Ok(Some(id)) = probe
+        .json::<serde_json::Value>("/api/v2/simulations")
+        .map(|body| {
+            body.get("id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        })
+    {
+        examples_integration::report_cleanup(
+            &client,
+            &format!("/api/v2/simulations/{id}"),
+            "the probe simulation",
+        );
+    }
 
     let cases = vec![
         Case {
@@ -188,12 +223,42 @@ fn test_the_v2_rejection_contract_names_its_field() {
             field: "step_interval_seconds",
         },
         Case {
+            // Issue #104 names this one explicitly: a range whose end is past
+            // the tape must name `to_step`, which is the field at fault here,
+            // unlike the inverted range above.
+            what: "a range past the end of the tape",
+            method: "GET",
+            path: simulation
+                .path("/export?dataset=underlying&format=csv&from_step=0&to_step=99999"),
+            body: None,
+            status: 400,
+            field: "to_step",
+        },
+        Case {
+            what: "steps above the cap",
+            method: "POST",
+            path: "/api/v2/simulations".to_string(),
+            body: Some(request_with("steps", serde_json::json!(10_000_000))),
+            status: 400,
+            field: "steps",
+        },
+        Case {
+            what: "a chain size above the cap",
+            method: "POST",
+            path: "/api/v2/simulations".to_string(),
+            body: Some(request_with("chain_size", serde_json::json!(10_000_000))),
+            status: 400,
+            field: "chain_size",
+        },
+        Case {
             what: "an unknown body key",
             method: "POST",
             path: "/api/v2/simulations".to_string(),
             body: Some(request_with("stepss", serde_json::json!(4))),
             status: 400,
-            field: "",
+            // The handler recovers the offending key, so the contract is that
+            // it names it rather than shrugging.
+            field: "stepss",
         },
     ];
 
@@ -213,11 +278,26 @@ fn test_the_v2_rejection_contract_names_its_field() {
             Err(error) => panic!("{what}: {error}"),
         };
 
-        // A deployment older than the route answers 404 for the path itself;
-        // that is a lag to report, not a contract failure.
-        if response.status == 404 && !path.contains("not-a-uuid") {
-            println!("SKIP: {what} is not deployed here ({path})");
-            continue;
+        // A regression that ACCEPTS one of these requests hands back a
+        // simulation, and failing before deleting it would leave it on a
+        // shared deployment. Clean up first, then fail.
+        if response.status == 200 || response.status == 201 {
+            if let Ok(Some(id)) = response.json::<serde_json::Value>(&path).map(|body| {
+                body.get("id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            }) {
+                examples_integration::report_cleanup(
+                    &client,
+                    &format!("/api/v2/simulations/{id}"),
+                    "a simulation an invalid request should not have created",
+                );
+            }
+            panic!(
+                "{what} was ACCEPTED with {}: {}",
+                response.status,
+                response.text()
+            );
         }
 
         let rejection = rejection(&client, what, &response);
@@ -226,13 +306,13 @@ fn test_the_v2_rejection_contract_names_its_field() {
             "{what} must answer {status}, got {} with {}",
             response.status, rejection.error
         );
-        if !field.is_empty() {
-            assert_eq!(
-                rejection.field, field,
-                "{what} must name {field}, named {:?} with {}",
-                rejection.field, rejection.error
-            );
-        }
+        assert_eq!(
+            rejection.field.as_deref(),
+            Some(field),
+            "{what} must name {field:?}, named {:?} with {}",
+            rejection.field,
+            rejection.error
+        );
         assert!(
             !rejection.error.is_empty(),
             "{what} must explain itself, not answer an empty message"
@@ -277,7 +357,23 @@ fn test_a_missing_simulation_is_not_found_on_every_verb() {
             response.status,
             response.text()
         );
-        assert_no_leak(&format!("{method} {path}"), &response.text(), &client);
+
+        // The same shared assertions as every other rejection: a JSON body in
+        // the documented shape, leaking nothing. A plaintext 404 is what an
+        // unmounted route produces and must not pass here.
+        let what = format!("{method} {path}");
+        let rejection = rejection(&client, &what, &response);
+        assert!(
+            !rejection.error.is_empty(),
+            "{what} must explain itself rather than answer an empty message"
+        );
+        // A not-found carries no field: no request field is at fault, the
+        // resource simply is not there. Deliberate, so asserted.
+        assert_eq!(
+            rejection.field, None,
+            "{what} names a field, which a not-found has no business doing: {:?}",
+            rejection.field
+        );
     }
 }
 
@@ -300,12 +396,25 @@ fn test_the_v1_rejection_contract_is_a_400_that_explains_itself() {
         return;
     };
 
-    for (case, path) in [
+    // What a live service answers TODAY, asserted exactly, so a change in
+    // either direction is visible rather than silently tolerated: the
+    // malformed case carries no `field` key at all and renders with an
+    // `Invalid State` prefix, and the missing one carries an empty field.
+    // Both are what issue #119 decides; when it is decided these expectations
+    // change with it, deliberately.
+    for (case, path, expects_field, prefix) in [
         (
             "a malformed session id",
             "/api/v1/chain?sessionid=not-a-uuid",
+            None,
+            "Invalid State",
         ),
-        ("a missing session id", "/api/v1/chain"),
+        (
+            "a missing session id",
+            "/api/v1/chain",
+            Some(String::new()),
+            "Query deserialize error",
+        ),
     ] {
         let response = match client.get(path) {
             Ok(response) => response,
@@ -320,28 +429,19 @@ fn test_the_v1_rejection_contract_is_a_400_that_explains_itself() {
             response.text()
         );
 
-        let content_type = response.header("content-type").unwrap_or_default();
+        let rejection = rejection(&client, case, &response);
         assert!(
-            content_type.contains("application/json"),
-            "{case} answered {content_type:?} rather than JSON: {}",
-            response.text()
+            rejection.error.starts_with(prefix),
+            "{case} renders as {prefix:?} today, which is part of what #119 decides; it \
+             rendered as {:?}",
+            rejection.error
         );
-        assert_no_leak(case, &response.text(), &client);
-
-        // `field` is what issue #119 is about, so only `error` is required
-        // here; when #119 is decided, this becomes an assertion on the field.
-        let body: serde_json::Value = match response.json(path) {
-            Ok(body) => body,
-            Err(error) => panic!("{case} must answer JSON: {error}"),
-        };
-        let message = body.get("error").and_then(|error| error.as_str());
-        assert!(
-            message.is_some_and(|message| !message.is_empty()),
-            "{case} must explain itself: {body}"
+        assert_eq!(
+            rejection.field, expects_field,
+            "{case} carries {expects_field:?} today, which is the v1 gap #119 records; it \
+             carried {:?}",
+            rejection.field
         );
-        if body.get("field").is_none() {
-            println!("INFO: {case} answers no `field` key, the v1 gap recorded in issue #119");
-        }
     }
 }
 
