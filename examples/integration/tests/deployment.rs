@@ -6,63 +6,91 @@
 
 use examples_integration::{Simulation, reference_request, service};
 
-/// The deployment answers, and the run reports which contract it exercised.
+/// The deployment is an optionchain-simulator, and the run reports which
+/// version of it.
 ///
-/// A deployed build is not `main`: it can be older, so this reads the version
-/// and prints it rather than asserting one. What it does assert is that
-/// something is listening and speaking HTTP where the operator said it would
-/// be.
+/// This is the identity probe every other test leans on: they skip a feature
+/// that answers 404, which is only sound if 404 means "this build is older",
+/// not "this is somebody else's service". So the identity has to be
+/// unmistakable before any skip is trusted. An OpenAPI document naming the
+/// service is the strongest signal available over HTTP, and a build too old to
+/// serve one still has to answer the v1 route with a body this service would
+/// produce.
 #[test]
-fn test_the_deployment_answers_and_names_its_version() {
+fn test_the_deployment_is_this_service_and_names_its_version() {
     let Some(client) = service() else {
         return;
     };
 
-    // `/api/v1/chain` is the oldest route in the service and exists in every
-    // build, so it is the safest probe for "is anything there".
+    let document = match client.get("/api-docs/openapi.json") {
+        Ok(response) if response.status == 200 => response
+            .json::<serde_json::Value>("/api-docs/openapi.json")
+            .ok(),
+        Ok(_) | Err(_) => None,
+    };
+
+    if let Some(document) = document {
+        let info = document.get("info");
+        let title = info
+            .and_then(|info| info.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let version = info
+            .and_then(|info| info.get("version"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        assert!(
+            title.to_ascii_lowercase().contains("optionchain"),
+            "{} serves an OpenAPI document titled {title:?}, which is not this service; every \
+             skip in this suite assumes a 404 means an older build of THIS service, so a \
+             different one has to fail loudly",
+            client.base_url()
+        );
+        assert!(
+            !version.is_empty(),
+            "the OpenAPI document must carry a version: {document}"
+        );
+        println!(
+            "INFO: {} serves {title} {version}; these tests describe the contract of the \
+             working tree, so a difference is a lag, not a defect",
+            client.base_url()
+        );
+        return;
+    }
+
+    // No document: a build old enough to lack one must still answer the oldest
+    // route in the service with a body only this service produces.
     let response = match client.get("/api/v1/chain") {
         Ok(response) => response,
         Err(error) => panic!("{error}"),
     };
-
-    assert!(
-        response.status < 500,
-        "{} answered {} for the oldest route in the service, which means it is not serving \
-         normally: {}",
+    assert_eq!(
+        response.status,
+        400,
+        "{} serves no OpenAPI document and does not answer /api/v1/chain the way this service \
+         does ({}), so it cannot be identified as an optionchain-simulator: {}",
         client.base_url(),
         response.status,
         response.text()
     );
-
-    // The OpenAPI document carries the version the deployment actually runs.
-    // A build too old to serve it is a fact to report, not a failure.
-    match client.get("/api-docs/openapi.json") {
-        Ok(document) if document.status == 200 => {
-            let version = document
-                .json::<serde_json::Value>("/api-docs/openapi.json")
-                .ok()
-                .and_then(|body| {
-                    body.get("info")
-                        .and_then(|info| info.get("version"))
-                        .and_then(|version| version.as_str())
-                        .map(str::to_string)
-                });
-            match version {
-                Some(version) => println!(
-                    "INFO: {} serves optionchain-simulator {version}; these tests describe the \
-                     contract of the working tree, so a difference is a lag, not a defect",
-                    client.base_url()
-                ),
-                None => println!("INFO: the OpenAPI document carries no version"),
-            }
-        }
-        Ok(document) => println!(
-            "SKIP: {} does not serve an OpenAPI document ({}), so the version could not be read",
-            client.base_url(),
-            document.status
+    let body: serde_json::Value = match response.json("/api/v1/chain") {
+        Ok(body) => body,
+        Err(error) => panic!(
+            "{} answered /api/v1/chain with something that is not this service's rejection \
+             shape: {error}",
+            client.base_url()
         ),
-        Err(error) => println!("SKIP: the OpenAPI document could not be read: {error}"),
-    }
+    };
+    assert!(
+        body.get("error").is_some(),
+        "the rejection shape of this service carries an error field: {body}"
+    );
+    println!(
+        "INFO: {} serves no OpenAPI document, so it predates one; identified by its v1 \
+         rejection shape instead",
+        client.base_url()
+    );
 }
 
 /// A simulation created by a test is gone when the test is.

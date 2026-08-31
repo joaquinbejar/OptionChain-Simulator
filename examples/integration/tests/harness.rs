@@ -78,23 +78,40 @@ fn test_a_usable_base_url_is_normalised() {
 
 /// An unreachable deployment names the URL it could not reach.
 ///
-/// Port 1 on the loopback interface refuses immediately, so this is a fast,
-/// hermetic check of the message rather than a wait on a timeout.
+/// Asserted on the error VALUE rather than by dialling a socket. The promise
+/// this crate makes is that `cargo test --workspace` with the variable unset
+/// starts no network connection at all, and a loopback connect to a closed
+/// port is still a connection: on a machine with an aggressive firewall or a
+/// proxy it is also a slow one. What matters here is that a transport failure
+/// carries the URL to the person reading the output, and that is a property of
+/// the message.
 #[test]
-fn test_an_unreachable_service_names_the_url() {
-    let client = match ServiceClient::new("http://127.0.0.1:1") {
-        Ok(client) => client,
-        Err(error) => panic!("the URL is well formed: {error}"),
+fn test_an_unreachable_service_names_the_url_in_its_error() {
+    let error = IntegrationError::Unreachable {
+        url: "http://a.host:7070/health".to_string(),
+        cause: "connection refused".to_string(),
     };
 
-    match client.get("/health") {
-        Ok(response) => panic!("nothing listens there, got {}", response.status),
-        Err(error) => {
-            let rendered = error.to_string();
-            assert!(
-                rendered.contains("http://127.0.0.1:1/health"),
-                "the failure must name the URL: {rendered}"
-            );
-        }
-    }
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("http://a.host:7070/health"),
+        "the failure must name the URL: {rendered}"
+    );
+    assert!(
+        rendered.contains("connection refused"),
+        "the failure must carry the underlying cause: {rendered}"
+    );
+}
+
+/// The same for a body that never arrives: the URL travels with the failure.
+#[test]
+fn test_a_malformed_answer_names_the_url_in_its_error() {
+    let error = IntegrationError::MalformedResponse {
+        url: "http://a.host:7070/export".to_string(),
+        reason: "the connection closed before the terminating zero chunk".to_string(),
+    };
+
+    let rendered = error.to_string();
+    assert!(rendered.contains("http://a.host:7070/export"), "{rendered}");
+    assert!(rendered.contains("terminating zero chunk"), "{rendered}");
 }

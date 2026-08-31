@@ -43,7 +43,7 @@
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 /// The variable naming the service under test.
@@ -268,8 +268,19 @@ impl ServiceClient {
             cause,
         };
 
-        let stream =
-            TcpStream::connect(&self.address).map_err(|error| unreachable(error.to_string()))?;
+        // `TcpStream::connect` has no deadline of its own, so a black-holed
+        // address would hang for the operating system's TCP timeout, which on
+        // a scheduled job means minutes rather than the request deadline. The
+        // address is resolved first and dialled with an explicit one, so every
+        // phase of a request is bounded by the same number.
+        let address = self
+            .address
+            .to_socket_addrs()
+            .map_err(|error| unreachable(format!("the address does not resolve: {error}")))?
+            .next()
+            .ok_or_else(|| unreachable("the address resolves to nothing".to_string()))?;
+        let stream = TcpStream::connect_timeout(&address, REQUEST_TIMEOUT)
+            .map_err(|error| unreachable(error.to_string()))?;
         stream
             .set_read_timeout(Some(REQUEST_TIMEOUT))
             .map_err(|error| unreachable(error.to_string()))?;
@@ -420,19 +431,35 @@ fn read_chunked(
     let mut body = Vec::new();
     loop {
         let mut size_line = String::new();
-        reader
+        let read = reader
             .read_line(&mut size_line)
             .map_err(|error| unreachable(error.to_string()))?;
+
+        // A chunked body is complete only after a zero-size chunk. End of
+        // stream here means the connection died mid-download, and accepting it
+        // would hand a test a truncated export that looks like valid partial
+        // data — exactly the failure this suite exists to catch.
+        if read == 0 {
+            return Err(malformed(
+                "the connection closed before the terminating zero chunk, so the body is \
+                 truncated"
+                    .to_string(),
+            ));
+        }
         let size_text = size_line.trim();
         if size_text.is_empty() {
-            break;
+            return Err(malformed(
+                "a blank line where a chunk size was expected, so the body is truncated"
+                    .to_string(),
+            ));
         }
+
         // A chunk size may carry extensions after a semicolon.
         let size_text = size_text.split(';').next().unwrap_or(size_text);
         let size = usize::from_str_radix(size_text, 16)
             .map_err(|error| malformed(format!("chunk size {size_text:?} is not hex: {error}")))?;
         if size == 0 {
-            break;
+            return Ok(body);
         }
 
         let mut chunk = vec![0_u8; size];
@@ -441,14 +468,18 @@ fn read_chunked(
             .map_err(|error| unreachable(error.to_string()))?;
         body.extend_from_slice(&chunk);
 
-        // Each chunk is followed by CRLF.
+        // Each chunk is followed by CRLF; anything else means the framing is
+        // not what it claims to be.
         let mut terminator = String::new();
-        reader
+        let read = reader
             .read_line(&mut terminator)
             .map_err(|error| unreachable(error.to_string()))?;
+        if read == 0 || terminator.trim_end_matches(['\r', '\n']) != "" {
+            return Err(malformed(format!(
+                "a chunk of {size} bytes was followed by {terminator:?} rather than a line end"
+            )));
+        }
     }
-
-    Ok(body)
 }
 
 /// The client for the configured deployment, or `None` when there is none.
@@ -542,10 +573,27 @@ impl Drop for Simulation {
     fn drop(&mut self) {
         // A failing test must not leave a simulation behind on a shared
         // deployment, and a cleanup that itself fails must not mask the
-        // failure that is already being reported.
-        if let Err(error) = self.client.delete(&self.path("")) {
-            println!("WARNING: could not delete simulation {}: {error}", self.id);
-        }
+        // failure that is already being reported — so this reports loudly and
+        // never panics.
+        report_cleanup(&self.client, &self.path(""), &self.id);
+    }
+}
+
+/// Deletes one resource and says plainly whether it worked.
+///
+/// A transport error is not the only way cleanup fails: a 401, a 405 or a 500
+/// all return `Ok(Response)`, and treating those as success is how a shared
+/// deployment fills up with abandoned simulations. Only the documented success
+/// codes count, plus 404, which means someone or something already removed it.
+pub fn report_cleanup(client: &ServiceClient, path: &str, what: &str) {
+    match client.delete(path) {
+        Ok(response) if matches!(response.status, 200 | 202 | 204 | 404) => {}
+        Ok(response) => println!(
+            "WARNING: deleting {what} answered {}, so it may still exist on the deployment: {}",
+            response.status,
+            response.text()
+        ),
+        Err(error) => println!("WARNING: could not delete {what}: {error}"),
     }
 }
 
