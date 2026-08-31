@@ -383,6 +383,45 @@ fn arrow_cell(column: &dyn arrow::array::Array, index: usize) -> String {
     }
 }
 
+/// A deployment serves every format its own document advertises.
+///
+/// The two can disagree: `arrow-export` is a Cargo feature, so a build without
+/// it refuses `format=arrow` in a typed 400 while the OpenAPI document the same
+/// process serves still lists the format. That is a contract a client cannot
+/// follow, and it shipped in every published image up to 0.2.25 (issue #148).
+///
+/// The rest of this file treats an advertised-but-absent format as a skip,
+/// which is what lets it run anywhere. This test is where that stops being
+/// acceptable, because what it holds is not the format matrix but the
+/// agreement between the document and the build behind it.
+#[test]
+fn test_the_deployment_serves_every_format_it_advertises() {
+    let Some(client) = service() else {
+        return;
+    };
+    let Some(exported) = Exported::create(&client) else {
+        return;
+    };
+    let offered = offered_formats(&client, &exported);
+
+    assert!(
+        offered.absent.is_empty(),
+        "this deployment advertises {:?} and cannot serve them: {:?}. A format in the document \
+         is a promise to a client that reads it, so either the build carries the format or the \
+         document stops offering it",
+        offered
+            .absent
+            .iter()
+            .map(|(format, _)| format.as_str())
+            .collect::<Vec<_>>(),
+        offered.absent
+    );
+    println!(
+        "INFO: every advertised format is served: {}",
+        offered.usable.join(", ")
+    );
+}
+
 /// Every dataset carries the same rows and the same values in every format the
 /// deployment advertises and serves.
 #[test]

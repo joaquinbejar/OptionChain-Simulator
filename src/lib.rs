@@ -665,11 +665,15 @@
 //!
 //! - **`arrow`** — an Arrow IPC **stream**, one record batch per block.
 //!   `Content-Type: application/vnd.apache.arrow.stream`, extension `arrow`.
-//!   Available only when the service is built with the **`arrow-export`**
-//!   feature, which is off by default because the `arrow` crate is a large tree
-//!   and a deployment that never exports should not carry it. Asking for
-//!   `format=arrow` without it is a typed `400` naming the format, never a 500
-//!   and never a silent fallback.
+//!   Behind the **`arrow-export`** feature, which is off by default in
+//!   `Cargo.toml` because a library consumer should not carry the `arrow` tree
+//!   to use this crate. A DEPLOYMENT is the other case: this document
+//!   advertises the format, so an image that could not serve it would refuse
+//!   its own contract (issue #148). `make release` therefore builds the feature
+//!   in, and the published image carries it, at about 1.2 MB of binary. Build
+//!   without it with `make release RELEASE_FEATURES=`; asking for
+//!   `format=arrow` then is a typed `400` naming the format, never a 500 and
+//!   never a silent fallback.
 //! - **`packed`** — a dependency-free columnar block format for the browser.
 //!   `Content-Type: application/octet-stream`, extension `ocsp`.
 //!

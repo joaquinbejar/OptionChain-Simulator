@@ -31,6 +31,7 @@ on:
       - "src/infrastructure/config/**"
       - "src/main.rs"
       - "Docker/Dockerfile"
+      - "Makefile"
       - "Docker/docker-compose.yml"
       - "scripts/replica_isolation_test.sh"
       - ".github/workflows/replica-isolation.yml"
