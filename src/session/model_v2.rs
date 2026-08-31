@@ -26,7 +26,7 @@ use crate::api::rest::validation::{
     time_frame_field,
 };
 use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, tzdb_version};
-use crate::domain::ladder::{StrikeLadder, ensure_ladder_fits};
+use crate::domain::ladder::{MAX_PINNED_WIDTH, StrikeLadder, ensure_ladder_fits};
 use crate::domain::simulator::DEFAULT_CHAIN_SIZE;
 use crate::domain::spread::{MAX_PROPORTIONAL, MAX_TICK, MAX_WIDENING};
 use crate::infrastructure::max_snapshot_contracts;
@@ -299,6 +299,19 @@ pub struct SimulationParametersV2 {
     /// The effective RNG seed. Non-optional: a v2 simulation is always
     /// reproducible, so the seed is resolved at conversion and never `None`.
     pub seed: u64,
+    /// How far a pinned ladder may make a step widen the chain it asks
+    /// upstream for, in strikes per side.
+    ///
+    /// Resolved ONCE, at creation, from the per-snapshot contract cap and this
+    /// simulation's own schedule, exactly as the effective seed is resolved
+    /// once and then carried. The domain reads it from here rather than from
+    /// the environment, so a session keeps the ceiling it was created under for
+    /// its whole life: the same parameters and seed then reach the same step on
+    /// any instance, whatever an operator has since done to
+    /// `OCS_MAX_SNAPSHOT_CONTRACTS`.
+    ///
+    /// A `rolling` simulation carries it too and never consults it.
+    pub pinned_width_ceiling: usize,
 }
 
 /// The deserialization shape of [`SimulationParametersV2`].
@@ -347,12 +360,23 @@ struct SimulationParametersV2Wire {
     #[serde(default)]
     spread_tick: Option<Positive>,
     seed: u64,
+    /// Absent in a document written before the ceiling was stored. Such a
+    /// session is resolved once here, on load, which is the ceiling it would
+    /// have had, and keeps it from then on.
+    #[serde(default)]
+    pinned_width_ceiling: Option<usize>,
 }
 
 impl TryFrom<SimulationParametersV2Wire> for SimulationParametersV2 {
     type Error = ChainError;
 
     fn try_from(wire: SimulationParametersV2Wire) -> Result<Self, Self::Error> {
+        // A document written before the ceiling was stored resolves it once,
+        // here, and carries it from then on.
+        let pinned_width_ceiling = match wire.pinned_width_ceiling {
+            Some(ceiling) => ceiling,
+            None => crate::domain::resolve_pinned_ceiling(&wire.schedule)?,
+        };
         let parameters = Self {
             symbol: wire.symbol,
             steps: wire.steps,
@@ -377,8 +401,9 @@ impl TryFrom<SimulationParametersV2Wire> for SimulationParametersV2 {
             spread_tenor_widening: wire.spread_tenor_widening,
             spread_tick: wire.spread_tick,
             seed: wire.seed,
+            pinned_width_ceiling,
         };
-        parameters.validate()?;
+        parameters.validate_stored()?;
         Ok(parameters)
     }
 }
@@ -407,6 +432,37 @@ impl SimulationParametersV2 {
     /// model fails its own invariants, `volatility` disagrees with the walk
     /// model's own volatility, or the schedule is invalid.
     pub fn validate(&self) -> Result<(), ChainError> {
+        self.validate_inner(true)
+    }
+
+    /// The same invariants, for a document coming back from the STORE rather
+    /// than from a request.
+    ///
+    /// One check differs, deliberately. `OCS_MAX_SNAPSHOT_CONTRACTS` is
+    /// admission control: it decides what this instance is willing to accept,
+    /// which is a question about the future. A session that already exists
+    /// answered it when it was created, and re-answering it on load with
+    /// whatever cap the instance happens to run today would mean a simulation
+    /// created under a higher cap fails to DESERIALIZE on a smaller instance,
+    /// taking the tape with it. That is exactly the cross-instance breakage
+    /// issue #109 set out to remove.
+    ///
+    /// So a stored document whose work exceeds this instance's cap loads with
+    /// a warning, the same treatment a `tzdb_version` from another release
+    /// gets, and every deployment-independent invariant still applies —
+    /// including the absolute ceiling on `pinned_width_ceiling`, which is what
+    /// keeps a corrupted document from buying unbounded pricing.
+    ///
+    /// # Errors
+    ///
+    /// As [`SimulationParametersV2::validate`], minus the per-snapshot cap.
+    pub fn validate_stored(&self) -> Result<(), ChainError> {
+        self.validate_inner(false)
+    }
+
+    /// The shared body. `enforce_cap` is what separates a request from a
+    /// document that already exists.
+    fn validate_inner(&self, enforce_cap: bool) -> Result<(), ChainError> {
         if self.steps < 1 {
             return Err(ChainError::Validation {
                 field: "steps".to_string(),
@@ -517,7 +573,20 @@ impl SimulationParametersV2 {
             });
         }
         self.schedule.validate()?;
-        self.validate_snapshot_work()?;
+        self.enforce_snapshot_work(enforce_cap)?;
+
+        // Deployment-independent, so it holds on every path: a stored ceiling
+        // above the absolute maximum would let a corrupted document buy a
+        // widening no request could ever ask for.
+        if self.pinned_width_ceiling > MAX_PINNED_WIDTH {
+            return Err(ChainError::Validation {
+                field: "pinned_width_ceiling".to_string(),
+                reason: format!(
+                    "must not exceed {MAX_PINNED_WIDTH}, got {}",
+                    self.pinned_width_ceiling
+                ),
+            });
+        }
 
         // A simulation has exactly one base volatility. v1 accepts a top-level
         // value and a walk model carrying a different one, and silently prices
@@ -570,7 +639,39 @@ impl SimulationParametersV2 {
     ///
     /// Returns [`ChainError::Validation`] naming `chain_size`, which is the
     /// field a client can lower without changing what the simulation means.
-    fn validate_snapshot_work(&self) -> Result<(), ChainError> {
+    fn enforce_snapshot_work(&self, enforce_cap: bool) -> Result<(), ChainError> {
+        let contracts = self.snapshot_contracts()?;
+        let cap = max_snapshot_contracts();
+
+        if contracts <= cap {
+            return Ok(());
+        }
+        if !enforce_cap {
+            // A session that already exists keeps loading; see
+            // `validate_stored`.
+            warn!(
+                contracts,
+                cap,
+                "a stored simulation prices more contracts per snapshot than this instance would accept"
+            );
+            return Ok(());
+        }
+
+        Err(ChainError::Validation {
+            field: "chain_size".to_string(),
+            reason: format!(
+                "every snapshot would price {contracts} contracts, above the {cap} maximum; \
+                 lower chain_size or the schedules' target_count"
+            ),
+        })
+    }
+
+    /// How many contracts one snapshot of this configuration prices.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChainError::Validation`] when the count is not representable.
+    fn snapshot_contracts(&self) -> Result<usize, ChainError> {
         let requested = self.chain_size.unwrap_or(DEFAULT_CHAIN_SIZE);
         let strikes = strikes_per_chain(requested).ok_or_else(|| ChainError::Validation {
             field: "chain_size".to_string(),
@@ -588,7 +689,7 @@ impl SimulationParametersV2 {
                 reason: "the requested expiration counts overflow".to_string(),
             })?;
 
-        let contracts = strikes
+        strikes
             .checked_mul(expirations)
             .ok_or_else(|| ChainError::Validation {
                 field: "chain_size".to_string(),
@@ -596,21 +697,7 @@ impl SimulationParametersV2 {
                     "{strikes} strikes across {expirations} expirations overflows the \
                      contract count"
                 ),
-            })?;
-
-        let cap = max_snapshot_contracts();
-        if contracts > cap {
-            return Err(ChainError::Validation {
-                field: "chain_size".to_string(),
-                reason: format!(
-                    "every snapshot would price {contracts} contracts ({strikes} strikes \
-                     across up to {expirations} expirations), above the {cap} maximum; lower \
-                     chain_size or the schedules' target_count"
-                ),
-            });
-        }
-
-        Ok(())
+            })
     }
 
     /// The simulated instant at `cursor`.
@@ -725,6 +812,10 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
             request.schedules,
         )?;
 
+        // The pinned widening ceiling is resolved here, once, from the cap
+        // this instance runs and this simulation's own schedule, and stored.
+        let pinned_width_ceiling = crate::domain::resolve_pinned_ceiling(&schedule)?;
+
         let parameters = Self {
             symbol: request.symbol,
             steps: request.steps,
@@ -756,6 +847,7 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
                 .map(|value| positive_field("spread", value))
                 .transpose()?,
             strike_ladder: request.strike_ladder.unwrap_or_default(),
+            pinned_width_ceiling,
             // The widening coefficients are rates, not prices: zero is the
             // documented default and a negative one would NARROW a quote away
             // from the money, which is not a market anyone trades.
@@ -1620,6 +1712,133 @@ mod tests {
                 "an older document must read as the behaviour it was written under"
             ),
             Err(error) => panic!("an older document must still load: {error}"),
+        }
+    }
+
+    /// A document written before the ceiling was stored still loads, and gets
+    /// the ceiling it would have had, resolved once on the way in.
+    #[test]
+    fn test_stored_parameters_without_a_pinned_ceiling_still_load() {
+        let parameters = parameters(reference_request());
+        let json = match serde_json::to_value(&parameters) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                assert!(
+                    map.remove("pinned_width_ceiling").is_some(),
+                    "the ceiling must be part of the stored shape"
+                );
+                serde_json::Value::Object(map)
+            }
+            other => panic!("the parameters must serialize to an object, got {other:?}"),
+        };
+
+        match serde_json::from_value::<SimulationParametersV2>(json) {
+            Ok(loaded) => assert_eq!(
+                loaded.pinned_width_ceiling, parameters.pinned_width_ceiling,
+                "an older document must read as the ceiling it would have had"
+            ),
+            Err(error) => panic!("an older document must still load: {error}"),
+        }
+    }
+
+    /// A stored ceiling survives the round trip rather than being re-resolved,
+    /// which is the whole point: a session created under a tighter cap keeps
+    /// that ceiling on an instance whose own cap is wider.
+    #[test]
+    fn test_a_stored_pinned_ceiling_survives_the_round_trip() {
+        let mut parameters = parameters(reference_request());
+        parameters.pinned_width_ceiling = 7;
+
+        let json = match serde_json::to_string(&parameters) {
+            Ok(json) => json,
+            Err(error) => panic!("must serialize: {error}"),
+        };
+        match serde_json::from_str::<SimulationParametersV2>(&json) {
+            Ok(loaded) => assert_eq!(loaded.pinned_width_ceiling, 7),
+            Err(error) => panic!("must deserialize: {error}"),
+        }
+    }
+
+    /// A corrupted document cannot buy a widening no request could ask for.
+    ///
+    /// Redis is an outer layer: the stored ceiling is a number the domain then
+    /// obeys, so a hand-edited document raising it past the absolute maximum
+    /// would bypass the guard on how much the service prices per step.
+    #[test]
+    fn test_a_stored_pinned_ceiling_above_the_maximum_is_refused() {
+        let parameters = parameters(reference_request());
+
+        let json = match serde_json::to_value(&parameters) {
+            Ok(serde_json::Value::Object(mut map)) => {
+                map.insert(
+                    "pinned_width_ceiling".to_string(),
+                    serde_json::json!(MAX_PINNED_WIDTH + 1),
+                );
+                serde_json::Value::Object(map)
+            }
+            other => panic!("the parameters must serialize to an object, got {other:?}"),
+        };
+
+        match serde_json::from_value::<SimulationParametersV2>(json) {
+            Ok(loaded) => panic!(
+                "a ceiling of {} must be refused, loaded {loaded:?}",
+                MAX_PINNED_WIDTH + 1
+            ),
+            Err(error) => {
+                let rendered = error.to_string();
+                assert!(
+                    rendered.contains("pinned_width_ceiling"),
+                    "the failure must name the field: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// A session created under a higher per-snapshot cap keeps LOADING on an
+    /// instance running a lower one.
+    ///
+    /// The cap is admission control, a decision about what to accept next. A
+    /// session that already exists answered it at creation, and re-answering it
+    /// on load would mean a smaller instance cannot even deserialize a tape a
+    /// bigger one is serving, which is the cross-instance breakage #109 exists
+    /// to remove. The creation path still refuses the same configuration.
+    #[test]
+    fn test_a_stored_simulation_over_the_cap_still_loads_but_is_not_creatable() {
+        let mut parameters = parameters(reference_request());
+
+        // 1 001 strikes across 512 live expirations is half a million
+        // contracts a snapshot, far above any sane cap.
+        parameters.chain_size = Some(*MAX_CHAIN_SIZE);
+        let rules = match (
+            ExpiryRule::new("dailies", ExpiryRuleKind::Daily, 256),
+            ExpiryRule::new("more_dailies", ExpiryRuleKind::Daily, 256),
+        ) {
+            (Ok(first), Ok(second)) => vec![first, second],
+            (first, second) => panic!("the test rules must be valid: {first:?} {second:?}"),
+        };
+        parameters.schedule = match ExpirationSchedule::new(
+            parameters.schedule.calendar(),
+            parameters.schedule.timezone(),
+            parameters.schedule.expiration_time(),
+            rules,
+        ) {
+            Ok(schedule) => schedule,
+            Err(error) => panic!("the test schedule must be valid: {error}"),
+        };
+
+        match parameters.validate() {
+            Ok(()) => panic!("a request for that much work must be refused at creation"),
+            Err(ChainError::Validation { field, reason }) => {
+                assert_eq!(field, "chain_size");
+                assert!(reason.contains("above the"), "{reason}");
+            }
+            Err(error) => panic!("expected a validation failure, got {error:?}"),
+        }
+
+        match parameters.validate_stored() {
+            Ok(()) => {}
+            Err(error) => panic!(
+                "a session that already exists must keep loading on a smaller instance: {error}"
+            ),
         }
     }
 
