@@ -65,52 +65,53 @@ fn test_metrics_expose_the_documented_counters_and_move() {
         );
     }
 
-    let before = counter(&body, "api_requests_total");
+    // The EXACT series this test moves: one endpoint, one method, one status.
+    // Summing every label set would let parallel traffic from the other tests
+    // in this suite satisfy the assertion without these three requests being
+    // recorded at all.
+    let series = "api_requests_total{endpoint=\"/api/v1/chain\",method=\"GET\",status=\"404\"}";
+    let before = sample(&body, series).unwrap_or(0.0);
 
-    // Serve some traffic that is unambiguously an API request.
+    // Three requests that land on exactly that series: a well-formed id that
+    // cannot exist is a 404 from the v1 route.
+    let absent = "/api/v1/chain?sessionid=00000000-0000-4000-8000-000000000000";
     for _ in 0..3 {
-        match client.get("/api/v1/chain?sessionid=00000000-0000-4000-8000-000000000000") {
-            Ok(_) => {}
+        match client.get(absent) {
+            Ok(response) => assert_eq!(
+                response.status,
+                404,
+                "the fixture request must be a 404 for this series to mean anything, got {} \
+                 with {}",
+                response.status,
+                response.text()
+            ),
             Err(error) => panic!("{error}"),
         }
     }
 
     let after = match client.get("/metrics") {
-        Ok(response) => counter(&response.text(), "api_requests_total"),
+        Ok(response) => sample(&response.text(), series).unwrap_or(0.0),
         Err(error) => panic!("{error}"),
     };
 
-    match (before, after) {
-        (Some(before), Some(after)) => assert!(
-            after > before,
-            "serving three requests must move api_requests_total, it went {before} to {after}"
-        ),
-        _ => println!(
-            "INFO: api_requests_total carries labels this test does not sum; the exposition was \
-             checked but the movement was not"
-        ),
-    }
+    assert_eq!(
+        after - before,
+        3.0,
+        "three requests on {series} must move it by three, it went {before} to {after}"
+    );
 }
 
-/// The total of one counter across its label sets, or `None` when it is not
-/// exposed as a plain sample.
-fn counter(body: &str, name: &str) -> Option<f64> {
-    let mut total = 0.0;
-    let mut seen = false;
-    for line in body.lines() {
-        if line.starts_with('#') {
-            continue;
-        }
-        let Some((series, value)) = line.rsplit_once(' ') else {
-            continue;
-        };
-        let matches = series == name || series.starts_with(&format!("{name}{{"));
-        if let (true, Ok(value)) = (matches, value.parse::<f64>()) {
-            total += value;
-            seen = true;
-        }
-    }
-    seen.then_some(total)
+/// One exact series, or `None` when the exposition does not carry it.
+///
+/// An absent series is a real answer: a counter with no observations yet is
+/// zero, and the caller decides what that means.
+fn sample(body: &str, series: &str) -> Option<f64> {
+    body.lines()
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            let (name, value) = line.rsplit_once(' ')?;
+            (name == series).then(|| value.parse::<f64>().ok())?
+        })
 }
 
 /// Every path the deployment advertises actually answers.
@@ -129,13 +130,15 @@ fn test_every_advertised_path_answers() {
             Ok(document) => document,
             Err(error) => panic!("{error}"),
         },
-        Ok(response) => {
-            println!(
-                "SKIP: this deployment serves no OpenAPI document ({})",
-                response.status
-            );
-            return;
-        }
+        // The document IS the contract this test exists to enforce. A
+        // deployment that stopped serving it is the regression, and skipping
+        // would remove the whole advertised-route check exactly when it
+        // matters.
+        Ok(response) => panic!(
+            "the deployment must serve an OpenAPI document, it answered {}: {}",
+            response.status,
+            response.text()
+        ),
         Err(error) => panic!("{error}"),
     };
 
@@ -182,11 +185,36 @@ fn test_every_advertised_path_answers() {
                 response.status,
                 response.text()
             );
+
             if response.status == 404 {
+                // A 404 is only acceptable where the operation takes an id: it
+                // then means "no such simulation", which is a documented
+                // result. Everywhere else it means the route is not mounted.
                 assert!(
-                    !response.body.is_empty(),
-                    "{method} {path} is advertised and answers a bare 404, which is what an \
-                     unmounted route does; a mounted one explains itself"
+                    template.contains("{id}"),
+                    "{method} {path} takes no id, so a 404 means the route is not mounted"
+                );
+
+                // And it must be THIS service's 404, not a proxy's or a
+                // framework default: proxies answer HTML happily, which is why
+                // a non-empty body proves nothing.
+                let content_type = response.header("content-type").unwrap_or_default();
+                assert!(
+                    content_type.contains("application/json"),
+                    "{method} {path} answered a {content_type:?} 404, which is what a proxy or \
+                     an unmounted route produces; this service answers JSON"
+                );
+                let body: serde_json::Value = match response.json(&path) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        panic!("{method} {path}: a 404 must be this service's shape: {error}")
+                    }
+                };
+                assert!(
+                    body.get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|message| !message.is_empty()),
+                    "{method} {path}: a 404 must explain itself: {body}"
                 );
             }
             checked += 1;
@@ -251,12 +279,6 @@ fn test_the_probes_answer_and_stay_out_of_the_metrics() {
         Ok(response) => response,
         Err(error) => panic!("{error}"),
     };
-    assert!(
-        ready.status == 200 || ready.status == 503,
-        "/ready must be 200 or 503, got {} with {}",
-        ready.status,
-        ready.text()
-    );
 
     let body: serde_json::Value = match ready.json("/ready") {
         Ok(body) => body,
@@ -270,22 +292,76 @@ fn test_the_probes_answer_and_stay_out_of_the_metrics() {
         !dependencies.is_empty(),
         "/ready must name at least one dependency: {body}"
     );
-    for dependency in dependencies {
+
+    // The dependencies this service has. A readiness answer that stopped
+    // probing one of them would otherwise look healthier than the deployment
+    // is.
+    let named: Vec<&str> = dependencies
+        .iter()
+        .filter_map(|dependency| dependency.get("name").and_then(serde_json::Value::as_str))
+        .collect();
+    for required in ["redis", "mongodb"] {
         assert!(
-            dependency
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .is_some(),
-            "every dependency must be named: {dependency}"
-        );
-        assert!(
-            dependency
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|status| status == "up" || status == "down"),
-            "every dependency must report up or down: {dependency}"
+            named.contains(&required),
+            "/ready must probe {required}, it named {named:?}"
         );
     }
+
+    let mut all_up = true;
+    for dependency in dependencies {
+        let name = dependency
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("every dependency must be named: {dependency}"));
+        let status = dependency
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{name} must report a status: {dependency}"));
+        assert!(
+            status == "up" || status == "down",
+            "{name} reports {status:?}, where the contract is up or down"
+        );
+
+        match status {
+            "up" => assert!(
+                dependency.get("reason").is_none()
+                    || dependency.get("reason") == Some(&serde_json::Value::Null),
+                "{name} is up and still carries a reason: {dependency}"
+            ),
+            _ => {
+                all_up = false;
+                // A reason is a CATEGORY, never a message: anything else risks
+                // carrying a host name or a credential into an operator's logs.
+                let reason = dependency
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("{name} is down and says nothing: {dependency}"));
+                assert!(
+                    reason == "unreachable" || reason == "timed out",
+                    "{name} is down for {reason:?}, which is not one of the documented \
+                     categories"
+                );
+            }
+        }
+    }
+
+    // The aggregate must follow from the parts, in both directions: a 200 with
+    // something down, or a 503 with everything up, is a probe an orchestrator
+    // cannot trust.
+    let status = body
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("/ready must report an aggregate status: {body}"));
+    let expected = if all_up {
+        ("ready", 200)
+    } else {
+        ("not_ready", 503)
+    };
+    assert_eq!(
+        (status, ready.status),
+        expected,
+        "the aggregate must follow from the dependencies: {body}"
+    );
 
     // Probing must not pollute the counters: an orchestrator probes every few
     // seconds forever, and a request rate that is mostly liveness checks tells
