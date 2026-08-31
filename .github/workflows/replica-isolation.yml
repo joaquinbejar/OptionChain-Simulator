@@ -1,0 +1,52 @@
+# Proves the readiness probe is per REPLICA, not per deployment.
+#
+# The Integration job runs one instance against healthy dependencies, so it
+# sees a 200 and nothing else. What an orchestrator actually relies on is the
+# other case: one replica loses a dependency, says so about ITSELF, and its
+# neighbour keeps serving. That needs an operator's hands on the containers,
+# which is what scripts/replica_isolation_test.sh has and a client of the
+# deployment does not.
+#
+# Deliberately NOT on every push: it builds the service image and runs five
+# containers, and it has nothing to say about a change that touches neither the
+# probes, nor what they probe, nor how the service is packaged.
+name: Replica isolation (readiness per instance)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    # Everything that decides what this fixture observes, not only the modules
+    # named after it. The probe bodies and the instance header are the visible
+    # half; the wiring that chooses which dependencies are probed, mounts the
+    # routes and installs the header can regress on its own, and the clients
+    # the probes call decide what "unreachable" even means.
+    paths:
+      - "src/api/rest/health.rs"
+      - "src/api/rest/instance.rs"
+      - "src/api/rest/routes.rs"
+      - "src/api/rest/controller.rs"
+      - "src/infrastructure/health.rs"
+      - "src/infrastructure/redis/**"
+      - "src/infrastructure/mongodb/**"
+      - "src/infrastructure/config/**"
+      - "src/main.rs"
+      - "Docker/Dockerfile"
+      - "Docker/docker-compose.yml"
+      - "scripts/replica_isolation_test.sh"
+      - ".github/workflows/replica-isolation.yml"
+
+jobs:
+  isolation:
+    name: A replica reports its own broken dependency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Built here rather than inside the script so the build is a step of its
+      # own in the log: a compile error is then a build failure rather than a
+      # fixture that appears to fail at its first assertion.
+      - name: Build the service image
+        run: docker build -f Docker/Dockerfile -t ocs-replica-isolation:ci .
+
+      - name: Isolate one replica from Redis
+        run: ./scripts/replica_isolation_test.sh ocs-replica-isolation:ci

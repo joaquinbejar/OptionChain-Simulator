@@ -215,6 +215,19 @@ hosts, paths and tokens no redaction reliably recognises, so the full
 explanation stays in the service's log. Nothing is cached, so an instance
 whose Redis came back reports itself ready again without a restart.
 
+That last claim is the one an orchestrator acts on, so it is proven by a
+fixture rather than asserted: `scripts/replica_isolation_test.sh` runs two
+replicas over shared dependencies, disconnects ONE of them from the Redis
+network — the dependency is never stopped, which would break both — and
+requires the isolated instance to answer 503 naming Redis while its
+neighbour still answers 200. Each answer is attributed by its
+`x-ocs-instance` header, so the assertions are about a named replica rather
+than about whichever one a balancer chose, and the recovery is asserted by
+reconnecting the network and requiring the SAME instance id to report
+itself ready again: an unchanged id is a process that was never restarted.
+CI runs it on a change to the probes, to what they probe, or to how the
+service is packaged.
+
 Both are unversioned, unauthenticated, and excluded from the request
 metrics: an orchestrator polling forever would otherwise add a constant to
 every series and a flood of 503s to the error series while a dependency is
