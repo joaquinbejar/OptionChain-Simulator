@@ -139,6 +139,14 @@ pub struct ErrorResponse {
 /// Error body returned for request-validation failures (HTTP 400): the
 /// human-readable message plus the exact request field that failed, so
 /// generated clients match the actual wire shape.
+///
+/// **Not every v1 400 uses this shape.** A `sessionid` that cannot be parsed
+/// answers [`ErrorResponse`] instead — `error` alone, no `field`, with the
+/// message prefixed `Invalid State` — while a missing one answers this shape
+/// with `field` empty. v2 names `id` for the same mistake. `/api/v1/chain` is
+/// frozen on rendered values, so aligning the two would change what an
+/// existing client parses; issue #119 records the decision to document the
+/// difference rather than remove it.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
 pub struct ValidationErrorResponse {
     /// Human-readable description of the validation failure.
