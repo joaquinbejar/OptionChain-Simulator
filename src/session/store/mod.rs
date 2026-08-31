@@ -55,7 +55,7 @@ pub use in_memory::InMemorySessionStore;
 pub use in_redis::InRedisSessionStore;
 pub use interface::SessionStore;
 pub(crate) use tape_cache::tape_key;
-pub use tape_cache::{DEFAULT_TAPE_KEY_PREFIX, RedisTapeCache, SharedTapeCache};
+pub use tape_cache::{BuildClaim, DEFAULT_TAPE_KEY_PREFIX, RedisTapeCache, SharedTapeCache};
 pub use v2_interface::SimulationStore;
 pub use v2_memory::{DEFAULT_V2_RETENTION_SECS, InMemorySimulationStore};
 pub use v2_redis::{DEFAULT_V2_KEY_PREFIX, InRedisSimulationStore};

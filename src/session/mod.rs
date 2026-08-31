@@ -84,7 +84,7 @@ pub use manager_v2::SimulationManager;
 pub use model::{Session, SessionState, SimulationMethod, SimulationParameters};
 pub use model_v2::{SESSION_V2_SCHEMA_VERSION, SessionV2, SimulationParametersV2};
 pub use store::{
-    DEFAULT_TAPE_KEY_PREFIX, DEFAULT_V2_KEY_PREFIX, DEFAULT_V2_RETENTION_SECS,
+    BuildClaim, DEFAULT_TAPE_KEY_PREFIX, DEFAULT_V2_KEY_PREFIX, DEFAULT_V2_RETENTION_SECS,
     InMemorySessionStore, InMemorySimulationStore, InRedisSessionStore, InRedisSimulationStore,
     RedisTapeCache, SessionStore, SharedTapeCache, SimulationStore,
 };

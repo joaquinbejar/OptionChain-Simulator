@@ -27,7 +27,7 @@ use crate::domain::series::{SeriesBuilder, SeriesSnapshot, SnapshotCache};
 use crate::infrastructure::{SimulationSnapshotRepository, SimulationV2Config, SnapshotRecord};
 use crate::session::model::SessionState;
 use crate::session::snapshot_record::{snapshot_quote_count, snapshot_record};
-use crate::session::store::{SharedTapeCache, SimulationStore, tape_key};
+use crate::session::store::{BuildClaim, SharedTapeCache, SimulationStore, tape_key};
 use crate::session::{SessionV2, SimulationParametersV2};
 use crate::utils::ChainError;
 use std::collections::HashMap;
@@ -50,12 +50,147 @@ const SHARED_BUILD_POLL: Duration = Duration::from_millis(50);
 
 /// What asking for the deployment-wide build claim produced.
 enum SharedBuild {
-    /// This caller builds.
-    Owner,
+    /// This caller builds. The token, when there is one, is what releases the
+    /// claim; there is none when no cache is configured, when the cache could
+    /// not answer, or when the wait for another instance ran out.
+    Owner(Option<String>),
     /// Another instance built it, and here it is.
     Waited(FactorTape),
-    /// Another instance owns the claim but published nothing in time.
-    Unavailable,
+}
+
+/// Everything the owner of a tape build needs, owned rather than borrowed.
+///
+/// Owned because the workflow runs in a task that outlives the request that
+/// started it: the build cannot be cancelled once it is on the blocking pool,
+/// and the waiters, the shared cache and the deployment-wide claim must be
+/// settled whether the caller is still there or not.
+struct OwnedBuild {
+    id: Uuid,
+    /// The tape's shared-cache key, computed once by the caller.
+    key: String,
+    parameters: SimulationParametersV2,
+    tapes: Arc<Mutex<HashMap<Uuid, TapeEntry>>>,
+    builds: Arc<Mutex<HashMap<Uuid, TapeBuilds>>>,
+    shared: Option<Arc<dyn SharedTapeCache>>,
+    max_cached_tapes: usize,
+    shared_build_wait: Duration,
+}
+
+impl OwnedBuild {
+    /// Builds the tape (or takes another instance's), publishes it, and gives
+    /// back every claim it took.
+    async fn run(self, sender: TapeBuilds) {
+        let claim = self.claim().await;
+        let built_here = !matches!(claim, SharedBuild::Waited(_));
+        // Kept out of the match, which consumes the claim, because the token
+        // is what releases it at the end.
+        let token = match &claim {
+            SharedBuild::Owner(token) => token.clone(),
+            SharedBuild::Waited(_) => None,
+        };
+
+        let result = match claim {
+            SharedBuild::Waited(tape) => {
+                SimulationManager::cache_tape(
+                    &self.tapes,
+                    self.max_cached_tapes,
+                    self.id,
+                    tape.clone(),
+                );
+                Ok(tape)
+            }
+            SharedBuild::Owner(_) => {
+                SimulationManager::build_tape_into(
+                    self.parameters.clone(),
+                    self.id,
+                    Arc::clone(&self.tapes),
+                    self.max_cached_tapes,
+                )
+                .await
+            }
+        };
+
+        // Publish to whoever is waiting and stop being the owner, in that
+        // order: a caller that subscribes after the removal misses the
+        // broadcast, retries, and finds the tape in the cache.
+        //
+        // Before the shared write, deliberately. A slow Redis would otherwise
+        // hold every local waiter behind a round trip they do not need.
+        {
+            let mut builds = match self.builds.lock() {
+                Ok(builds) => builds,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            builds.remove(&self.id);
+        }
+        let published = match &result {
+            Ok(tape) => Ok(tape.clone()),
+            Err(error) => Err(error.to_string()),
+        };
+        // An error means nobody was waiting, which happens whenever the
+        // request that started this went away.
+        let _ = sender.send(published);
+
+        // Only now offer it to the other instances: this process is already
+        // served, so a slow or failing write costs the deployment a rebuild
+        // elsewhere and costs this request nothing. A tape another instance
+        // published is already there, so only one built here is worth writing.
+        if let (Some(shared), true, Ok(tape)) = (self.shared.as_ref(), built_here, &result) {
+            SimulationManager::share_tape_to(shared.as_ref(), &self.key, self.id, tape).await;
+        }
+
+        // The claim goes back after the shared write, not before: an instance
+        // that wakes on the release must find the tape rather than an empty
+        // key. Released whether the build succeeded or not, so a failure does
+        // not make the others wait out the expiry for a tape nobody wrote.
+        if let (Some(shared), Some(token)) = (self.shared.as_ref(), &token) {
+            shared.release_build(&self.key, token).await;
+        }
+    }
+
+    /// Claims the deployment-wide right to build this tape, or waits for the
+    /// instance that holds it.
+    ///
+    /// The wait is bounded and polls the shared cache rather than a channel:
+    /// there is no channel between processes, and an owner that dies would
+    /// otherwise leave every waiter hanging until its claim expired. When the
+    /// wait runs out this caller builds, which is duplicated work rather than
+    /// a request that never answers.
+    async fn claim(&self) -> SharedBuild {
+        let Some(shared) = self.shared.as_ref() else {
+            return SharedBuild::Owner(None);
+        };
+
+        match shared.claim_build(&self.key).await {
+            // Nothing to release: without a claim there is nothing this
+            // instance holds, and deleting the key would take a claim another
+            // instance owns.
+            BuildClaim::Unclaimed => return SharedBuild::Owner(None),
+            BuildClaim::Held(token) => return SharedBuild::Owner(Some(token)),
+            BuildClaim::Taken => {}
+        }
+
+        debug!(
+            simulation_id = %self.id,
+            "another instance is building this tape; waiting for it"
+        );
+        let deadline = Instant::now() + self.shared_build_wait;
+        while Instant::now() < deadline {
+            tokio::time::sleep(SHARED_BUILD_POLL).await;
+            if let Some(tape) =
+                SimulationManager::shared_tape_from(shared.as_ref(), &self.key, self.id).await
+            {
+                return SharedBuild::Waited(tape);
+            }
+        }
+
+        warn!(
+            simulation_id = %self.id,
+            waited_secs = self.shared_build_wait.as_secs(),
+            "the instance building this tape did not publish in time; building it here"
+        );
+        SharedBuild::Owner(None)
+    }
 }
 
 /// One cached factor tape and the last time it was used.
@@ -74,6 +209,9 @@ type SnapshotKey = (Uuid, usize);
 /// internal error, which is what the owner would have reported anyway.
 type SnapshotBuilds = broadcast::Sender<Result<SeriesSnapshot, String>>;
 
+/// How a tape build publishes its result to the callers waiting on it.
+type TapeBuilds = broadcast::Sender<Result<FactorTape, String>>;
+
 /// Owns the lifecycle of v2 rolling simulations.
 pub struct SimulationManager {
     store: Arc<dyn SimulationStore>,
@@ -87,7 +225,7 @@ pub struct SimulationManager {
     /// `spawn_blocking` does not bound that: its pool grows to hundreds of
     /// threads, so the cache would still be cold while every core was busy
     /// filling it with the same answer.
-    builds: Mutex<HashMap<Uuid, broadcast::Sender<Result<FactorTape, String>>>>,
+    builds: Arc<Mutex<HashMap<Uuid, TapeBuilds>>>,
     /// Snapshot builds currently running, one entry per `(simulation, step)`.
     ///
     /// The same argument as [`SimulationManager::builds`], one level down and
@@ -175,7 +313,7 @@ impl SimulationManager {
             store,
             config,
             tapes: Arc::new(Mutex::new(HashMap::new())),
-            builds: Mutex::new(HashMap::new()),
+            builds: Arc::new(Mutex::new(HashMap::new())),
             snapshot_builds: Mutex::new(HashMap::new()),
             snapshots: Arc::new(Mutex::new(SnapshotCache::with_bounds(
                 config.max_cached_snapshots,
@@ -682,11 +820,16 @@ impl SimulationManager {
         }
 
         let id = simulation.id;
+        // Computed ONCE. The key serialises every parameter, and a historical
+        // simulation carries its prices, so recomputing it per lookup — the
+        // waiter below polls twenty times a second — would put a large
+        // synchronous serialization on the runtime for every poll.
+        let key = tape_key(id, &simulation.parameters);
 
         // Another instance may already have walked this. Consulted before the
         // build lock rather than after, so a hit costs one round trip instead
         // of queueing behind a build that is about to be redundant.
-        if let Some(tape) = self.shared_tape(simulation).await {
+        if let Some(tape) = self.shared_tape(&key, id).await {
             Self::cache_tape(&self.tapes, self.config.max_cached_tapes, id, tape.clone());
             return Ok(tape);
         }
@@ -702,94 +845,54 @@ impl SimulationManager {
         // Either this call owns the build or it waits on the one already
         // running. Decided under the lock, so two callers cannot both decide
         // they are the owner.
-        let subscription = {
+        let (mut waiting, owned) = {
             let mut builds = match self.builds.lock() {
                 Ok(builds) => builds,
                 Err(poisoned) => poisoned.into_inner(),
             };
 
             match builds.get(&id) {
-                Some(running) => Some(running.subscribe()),
+                Some(running) => (running.subscribe(), None),
                 None => {
-                    let (sender, _) = broadcast::channel(1);
-                    builds.insert(id, sender);
-                    None
+                    let (sender, receiver) = broadcast::channel(1);
+                    builds.insert(id, sender.clone());
+                    (receiver, Some(sender))
                 }
             }
         };
 
-        if let Some(mut waiting) = subscription {
-            return match waiting.recv().await {
-                Ok(Ok(tape)) => Ok(tape),
-                // The owner failed; report what it reported rather than
-                // starting a second build that would fail the same way.
-                Ok(Err(reason)) => Err(ChainError::Internal(reason)),
-                // The owner's task died without publishing. Rare, and the
-                // honest answer is to build it here rather than hang.
-                Err(_) => self.build_tape(simulation).await,
-            };
+        // The owner's work runs in a task that OUTLIVES this future, and the
+        // owner waits on the same channel as everyone else. A blocking build
+        // keeps running when the client that asked for it disconnects, so
+        // doing this inline would let a cancelled owner leave its entry in
+        // `builds` with nobody to publish it, its deployment-wide claim held
+        // until expiry, and its tape unshared — local waiters hanging on a
+        // tape that was in fact built.
+        if let Some(sender) = owned {
+            tokio::spawn(
+                OwnedBuild {
+                    id,
+                    key,
+                    parameters: simulation.parameters.clone(),
+                    tapes: Arc::clone(&self.tapes),
+                    builds: Arc::clone(&self.builds),
+                    shared: self.shared_tapes.clone(),
+                    max_cached_tapes: self.config.max_cached_tapes,
+                    shared_build_wait: self.shared_build_wait,
+                }
+                .run(sender),
+            );
         }
 
-        // Within this process one caller builds and the rest wait, which is
-        // what `builds` above decided. Across instances the same question is
-        // asked of the shared cache: without it, N instances all believing
-        // they are the only builder run N copies of the one job the
-        // coalescing exists to avoid (issue #137).
-        let claim = self.claim_shared_build(simulation).await;
-        let owns_claim = matches!(claim, SharedBuild::Owner);
-        // A tape another instance published is already shared; only a tape
-        // built here is worth offering back.
-        let built_here = !matches!(claim, SharedBuild::Waited(_));
-        let result = match claim {
-            SharedBuild::Owner => self.build_tape(simulation).await,
-            SharedBuild::Waited(tape) => Ok(tape),
-            // Another instance owns it and did not publish in time. Building
-            // is the answer that still serves the request; the duplicate work
-            // is the price of not hanging.
-            SharedBuild::Unavailable => self.build_tape(simulation).await,
-        };
-
-        // Publish to whoever is waiting and stop being the owner, in that
-        // order: a caller that subscribes after the removal misses the
-        // broadcast, retries, and finds the tape in the cache.
-        //
-        // Before the shared write, deliberately. A slow Redis would otherwise
-        // hold every local waiter behind a round trip they do not need, and a
-        // cancellation during that await would leave this owner's entry in
-        // `builds` with nobody to publish it — waiters hanging on a tape that
-        // is already warm in this process.
-        let sender = {
-            let mut builds = match self.builds.lock() {
-                Ok(builds) => builds,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            builds.remove(&id)
-        };
-        if let Some(sender) = sender {
-            let published = match &result {
-                Ok(tape) => Ok(tape.clone()),
-                Err(error) => Err(error.to_string()),
-            };
-            // An error means nobody was waiting, which is the common case.
-            let _ = sender.send(published);
+        match waiting.recv().await {
+            Ok(Ok(tape)) => Ok(tape),
+            // The owner failed; report what it reported rather than
+            // starting a second build that would fail the same way.
+            Ok(Err(reason)) => Err(ChainError::Internal(reason)),
+            // The owner's task died without publishing. Rare, and the
+            // honest answer is to build it here rather than hang.
+            Err(_) => self.build_tape(simulation).await,
         }
-
-        // Only now offer it to the other instances: this process is already
-        // served, so a slow or failing write costs the deployment a rebuild
-        // elsewhere and costs this request nothing.
-        if let (true, Ok(tape)) = (built_here, &result) {
-            self.share_tape(simulation, tape).await;
-        }
-
-        // The claim goes back after the shared write, not before: an instance
-        // that wakes on the release must find the tape rather than an empty
-        // key. Released whether the build succeeded or not, so a failure does
-        // not make the others wait out the expiry for a tape nobody wrote.
-        if owns_claim {
-            self.release_shared_build(simulation).await;
-        }
-
-        result
     }
 
     /// Builds a tape off the runtime and files it.
@@ -807,11 +910,25 @@ impl SimulationManager {
     /// filing afterwards would throw away a build that ran to completion
     /// anyway.
     async fn build_tape(&self, simulation: &SessionV2) -> Result<FactorTape, ChainError> {
-        let parameters = simulation.parameters.clone();
-        let id = simulation.id;
-        let tapes = Arc::clone(&self.tapes);
-        let max_cached_tapes = self.config.max_cached_tapes;
+        Self::build_tape_into(
+            simulation.parameters.clone(),
+            simulation.id,
+            Arc::clone(&self.tapes),
+            self.config.max_cached_tapes,
+        )
+        .await
+    }
 
+    /// As [`Self::build_tape`], without borrowing the manager.
+    ///
+    /// Owned so the build can run in a task that outlives the request that
+    /// asked for it; see [`OwnedBuild`].
+    async fn build_tape_into(
+        parameters: SimulationParametersV2,
+        id: Uuid,
+        tapes: Arc<Mutex<HashMap<Uuid, TapeEntry>>>,
+        max_cached_tapes: usize,
+    ) -> Result<FactorTape, ChainError> {
         tokio::task::spawn_blocking(move || {
             let tape = FactorTape::build(&parameters, &parameters.method)?;
             Self::cache_tape(&tapes, max_cached_tapes, id, tape.clone());
@@ -821,69 +938,35 @@ impl SimulationManager {
         .map_err(|e| ChainError::Internal(format!("the factor tape build did not finish: {e}")))?
     }
 
-    /// Claims the deployment-wide right to build this tape, or waits for the
-    /// instance that holds it.
-    ///
-    /// The wait is bounded and polls the shared cache rather than a channel:
-    /// there is no channel between processes, and an owner that dies would
-    /// otherwise leave every waiter hanging until its claim expired. When the
-    /// wait runs out this caller builds, which is duplicated work rather than
-    /// a request that never answers.
-    async fn claim_shared_build(&self, simulation: &SessionV2) -> SharedBuild {
-        let Some(shared) = self.shared_tapes.as_ref() else {
-            return SharedBuild::Owner;
-        };
-        let key = tape_key(simulation.id, &simulation.parameters);
-
-        if shared.claim_build(&key).await {
-            return SharedBuild::Owner;
-        }
-
-        debug!(
-            simulation_id = %simulation.id,
-            "another instance is building this tape; waiting for it"
-        );
-        let deadline = Instant::now() + self.shared_build_wait;
-        while Instant::now() < deadline {
-            tokio::time::sleep(SHARED_BUILD_POLL).await;
-            if let Some(tape) = self.shared_tape(simulation).await {
-                return SharedBuild::Waited(tape);
-            }
-        }
-
-        warn!(
-            simulation_id = %simulation.id,
-            waited_secs = self.shared_build_wait.as_secs(),
-            "the instance building this tape did not publish in time; building it here"
-        );
-        SharedBuild::Unavailable
-    }
-
-    /// Gives up the deployment-wide build claim.
-    async fn release_shared_build(&self, simulation: &SessionV2) {
-        if let Some(shared) = self.shared_tapes.as_ref() {
-            let key = tape_key(simulation.id, &simulation.parameters);
-            shared.release_build(&key).await;
-        }
-    }
-
     /// The tape another instance left, decoded, or `None`.
+    ///
+    /// Takes the key rather than the simulation because computing it
+    /// serialises every parameter, which is expensive enough that the caller
+    /// does it once and reuses it.
+    async fn shared_tape(&self, key: &str, id: Uuid) -> Option<FactorTape> {
+        let shared = self.shared_tapes.as_ref()?;
+        Self::shared_tape_from(shared.as_ref(), key, id).await
+    }
+
+    /// As [`Self::shared_tape`], against a cache the caller already has.
     ///
     /// A stored document this build cannot decode is a miss, not an error: the
     /// key carries the snapshot generation and a fingerprint of the
     /// parameters, so it should not happen, and rebuilding is the answer that
     /// still serves the request.
-    async fn shared_tape(&self, simulation: &SessionV2) -> Option<FactorTape> {
-        let shared = self.shared_tapes.as_ref()?;
-        let key = tape_key(simulation.id, &simulation.parameters);
-        let encoded = shared.get(&key).await?;
+    async fn shared_tape_from(
+        shared: &dyn SharedTapeCache,
+        key: &str,
+        id: Uuid,
+    ) -> Option<FactorTape> {
+        let encoded = shared.get(key).await?;
 
         match serde_json::from_str::<FactorTape>(&encoded) {
             Ok(tape) => Some(tape),
             Err(error) => {
                 warn!(
                     %error,
-                    simulation_id = %simulation.id,
+                    simulation_id = %id,
                     "a shared tape did not decode; rebuilding it"
                 );
                 None
@@ -892,18 +975,12 @@ impl SimulationManager {
     }
 
     /// Leaves a built tape where the other instances can find it.
-    async fn share_tape(&self, simulation: &SessionV2, tape: &FactorTape) {
-        let Some(shared) = self.shared_tapes.as_ref() else {
-            return;
-        };
+    async fn share_tape_to(shared: &dyn SharedTapeCache, key: &str, id: Uuid, tape: &FactorTape) {
         match serde_json::to_string(tape) {
-            Ok(encoded) => {
-                let key = tape_key(simulation.id, &simulation.parameters);
-                shared.put(&key, &encoded).await;
-            }
+            Ok(encoded) => shared.put(key, &encoded).await,
             Err(error) => warn!(
                 %error,
-                simulation_id = %simulation.id,
+                simulation_id = %id,
                 "a built tape did not encode; it stays local to this instance"
             ),
         }
@@ -1151,21 +1228,29 @@ mod tests {
             }
         }
 
-        async fn claim_build(&self, key: &str) -> bool {
+        async fn claim_build(&self, key: &str) -> BuildClaim {
             self.claims.fetch_add(1, Ordering::SeqCst);
             let mut held = match self.building.lock() {
                 Ok(held) => held,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            held.insert(key.to_string())
+            if held.insert(key.to_string()) {
+                BuildClaim::Held(format!("token:{key}"))
+            } else {
+                BuildClaim::Taken
+            }
         }
 
-        async fn release_build(&self, key: &str) {
+        async fn release_build(&self, key: &str, token: &str) {
             let mut held = match self.building.lock() {
                 Ok(held) => held,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            held.remove(key);
+            // Ownership-safe like the Redis script: a token that is not this
+            // claim's releases nothing.
+            if token == format!("token:{key}") {
+                held.remove(key);
+            }
         }
     }
 
@@ -1185,11 +1270,11 @@ mod tests {
 
         /// A gate that cannot be reached must let the caller build, or an
         /// unreachable Redis becomes an unanswerable request.
-        async fn claim_build(&self, _key: &str) -> bool {
-            true
+        async fn claim_build(&self, _key: &str) -> BuildClaim {
+            BuildClaim::Unclaimed
         }
 
-        async fn release_build(&self, _key: &str) {}
+        async fn release_build(&self, _key: &str, _token: &str) {}
     }
 
     /// A warehouse that records what it was asked to file, and can be told to
@@ -2207,7 +2292,7 @@ mod tests {
         // Somebody else claims the build and dies without publishing.
         let key = tape_key(created.id, &created.parameters);
         assert!(
-            shared.claim_build(&key).await,
+            matches!(shared.claim_build(&key).await, BuildClaim::Held(_)),
             "the claim must be free first"
         );
 
@@ -2215,6 +2300,58 @@ mod tests {
             Ok(_) => {}
             Err(error) => panic!("an abandoned claim must not stop a build: {error}"),
         }
+    }
+
+    /// A client that goes away mid-build strands nothing.
+    ///
+    /// The build is on the blocking pool and keeps running whatever the caller
+    /// does, so the owner's workflow lives in a task of its own. Were it in the
+    /// request's future, a disconnect would leave the local waiters with an
+    /// entry in `builds` nobody will ever publish, the deployment-wide claim
+    /// held until it expires, and the finished tape unshared.
+    #[tokio::test]
+    async fn test_an_abandoned_owner_still_publishes_and_releases() {
+        let store = Arc::new(InMemorySimulationStore::new());
+        let shared = Arc::new(SharedTapes::default());
+        let manager = Arc::new(
+            SimulationManager::new(
+                Arc::clone(&store) as Arc<dyn SimulationStore>,
+                SimulationV2Config::default(),
+            )
+            .with_shared_tapes(Arc::clone(&shared) as Arc<dyn SharedTapeCache>),
+        );
+
+        let created = match manager.create(parameters(11)).await {
+            Ok(created) => created,
+            Err(error) => panic!("the simulation must be created: {error}"),
+        };
+
+        // The owner starts the build and its client disconnects.
+        let owner = {
+            let manager = Arc::clone(&manager);
+            let id = created.id;
+            tokio::spawn(async move { manager.peek(id).await })
+        };
+        owner.abort();
+
+        // Whoever is left must still be served.
+        match tokio::time::timeout(Duration::from_secs(5), manager.peek(created.id)).await {
+            Ok(Ok(_)) => {}
+            other => panic!("an abandoned owner must not strand the request after it: {other:?}"),
+        }
+
+        // And the deployment-wide claim came back rather than being left to
+        // expire, so another instance is not blocked behind a client that left.
+        let held = match shared.building.lock() {
+            Ok(held) => held.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        };
+        assert_eq!(held, 0, "the build claim must have been released");
+        assert_eq!(
+            shared.keys().len(),
+            1,
+            "the built tape must have been shared even though its caller left"
+        );
     }
 
     /// A shared cache that cannot be reached costs a rebuild, not a failure.
