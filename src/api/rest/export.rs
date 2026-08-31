@@ -1644,7 +1644,7 @@ fn csv_rows(
 /// makes the rendering depend on the number, which is what a client compares.
 #[must_use]
 #[inline]
-fn decimal_to_f64(value: rust_decimal::Decimal) -> Option<f64> {
+pub(super) fn decimal_to_f64(value: rust_decimal::Decimal) -> Option<f64> {
     use rust_decimal::prelude::ToPrimitive;
     value.normalize().to_f64()
 }
@@ -1656,7 +1656,7 @@ fn decimal_to_f64(value: rust_decimal::Decimal) -> Option<f64> {
 /// instead.
 #[must_use]
 #[inline]
-fn positive_to_f64(value: positive::Positive) -> f64 {
+pub(super) fn positive_to_f64(value: positive::Positive) -> f64 {
     // A `Positive` is finite and in range by construction, so the fallback is
     // unreachable; it is the value `to_f64` itself would have produced.
     decimal_to_f64(value.to_dec()).unwrap_or_default()
@@ -1728,16 +1728,23 @@ mod tests {
 
     /// A quote read back from the warehouse views exactly as the priced one.
     ///
-    /// The end of the same defect, one layer up: both sources are reduced to a
-    /// `QuoteView`, and it is that reduction which has to be blind to how the
-    /// value was written. The round trip is reproduced here rather than called
-    /// into: what the column does to a value is scale it out and strip the
-    /// zeros back off, and this layer must survive that whoever performs it.
+    /// The end of the same defect, at the layer that matters: the priced side
+    /// goes through the REPLAYED adapter and the stored side through the
+    /// stored one, so a conversion that bypassed the canonical helper on
+    /// either would show here.
+    ///
+    /// The round trip is reproduced rather than called into — what the column
+    /// does to a value is scale it out and strip the zeros back off — and the
+    /// test first asserts that the two forms DO render differently through the
+    /// raw conversion, so it cannot pass by comparing a value that never
+    /// carried the problem.
     #[test]
     fn test_a_stored_quote_views_as_the_priced_one_does() {
         use crate::infrastructure::QuoteRow;
+        use optionstratlib::chains::OptionData;
         use positive::Positive;
         use rust_decimal::Decimal;
+        use rust_decimal::prelude::ToPrimitive;
 
         /// A `Positive` that keeps the decimal's own form, which is the point.
         fn exactly(value: Decimal) -> Positive {
@@ -1747,47 +1754,57 @@ mod tests {
             }
         }
 
-        let Some(priced_mid) = Decimal::from(4_291_i64).checked_div(Decimal::from(7_919_i64))
-        else {
-            panic!("the reference mid must divide");
-        };
-        let priced_mid = priced_mid.normalize();
+        /// The form the pricing arithmetic hands over: the value carrying
+        /// trailing zeros, which is what a division or an average produces and
+        /// what the column then holds at its own scale.
+        fn as_priced(value: Decimal) -> Option<Decimal> {
+            let shift = 28_u32.checked_sub(value.scale())?;
+            let factor = 10_i128.checked_pow(shift)?;
+            let mantissa = value.mantissa().checked_mul(factor)?;
+            Decimal::try_from_i128_with_scale(mantissa, 28).ok()
+        }
 
-        // Through the column and back: scaled to twenty-eight decimals, then
-        // returned with its trailing zeros stripped.
-        let stored_mid = {
-            let Some(shift) = 28_u32.checked_sub(priced_mid.scale()) else {
-                panic!("the reference mid must fit the column's scale");
+        // A value whose two forms render differently WITHOUT the canonical
+        // conversion. Searched rather than assumed, so this test keeps its
+        // teeth if the arithmetic below ever changes.
+        let mut reference = None;
+        for numerator in 1..4_000_i64 {
+            let Some(candidate) = Decimal::from(numerator).checked_div(Decimal::from(7_919_i64))
+            else {
+                continue;
             };
-            let Some(factor) = 10_i128.checked_pow(shift) else {
-                panic!("the scale factor must exist");
+            // Stored: what the read gives back, with the trailing zeros gone.
+            let stored = candidate.normalize();
+            // Priced: the same number carrying them, which is the form the
+            // arithmetic produced before anything was written down.
+            let Some(priced) = as_priced(stored) else {
+                continue;
             };
-            let Some(mantissa) = priced_mid.mantissa().checked_mul(factor) else {
-                panic!("the reference mid must fit the column");
-            };
-            let mut mantissa = mantissa;
-            let mut scale = 28_u32;
-            while scale > 0 && mantissa % 10 == 0 {
-                mantissa /= 10;
-                scale -= 1;
+            if priced.to_f64().map(f64::to_bits) != stored.to_f64().map(f64::to_bits) {
+                reference = Some((priced, stored));
+                break;
             }
-            match Decimal::try_from_i128_with_scale(mantissa, scale) {
-                Ok(value) => value,
-                Err(error) => panic!("the stored mid must read back: {error}"),
-            }
+        }
+        let Some((priced_mid, stored_mid)) = reference else {
+            panic!("no value renders differently by scale, so this test would prove nothing");
         };
         assert_eq!(
-            stored_mid, priced_mid,
+            priced_mid, stored_mid,
             "the round trip must preserve the value, or this test is about something else"
         );
 
         let strike = exactly(Decimal::from(5_000_i64));
-        let priced_view = QuoteView::stored(&QuoteRow::new(strike, exactly(priced_mid)).with_call(
-            None,
-            None,
-            Some(exactly(priced_mid)),
-            None,
-        ));
+
+        // The priced side, through the adapter a replayed step uses.
+        let priced = OptionData {
+            strike_price: strike,
+            implied_volatility: exactly(priced_mid),
+            call_middle: Some(exactly(priced_mid)),
+            ..Default::default()
+        };
+        let replayed_view = QuoteView::replayed(&priced);
+
+        // The stored side, through the adapter a filed step uses.
         let stored_view = QuoteView::stored(&QuoteRow::new(strike, exactly(stored_mid)).with_call(
             None,
             None,
@@ -1796,18 +1813,18 @@ mod tests {
         ));
 
         assert_eq!(
-            priced_view.call_mid.map(f64::to_bits),
+            replayed_view.call_mid.map(f64::to_bits),
             stored_view.call_mid.map(f64::to_bits),
-            "a mid that went through storage views as {:?} against {:?} priced",
+            "a mid that went through storage views as {:?} against {:?} replayed",
             stored_view.call_mid,
-            priced_view.call_mid
+            replayed_view.call_mid
         );
         assert_eq!(
-            priced_view.implied_volatility.to_bits(),
+            replayed_view.implied_volatility.to_bits(),
             stored_view.implied_volatility.to_bits(),
-            "an implied volatility that went through storage views as {} against {} priced",
+            "an implied volatility that went through storage views as {} against {} replayed",
             stored_view.implied_volatility,
-            priced_view.implied_volatility
+            replayed_view.implied_volatility
         );
     }
 

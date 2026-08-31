@@ -242,19 +242,43 @@ fn test_a_stored_tape_exports_what_a_replayed_one_does() {
         return;
     };
 
+    // The whole tape, rendered from a walk inside the export itself. Its row
+    // count is also how many quote rows the warehouse has to accept before the
+    // other tape can be served from storage rather than replayed.
+    let reference = fresh.export("dataset=option_chains&format=csv");
+    assert_eq!(
+        reference.status,
+        200,
+        "a replayed export must serve: {}",
+        reference.text()
+    );
+    let quote_rows = reference
+        .text()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+        .saturating_sub(1) as u64;
+    assert!(
+        quote_rows > 0,
+        "the reference tape must carry quote rows, or there is nothing to file"
+    );
+
     // Only the first is walked. Its steps are what the warehouse has to file;
     // the second's tape exists only inside the export that asks for it.
     let before = filed_rows(&client);
     served.walk();
 
-    // Waiting for a ROW, not for a while. The export replays whatever storage
-    // does not have, so comparing before the writer has filed anything would
-    // compare two replays and pass without touching the warehouse, which is
-    // the false green this test exists to remove.
+    // Waiting for the tape's OWN rows, not merely for the counter to twitch.
+    // The export replays whatever storage does not have, so a comparison made
+    // while the writer is still draining — or after it failed — would compare
+    // two replays and pass without touching the warehouse, which is the false
+    // green this test exists to remove. Requiring the count to rise by at
+    // least this tape's quote rows is the closest a client of the deployment
+    // can get to provenance.
     let mut filed = false;
     for _ in 0..SETTLE_ATTEMPTS {
         match (before, filed_rows(&client)) {
-            (Some(before), Some(now)) if now > before => {
+            (Some(before), Some(now)) if now.saturating_sub(before) >= quote_rows => {
                 filed = true;
                 break;
             }
@@ -266,8 +290,9 @@ fn test_a_stored_tape_exports_what_a_replayed_one_does() {
 
     if !filed {
         println!(
-            "SKIP: no instance reported {FILED_ROWS_METRIC} rising after a walked tape, so \
-             nothing here would be served from storage and the comparison would be two replays"
+            "SKIP: no instance reported {FILED_ROWS_METRIC} rising by the tape's {quote_rows} \
+             quote rows, so an export here would replay what storage does not hold and the \
+             comparison would be two replays"
         );
         return;
     }

@@ -2,9 +2,16 @@ version: '3.8'
 
 # Deployable stack: the four services the binary actually needs. Redis and
 # MongoDB are HARD requirements (src/main.rs propagates their connection errors
-# with `?`, so the process exits without them); ClickHouse is optional
-# (src/domain/simulator.rs logs the failure and runs with database_repo: None,
-# which only degrades the Historical source).
+# with `?`, so the process exits without them).
+#
+# ClickHouse is optional to the CRATE and required by THIS stack. The historical
+# source degrades without it (src/domain/simulator.rs logs the failure and runs
+# with database_repo: None), but this file turns snapshot persistence on, and
+# that makes the warehouse a startup dependency — the schema is created at boot
+# — and a readiness one: `/ready` then names `clickhouse`, so a replica whose
+# warehouse is down reports itself unready and takes no work. Set
+# OCS_SNAPSHOT_PERSISTENCE_ENABLED=false to go back to a stack where ClickHouse
+# is only the historical source.
 #
 # The admin UIs (mongo-express, redis-commander) and the host-published
 # infrastructure ports live in docker-compose.dev.yml, NOT here: `docker stack
