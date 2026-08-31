@@ -42,6 +42,7 @@ mod interface;
 /// Deliberately separate from [`interface`]: the two store different documents
 /// under different key spaces, and keeping the traits apart is what makes the
 /// isolation structural rather than conventional.
+mod tape_cache;
 mod v2_interface;
 
 /// In-memory implementation of the v2 simulation store.
@@ -53,6 +54,8 @@ mod v2_redis;
 pub use in_memory::InMemorySessionStore;
 pub use in_redis::InRedisSessionStore;
 pub use interface::SessionStore;
+pub(crate) use tape_cache::tape_key;
+pub use tape_cache::{DEFAULT_TAPE_KEY_PREFIX, RedisTapeCache, SharedTapeCache};
 pub use v2_interface::SimulationStore;
 pub use v2_memory::{DEFAULT_V2_RETENTION_SECS, InMemorySimulationStore};
 pub use v2_redis::{DEFAULT_V2_KEY_PREFIX, InRedisSimulationStore};

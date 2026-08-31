@@ -87,11 +87,17 @@ use optionstratlib::volatility::{adjust_volatility, constant_volatility};
 use positive::Positive;
 use rust_decimal::{Decimal, MathematicalOps};
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
 /// One step of the market path: everything a snapshot needs that is not an
 /// option contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialisable so a built tape can be shared between instances rather than
+/// rebuilt on each one (issue #136). The shape is small — four values per step
+/// — which is what makes sharing it worth a round trip when building it is
+/// seconds of walking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FactorRow {
     /// The 0-based step index this row describes.
     pub(crate) step: usize,
@@ -114,7 +120,7 @@ pub(crate) struct FactorRow {
 }
 
 /// The ordered market path of a simulation, one row per requested step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FactorTape {
     rows: Vec<FactorRow>,
 }

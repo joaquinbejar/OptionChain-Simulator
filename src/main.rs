@@ -72,11 +72,13 @@ use optionchain_simulator::infrastructure::{
     init_mongodb, resolve_log_level_from_env,
 };
 use optionchain_simulator::session::{
-    InRedisSessionStore, InRedisSimulationStore, SessionManager, SimulationManager,
+    DEFAULT_TAPE_KEY_PREFIX, InRedisSessionStore, InRedisSimulationStore, RedisTapeCache,
+    SessionManager, SimulationManager,
 };
 use optionstratlib::utils::setup_logger_with_level;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// The `main` function is the entry point of the application using the Actix Web server framework.
@@ -188,9 +190,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // simulations live.
     let v2_config = SimulationV2Config::from_env()?;
     let simulation_store = Arc::new(InRedisSimulationStore::new(
-        redis_client_v2,
+        Arc::clone(&redis_client_v2),
         None, // the documented v2 prefix
         Some(v2_config.retention_secs()),
+    ));
+    // Built tapes are shared through the same Redis, so a step served by a
+    // different instance does not rebuild what its neighbour already walked
+    // (issue #136). The window matches the simulations': a tape that outlives
+    // its simulation is memory nobody can use, and one that expires first
+    // costs a rebuild.
+    let shared_tapes = Arc::new(RedisTapeCache::new(
+        Arc::clone(&redis_client_v2),
+        DEFAULT_TAPE_KEY_PREFIX,
+        Duration::from_secs(v2_config.retention_secs()),
+        // The same knob that bounds this instance's own map bounds the shared
+        // cache, so the number an operator writes is how many tapes the
+        // deployment keeps rather than how many each replica keeps.
+        v2_config.max_cached_tapes,
     ));
     // Snapshot persistence is opt-in (`OCS_SNAPSHOT_PERSISTENCE_ENABLED`). When
     // it is off the manager never learns the feature exists; when it is on, the
@@ -202,7 +218,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // export reads back through the same handle — the routes take it off the
     // manager rather than being passed a second one, because two handles could
     // be configured differently and there is only ever one warehouse.
-    let mut simulation_manager = SimulationManager::new(simulation_store, v2_config);
+    let mut simulation_manager =
+        SimulationManager::new(simulation_store, v2_config).with_shared_tapes(shared_tapes);
     match ClickHouseSnapshotRepository::from_env()? {
         Some(warehouse) => {
             warehouse.ensure_schema().await?;
