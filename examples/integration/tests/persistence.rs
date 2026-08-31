@@ -299,23 +299,19 @@ fn test_a_stored_tape_exports_what_a_replayed_one_does() {
              so the rows must not depend on whether they came back from storage"
         );
 
-        if stored_body != expected.body {
-            // Equal as values, different as bytes. Storage renders a mid price
-            // a digit or two shorter than the replay does, because it crosses
-            // a float on the way in and back. It is not a corrupted row, and
-            // it is not nothing either: a consumer that diffs two exports of
-            // the same tape sees a change that is not there.
-            println!(
-                "INFO: the {dataset} export agrees value by value but not byte for byte, {} bytes \
-                 stored against {} replayed, which is issue #152",
-                stored_body.len(),
-                expected.body.len()
-            );
-        }
+        assert_eq!(
+            stored_body,
+            expected.body,
+            "the {dataset} export of a tape whose steps were served agrees value by value with \
+             the replayed one but not byte for byte, {} bytes against {}. The rendering must \
+             depend on the number and not on how it was stored",
+            stored_body.len(),
+            expected.body.len()
+        );
     }
 
     println!(
-        "INFO: a stored tape and a replayed one agree on every value in every dataset compared"
+        "INFO: a stored tape and a replayed one export the same bytes for every dataset compared"
     );
 }
 

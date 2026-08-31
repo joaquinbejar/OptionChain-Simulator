@@ -129,7 +129,7 @@ services:
     # Published by .github/workflows/docker-publish.yml on every Cargo.toml
     # version bump, or by `make docker-push` from a workstation. Bump the
     # default tag in the same PR that bumps the crate version.
-    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.27}
+    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.2.28}
     deploy:
       # More than one instance is the intended shape: session and simulation
       # state lives in Redis, and the write that decides who advanced a
@@ -157,23 +157,20 @@ services:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
       CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
-      # This stack SHIPS the warehouse two services up, and still does not use
-      # it by default (issue #149). Set this to true to turn snapshot
-      # persistence on; what that buys is an export that reads back the steps
-      # already served instead of re-walking them.
+      # This stack SHIPS the warehouse two services up, so it uses it (issues
+      # #149 and #152). What it buys is an export that reads back the steps
+      # already served instead of re-walking them, which is the expensive half
+      # of answering one.
       #
-      # What it costs today, measured rather than assumed: an export served
-      # from storage renders a computed price a digit differently from one that
-      # replayed the tape, so two exports of the SAME tape stop being byte
-      # identical (issue #152). The values agree; the bytes do not, and a
-      # consumer that diffs exports sees a change that is not there. The
-      # default flips to true when that is fixed.
+      # It was held off until an export served from storage rendered the same
+      # bytes as one that replayed the tape (#152); it does now, so this is on.
       #
-      # The other consequences an operator should know: the schema is created
-      # at boot, so a warehouse that cannot be reached fails the boot rather
-      # than degrading quietly, and `/ready` gains a `clickhouse` dependency, so
-      # a replica whose warehouse is down reports itself unready.
-      OCS_SNAPSHOT_PERSISTENCE_ENABLED: ${OCS_SNAPSHOT_PERSISTENCE_ENABLED:-false}
+      # The consequences an operator should know: the schema is created at
+      # boot, so a warehouse that cannot be reached fails the boot rather than
+      # degrading quietly, and `/ready` gains a `clickhouse` dependency, so a
+      # replica whose warehouse is down reports itself unready. Set it to false
+      # to go back to replay-only.
+      OCS_SNAPSHOT_PERSISTENCE_ENABLED: ${OCS_SNAPSHOT_PERSISTENCE_ENABLED:-true}
       MONGODB_URI: ${MONGODB_URI:-mongodb://admin:password@mongodb:27017}
       MONGODB_DATABASE: ${MONGODB_DATABASE:-optionchain_simulator}
       MONGODB_STEPS_COLLECTION: ${MONGODB_STEPS_COLLECTION:-steps}

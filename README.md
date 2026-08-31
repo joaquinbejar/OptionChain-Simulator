@@ -228,6 +228,16 @@ itself ready again: an unchanged id is a process that was never restarted.
 CI runs it on a change to the probes, to what they probe, or to how the
 service is packaged.
 
+An exported value renders by NUMBER, not by how it was stored. A decimal is
+a mantissa and a scale, so one value has several forms, and the warehouse
+round trip changes the form: a value is scaled out to the column's
+twenty-eight decimals going in and comes back with its trailing zeros
+stripped. Converting either form straight to the wire's `f64` reads the
+mantissa and can land on adjacent floats, which made an export of a tape
+whose rows had been filed differ in a digit from the same tape replayed, and
+broke byte-identical repeats on a deployment with persistence on (issue
+##152). Every conversion in the export normalises first, so the two agree.
+
 Whether a deployment persists its snapshots is visible in the readiness
 body: the warehouse probe exists only when the manager has a warehouse, so
 a `clickhouse` dependency there is persistence being on. The integration
