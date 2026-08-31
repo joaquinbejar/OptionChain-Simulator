@@ -13,7 +13,8 @@
 //! Skipped entirely when `OCS_INTEGRATION_BASE_URL` is unset.
 
 use examples_integration::{
-    ServiceClient, instances_behind, reference_request, report_cleanup, service,
+    ServiceClient, instance_clients, instances_behind, reference_request, report_cleanup,
+    responding_instance, service,
 };
 
 /// Steps walked by the tests that need a tape.
@@ -94,14 +95,28 @@ fn test_the_deployment_reports_how_many_instances_answer() {
         return;
     };
 
-    let instances = instances_behind(&client, SCRAPES);
-    assert!(instances >= 1, "something must be answering");
-    if instances == 1 {
+    match instances_behind(&client, SCRAPES) {
+        Some(1) => println!(
+            "INFO: one instance answered every probe; the replicated paths below still run, \
+             trivially"
+        ),
+        Some(instances) => println!("INFO: {instances} distinct instances answered"),
+        None => println!(
+            "INFO: this deployment reports no instance identity, so answers cannot be \
+             attributed; the tests that need attribution say so themselves"
+        ),
+    }
+
+    // Whether the replicas can be reached individually decides what the rest
+    // of this file can prove, so it is reported here too.
+    let direct = instance_clients();
+    if direct.is_empty() {
         println!(
-            "INFO: one instance answered every scrape; the replicated paths below are still exercised, trivially"
+            "INFO: {} is unset, so the tests needing a known replica will skip",
+            examples_integration::INSTANCE_URLS_VARIABLE
         );
     } else {
-        println!("INFO: at least {instances} instances are behind this address");
+        println!("INFO: {} replicas can be reached directly", direct.len());
     }
 }
 
@@ -199,19 +214,30 @@ fn test_a_walk_through_the_balancer_serves_every_step_once() {
 
 /// The same seed produces the same market whichever instance serves each step.
 ///
-/// The reproducibility file compares two simulations against each other, which
-/// cannot see a divergence that affects both equally. This walks one
-/// simulation through the balancer and compares it against a tape built from a
-/// second simulation with identical parameters, then requires each step to
-/// match the corresponding step of the other: a per-instance difference in how
-/// a step is priced would break exactly this.
+/// The baseline is walked against ONE named replica, bypassing the balancer,
+/// and the subject through the balanced address. Two simulations walked
+/// through the same balanced client would prove less than it looks: a
+/// replica-specific defect affects both equally, and both can land on the same
+/// replica anyway.
+///
+/// Skipped, loudly, when the replicas cannot be reached individually: a
+/// single-instance baseline cannot be established through a balancer.
 #[test]
 fn test_a_tape_is_the_same_whichever_instance_serves_it() {
     let Some(client) = service() else {
         return;
     };
-    let (Some(left), Some(right)) = (
-        Live::create(&client, STEPS, 99),
+    let direct = instance_clients();
+    let Some(baseline_client) = direct.first() else {
+        println!(
+            "SKIP: {} is unset, so there is no single-instance baseline to compare against",
+            examples_integration::INSTANCE_URLS_VARIABLE
+        );
+        return;
+    };
+
+    let (Some(baseline), Some(balanced)) = (
+        Live::create(baseline_client, STEPS, 99),
         Live::create(&client, STEPS, 99),
     ) else {
         return;
@@ -228,9 +254,9 @@ fn test_a_tape_is_the_same_whichever_instance_serves_it() {
         serde_json::Value::Object(market)
     };
 
-    let serve = |live: &Live| -> serde_json::Value {
+    let serve = |with: &ServiceClient, live: &Live| -> (serde_json::Value, Option<String>) {
         let path = live.path("/step");
-        match client.request("POST", &path, None) {
+        match with.request("POST", &path, None) {
             Ok(response) => {
                 assert_eq!(
                     response.status,
@@ -238,8 +264,9 @@ fn test_a_tape_is_the_same_whichever_instance_serves_it() {
                     "a step must serve: {}",
                     response.text()
                 );
+                let instance = responding_instance(&response);
                 match response.json::<serde_json::Value>(&path) {
-                    Ok(body) => market(&body),
+                    Ok(body) => (market(&body), instance),
                     Err(error) => panic!("{error}"),
                 }
             }
@@ -247,17 +274,37 @@ fn test_a_tape_is_the_same_whichever_instance_serves_it() {
         }
     };
 
-    // Interleaved, so consecutive steps of each simulation land on different
-    // instances as often as the balancer allows.
+    let mut baseline_instances = std::collections::BTreeSet::new();
+    let mut balanced_instances = std::collections::BTreeSet::new();
+
     for step in 0..STEPS {
-        let one = serve(&left);
-        let two = serve(&right);
+        let (from_one, one_instance) = serve(baseline_client, &baseline);
+        let (through_balancer, balanced_instance) = serve(&client, &balanced);
+
+        if let Some(instance) = one_instance {
+            baseline_instances.insert(instance);
+        }
+        if let Some(instance) = balanced_instance {
+            balanced_instances.insert(instance);
+        }
+
         assert_eq!(
-            one, two,
-            "step {step} differs between two simulations with the same seed; whichever instance \
-             served each one, the market must be the same"
+            from_one, through_balancer,
+            "step {step} differs between a tape walked against one replica and the same seed \
+             walked through the balancer"
         );
     }
+
+    assert!(
+        baseline_instances.len() <= 1,
+        "the baseline must come from ONE instance, it came from {}",
+        baseline_instances.len()
+    );
+    println!(
+        "INFO: baseline from {} instance, balanced walk served by {} instance(s)",
+        baseline_instances.len().max(1),
+        balanced_instances.len().max(1)
+    );
 }
 
 /// An export of one simulation is byte-identical however many instances serve
@@ -316,38 +363,56 @@ fn test_an_export_is_byte_identical_across_instances() {
     }
 }
 
-/// The probes describe the instance that answers them, and a deployment whose
-/// instances disagree says so rather than averaging.
+/// Each replica answers readiness for ITSELF.
 ///
-/// `/ready` is asked repeatedly: every answer must be internally consistent —
-/// ready if and only if every dependency it names is up — regardless of which
-/// instance produced it. An instance whose Redis is gone must not be able to
-/// hide behind one whose Redis is fine, because each answer is that instance's
-/// own.
+/// Asked of every replica directly, which is the only way to see that a
+/// reply is that instance's own view: through a balancer, a replica whose
+/// Redis is gone is indistinguishable from one whose Redis is fine, because
+/// the next request may go to either.
+///
+/// What this cannot do is BREAK a dependency on one replica; that needs an
+/// operator-level fixture and is issue #145. What it proves is that each
+/// replica answers for itself: a distinct identity per address, and an
+/// aggregate that follows from the dependencies that same replica reported.
 #[test]
-fn test_every_readiness_answer_is_consistent_with_itself() {
+fn test_each_replica_answers_readiness_for_itself() {
     let Some(client) = service() else {
         return;
     };
 
-    let mut ready_answers = 0_usize;
-    let mut not_ready_answers = 0_usize;
+    let direct = instance_clients();
+    let targets: Vec<&ServiceClient> = if direct.is_empty() {
+        println!(
+            "SKIP: {} is unset, so readiness is checked through the balancer only",
+            examples_integration::INSTANCE_URLS_VARIABLE
+        );
+        vec![&client]
+    } else {
+        direct.iter().collect()
+    };
 
-    for attempt in 0..(SCRAPES * 2) {
-        let response = match client.get("/ready") {
+    let mut identities = std::collections::BTreeSet::new();
+
+    for target in &targets {
+        let response = match target.get("/ready") {
             Ok(response) => response,
-            Err(error) => panic!("{error}"),
+            Err(error) => panic!("{}: {error}", target.base_url()),
         };
         if response.status == 404 {
-            println!("SKIP: this deployment predates /ready");
+            println!("SKIP: {} predates /ready", target.base_url());
             return;
         }
         assert!(
             response.status == 200 || response.status == 503,
-            "/ready answered {} on attempt {attempt}: {}",
+            "{} answered {} for /ready: {}",
+            target.base_url(),
             response.status,
             response.text()
         );
+
+        if let Some(instance) = responding_instance(&response) {
+            identities.insert(instance);
+        }
 
         let body: serde_json::Value = match response.json("/ready") {
             Ok(body) => body,
@@ -356,16 +421,19 @@ fn test_every_readiness_answer_is_consistent_with_itself() {
         let dependencies = body
             .get("dependencies")
             .and_then(serde_json::Value::as_array)
-            .unwrap_or_else(|| panic!("/ready must name its dependencies: {body}"));
+            .unwrap_or_else(|| panic!("{} must name its dependencies: {body}", target.base_url()));
+        assert!(
+            !dependencies.is_empty(),
+            "a readiness answer names what it probed"
+        );
+
         let all_up = dependencies.iter().all(|dependency| {
             dependency.get("status").and_then(serde_json::Value::as_str) == Some("up")
         });
-
         let status = body
             .get("status")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or_else(|| panic!("/ready must report an aggregate: {body}"));
-
+            .unwrap_or_else(|| panic!("{} must report an aggregate: {body}", target.base_url()));
         let expected = if all_up {
             ("ready", 200)
         } else {
@@ -374,23 +442,22 @@ fn test_every_readiness_answer_is_consistent_with_itself() {
         assert_eq!(
             (status, response.status),
             expected,
-            "attempt {attempt}: the aggregate must follow from the dependencies of the instance \
-             that answered: {body}"
+            "{}: the aggregate must follow from the dependencies THIS replica probed: {body}",
+            target.base_url()
         );
-
-        if all_up {
-            ready_answers += 1;
-        } else {
-            not_ready_answers += 1;
-        }
     }
 
-    if not_ready_answers > 0 {
+    if direct.len() > 1 {
+        assert_eq!(
+            identities.len(),
+            direct.len(),
+            "{} addresses answered with {} distinct instances, so they are not separate replicas",
+            direct.len(),
+            identities.len()
+        );
         println!(
-            "INFO: {not_ready_answers} of {} readiness answers reported a dependency down; a \
-             replicated deployment reports per instance, so this is one replica's view rather \
-             than the deployment's",
-            ready_answers + not_ready_answers
+            "INFO: {} replicas each answered readiness for themselves",
+            direct.len()
         );
     }
 }

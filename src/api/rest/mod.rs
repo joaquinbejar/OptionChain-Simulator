@@ -9,6 +9,7 @@ pub(crate) mod greeks;
 pub(crate) mod handlers;
 pub(crate) mod handlers_v2;
 pub(crate) mod health;
+pub(crate) mod instance;
 pub(crate) mod limits;
 mod middleware;
 pub(crate) mod models;

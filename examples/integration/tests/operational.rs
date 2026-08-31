@@ -82,7 +82,11 @@ fn test_metrics_expose_the_documented_counters_and_move() {
     // And the traffic has to reach every instance, or the instance holding the
     // maximum may not be the one that served it. Sending several requests per
     // instance is what makes the maximum move.
-    let instances = instances_behind(&client, 8);
+    // The instance count comes from the identity each response carries, which
+    // is exact rather than inferred. A deployment that does not report one
+    // cannot be attributed, and four requests is then the same conservative
+    // amount of traffic a single instance would need.
+    let instances = instances_behind(&client, 8).unwrap_or(1);
     let requests = instances * 4;
 
     let peak = |what: &str| -> f64 {

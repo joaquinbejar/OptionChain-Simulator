@@ -616,59 +616,70 @@ pub fn report_cleanup(client: &ServiceClient, path: &str, what: &str) {
     }
 }
 
-/// How many distinct processes answered `scrapes` scrapes of `/metrics`.
-///
-/// A counter is per process and only ever grows, so one instance produces a
-/// non-decreasing sequence of scrapes. N instances taking turns produce N such
-/// sequences INTERLEAVED, which reads as a series that keeps stepping
-/// backwards. The instance count is therefore the smallest number of
-/// non-decreasing sequences the observations can be split into, which is what
-/// the greedy pass below computes.
-///
-/// It is a lower bound: two instances that happen to hold the same value are
-/// indistinguishable from one. It never overcounts, which is what matters for
-/// a number this suite only reports.
-pub fn instances_behind(client: &ServiceClient, scrapes: usize) -> usize {
-    let series = "api_requests_total{endpoint=\"/metrics\",method=\"GET\",status=\"200\"}";
-    let mut observed = Vec::new();
+/// The header every response of this service carries, naming the process that
+/// produced it.
+pub const INSTANCE_HEADER: &str = "x-ocs-instance";
 
-    for _ in 0..scrapes {
-        let body = match client.get("/metrics") {
-            Ok(response) => {
-                assert_eq!(response.status, 200, "/metrics must answer 200");
-                response.text()
-            }
+/// The variable naming the individual replicas, when an operator has them.
+///
+/// Comma-separated base URLs, one per instance, bypassing the balancer. Some
+/// contracts cannot be checked through a balanced address at all — "this
+/// replica answers for itself" needs a way to reach that replica — and this is
+/// how a test gets one. Unset, those tests skip and say why.
+pub const INSTANCE_URLS_VARIABLE: &str = "OCS_INTEGRATION_INSTANCE_URLS";
+
+/// The instance that produced a response, if it said.
+///
+/// A deployment predating the header answers `None`, which every caller treats
+/// as "cannot attribute" rather than as a failure.
+#[must_use]
+pub fn responding_instance(response: &Response) -> Option<String> {
+    response.header(INSTANCE_HEADER).map(str::to_string)
+}
+
+/// One client per replica, when `OCS_INTEGRATION_INSTANCE_URLS` names them.
+///
+/// # Panics
+///
+/// When the variable is set to something that is not a usable base URL, which
+/// is a configuration mistake rather than an absent deployment.
+#[must_use]
+pub fn instance_clients() -> Vec<ServiceClient> {
+    let Some(raw) = optionchain_simulator::utils::env::read_var(INSTANCE_URLS_VARIABLE) else {
+        return Vec::new();
+    };
+
+    raw.split(',')
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| match ServiceClient::new(url) {
+            Ok(client) => client,
+            Err(error) => panic!("{INSTANCE_URLS_VARIABLE} names an unusable URL: {error}"),
+        })
+        .collect()
+}
+
+/// How many distinct processes answered `probes` requests.
+///
+/// Counted from the identity each response carries, which is exact: two
+/// responses with the same value came from one process and two values came
+/// from two. A deployment that predates the header reports `None`, and a
+/// caller then knows it cannot attribute rather than guessing from a counter.
+#[must_use]
+pub fn instances_behind(client: &ServiceClient, probes: usize) -> Option<usize> {
+    let mut seen = std::collections::BTreeSet::new();
+
+    for _ in 0..probes {
+        let response = match client.get("/health") {
+            Ok(response) => response,
             Err(error) => panic!("{error}"),
         };
-        if let Some(value) = body
-            .lines()
-            .filter(|line| !line.starts_with('#'))
-            .find_map(|line| line.strip_prefix(series))
-            .and_then(|value| value.trim().parse::<i64>().ok())
-        {
-            observed.push(value);
-        }
+        // One unlabelled answer is enough to know this deployment cannot be
+        // attributed at all.
+        seen.insert(responding_instance(&response)?);
     }
 
-    if observed.is_empty() {
-        return 1;
-    }
-
-    // Greedy cover: each observation joins a sequence whose last value it does
-    // not go below, and starts a new one when none will take it.
-    let mut tails: Vec<i64> = Vec::new();
-    for value in observed {
-        match tails
-            .iter_mut()
-            .filter(|tail| **tail <= value)
-            .min_by_key(|tail| value - **tail)
-        {
-            Some(tail) => *tail = value,
-            None => tails.push(value),
-        }
-    }
-
-    tails.len().max(1)
+    Some(seen.len().max(1))
 }
 
 /// A minimal v2 create request, as a starting point for a test that varies one
