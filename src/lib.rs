@@ -211,6 +211,12 @@
 //! CI runs it on a change to the probes, to what they probe, or to how the
 //! service is packaged.
 //!
+//! Whether a deployment persists its snapshots is visible in the readiness
+//! body: the warehouse probe exists only when the manager has a warehouse, so
+//! a `clickhouse` dependency there is persistence being on. The integration
+//! suite reads it and says which of the two export paths a run exercises,
+//! rather than testing one and reporting as though it had covered both.
+//!
 //! Both are unversioned, unauthenticated, and excluded from the request
 //! metrics: an orchestrator polling forever would otherwise add a constant to
 //! every series and a flood of 503s to the error series while a dependency is
