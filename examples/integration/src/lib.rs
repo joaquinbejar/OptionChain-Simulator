@@ -474,7 +474,7 @@ fn read_chunked(
         let read = reader
             .read_line(&mut terminator)
             .map_err(|error| unreachable(error.to_string()))?;
-        if read == 0 || terminator.trim_end_matches(['\r', '\n']) != "" {
+        if read == 0 || !terminator.trim_end_matches(['\r', '\n']).is_empty() {
             return Err(malformed(format!(
                 "a chunk of {size} bytes was followed by {terminator:?} rather than a line end"
             )));
