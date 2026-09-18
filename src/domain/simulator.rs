@@ -691,8 +691,31 @@ mod tests {
     /// SAME binary, which is exactly why none of them caught that shift. This
     /// one holds the numbers themselves, so the next upstream bump has to
     /// declare what it moved instead of moving it silently.
+    ///
+    /// The pins are compared at 20 decimal places, not at the full 28 of a
+    /// `Decimal`: rust_decimal 1.43.0 re-rounded its transcendental kernels
+    /// (`exp`, `ln`, `powd`) and moved the 110-strike gamma from `...5884` to
+    /// `...5889` in its last two digits, with every delta untouched. That is
+    /// last-place noise in the library, not a change in the model, and a pin
+    /// that fires on it would have every rust_decimal bump re-declare digits
+    /// no consumer can see. A carry-term shift is 26 orders of magnitude
+    /// bigger and still trips it.
     #[tokio::test]
     async fn test_greek_columns_are_pinned_at_a_non_zero_dividend_yield() {
+        /// Decimal places at which a greek pin is held; see the test doc.
+        const PIN_DP: u32 = 20;
+        fn assert_pinned(actual: Option<Decimal>, expected: Decimal, what: &str) {
+            let actual = match actual {
+                Some(actual) => actual,
+                None => panic!("the contract must carry {what}"),
+            };
+            assert_eq!(
+                actual.round_dp(PIN_DP),
+                expected.round_dp(PIN_DP),
+                "{what} moved: got {actual}, pinned {expected}"
+            );
+        }
+
         let mut session = create_test_session(Some(Uuid::new_v4()));
         session.parameters.dividend_yield = pos_or_panic!(0.015);
         session.parameters.risk_free_rate = dec!(0.04);
@@ -717,9 +740,21 @@ mod tests {
             Some(contract) => contract,
             None => panic!("the chain must carry the at-the-money strike"),
         };
-        assert_eq!(atm.delta_call, Some(dec!(0.5250683903310066130344888912)));
-        assert_eq!(atm.delta_put, Some(dec!(-0.4736994926369290798684617156)));
-        assert_eq!(atm.gamma, Some(dec!(0.0693468762175267532729472986)));
+        assert_pinned(
+            atm.delta_call,
+            dec!(0.5250683903310066130344888912),
+            "the at-the-money call delta",
+        );
+        assert_pinned(
+            atm.delta_put,
+            dec!(-0.4736994926369290798684617156),
+            "the at-the-money put delta",
+        );
+        assert_pinned(
+            atm.gamma,
+            dec!(0.0693468762175267532729472986),
+            "the at-the-money gamma",
+        );
 
         // A wing, so the pin is not a single point on the curve.
         let wing = match chain
@@ -729,9 +764,21 @@ mod tests {
             Some(contract) => contract,
             None => panic!("the chain must carry the 110 strike"),
         };
-        assert_eq!(wing.delta_call, Some(dec!(0.0523243367419569481464854646)));
-        assert_eq!(wing.delta_put, Some(dec!(-0.9464435462259787447564651422)));
-        assert_eq!(wing.gamma, Some(dec!(0.0189194837294070818706825884)));
+        assert_pinned(
+            wing.delta_call,
+            dec!(0.0523243367419569481464854646),
+            "the 110-strike call delta",
+        );
+        assert_pinned(
+            wing.delta_put,
+            dec!(-0.9464435462259787447564651422),
+            "the 110-strike put delta",
+        );
+        assert_pinned(
+            wing.gamma,
+            dec!(0.0189194837294070818706825884),
+            "the 110-strike gamma",
+        );
 
         // The call and put deltas sum to `e^{-qT}`, not to 1: the dividend
         // yield is genuinely in the numbers, which is what makes this a test

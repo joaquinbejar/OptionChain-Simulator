@@ -67,7 +67,7 @@ optionchain_simulator = { path = "." }
 optionstratlib = "0.21"
 positive = "0.6"
 tracing = "0.1"
-rust_decimal = { version = "1.42", features = ["maths", "serde"] }
+rust_decimal = { version = "1.43", features = ["maths", "serde"] }
 rust_decimal_macros = "1.40"
 serde_json = "1.0"
 serde = "1.0"
@@ -83,7 +83,7 @@ clickhouse = "0.15"
 tokio = { version = "1.53", features = ["full"] }
 async-trait = "0.1"
 actix-web = { version = "4.15", features = ["rustls"] }
-redis = { version = "1.6", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.7", features = ["tokio-comp", "connection-manager"] }
 # actix_extras is unavailable: optionstratlib enables utoipa/axum_extras,
 # and utoipa's framework extras are mutually exclusive
 utoipa = "5.5"
@@ -92,7 +92,7 @@ rand = "0.10"
 rand_distr = "0.6"
 prometheus = "0.14"
 futures = "0.3"
-mongodb = "3.8"
+mongodb = "3.9"
 mockall = "0.15"
 tempfile = "3.27"
 once_cell = "1.21"
@@ -101,4 +101,4 @@ once_cell = "1.21"
 # crates.io consumer using this as a library — must not pay for it.
 # `default-features = false` and the version match IronCondor, which consumes
 # the stream and writes Parquet.
-arrow = { version = "59.2", default-features = false, features = ["ipc"] }
+arrow = { version = "60.0", default-features = false, features = ["ipc"] }
