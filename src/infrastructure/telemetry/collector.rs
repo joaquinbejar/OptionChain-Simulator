@@ -256,6 +256,9 @@ impl MetricsCollector {
     /// documented known drift; a store-derived gauge is future work).
     pub fn record_session_deleted(&self) {
         self.session_deletion_counter.inc();
+        // Rust 1.99 renamed `fetch_update` to `try_update`, but `try_update`
+        // is only stable since 1.95 and the MSRV is 1.89.
+        #[allow(deprecated)]
         let owned_one =
             self.owned_active_sessions
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
