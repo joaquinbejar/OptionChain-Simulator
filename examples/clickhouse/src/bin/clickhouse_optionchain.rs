@@ -2,13 +2,14 @@ use chrono::Duration;
 use optionchain_simulator::infrastructure::{
     ClickHouseClient, ClickHouseConfig, ClickHouseHistoricalRepository, HistoricalDataRepository,
 };
+use optionchain_simulator::infrastructure::{init_logging, resolve_log_level_from_env};
 use optionchain_simulator::session::{
     InMemorySessionStore, SessionManager, SimulationMethod, SimulationParameters,
 };
 use optionchain_simulator::utils::ChainError;
-use optionstratlib::utils::others::calculate_log_returns;
+use optionstratlib::utils::calculate_log_returns;
 use optionstratlib::utils::time::convert_time_frame;
-use optionstratlib::utils::{Len, TimeFrame, setup_logger};
+use optionstratlib::utils::{Len, TimeFrame};
 use optionstratlib::volatility::{annualized_volatility, constant_volatility};
 use positive::{Positive, pos_or_panic, spos};
 use rust_decimal::Decimal;
@@ -20,7 +21,7 @@ use uuid::Uuid;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    setup_logger();
+    init_logging(resolve_log_level_from_env().level);
     info!("Starting ClickHouse + Option Chain Simulation Example");
 
     // Step 1: Set up ClickHouse client
@@ -128,7 +129,10 @@ fn create_simulation_parameters(
 ) -> SimulationParameters {
     // Convert timeframes for simulation
     let time_frame = TimeFrame::Day;
-    let dt = convert_time_frame(Positive::ONE, &time_frame, &TimeFrame::Day);
+    let dt = match convert_time_frame(Positive::ONE, &time_frame, &TimeFrame::Day) {
+        Ok(dt) => dt,
+        Err(error) => panic!("a fixed time frame converts to days: {error}"),
+    };
 
     SimulationParameters {
         symbol,

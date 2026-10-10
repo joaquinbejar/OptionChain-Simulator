@@ -3,7 +3,8 @@ use optionchain_simulator::infrastructure::{
     ClickHouseClient, ClickHouseConfig, ClickHouseHistoricalRepository, HistoricalDataRepository,
     PriceType,
 };
-use optionstratlib::utils::{TimeFrame, setup_logger};
+use optionchain_simulator::infrastructure::{init_logging, resolve_log_level_from_env};
+use optionstratlib::utils::TimeFrame;
 use positive::{Positive, pos_or_panic};
 use std::sync::Arc;
 use tracing::{error, info};
@@ -11,7 +12,7 @@ use tracing::{error, info};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    setup_logger();
+    init_logging(resolve_log_level_from_env().level);
     info!("Starting ClickHouse client example");
     let config = ClickHouseConfig::default();
 

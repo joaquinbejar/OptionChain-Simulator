@@ -21,7 +21,7 @@
 //!
 //! # Dependencies
 //! - The `optionchain_simulator` crate is used for infrastructure utilities like Redis client and session store setup.
-//! - `optionstratlib::utils::setup_logger_with_level` sets up logging, at the
+//! - `infrastructure::init_logging` installs the `tracing` subscriber, at the
 //!   level `LOGLEVEL` resolves to (default `INFO`).
 //! - `tracing` crate is used for log output.
 //!
@@ -69,14 +69,13 @@ use optionchain_simulator::api::start_server;
 use optionchain_simulator::infrastructure::{
     ClickHouseSnapshotRepository, DEFAULT_PRICING_GATE_KEY, DependencyProbe, MetricsCollector,
     MongoDbProbe, Readiness, RedisClient, RedisConfig, RedisPricingGate, RedisProbe, ServerConfig,
-    SimulationV2Config, WarehouseProbe, init_mongodb, resolve_log_level_from_env,
+    SimulationV2Config, WarehouseProbe, init_logging, init_mongodb, resolve_log_level_from_env,
 };
 use optionchain_simulator::session::{
     DEFAULT_TAPE_KEY_PREFIX, InRedisSessionStore, InRedisSimulationStore, RedisTapeCache,
     SessionManager, SimulationManager,
 };
 use optionchain_simulator::utils::admission::{configured_jobs, install_shared_gate};
-use optionstratlib::utils::setup_logger_with_level;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // subscriber exists, so a rejected value is carried out of the resolver and
     // warned about below, once the subscriber can carry the warning.
     let log_level = resolve_log_level_from_env();
-    setup_logger_with_level(log_level.level.as_str());
+    init_logging(log_level.level);
     if let Some(rejected) = &log_level.rejected {
         warn!(
             value = %rejected,

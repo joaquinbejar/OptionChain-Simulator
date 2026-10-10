@@ -202,6 +202,9 @@ impl FactorTape {
             // calling `generate_with_vol` on ours. The clone shares the same
             // `Arc<Mutex<StdRng>>`, so there is exactly one stream either way.
             walker: Box::new(walker.clone()),
+            // `Walker` overrides every stochastic walk method and draws from its own
+            // seeded RNG, so the 0.22 per-walk seed stays unset.
+            seed: None,
         };
 
         let path = walker.generate_with_vol(&walk_params).map_err(|e| {
@@ -2564,6 +2567,9 @@ mod tests {
             },
             walk_type: parameters.method.clone(),
             walker: Box::new(Walker::new_with_seed(parameters.seed)),
+            // `Walker` overrides every stochastic walk method and draws from its own
+            // seeded RNG, so the 0.22 per-walk seed stays unset.
+            seed: None,
         };
 
         // The driver builds its steps in parallel, so the volatilities are
