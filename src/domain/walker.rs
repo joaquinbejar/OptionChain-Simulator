@@ -961,6 +961,9 @@ mod tests {
                 jump_volatility: pos_or_panic!(0.1),
             },
             walker: Box::new(Walker::new_with_seed(1)),
+            // `Walker` overrides every stochastic walk method and draws from its own
+            // seeded RNG, so the 0.22 per-walk seed stays unset.
+            seed: None,
         }
     }
 

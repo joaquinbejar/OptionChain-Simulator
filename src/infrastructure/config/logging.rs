@@ -51,7 +51,7 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    /// The upper-case name upstream's `setup_logger_with_level` expects.
+    /// The upper-case name, as `LOGLEVEL` spells it.
     #[must_use]
     #[inline]
     pub fn as_str(self) -> &'static str {
@@ -79,6 +79,34 @@ impl LogLevel {
             _ => None,
         }
     }
+}
+
+impl LogLevel {
+    /// The `tracing` level this one installs as the subscriber's maximum.
+    #[must_use]
+    #[inline]
+    pub fn as_tracing_level(self) -> tracing::Level {
+        match self {
+            LogLevel::Trace => tracing::Level::TRACE,
+            LogLevel::Debug => tracing::Level::DEBUG,
+            LogLevel::Info => tracing::Level::INFO,
+            LogLevel::Warn => tracing::Level::WARN,
+            LogLevel::Error => tracing::Level::ERROR,
+        }
+    }
+}
+
+/// Installs the process-wide `tracing` subscriber at `level`.
+///
+/// optionstratlib 0.22 removed `setup_logger_with_level` and no longer depends
+/// on `tracing-subscriber`, so the subscriber is installed here: the same
+/// formatted output with `level` as the maximum. Idempotent: if a global
+/// subscriber already exists (a second call, or a test harness that installed
+/// one), the existing one is kept and this is a no-op.
+pub fn init_logging(level: LogLevel) {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(level.as_tracing_level())
+        .try_init();
 }
 
 impl fmt::Display for LogLevel {
@@ -227,18 +255,12 @@ mod tests {
         assert_eq!(resolved.rejected, Some("verbose".to_string()));
     }
 
-    /// Every name lands on the level it says, in UPSTREAM's matcher.
+    /// Every variant installs the `tracing` level of the same name.
     ///
-    /// `setup_logger_with_level` matches `DEBUG | ERROR | WARN | TRACE` and
-    /// treats everything else as `INFO`, silently. So a renamed variant would
-    /// not fail anywhere: it would just quietly log at `INFO`. Round-tripping
-    /// through this module's own `parse` would not catch that — it would agree
-    /// with itself — so the upstream arm set is pinned here instead, and a
-    /// rename breaks this test rather than production.
+    /// A swapped arm would not fail anywhere else: the service would just log
+    /// at the wrong verbosity. Comparing the names pins the mapping.
     #[test]
-    fn test_every_name_lands_on_its_level_upstream() {
-        const UPSTREAM_ARMS: [&str; 4] = ["DEBUG", "ERROR", "WARN", "TRACE"];
-
+    fn test_every_level_maps_to_the_tracing_level_of_the_same_name() {
         for level in [
             LogLevel::Trace,
             LogLevel::Debug,
@@ -246,18 +268,7 @@ mod tests {
             LogLevel::Warn,
             LogLevel::Error,
         ] {
-            let name = level.as_str();
-            if level == LogLevel::Info {
-                assert!(
-                    !UPSTREAM_ARMS.contains(&name),
-                    "INFO reaches upstream through its fallback arm, not a named one"
-                );
-            } else {
-                assert!(
-                    UPSTREAM_ARMS.contains(&name),
-                    "{name} is not an arm upstream matches; it would silently log at INFO"
-                );
-            }
+            assert_eq!(level.as_tracing_level().as_str(), level.as_str());
         }
     }
 

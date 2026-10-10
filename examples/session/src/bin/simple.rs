@@ -1,5 +1,6 @@
+use optionchain_simulator::infrastructure::{init_logging, resolve_log_level_from_env};
+use optionstratlib::utils::TimeFrame;
 use optionstratlib::utils::time::convert_time_frame;
-use optionstratlib::utils::{TimeFrame, setup_logger};
 use positive::{Positive, pos_or_panic, spos};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -14,7 +15,7 @@ use optionchain_simulator::utils::error::ChainError;
 /// Example demonstrating the usage of SessionManager and Session for option chain simulation
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setup_logger();
+    init_logging(resolve_log_level_from_env().level);
 
     info!("Starting OptionChain-Simulator example");
 
@@ -71,7 +72,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn create_simulation_parameters() -> SimulationParameters {
     let volatility = pos_or_panic!(0.2);
     let time_frame = TimeFrame::Minute;
-    let dt = convert_time_frame(Positive::ONE, &time_frame, &TimeFrame::Day);
+    let dt = match convert_time_frame(Positive::ONE, &time_frame, &TimeFrame::Day) {
+        Ok(dt) => dt,
+        Err(error) => panic!("a fixed time frame converts to days: {error}"),
+    };
     SimulationParameters {
         symbol: "CL".to_string(),
         steps: 30,
@@ -137,7 +141,10 @@ async fn run_session_lifecycle(
     // Increase volatility
     let volatility = pos_or_panic!(0.3); // Increased from 0.2 to 0.3
     let time_frame = TimeFrame::Minute;
-    let dt = convert_time_frame(Positive::ONE, &time_frame, &TimeFrame::Day);
+    let dt = match convert_time_frame(Positive::ONE, &time_frame, &TimeFrame::Day) {
+        Ok(dt) => dt,
+        Err(error) => panic!("a fixed time frame converts to days: {error}"),
+    };
 
     modified_params.volatility = volatility;
     modified_params.method = SimulationMethod::GeometricBrownian {

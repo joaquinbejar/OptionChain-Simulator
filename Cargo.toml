@@ -1,6 +1,6 @@
 [package]
 name = "optionchain_simulator"
-version = "0.2.29"
+version = "0.3.0"
 edition = "2024"
 # The maximum `rust-version` across the RESOLVED graph, not the highest direct
 # dependency: clickhouse 0.15.1, nalgebra 0.35, statrs 0.19.1 and wide 1.7 all
@@ -28,6 +28,7 @@ arrow = { workspace = true, optional = true }
 optionstratlib = { workspace = true }
 positive = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 serde_json = { workspace = true }
@@ -64,9 +65,12 @@ members = [
 
 [workspace.dependencies]
 optionchain_simulator = { path = "." }
-optionstratlib = "0.21"
-positive = "0.6"
+optionstratlib = "0.22"
+positive = "0.8"
 tracing = "0.1"
+# The process log subscriber. optionstratlib 0.22 removed `setup_logger*` and
+# no longer depends on tracing-subscriber, so the binaries install their own.
+tracing-subscriber = "0.3"
 rust_decimal = { version = "1.43", features = ["maths", "serde"] }
 rust_decimal_macros = "1.40"
 serde_json = "1.0"
@@ -84,10 +88,8 @@ tokio = { version = "1.53", features = ["full"] }
 async-trait = "0.1"
 actix-web = { version = "4.15", features = ["rustls"] }
 redis = { version = "1.7", features = ["tokio-comp", "connection-manager"] }
-# actix_extras is unavailable: optionstratlib enables utoipa/axum_extras,
-# and utoipa's framework extras are mutually exclusive
-utoipa = "5.5"
-utoipa-swagger-ui = { version = "9.0", features = ["actix-web"] }
+utoipa = "6.0"
+utoipa-swagger-ui = { version = "10.0", features = ["actix-web"] }
 rand = "0.10"
 rand_distr = "0.6"
 prometheus = "0.14"

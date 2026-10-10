@@ -94,6 +94,9 @@ fn params_with(walk_type: WalkType) -> WalkParams<Positive, OptionChain> {
         },
         walk_type,
         walker: Box::new(Walker::new_with_seed(FIXTURE_SEED)),
+        // `Walker` overrides every stochastic walk method and draws from its own
+        // seeded RNG, so the 0.22 per-walk seed stays unset.
+        seed: None,
     }
 }
 

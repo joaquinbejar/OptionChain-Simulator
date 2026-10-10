@@ -537,6 +537,9 @@ impl Simulator {
             },
             walk_type: method,
             walker,
+            // `Walker` overrides every stochastic walk method and draws from its own
+            // seeded RNG, so the 0.22 per-walk seed stays unset.
+            seed: None,
         };
 
         // Create the random walk
@@ -700,6 +703,11 @@ mod tests {
     /// that fires on it would have every rust_decimal bump re-declare digits
     /// no consumer can see. A carry-term shift is 26 orders of magnitude
     /// bigger and still trips it.
+    ///
+    /// optionstratlib 0.22 moved that same 110-strike gamma by `2.2e-17`
+    /// (`0.01891948372940708187...` to `0.01891948372940706017...`), past the 20th place, with
+    /// every delta and the at-the-money gamma untouched; it is re-pinned at
+    /// the 0.22 value. Same class of last-place noise, same reasoning.
     #[tokio::test]
     async fn test_greek_columns_are_pinned_at_a_non_zero_dividend_yield() {
         /// Decimal places at which a greek pin is held; see the test doc.
@@ -776,7 +784,7 @@ mod tests {
         );
         assert_pinned(
             wing.gamma,
-            dec!(0.0189194837294070818706825884),
+            dec!(0.018919483729407060169537808),
             "the 110-strike gamma",
         );
 
