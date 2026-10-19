@@ -1,6 +1,6 @@
 [package]
 name = "optionchain_simulator"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 # The maximum `rust-version` across the RESOLVED graph, not the highest direct
 # dependency: clickhouse 0.15.1, nalgebra 0.35, statrs 0.19.1 and wide 1.7 all
@@ -65,7 +65,7 @@ members = [
 
 [workspace.dependencies]
 optionchain_simulator = { path = "." }
-optionstratlib = "0.22"
+optionstratlib = "0.23"
 positive = "0.8"
 tracing = "0.1"
 # The process log subscriber. optionstratlib 0.22 removed `setup_logger*` and
