@@ -1612,7 +1612,6 @@ Repositories by the same author that this project depends on, and repositories t
 | Repository | Description |
 |------------|-------------|
 | [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing, Greeks and chain generation used to build and evolve the simulated chains. |
-| [fauxchange](https://github.com/joaquinbejar/fauxchange) | Local options exchange simulator with realistic matching, FIX/WS/REST APIs and historical replay. |
 | [positive](https://github.com/joaquinbejar/positive) | Type-safe non-negative decimal type used for prices, strikes and volatilities. |
 
 <!-- related-projects:end -->
