@@ -1590,7 +1590,6 @@ We welcome contributions to this project! If you would like to contribute, pleas
 If you have any questions, issues, or would like to provide feedback, please feel free to contact the project maintainer:
 
 ### **Contact Information**
-
 - **Author**: Joaquín Béjar García
 - **Email**: jb@taunais.com
 - **Telegram**: [@joaquin_bejar](https://t.me/joaquin_bejar)
@@ -1612,7 +1611,7 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) · [crates.io](https://crates.io/crates/optionstratlib) | Options pricing, Greeks, strategies and simulation library. |
-| [positive](https://github.com/joaquinbejar/positive) · [crates.io](https://crates.io/crates/positive) | Type-safe wrapper for guaranteed non-negative Decimal values. |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing, Greeks and chain generation used to build and evolve the simulated chains. |
+| [positive](https://github.com/joaquinbejar/positive) | Type-safe non-negative decimal type used for prices, strikes and volatilities. |
 
 <!-- related-projects:end -->
