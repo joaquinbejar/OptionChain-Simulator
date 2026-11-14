@@ -27,6 +27,7 @@ use crate::api::rest::validation::{
 };
 use crate::domain::expiry::{CalendarVersion, ExpirationSchedule, tzdb_version};
 use crate::domain::ladder::{MAX_PINNED_WIDTH, StrikeLadder, ensure_ladder_fits};
+use crate::domain::perpetual::PerpetualSpec;
 use crate::domain::simulator::DEFAULT_CHAIN_SIZE;
 use crate::domain::spread::{MAX_PROPORTIONAL, MAX_TICK, MAX_WIDENING};
 use crate::infrastructure::max_snapshot_contracts;
@@ -40,6 +41,7 @@ use rand::RngExt;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::time::SystemTime;
 use tracing::warn;
@@ -312,6 +314,12 @@ pub struct SimulationParametersV2 {
     ///
     /// A `rolling` simulation carries it too and never consults it.
     pub pinned_width_ceiling: usize,
+    /// The perpetual options the simulation quotes beside its expiring chains,
+    /// when it quotes any. Absent in every simulation created before the field
+    /// existed and in every one that does not ask for them, and such a
+    /// simulation serves exactly what it always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perpetuals: Option<PerpetualSpec>,
 }
 
 /// The deserialization shape of [`SimulationParametersV2`].
@@ -365,6 +373,9 @@ struct SimulationParametersV2Wire {
     /// have had, and keeps it from then on.
     #[serde(default)]
     pinned_width_ceiling: Option<usize>,
+    /// Absent in a document written before perpetual options existed.
+    #[serde(default)]
+    perpetuals: Option<PerpetualSpec>,
 }
 
 impl TryFrom<SimulationParametersV2Wire> for SimulationParametersV2 {
@@ -402,6 +413,7 @@ impl TryFrom<SimulationParametersV2Wire> for SimulationParametersV2 {
             spread_tick: wire.spread_tick,
             seed: wire.seed,
             pinned_width_ceiling,
+            perpetuals: wire.perpetuals,
         };
         parameters.validate_stored()?;
         Ok(parameters)
@@ -573,6 +585,11 @@ impl SimulationParametersV2 {
             });
         }
         self.schedule.validate()?;
+        // Before the work bound, so a specification no request could carry is
+        // refused by name rather than counted.
+        if let Some(perpetuals) = &self.perpetuals {
+            perpetuals.validate(self)?;
+        }
         self.enforce_snapshot_work(enforce_cap)?;
 
         // Deployment-independent, so it holds on every path: a stored ceiling
@@ -689,13 +706,30 @@ impl SimulationParametersV2 {
                 reason: "the requested expiration counts overflow".to_string(),
             })?;
 
-        strikes
+        let expiring = strikes
             .checked_mul(expirations)
             .ok_or_else(|| ChainError::Validation {
                 field: "chain_size".to_string(),
                 reason: format!(
                     "{strikes} strikes across {expirations} expirations overflows the \
                      contract count"
+                ),
+            })?;
+
+        // The perpetual block prices the same ladder once per rung, so it is
+        // work of the same kind and counts against the same cap.
+        let Some(perpetuals) = &self.perpetuals else {
+            return Ok(expiring);
+        };
+        perpetuals
+            .contracts(strikes)
+            .and_then(|perpetual| expiring.checked_add(perpetual))
+            .ok_or_else(|| ChainError::Validation {
+                field: "chain_size".to_string(),
+                reason: format!(
+                    "{strikes} strikes across {expirations} expirations and {} perpetual \
+                     rungs overflows the contract count",
+                    perpetuals.rungs
                 ),
             })
     }
@@ -891,6 +925,25 @@ impl TryFrom<CreateSimulationRequest> for SimulationParametersV2 {
                 })
                 .transpose()?,
             seed: request.seed.unwrap_or_else(|| rand::rng().random()),
+            perpetuals: request
+                .perpetuals
+                .map(|perpetuals| {
+                    let rungs = perpetuals.rungs.unwrap_or(1);
+                    let Some(rungs) = NonZeroU32::new(rungs) else {
+                        return Err(ChainError::Validation {
+                            field: "perpetuals.rungs".to_string(),
+                            reason: "must be at least 1, got 0".to_string(),
+                        });
+                    };
+                    Ok(PerpetualSpec {
+                        funding_rate: strictly_positive_field(
+                            "perpetuals.funding_rate",
+                            perpetuals.funding_rate,
+                        )?,
+                        rungs,
+                    })
+                })
+                .transpose()?,
         };
 
         // Run the same checks the stored-document path runs, so a request and a
@@ -1153,6 +1206,7 @@ impl fmt::Display for SessionV2 {
 mod tests {
     use super::*;
     use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
+    use crate::api::rest::requests_v2::PerpetualsRequest;
     use crate::domain::expiry::{ExpiryRule, ExpiryRuleKind, MAX_TARGET_COUNT};
     use chrono::{TimeZone, Weekday};
     use positive::pos_or_panic;
@@ -1217,6 +1271,7 @@ mod tests {
             spread_tenor_widening: None,
             spread_tick: None,
             seed: Some(42),
+            perpetuals: None,
         }
     }
 
@@ -2170,6 +2225,133 @@ mod tests {
             },
             Err(error) => panic!("the reference request must convert: {error}"),
         }
+    }
+
+    /// The reference request, pinned and quoting perpetual options.
+    fn perpetual_request(funding_rate: f64, rungs: Option<u32>) -> CreateSimulationRequest {
+        let mut request = reference_request();
+        request.strike_ladder = Some(StrikeLadder::Pinned);
+        request.perpetuals = Some(PerpetualsRequest {
+            funding_rate,
+            rungs,
+        });
+        request
+    }
+
+    /// The perpetual specification is resolved at conversion: the rate becomes
+    /// a `Positive` and an omitted rung count becomes one.
+    #[test]
+    fn test_perpetuals_are_resolved_at_conversion() {
+        let resolved = parameters(perpetual_request(12.0, None));
+        match resolved.perpetuals {
+            Some(perpetuals) => {
+                assert_eq!(perpetuals.funding_rate, pos_or_panic!(12.0));
+                assert_eq!(perpetuals.rungs.get(), 1);
+            }
+            None => panic!("the perpetual specification must survive the conversion"),
+        }
+        assert!(parameters(reference_request()).perpetuals.is_none());
+    }
+
+    /// Stored parameters keep their perpetual specification across a round
+    /// trip, so a reloaded simulation quotes the contracts it was created with.
+    #[test]
+    fn test_stored_parameters_keep_their_perpetuals() {
+        let parameters = parameters(perpetual_request(52.0, Some(3)));
+        let json = match serde_json::to_string(&parameters) {
+            Ok(json) => json,
+            Err(error) => panic!("the parameters must serialize: {error}"),
+        };
+        assert!(json.contains("\"perpetuals\""), "{json}");
+
+        match serde_json::from_str::<SimulationParametersV2>(&json) {
+            Ok(loaded) => assert_eq!(loaded, parameters),
+            Err(error) => panic!("the parameters must load back: {error}"),
+        }
+    }
+
+    /// A simulation that quotes no perpetual options stores no key for them,
+    /// so its document is the one an older binary wrote and can still read.
+    #[test]
+    fn test_stored_parameters_without_perpetuals_carry_no_key() {
+        let parameters = parameters(reference_request());
+        let json = match serde_json::to_value(&parameters) {
+            Ok(json) => json,
+            Err(error) => panic!("the parameters must serialize: {error}"),
+        };
+        assert!(json.get("perpetuals").is_none(), "{json}");
+
+        match serde_json::from_value::<SimulationParametersV2>(json) {
+            Ok(loaded) => assert!(loaded.perpetuals.is_none()),
+            Err(error) => panic!("a document without the key must load: {error}"),
+        }
+    }
+
+    /// A stored document is held to the bounds a request is: a hand-edited
+    /// rung count, funding rate or ladder is refused on load, by name.
+    #[test]
+    fn test_stored_perpetuals_are_validated_on_load() {
+        let parameters = parameters(perpetual_request(12.0, Some(2)));
+        let document = match serde_json::to_value(&parameters) {
+            Ok(document) => document,
+            Err(error) => panic!("the parameters must serialize: {error}"),
+        };
+
+        let cases = [
+            (
+                "/perpetuals/rungs",
+                serde_json::json!(9),
+                "perpetuals.rungs",
+            ),
+            (
+                "/perpetuals/funding_rate",
+                serde_json::json!(0.02),
+                "perpetuals.funding_rate",
+            ),
+            (
+                "/perpetuals/funding_rate",
+                serde_json::json!(10_000),
+                "perpetuals.funding_rate",
+            ),
+            (
+                "/strike_ladder",
+                serde_json::json!("rolling"),
+                "strike_ladder",
+            ),
+        ];
+        for (pointer, value, expected) in cases {
+            let mut edited = document.clone();
+            match edited.pointer_mut(pointer) {
+                Some(slot) => *slot = value,
+                None => panic!("the document must carry {pointer}"),
+            }
+            match serde_json::from_value::<SimulationParametersV2>(edited) {
+                Ok(_) => panic!("an edited {pointer} must be refused"),
+                Err(error) => assert!(
+                    error.to_string().contains(expected),
+                    "the error must name {expected}, got {error}"
+                ),
+            }
+        }
+    }
+
+    /// The perpetual contracts count against the per-snapshot cap: one per
+    /// strike and rung, on top of the expiring ones.
+    #[test]
+    fn test_perpetual_contracts_count_against_the_snapshot_cap() {
+        let mut plain = reference_request();
+        plain.strike_ladder = Some(StrikeLadder::Pinned);
+        let plain = match parameters(plain).snapshot_contracts() {
+            Ok(contracts) => contracts,
+            Err(error) => panic!("the count must be representable: {error}"),
+        };
+        let quoted = match parameters(perpetual_request(12.0, Some(3))).snapshot_contracts() {
+            Ok(contracts) => contracts,
+            Err(error) => panic!("the count must be representable: {error}"),
+        };
+
+        // A chain size of 15 is 31 strikes, and three rungs price each once.
+        assert_eq!(quoted.checked_sub(plain), Some(93));
     }
 
     /// An unknown field in a stored document is an error, not a silent drop.

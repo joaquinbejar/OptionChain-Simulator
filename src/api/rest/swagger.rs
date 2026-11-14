@@ -38,6 +38,12 @@ use utoipa::OpenApi;
             crate::api::rest::responses_v2::OptionQuoteResponse,
             crate::api::rest::responses_v2::UnderlyingResponse,
             crate::api::rest::responses_v2::CursorResponse,
+            crate::api::rest::requests_v2::PerpetualsRequest,
+            crate::api::rest::responses_v2::PerpetualsParametersResponse,
+            crate::api::rest::responses_v2::PerpetualChainResponse,
+            crate::api::rest::responses_v2::PerpetualRungResponse,
+            crate::api::rest::responses_v2::PerpetualContractResponse,
+            crate::api::rest::responses_v2::PerpetualQuoteResponse,
             crate::api::rest::greeks::GreeksResponse,
             crate::api::rest::greeks::FirstOrderGreeks,
             crate::api::rest::greeks::FullGreeks,
@@ -430,6 +436,73 @@ mod tests {
             assert!(
                 schema.contains("GreekLevel"),
                 "{method} {path} must type the parameter as the enum, got {schema}"
+            );
+        }
+    }
+
+    /// The perpetual option types reach the document, and the two places that
+    /// carry them, the request and the snapshot, point at them.
+    #[test]
+    fn test_the_openapi_document_carries_the_perpetual_schemas() {
+        let spec = match ApiDoc::openapi().to_json() {
+            Ok(json) => json,
+            Err(error) => panic!("the OpenAPI document must render: {error}"),
+        };
+        let parsed: Value = match serde_json::from_str(&spec) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("the OpenAPI document must parse: {error}"),
+        };
+        let schemas = match parsed
+            .get("components")
+            .and_then(|components| components.get("schemas"))
+            .and_then(Value::as_object)
+        {
+            Some(schemas) => schemas,
+            None => panic!("the document must carry component schemas"),
+        };
+
+        for name in [
+            "PerpetualsRequest",
+            "PerpetualsParametersResponse",
+            "PerpetualChainResponse",
+            "PerpetualRungResponse",
+            "PerpetualContractResponse",
+            "PerpetualQuoteResponse",
+        ] {
+            assert!(
+                schemas.contains_key(name),
+                "the document must carry the {name} schema"
+            );
+        }
+
+        for (owner, target) in [
+            ("CreateSimulationRequest", "PerpetualsRequest"),
+            ("SnapshotResponse", "PerpetualChainResponse"),
+            (
+                "SimulationParametersResponse",
+                "PerpetualsParametersResponse",
+            ),
+        ] {
+            let property = schemas
+                .get(owner)
+                .and_then(|schema| schema.get("properties"))
+                .and_then(|properties| properties.get("perpetuals"))
+                .map(Value::to_string)
+                .unwrap_or_default();
+            assert!(
+                property.contains(target),
+                "{owner}.perpetuals must reference {target}, got {property}"
+            );
+            // Optional everywhere: a client that omits it, or a simulation
+            // that does not quote them, is the common case.
+            let required = schemas
+                .get(owner)
+                .and_then(|schema| schema.get("required"))
+                .map(Value::to_string)
+                .unwrap_or_default();
+            assert!(
+                !required.contains("perpetuals"),
+                "{owner}.perpetuals must be optional"
             );
         }
     }

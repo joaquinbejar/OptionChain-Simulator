@@ -138,6 +138,37 @@ pub struct CreateSimulationRequest {
     /// seed, exactly as in v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
+    /// Perpetual options to quote beside the expiring chains. Omitted by
+    /// default, and a simulation that omits it serves exactly what it always
+    /// did.
+    ///
+    /// Requires `strike_ladder: "pinned"`: a contract that never expires has to
+    /// stay quoted, and the perpetual contracts are quoted at exactly the
+    /// pinned strikes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perpetuals: Option<PerpetualsRequest>,
+}
+
+/// The perpetual options a simulation quotes.
+///
+/// A perpetual option never expires. It is kept at its payoff by a funding
+/// payment from the long side to the short side, which makes it worth what a
+/// European option of a random maturity is worth; `funding_rate` sets the mean
+/// of that maturity.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PerpetualsRequest {
+    /// The funding rate, per year. Rung `j` has a mean maturity of
+    /// `j / funding_rate` years, so `12` is a mean maturity of one month at
+    /// rung 1. Must be within `[0.01, 8760]` and at least twice
+    /// `risk_free_rate - dividend_yield`: at or below that drift the contract
+    /// has no finite price, and just above it the price is too large to quote.
+    pub funding_rate: f64,
+    /// How many rungs of the ladder to quote, from rung 1 up. Rung 1 is the
+    /// plain perpetual option; rung `j` is funded against the price of rung
+    /// `j - 1` instead of against the payoff. Between 1 and 8. Default: `1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rungs: Option<u32>,
 }
 
 impl fmt::Display for CreateSimulationRequest {
@@ -302,6 +333,67 @@ mod tests {
             error.contains("weekdays"),
             "the error must name the offending field, got {error}"
         );
+    }
+
+    /// A request may ask for perpetual options, with or without a rung count.
+    #[test]
+    fn test_a_request_may_ask_for_perpetuals() {
+        let with_rungs = REFERENCE_REQUEST.replacen(
+            "\"seed\": 42",
+            "\"seed\": 42, \"strike_ladder\": \"pinned\", \
+             \"perpetuals\": { \"funding_rate\": 12.0, \"rungs\": 3 }",
+            1,
+        );
+        match serde_json::from_str::<CreateSimulationRequest>(&with_rungs) {
+            Ok(request) => assert_eq!(
+                request.perpetuals,
+                Some(PerpetualsRequest {
+                    funding_rate: 12.0,
+                    rungs: Some(3),
+                })
+            ),
+            Err(error) => panic!("the request must deserialize: {error}"),
+        }
+
+        let without_rungs = REFERENCE_REQUEST.replacen(
+            "\"seed\": 42",
+            "\"seed\": 42, \"perpetuals\": { \"funding_rate\": 52 }",
+            1,
+        );
+        match serde_json::from_str::<CreateSimulationRequest>(&without_rungs) {
+            Ok(request) => assert_eq!(
+                request.perpetuals,
+                Some(PerpetualsRequest {
+                    funding_rate: 52.0,
+                    rungs: None,
+                })
+            ),
+            Err(error) => panic!("the request must deserialize: {error}"),
+        }
+
+        match serde_json::from_str::<CreateSimulationRequest>(REFERENCE_REQUEST) {
+            Ok(request) => {
+                assert!(request.perpetuals.is_none());
+                assert!(!request.to_string().contains("perpetuals"));
+            }
+            Err(error) => panic!("the reference request must deserialize: {error}"),
+        }
+    }
+
+    /// A typo inside the perpetual block is a refusal naming it, not a
+    /// parameter silently left at its default.
+    #[test]
+    fn test_unknown_field_inside_perpetuals_is_rejected() {
+        let json = REFERENCE_REQUEST.replacen(
+            "\"seed\": 42",
+            "\"seed\": 42, \"perpetuals\": { \"funding_rate\": 12.0, \"rung\": 3 }",
+            1,
+        );
+        let error = match serde_json::from_str::<CreateSimulationRequest>(&json) {
+            Ok(_) => panic!("an unknown field must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("rung"), "{error}");
     }
 
     /// The request round-trips through JSON, so a logged or echoed request

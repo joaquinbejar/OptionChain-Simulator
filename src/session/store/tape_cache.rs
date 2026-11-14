@@ -471,6 +471,7 @@ mod tests {
             spread_tick: None,
             strike_ladder: None,
             seed: Some(seed),
+            perpetuals: None,
         };
         match SimulationParametersV2::try_from(request) {
             Ok(parameters) => parameters,

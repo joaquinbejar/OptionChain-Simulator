@@ -467,6 +467,57 @@ provide. Widen the ladder at creation, with `chain_size`, rather than at
 step time. A spot that drifts further than the service will widen for is a
 `400` naming `strike_ladder` rather than a silently shorter chain.
 
+#### Perpetual options can be quoted beside the chains
+
+A perpetual option never expires. It is kept at its payoff by a funding
+payment: the long side pays the short side, continuously, the difference
+between the contract's price and the payoff at a rate `funding_rate` per
+year. That makes it worth what a European option of a random, exponentially
+distributed maturity is worth, with a mean maturity of `1 / funding_rate`
+years. A ladder stacks them: rung `j` is funded against the price of rung
+`j - 1` instead of against the payoff, and has a mean maturity of
+`j / funding_rate` years, so the rungs are a term structure with no
+expiration in it.
+
+`perpetuals` on the v2 create request asks for them:
+
+```json
+"strike_ladder": "pinned",
+"perpetuals": { "funding_rate": 12.0, "rungs": 3 }
+```
+
+| Field | Meaning |
+|-------|---------|
+| `funding_rate` | Per year, within `[0.01, 8760]`. It must be at least twice `risk_free_rate - dividend_yield`: at or below that drift the contract has no finite price, and just above it the price is too large to quote. Either way the request is a `400` naming the field. |
+| `rungs` | How many rungs to quote, from 1 to 8. `1` when omitted, which is the plain perpetual option. |
+
+Every snapshot then carries a `perpetuals` block: per rung, the rung's mean
+maturity and one contract per pinned strike, each side with its `price`,
+`delta`, `gamma`, `vega` and `funding`. `funding` is what the long pays the
+short at that step, per year and per unit of underlying; multiply by the
+length of a step in years for the payment over it.
+
+- **Opt-in and additive.** A simulation that does not ask serves no
+  `perpetuals` key anywhere and stores none, so its responses and its stored
+  document are the ones an older client and an older binary know.
+- **Pinned ladder required.** A contract that never expires has to stay
+  quoted, so the request is a `400` naming `strike_ladder` on a rolling
+  ladder, and the contracts are quoted at exactly the pinned strikes.
+- **Same step state.** The block is priced from the step's underlying price
+  and base volatility, with the drift `risk_free_rate - dividend_yield`, so
+  it is a pure function of the parameters and the tape and replays under the
+  same seed. Skew and smile are not applied: they are shaped per expiration
+  and a perpetual contract has none. The spread model is not applied either:
+  `price` is the model value.
+- **Counted as work.** The contracts count against the per-snapshot cap, one
+  per strike and rung.
+- **Not exported, not persisted.** The export datasets and the snapshot
+  warehouse carry the expiring chains only. A served snapshot is always
+  rebuilt from the tape, so the block is never missing from a response.
+
+The values are upstream's closed form under geometric Brownian motion
+(`optionstratlib::pricing::everlasting`); nothing is priced here.
+
 `/api/v1/chain` is untouched, model and all: it is frozen, and its chains
 come from a different upstream path.
 

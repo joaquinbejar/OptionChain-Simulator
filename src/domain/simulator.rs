@@ -911,6 +911,7 @@ mod tests {
             spread_tenor_widening: None,
             spread_tick: None,
             seed: Some(SEED),
+            perpetuals: None,
         };
         let parameters = match SimulationParametersV2::try_from(request) {
             Ok(parameters) => parameters,

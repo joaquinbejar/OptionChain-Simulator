@@ -18,6 +18,7 @@
 //! changes between two otherwise-identical replays.
 
 use crate::api::rest::greeks::{GreekLevel, GreeksResponse, greeks_for};
+use crate::domain::perpetual::{PerpetualChain, PerpetualQuote};
 use crate::domain::series::SeriesSnapshot;
 use crate::session::{ExpiryRule, ExpiryRuleKind, SessionV2, StrikeLadder};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -164,6 +165,9 @@ pub struct SimulationParametersResponse {
     /// The tick every quote is rounded and floored to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spread_tick: Option<f64>,
+    /// The perpetual options the simulation quotes, when it quotes any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perpetuals: Option<PerpetualsParametersResponse>,
 }
 
 /// A simulation's metadata, with no market data attached.
@@ -271,6 +275,118 @@ pub struct SnapshotResponse {
     pub underlying: UnderlyingResponse,
     /// The live chains, ordered by expiration.
     pub chains: Vec<ExpiryChainResponse>,
+    /// The perpetual options at this step. Absent entirely unless the
+    /// simulation was created with `perpetuals`, so a client that did not ask
+    /// sees the response it has always seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perpetuals: Option<PerpetualChainResponse>,
+}
+
+/// The perpetual options a simulation was created with, as resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct PerpetualsParametersResponse {
+    /// The funding rate, per year.
+    pub funding_rate: f64,
+    /// How many rungs of the ladder are quoted. Always present: the default is
+    /// resolved at creation.
+    pub rungs: u32,
+}
+
+/// One side of a perpetual contract.
+///
+/// Model values, with no spread applied.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct PerpetualQuoteResponse {
+    /// The model value of the contract.
+    pub price: Option<f64>,
+    /// The change in price per unit move of the underlying.
+    pub delta: Option<f64>,
+    /// The change in delta per unit move of the underlying.
+    pub gamma: Option<f64>,
+    /// The change in price per unit of volatility: a move of the volatility
+    /// from 0.50 to 0.51 moves the price by about `0.01 * vega`.
+    pub vega: Option<f64>,
+    /// What the long side pays the short side at this step, per year and per
+    /// unit of underlying. Multiply by the length of a step in years for the
+    /// payment over it.
+    pub funding: Option<f64>,
+}
+
+/// One strike of one rung.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct PerpetualContractResponse {
+    /// The strike price.
+    pub strike: f64,
+    /// The call side.
+    pub call: PerpetualQuoteResponse,
+    /// The put side.
+    pub put: PerpetualQuoteResponse,
+}
+
+/// One rung of the ladder at one step.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct PerpetualRungResponse {
+    /// The rung, from 1. Rung 1 is funded against the payoff, rung `j` against
+    /// the price of rung `j - 1`.
+    pub rung: u32,
+    /// The rung's mean maturity, `rung / funding_rate`, in years.
+    pub mean_maturity_years: f64,
+    /// The pinned strikes, ascending.
+    pub contracts: Vec<PerpetualContractResponse>,
+}
+
+/// Every perpetual option a simulation quotes at one step.
+///
+/// Priced from the step's underlying price and base volatility, with the drift
+/// `risk_free_rate - dividend_yield`. Skew and smile are not applied: they are
+/// shaped per expiration, and a perpetual contract has none.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct PerpetualChainResponse {
+    /// The funding rate every rung is funded at, per year.
+    pub funding_rate: f64,
+    /// The volatility every contract is priced at: this step's
+    /// `underlying.base_volatility`.
+    pub volatility: f64,
+    /// The rungs, ascending.
+    pub rungs: Vec<PerpetualRungResponse>,
+}
+
+/// Views one side of a perpetual contract.
+#[must_use]
+fn perpetual_quote_response(quote: &PerpetualQuote) -> PerpetualQuoteResponse {
+    PerpetualQuoteResponse {
+        price: quote.price.to_f64(),
+        delta: quote.delta.to_f64(),
+        gamma: quote.gamma.to_f64(),
+        vega: quote.vega.to_f64(),
+        funding: quote.funding.to_f64(),
+    }
+}
+
+/// Views the perpetual block of a snapshot.
+#[must_use]
+fn perpetual_chain_response(chain: &PerpetualChain) -> PerpetualChainResponse {
+    PerpetualChainResponse {
+        funding_rate: chain.funding_rate.to_f64(),
+        volatility: chain.volatility.to_f64(),
+        rungs: chain
+            .rungs
+            .iter()
+            .map(|rung| PerpetualRungResponse {
+                rung: rung.rung.get(),
+                mean_maturity_years: rung.mean_maturity_years.to_f64(),
+                contracts: rung
+                    .contracts
+                    .iter()
+                    .map(|contract| PerpetualContractResponse {
+                        strike: contract.strike.to_f64(),
+                        call: perpetual_quote_response(&contract.call),
+                        put: perpetual_quote_response(&contract.put),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
 }
 
 /// Views one strike at the requested greek level.
@@ -377,6 +493,12 @@ impl From<&SessionV2> for SimulationParametersResponse {
                 .spread_tenor_widening
                 .and_then(|value| value.to_f64()),
             spread_tick: parameters.spread_tick.map(|value| value.to_f64()),
+            perpetuals: parameters
+                .perpetuals
+                .map(|perpetuals| PerpetualsParametersResponse {
+                    funding_rate: perpetuals.funding_rate.to_f64(),
+                    rungs: perpetuals.rungs.get(),
+                }),
         }
     }
 }
@@ -465,5 +587,174 @@ pub(crate) fn snapshot_response(
                     .collect(),
             })
             .collect(),
+        perpetuals: snapshot.perpetuals.as_ref().map(perpetual_chain_response),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
+    use crate::api::rest::requests_v2::{CreateSimulationRequest, PerpetualsRequest};
+    use crate::domain::factors::FactorTape;
+    use crate::domain::series::SeriesBuilder;
+    use crate::session::SimulationParametersV2;
+    use chrono::TimeZone;
+
+    /// A pinned simulation of seven strikes, optionally quoting two rungs of
+    /// perpetual options, and its first snapshot.
+    fn served(perpetuals: Option<PerpetualsRequest>) -> (SessionV2, SnapshotResponse) {
+        let start_at = match Utc.with_ymd_and_hms(2026, 1, 5, 14, 30, 0).single() {
+            Some(instant) => instant,
+            None => panic!("the test instant must be valid"),
+        };
+        let rule = match ExpiryRule::new("zero_dte", ExpiryRuleKind::Daily, 1) {
+            Ok(rule) => rule,
+            Err(error) => panic!("the test rule must be valid: {error}"),
+        };
+        let request = CreateSimulationRequest {
+            symbol: "SPX".to_string(),
+            steps: 2,
+            start_at: Some(start_at),
+            step_interval_seconds: Some(86_400),
+            timezone: "America/New_York".to_string(),
+            calendar: None,
+            expiration_time: "17:00".to_string(),
+            schedules: vec![rule],
+            initial_price: 5000.0,
+            volatility: 0.2,
+            risk_free_rate: 0.04,
+            dividend_yield: 0.0,
+            method: ApiWalkType::Brownian {
+                dt: 1.0 / 252.0,
+                drift: 0.0,
+                volatility: 0.2,
+            },
+            time_frame: ApiTimeFrame::Day,
+            chain_size: Some(3),
+            strike_interval: Some(25.0),
+            skew_slope: None,
+            smile_curve: None,
+            spread: Some(0.02),
+            strike_ladder: Some(StrikeLadder::Pinned),
+            spread_proportional: None,
+            spread_moneyness_widening: None,
+            spread_tenor_widening: None,
+            spread_tick: None,
+            seed: Some(42),
+            perpetuals,
+        };
+
+        let parameters = match SimulationParametersV2::try_from(request) {
+            Ok(parameters) => parameters,
+            Err(error) => panic!("the request must convert: {error}"),
+        };
+        let tape = match FactorTape::build(&parameters, &parameters.method) {
+            Ok(tape) => tape,
+            Err(error) => panic!("the tape must build: {error}"),
+        };
+        let snapshot = match SeriesBuilder::new(&parameters, &tape).and_then(|b| b.snapshot(0)) {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("the snapshot must build: {error}"),
+        };
+        let simulation = SessionV2::new(parameters);
+        let response = snapshot_response(&simulation, &snapshot, GreekLevel::None);
+        (simulation, response)
+    }
+
+    fn two_rungs() -> Option<PerpetualsRequest> {
+        Some(PerpetualsRequest {
+            funding_rate: 12.0,
+            rungs: Some(2),
+        })
+    }
+
+    /// A simulation that did not ask for perpetual options serves no key for
+    /// them, in the snapshot or in its parameters: the response is the one a
+    /// client has always seen.
+    #[test]
+    fn test_a_response_without_perpetuals_carries_no_key() {
+        let (simulation, response) = served(None);
+
+        let snapshot = match serde_json::to_value(&response) {
+            Ok(json) => json,
+            Err(error) => panic!("the snapshot must serialize: {error}"),
+        };
+        assert!(snapshot.get("perpetuals").is_none(), "{snapshot}");
+        assert!(snapshot.get("chains").is_some());
+
+        let parameters = match serde_json::to_value(SimulationParametersResponse::from(&simulation))
+        {
+            Ok(json) => json,
+            Err(error) => panic!("the parameters must serialize: {error}"),
+        };
+        assert!(parameters.get("perpetuals").is_none(), "{parameters}");
+    }
+
+    /// The perpetual block reaches the wire with the documented shape.
+    #[test]
+    fn test_the_perpetual_block_has_the_documented_shape() {
+        let (simulation, response) = served(two_rungs());
+
+        let block = match &response.perpetuals {
+            Some(block) => block,
+            None => panic!("the snapshot must carry the perpetual block"),
+        };
+        assert_eq!(block.funding_rate, 12.0);
+        assert_eq!(block.volatility, response.underlying.base_volatility);
+        assert_eq!(block.rungs.len(), 2);
+
+        let strikes: Vec<f64> = response
+            .chains
+            .first()
+            .map(|chain| chain.contracts.iter().map(|c| c.strike).collect())
+            .unwrap_or_default();
+        for (index, rung) in block.rungs.iter().enumerate() {
+            assert_eq!(usize::try_from(rung.rung).ok(), index.checked_add(1));
+            let quoted: Vec<f64> = rung.contracts.iter().map(|c| c.strike).collect();
+            assert_eq!(
+                quoted, strikes,
+                "the rung must quote the chain's own strikes"
+            );
+            for contract in &rung.contracts {
+                for side in [&contract.call, &contract.put] {
+                    assert!(side.price.is_some_and(|price| price >= 0.0));
+                    assert!(side.delta.is_some());
+                    assert!(side.gamma.is_some_and(|gamma| gamma >= 0.0));
+                    assert!(side.vega.is_some_and(|vega| vega >= 0.0));
+                    assert!(side.funding.is_some());
+                }
+            }
+        }
+        // One month and two months, in years.
+        let maturities: Vec<f64> = block.rungs.iter().map(|r| r.mean_maturity_years).collect();
+        assert!((maturities[0] - 1.0 / 12.0).abs() < 1e-12);
+        assert!((maturities[1] - 2.0 / 12.0).abs() < 1e-12);
+
+        let json = match serde_json::to_value(&response) {
+            Ok(json) => json,
+            Err(error) => panic!("the snapshot must serialize: {error}"),
+        };
+        let first = json.pointer("/perpetuals/rungs/0/contracts/0/call");
+        let keys: Vec<&str> = first
+            .and_then(serde_json::Value::as_object)
+            .map(|side| side.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(keys, ["price", "delta", "gamma", "vega", "funding"]);
+
+        // And it reads back as what was served.
+        match serde_json::from_value::<SnapshotResponse>(json) {
+            Ok(read) => assert_eq!(read, response),
+            Err(error) => panic!("the snapshot must read back: {error}"),
+        }
+
+        let parameters = SimulationParametersResponse::from(&simulation);
+        assert_eq!(
+            parameters.perpetuals,
+            Some(PerpetualsParametersResponse {
+                funding_rate: 12.0,
+                rungs: 2,
+            })
+        );
     }
 }

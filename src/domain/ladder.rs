@@ -159,7 +159,6 @@ impl PinnedLadder {
     }
 
     /// The strikes, ascending.
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn strikes(&self) -> &BTreeSet<Positive> {
         &self.strikes
@@ -835,6 +834,7 @@ mod tests {
             spread_tenor_widening: None,
             spread_tick: None,
             seed: Some(42),
+            perpetuals: None,
         };
 
         match SimulationParametersV2::try_from(request) {

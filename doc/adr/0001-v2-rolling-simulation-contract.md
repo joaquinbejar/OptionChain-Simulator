@@ -465,6 +465,66 @@ Invariants a reviewer can check:
   (`src/session/model.rs:81`, `src/api/rest/handlers.rs:283`). v1's spelling is
   frozen (§12.1); v2 does not inherit it.
 
+### 7.1 Perpetual options (additive, issue #163)
+
+A simulation created with `perpetuals` carries one more key in every snapshot,
+after `chains`. A simulation created without it carries no such key, so
+everything above is unchanged for it.
+
+```jsonc
+"perpetuals": {
+  "funding_rate": 12.0,          // per year, as resolved at creation
+  "volatility": 0.18,            // this step's base_volatility
+  "rungs": [
+    {
+      "rung": 1,
+      "mean_maturity_years": 0.08333333333333333,   // rung / funding_rate
+      "contracts": [
+        {
+          "strike": 5000.0,
+          "call": { "price": 0.0, "delta": 0.0, "gamma": 0.0, "vega": 0.0, "funding": 0.0 },
+          "put":  { "price": 0.0, "delta": 0.0, "gamma": 0.0, "vega": 0.0, "funding": 0.0 }
+        }
+      ]
+    }
+  ]
+}
+```
+
+- The request field is `perpetuals: { funding_rate, rungs? }`. `funding_rate`
+  is per year, within `[0.01, 8760]` and at least twice
+  `risk_free_rate - dividend_yield`; `rungs` is `1..=8` and defaults to `1`.
+  At or below that drift the contract has no finite price. Above it the forward
+  of rung `j` is the spot times `(funding_rate / (funding_rate - drift))^j`,
+  which grows without bound as the rate approaches the drift; the factor of two
+  caps it at `2^j`.
+  Each violation is a `400` naming `perpetuals.funding_rate` or
+  `perpetuals.rungs`.
+- It requires `strike_ladder: "pinned"`, and is a `400` naming `strike_ladder`
+  otherwise. A contract that never expires has to stay quoted, which only a
+  pinned ladder guarantees; the contracts are quoted at exactly the pinned
+  strikes, whatever the spot has done.
+- The block is priced from the same factor row as the chains: the step's spot
+  and base volatility, with the drift `risk_free_rate - dividend_yield`. It is
+  therefore a pure function of the effective inputs and the cursor, like the
+  rest of the snapshot. Skew and smile are **not** applied, because upstream
+  shapes them per expiration and a perpetual contract has none; the spread model
+  is not applied either, so `price` is the model value.
+- `funding` is what the long side pays the short side at that step, per year
+  and per unit of underlying.
+- Pricing is upstream's (`optionstratlib::pricing::everlasting`, closed form
+  under geometric Brownian motion). Nothing is priced in this crate.
+- The contracts count against `OCS_MAX_SNAPSHOT_CONTRACTS` (§9.3), one per
+  strike and rung, and against the snapshot cache's contract budget.
+- The export datasets (§10) and the persisted snapshots (§12.2b) do not carry
+  the block. A served snapshot is always rebuilt from the tape, never read back
+  from the warehouse, so the block is never missing from a response.
+- Stored sessions (§12.2): a simulation without `perpetuals` stores no key for
+  it, so its document is byte for byte what the previous binary wrote and reads.
+  A simulation **with** it stores a key the previous binary refuses
+  (`deny_unknown_fields`), so after a rollback those simulations, and only
+  those, fail to load until the newer binary is back.
+
 ---
 
 ## 8. Replay
@@ -475,8 +535,9 @@ Invariants a reviewer can check:
 > **normalised schedules**, and market and chain parameters (`symbol`, `steps`,
 > `initial_price`, `volatility`, `risk_free_rate`, `dividend_yield`, `method`,
 > `chain_size`, `strike_interval`, `skew_slope`, `smile_curve`,
-> `strike_ladder`, and the spread model: `spread`, `spread_proportional`,
-> `spread_moneyness_widening`, `spread_tenor_widening`, `spread_tick`).
+> `strike_ladder`, the spread model: `spread`, `spread_proportional`,
+> `spread_moneyness_widening`, `spread_tenor_widening`, `spread_tick`, and
+> `perpetuals` when the simulation quotes them).
 
 That list is exhaustive and is meant to be checkable. All of it is resolved once
 at creation, persisted, and echoed in the creation and session responses — so a
