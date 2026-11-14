@@ -51,6 +51,7 @@
 
 use crate::domain::expiry::{ActiveExpiry, RollingPlanner};
 use crate::domain::factors::{FactorRow, FactorTape, build_chain};
+use crate::domain::perpetual::{PerpetualChain, build_perpetual_chain};
 use crate::infrastructure::{DEFAULT_MAX_CACHED_SNAPSHOT_CONTRACTS, DEFAULT_MAX_CACHED_SNAPSHOTS};
 use crate::session::SimulationParametersV2;
 use crate::utils::ChainError;
@@ -119,6 +120,9 @@ pub(crate) struct SeriesSnapshot {
     pub(crate) base_volatility: Positive,
     /// The live chains, ordered by `expires_at` ascending.
     pub(crate) chains: Vec<ExpiryChain>,
+    /// The perpetual options at this step, for a simulation that quotes them.
+    /// Priced from the same spot and base volatility as the chains.
+    pub(crate) perpetuals: Option<PerpetualChain>,
 }
 
 impl SeriesSnapshot {
@@ -163,10 +167,17 @@ impl SeriesSnapshot {
 /// expiration, which is what makes a snapshot heavy.
 #[must_use]
 fn snapshot_contracts(snapshot: &SeriesSnapshot) -> usize {
+    // The perpetual block is priced work like any chain, so it weighs the
+    // same: one per strike and rung.
+    let perpetual = snapshot
+        .perpetuals
+        .as_ref()
+        .map_or(0, PerpetualChain::contracts);
     snapshot
         .chains
         .iter()
         .map(|chain| chain.chain.options.len())
+        .chain(std::iter::once(perpetual))
         .sum()
 }
 
@@ -256,9 +267,14 @@ impl<'a> SeriesBuilder<'a> {
             chains.push(self.build_expiry_chain(row, expiry)?);
         }
 
+        // The same row the chains were priced from, so the two views of the
+        // step cannot disagree about the spot or the volatility.
+        let perpetuals = build_perpetual_chain(self.parameters, row.spot, row.base_volatility)?;
+
         debug!(
             step,
             chains = chains.len(),
+            perpetual_contracts = perpetuals.as_ref().map_or(0, PerpetualChain::contracts),
             "Built a rolling multi-expiration snapshot"
         );
 
@@ -270,6 +286,7 @@ impl<'a> SeriesBuilder<'a> {
             // The planner already returns its expirations chronologically and
             // deduplicated, so the snapshot inherits both properties.
             chains,
+            perpetuals,
         })
     }
 
@@ -558,7 +575,7 @@ impl SnapshotCache {
 mod tests {
     use super::*;
     use crate::api::rest::models::{ApiTimeFrame, ApiWalkType};
-    use crate::api::rest::requests_v2::CreateSimulationRequest;
+    use crate::api::rest::requests_v2::{CreateSimulationRequest, PerpetualsRequest};
     use crate::domain::ladder::{PinnedLadder, StrikeLadder};
     use crate::session::{ExpiryRule, ExpiryRuleKind};
     use chrono::{TimeZone, Weekday};
@@ -651,6 +668,7 @@ mod tests {
             spread_tenor_widening: None,
             spread_tick: None,
             seed: Some(42),
+            perpetuals: None,
         }
     }
 
@@ -1119,6 +1137,144 @@ mod tests {
         }
     }
 
+    /// A pinned request that also quotes three rungs of perpetual options.
+    fn perpetual_request(steps: usize) -> CreateSimulationRequest {
+        let mut created = request(steps, reference_schedules());
+        created.chain_size = Some(6);
+        created.strike_interval = Some(25.0);
+        created.strike_ladder = Some(StrikeLadder::Pinned);
+        created.perpetuals = Some(PerpetualsRequest {
+            funding_rate: 12.0,
+            rungs: Some(3),
+        });
+        created
+    }
+
+    /// A simulation that did not ask for perpetual options serves none, at
+    /// any step.
+    #[test]
+    fn test_a_simulation_without_perpetuals_serves_none() {
+        let parameters = parameters(request(4, reference_schedules()));
+        let tape = tape(&parameters);
+
+        for step in 0..tape.len() {
+            assert!(snapshot(&parameters, &tape, step).perpetuals.is_none());
+        }
+    }
+
+    /// The perpetual block is priced from the row the chains are priced from,
+    /// on the ladder the chains quote, at every step.
+    #[test]
+    fn test_perpetuals_share_the_step_state_and_the_pinned_ladder() {
+        let parameters = parameters(perpetual_request(12));
+        let tape = tape(&parameters);
+        let ladder = match PinnedLadder::resolve(&parameters) {
+            Ok(ladder) => ladder,
+            Err(error) => panic!("the ladder must resolve: {error}"),
+        };
+        let expected: Vec<Positive> = ladder.strikes().iter().copied().collect();
+
+        for step in 0..tape.len() {
+            let snapshot = snapshot(&parameters, &tape, step);
+            let perpetuals = match &snapshot.perpetuals {
+                Some(perpetuals) => perpetuals,
+                None => panic!("step {step} must carry the perpetual block"),
+            };
+
+            assert_eq!(perpetuals.volatility, snapshot.base_volatility);
+            assert_eq!(perpetuals.rungs.len(), 3);
+            for rung in &perpetuals.rungs {
+                let strikes: Vec<Positive> = rung
+                    .contracts
+                    .iter()
+                    .map(|contract| contract.strike)
+                    .collect();
+                assert_eq!(strikes, expected, "step {step}, rung {}", rung.rung);
+            }
+
+            // Rebuilt from the snapshot's own spot and volatility it is the
+            // same block: nothing else feeds it.
+            let rebuilt = match crate::domain::perpetual::build_perpetual_chain(
+                &parameters,
+                snapshot.spot,
+                snapshot.base_volatility,
+            ) {
+                Ok(rebuilt) => rebuilt,
+                Err(error) => panic!("the block must rebuild: {error}"),
+            };
+            assert_eq!(rebuilt.as_ref(), Some(perpetuals));
+        }
+    }
+
+    /// Asking for perpetual options does not move anything else: the chains
+    /// and the market state are the ones the same simulation serves without
+    /// them.
+    #[test]
+    fn test_perpetuals_do_not_move_the_expiring_chains() {
+        let with = parameters(perpetual_request(6));
+        let mut plain_request = perpetual_request(6);
+        plain_request.perpetuals = None;
+        let without = parameters(plain_request);
+        let with_tape = tape(&with);
+        let without_tape = tape(&without);
+
+        for step in 0..with_tape.len() {
+            let quoted = snapshot(&with, &with_tape, step);
+            let plain = snapshot(&without, &without_tape, step);
+
+            assert_eq!(quoted.spot, plain.spot);
+            assert_eq!(quoted.base_volatility, plain.base_volatility);
+            assert_eq!(quoted.chains, plain.chains, "step {step}");
+            assert!(quoted.perpetuals.is_some() && plain.perpetuals.is_none());
+        }
+    }
+
+    /// The same parameters and seed reproduce the perpetual block at every
+    /// step, and a different seed does not.
+    #[test]
+    fn test_perpetuals_reproduce_under_the_same_seed() {
+        let first_parameters = parameters(perpetual_request(8));
+        let second_parameters = parameters(perpetual_request(8));
+        let mut other_request = perpetual_request(8);
+        other_request.seed = Some(43);
+        let other_parameters = parameters(other_request);
+
+        let first_tape = tape(&first_parameters);
+        let second_tape = tape(&second_parameters);
+        let other_tape = tape(&other_parameters);
+
+        let mut differs = false;
+        for step in 0..first_tape.len() {
+            let first = snapshot(&first_parameters, &first_tape, step);
+            let second = snapshot(&second_parameters, &second_tape, step);
+            assert!(first.perpetuals.is_some());
+            assert_eq!(first, second, "step {step} diverged under the same seed");
+
+            let other = snapshot(&other_parameters, &other_tape, step);
+            differs |= first.perpetuals != other.perpetuals;
+        }
+        assert!(differs, "a different seed must move the perpetual quotes");
+    }
+
+    /// The cache weighs the perpetual contracts too, since they are priced
+    /// work like any other.
+    #[test]
+    fn test_the_cache_weight_counts_the_perpetual_contracts() {
+        let with = parameters(perpetual_request(2));
+        let mut plain_request = perpetual_request(2);
+        plain_request.perpetuals = None;
+        let without = parameters(plain_request);
+
+        let quoted = snapshot(&with, &tape(&with), 0);
+        let plain = snapshot(&without, &tape(&without), 0);
+
+        // Thirteen strikes on each of three rungs.
+        assert_eq!(
+            snapshot_contracts(&quoted).checked_sub(snapshot_contracts(&plain)),
+            Some(39)
+        );
+    }
+
     /// A different seed produces a different snapshot tape.
     #[test]
     fn test_a_different_seed_produces_a_different_snapshot_tape() {
@@ -1188,6 +1344,7 @@ mod tests {
             spot: Positive::ONE,
             base_volatility: Positive::ONE,
             chains: Vec::new(),
+            perpetuals: None,
         }
     }
 

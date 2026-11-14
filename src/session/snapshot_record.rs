@@ -164,6 +164,7 @@ mod tests {
             spread_tenor_widening: None,
             spread_tick: None,
             seed: Some(42),
+            perpetuals: None,
         };
 
         match SimulationParametersV2::try_from(request) {

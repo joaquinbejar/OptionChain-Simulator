@@ -555,6 +555,7 @@ mod live_tests {
             spread_tenor_widening: None,
             spread_tick: None,
             seed: Some(seed),
+            perpetuals: None,
         };
 
         let parameters =

@@ -1023,6 +1023,205 @@ mod tests {
         );
     }
 
+    /// The reference body, pinned and quoting perpetual options.
+    fn perpetual_body(perpetuals: Value) -> Value {
+        let mut body = reference_body();
+        match body.as_object_mut() {
+            Some(map) => {
+                map.insert("strike_ladder".to_string(), json!("pinned"));
+                map.insert("perpetuals".to_string(), perpetuals);
+            }
+            None => panic!("the reference body must be an object"),
+        }
+        body
+    }
+
+    /// Creates a simulation from `body`, expecting it to be accepted.
+    macro_rules! create_from {
+        ($app:expr, $body:expr) => {{
+            let request = actix_test::TestRequest::post()
+                .uri("/api/v2/simulations")
+                .set_json($body)
+                .to_request();
+            let response = actix_test::call_service(&$app, request).await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let body: Value = actix_test::read_body_json(response).await;
+            body
+        }};
+    }
+
+    /// Posts `body`, expecting a typed 400, and returns the field it names.
+    macro_rules! refused_field {
+        ($app:expr, $body:expr) => {{
+            let request = actix_test::TestRequest::post()
+                .uri("/api/v2/simulations")
+                .set_json($body)
+                .to_request();
+            let response = actix_test::call_service(&$app, request).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: Value = actix_test::read_body_json(response).await;
+            match body.get("field").and_then(Value::as_str) {
+                Some(field) => field.to_string(),
+                None => panic!("a typed 400 must name a field: {body}"),
+            }
+        }};
+    }
+
+    /// Perpetual options are accepted, echoed as resolved, and served on the
+    /// snapshot and on the step: per rung, one contract per pinned strike.
+    #[actix_web::test]
+    async fn test_perpetuals_are_accepted_echoed_and_served() {
+        let app = v2_service!();
+        let created = create_from!(
+            app,
+            perpetual_body(json!({ "funding_rate": 12.0, "rungs": 2 }))
+        );
+        assert_eq!(
+            created.get("parameters").and_then(|p| p.get("perpetuals")),
+            Some(&json!({ "funding_rate": 12.0, "rungs": 2 })),
+            "the echo must carry the resolved specification: {created}"
+        );
+
+        let id = id_of(&created);
+        let peeked = snapshot!(app, id, "");
+        let block = match peeked.get("perpetuals") {
+            Some(block) => block,
+            None => panic!("the snapshot must carry the perpetual block: {peeked}"),
+        };
+        assert_eq!(block.get("funding_rate"), Some(&json!(12.0)));
+        assert_eq!(
+            block.get("volatility"),
+            peeked.pointer("/underlying/base_volatility")
+        );
+
+        let rungs = match block.get("rungs").and_then(Value::as_array) {
+            Some(rungs) => rungs,
+            None => panic!("the block must carry rungs: {block}"),
+        };
+        assert_eq!(rungs.len(), 2);
+        let chain_strikes: Vec<&Value> = peeked
+            .pointer("/chains/0/contracts")
+            .and_then(Value::as_array)
+            .map(|contracts| contracts.iter().filter_map(|c| c.get("strike")).collect())
+            .unwrap_or_default();
+        assert_eq!(chain_strikes.len(), 7, "a half-width of three is 7 strikes");
+        for (index, rung) in rungs.iter().enumerate() {
+            assert_eq!(
+                rung.get("rung").and_then(Value::as_u64),
+                u64::try_from(index).ok().and_then(|i| i.checked_add(1))
+            );
+            let strikes: Vec<&Value> = rung
+                .get("contracts")
+                .and_then(Value::as_array)
+                .map(|contracts| contracts.iter().filter_map(|c| c.get("strike")).collect())
+                .unwrap_or_default();
+            assert_eq!(strikes, chain_strikes, "a rung quotes the pinned strikes");
+        }
+        for key in ["price", "delta", "gamma", "vega", "funding"] {
+            let value = block.pointer(&format!("/rungs/0/contracts/3/call/{key}"));
+            assert!(
+                value.is_some_and(Value::is_number),
+                "the at-the-money call must carry a numeric {key}: {block}"
+            );
+        }
+
+        // The step serves the same block the peek showed, then advances.
+        let request = actix_test::TestRequest::post()
+            .uri(&format!("/api/v2/simulations/{id}/step"))
+            .to_request();
+        let response = actix_test::call_service(&app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let stepped: Value = actix_test::read_body_json(response).await;
+        assert_eq!(stepped.get("perpetuals"), Some(block));
+    }
+
+    /// An omitted rung count is one rung, and the echo says so.
+    #[actix_web::test]
+    async fn test_the_rung_count_defaults_to_one() {
+        let app = v2_service!();
+        let created = create_from!(app, perpetual_body(json!({ "funding_rate": 52.0 })));
+        assert_eq!(
+            created.pointer("/parameters/perpetuals/rungs"),
+            Some(&json!(1))
+        );
+
+        let peeked = snapshot!(app, id_of(&created), "");
+        assert_eq!(
+            peeked
+                .pointer("/perpetuals/rungs")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+    }
+
+    /// A simulation that did not ask serves no `perpetuals` key, in its
+    /// parameters or in its snapshots: nothing changes for an existing client.
+    #[actix_web::test]
+    async fn test_a_simulation_that_did_not_ask_serves_no_perpetuals() {
+        let app = v2_service!();
+        let created = create!(app);
+        assert!(created.pointer("/parameters/perpetuals").is_none());
+
+        let peeked = snapshot!(app, id_of(&created), "");
+        assert!(peeked.get("perpetuals").is_none(), "{peeked}");
+    }
+
+    /// The same seed serves the same perpetual block.
+    #[actix_web::test]
+    async fn test_the_same_seed_serves_the_same_perpetuals() {
+        let app = v2_service!();
+        let body = perpetual_body(json!({ "funding_rate": 12.0, "rungs": 3 }));
+        let first = create_from!(app, body.clone());
+        let second = create_from!(app, body);
+
+        let first = snapshot!(app, id_of(&first), "");
+        let second = snapshot!(app, id_of(&second), "");
+        assert!(first.get("perpetuals").is_some());
+        assert_eq!(first.get("perpetuals"), second.get("perpetuals"));
+    }
+
+    /// Every way a perpetual request can be wrong is a typed 400 naming the
+    /// field to change.
+    #[actix_web::test]
+    async fn test_an_invalid_perpetual_request_is_a_typed_400() {
+        let app = v2_service!();
+
+        // A contract that never expires on a ladder that drops strikes.
+        let mut rolling = perpetual_body(json!({ "funding_rate": 12.0 }));
+        match rolling.as_object_mut() {
+            Some(map) => {
+                map.remove("strike_ladder");
+            }
+            None => panic!("the body must be an object"),
+        }
+        assert_eq!(refused_field!(app, rolling), "strike_ladder");
+
+        // At or below the drift (0.04 - 0.012) there is no finite price.
+        assert_eq!(
+            refused_field!(app, perpetual_body(json!({ "funding_rate": 0.02 }))),
+            "perpetuals.funding_rate"
+        );
+        assert_eq!(
+            refused_field!(app, perpetual_body(json!({ "funding_rate": 9000.0 }))),
+            "perpetuals.funding_rate"
+        );
+        assert_eq!(
+            refused_field!(
+                app,
+                perpetual_body(json!({ "funding_rate": 12.0, "rungs": 9 }))
+            ),
+            "perpetuals.rungs"
+        );
+        assert_eq!(
+            refused_field!(
+                app,
+                perpetual_body(json!({ "funding_rate": 12.0, "rungs": 0 }))
+            ),
+            "perpetuals.rungs"
+        );
+    }
+
     /// A pinned ladder without a grid is a typed 400 naming the field.
     #[actix_web::test]
     async fn test_a_pinned_ladder_without_an_interval_is_a_typed_400() {
