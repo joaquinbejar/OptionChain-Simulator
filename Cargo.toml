@@ -65,7 +65,7 @@ members = [
 
 [workspace.dependencies]
 optionchain_simulator = { path = "." }
-optionstratlib = "0.23"
+optionstratlib = "0.24"
 positive = "0.8"
 tracing = "0.1"
 # The process log subscriber. optionstratlib 0.22 removed `setup_logger*` and
