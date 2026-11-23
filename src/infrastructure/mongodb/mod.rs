@@ -1,3 +1,3 @@
 mod client;
 
-pub use client::MongoDBClient;
+pub use client::{MongoDBClient, MongoDBCredentials};
