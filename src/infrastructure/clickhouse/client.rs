@@ -173,17 +173,7 @@ fn timeframe_query_template(timeframe: &TimeFrame) -> Result<String, ChainError>
 impl ClickHouseClient {
     /// Creates a new ClickHouse client with the provided configuration
     #[instrument(name = "clickhouse_client_new", skip(config), level = "debug")]
-    pub fn new(mut config: ClickHouseConfig) -> Result<Self, ChainError> {
-        // Credentials from Docker secrets (CLICKHOUSE_USER_FILE,
-        // CLICKHOUSE_PASSWORD_FILE) win over the environment. Applied here,
-        // where every construction path passes, rather than in `Default`,
-        // which cannot report an unreadable file.
-        if let Some(user) = crate::utils::env::read_secret_file("CLICKHOUSE_USER")? {
-            config.username = user;
-        }
-        if let Some(password) = crate::utils::env::read_secret_file("CLICKHOUSE_PASSWORD")? {
-            config.password = password;
-        }
+    pub fn new(config: ClickHouseConfig) -> Result<Self, ChainError> {
         let url = format!("http://{}:{}", config.host, config.port);
 
         // Create the client with credentials

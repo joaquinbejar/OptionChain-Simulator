@@ -87,6 +87,31 @@ impl Default for ClickHouseConfig {
     }
 }
 
+impl ClickHouseConfig {
+    /// The deployment's configuration: [`ClickHouseConfig::default`] plus the
+    /// credentials from files. `CLICKHOUSE_USER_FILE` and
+    /// `CLICKHOUSE_PASSWORD_FILE` (Docker secrets), when set, win over
+    /// `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD`.
+    ///
+    /// Only the environment-driven paths use this; a config built explicitly
+    /// and handed to `ClickHouseClient::new` is never overridden, so the
+    /// deployment's credentials cannot reach a host somebody else chose.
+    ///
+    /// # Errors
+    ///
+    /// When a `*_FILE` variable names a file that cannot be read or is empty.
+    pub fn from_env() -> Result<Self, crate::utils::ChainError> {
+        let mut config = Self::default();
+        if let Some(user) = super::read_secret_file("CLICKHOUSE_USER")? {
+            config.username = user;
+        }
+        if let Some(password) = super::read_secret_file("CLICKHOUSE_PASSWORD")? {
+            config.password = password;
+        }
+        Ok(config)
+    }
+}
+
 impl fmt::Display for ClickHouseConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -447,5 +472,54 @@ mod tests {
         // 3. Puerto inválido debe usar valor predeterminado
         let config3 = create_config(None, Some("not_a_number"), None, None, None);
         assert_eq!(config3.port, 8123);
+    }
+
+    /// `from_env` takes the credentials from the secret files and refuses an
+    /// unreadable one; `default` (and so any explicitly built config) never
+    /// reads them.
+    #[test]
+    fn test_from_env_reads_the_secret_files() {
+        let _guard = match ENV_MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempdir().unwrap();
+        let user = dir.path().join("user");
+        let password = dir.path().join("password");
+        std::fs::write(&user, "fileuser\n").unwrap();
+        std::fs::write(&password, "filepass\n").unwrap();
+        #[allow(unused_unsafe)]
+        unsafe {
+            env::set_var("CLICKHOUSE_USER", "envuser");
+            env::set_var("CLICKHOUSE_PASSWORD", "envpass");
+            env::set_var("CLICKHOUSE_USER_FILE", &user);
+            env::set_var("CLICKHOUSE_PASSWORD_FILE", &password);
+        }
+
+        let config = ClickHouseConfig::from_env().expect("readable files");
+        assert_eq!(config.username, "fileuser");
+        assert_eq!(config.password, "filepass");
+        let plain = ClickHouseConfig::default();
+        assert_eq!(plain.username, "envuser", "default never reads the files");
+        assert_eq!(plain.password, "envpass");
+
+        #[allow(unused_unsafe)]
+        unsafe {
+            env::set_var("CLICKHOUSE_PASSWORD_FILE", dir.path().join("missing"));
+        }
+        let error = ClickHouseConfig::from_env().unwrap_err().to_string();
+        assert!(error.contains("CLICKHOUSE_PASSWORD_FILE"), "{error}");
+
+        #[allow(unused_unsafe)]
+        unsafe {
+            for name in [
+                "CLICKHOUSE_USER",
+                "CLICKHOUSE_PASSWORD",
+                "CLICKHOUSE_USER_FILE",
+                "CLICKHOUSE_PASSWORD_FILE",
+            ] {
+                env::remove_var(name);
+            }
+        }
     }
 }
