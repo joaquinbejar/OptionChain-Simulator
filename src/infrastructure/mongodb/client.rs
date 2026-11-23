@@ -3,6 +3,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::infrastructure::config::mongo::MongoDBConfig;
+use crate::infrastructure::config::read_secret_file;
 use crate::infrastructure::config::{redact_uri, redact_userinfo};
 use crate::utils::ChainError;
 use mongodb::options::ClientOptions;
@@ -36,6 +37,22 @@ impl MongoDBClient {
                 e
             )))
         })?;
+
+        // Credentials from Docker secrets win over the ones in the URI, so the
+        // URI can stay credential-free (MONGODB_USER_FILE /
+        // MONGODB_PASSWORD_FILE).
+        let file_user = read_secret_file("MONGODB_USER")?;
+        let file_password = read_secret_file("MONGODB_PASSWORD")?;
+        if file_user.is_some() || file_password.is_some() {
+            let mut credential = client_options.credential.take().unwrap_or_default();
+            if file_user.is_some() {
+                credential.username = file_user;
+            }
+            if file_password.is_some() {
+                credential.password = file_password;
+            }
+            client_options.credential = Some(credential);
+        }
 
         client_options.app_name = Some("OptionChain-Simulator".to_string());
         // `config.timeout` (MONGODB_TIMEOUT, seconds) bounds BOTH phases of

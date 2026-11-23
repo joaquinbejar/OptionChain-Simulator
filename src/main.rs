@@ -161,7 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = ServerConfig::from_env()?;
 
     // Create a session store
-    let redis_config = RedisConfig::default();
+    let redis_config = RedisConfig::from_env()?;
     info!("Connecting to Redis at {}", redis_config);
     let redis_client = Arc::new(RedisClient::new(redis_config).await?);
     let redis_client_v2 = Arc::clone(&redis_client);

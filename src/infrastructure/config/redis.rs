@@ -158,6 +158,26 @@ impl Default for RedisConfig {
     }
 }
 
+impl RedisConfig {
+    /// [`RedisConfig::default`] plus the credentials from files:
+    /// `REDIS_USER_FILE` and `REDIS_PASSWORD_FILE` (Docker secrets), when set,
+    /// win over `REDIS_USER` and `REDIS_PASSWORD`.
+    ///
+    /// # Errors
+    ///
+    /// When a `*_FILE` variable names a file that cannot be read or is empty.
+    pub fn from_env() -> Result<Self, crate::utils::ChainError> {
+        let mut config = Self::default();
+        if let Some(user) = super::read_secret_file("REDIS_USER")? {
+            config.username = Some(user);
+        }
+        if let Some(password) = super::read_secret_file("REDIS_PASSWORD")? {
+            config.password = Some(password);
+        }
+        Ok(config)
+    }
+}
+
 impl fmt::Display for RedisConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Build the redacted form directly from the fields: the password never
