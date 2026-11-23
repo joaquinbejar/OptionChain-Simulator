@@ -70,12 +70,16 @@ services:
   redis:
     image: redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
     # The password comes from the swarm secret, never from the environment or
-    # a literal in this file.
+    # a literal in this file. Trimmed like the backend trims it, and refused
+    # when empty: `--requirepass ""` would start Redis with NO authentication.
+    # The image's own docker-entrypoint.sh still runs, so the data directory
+    # is chowned and the server drops to the `redis` user as usual.
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >-
-        exec redis-server --appendonly yes
-        --requirepass "$$(cat /run/secrets/simulator_redis_password)"
+      - |
+        pw="$$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' /run/secrets/simulator_redis_password)" || exit 1
+        [ -n "$$pw" ] || { echo "redis: secret simulator_redis_password is empty" >&2; exit 1; }
+        exec docker-entrypoint.sh redis-server --appendonly yes --requirepass "$$pw"
     secrets:
       - simulator_redis_password
     volumes:
@@ -86,7 +90,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "REDISCLI_AUTH=\"$$(cat /run/secrets/simulator_redis_password)\" redis-cli ping | grep -q PONG",
+          "REDISCLI_AUTH=\"$$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$$//' /run/secrets/simulator_redis_password)\" redis-cli ping | grep -q PONG",
         ]
       interval: 10s
       timeout: 5s
