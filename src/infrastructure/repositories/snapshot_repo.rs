@@ -391,7 +391,7 @@ impl ClickHouseSnapshotRepository {
             return Ok(None);
         }
 
-        let client = ClickHouseClient::new(ClickHouseConfig::default())?;
+        let client = ClickHouseClient::new(ClickHouseConfig::from_env()?)?;
         Ok(Some(Self::new(Arc::new(client), config)))
     }
 

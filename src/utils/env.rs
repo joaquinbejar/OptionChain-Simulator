@@ -57,9 +57,36 @@ pub fn read_secret(variable: &str) -> Option<String> {
     std::env::var(variable).ok()
 }
 
+/// Reads a credential from the file named by `<variable>_FILE` (a Docker or
+/// Swarm secret, typically `/run/secrets/<name>`).
+///
+/// Returns `Ok(None)` when `<variable>_FILE` is unset or blank, so the caller
+/// falls back to `<variable>` itself. When it is set, the file is read and its
+/// content trimmed of surrounding whitespace (the trailing newline every
+/// editor and `docker secret create` leave behind); a file that cannot be read
+/// or is empty is an error naming the variable, never a silent fallback to
+/// the environment. The value itself never appears in the error.
+pub fn read_secret_file(variable: &str) -> Result<Option<String>, crate::utils::ChainError> {
+    let file_var = format!("{variable}_FILE");
+    let Some(path) = read_var(&file_var) else {
+        return Ok(None);
+    };
+    let path = path.trim();
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        crate::utils::ChainError::Internal(format!("{file_var}: cannot read {path}: {e}"))
+    })?;
+    let value = content.trim();
+    if value.is_empty() {
+        return Err(crate::utils::ChainError::Internal(format!(
+            "{file_var}: {path} is empty"
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{read_secret, read_var};
+    use super::{read_secret, read_secret_file, read_var};
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
 
@@ -179,5 +206,52 @@ mod tests {
         set_var("  s3cret  ");
         assert_eq!(read_var(TEST_VAR), Some("  s3cret  ".to_string()));
         remove_var();
+    }
+
+    /// `<VAR>_FILE` unset: nothing to read, the caller falls back to `<VAR>`.
+    /// Set: the file wins, trimmed; unreadable or empty: an error.
+    #[test]
+    fn test_secret_file_semantics() {
+        let _guard = match ENV_MUTEX.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        const VAR: &str = "OCS_TEST_SECRET_FILE_RULE";
+        let file_var = format!("{VAR}_FILE");
+        let set = |v: &str| {
+            #[allow(unused_unsafe)]
+            unsafe {
+                std::env::set_var(&file_var, v);
+            }
+        };
+
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(&file_var);
+        }
+        assert_eq!(read_secret_file(VAR).unwrap(), None);
+
+        let dir = std::env::temp_dir().join(format!("ocs-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("secret");
+        std::fs::write(&file, "  s3cr3t\n").unwrap();
+        set(file.to_str().unwrap());
+        assert_eq!(read_secret_file(VAR).unwrap().as_deref(), Some("s3cr3t"));
+
+        std::fs::write(&file, "\n").unwrap();
+        assert!(read_secret_file(VAR).is_err(), "an empty file is an error");
+
+        set(dir.join("missing").to_str().unwrap());
+        let err = read_secret_file(VAR).unwrap_err().to_string();
+        assert!(
+            err.contains(&file_var),
+            "the error names the variable: {err}"
+        );
+
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::remove_var(&file_var);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -23,7 +23,7 @@ pub mod snapshot;
 /// The rule and its rationale live in [`crate::utils::env`], which every layer
 /// of this service reads knobs through. Re-exported here so the configuration
 /// modules read it from their own namespace.
-pub(crate) use crate::utils::env::{read_secret, read_var};
+pub(crate) use crate::utils::env::{read_secret, read_secret_file, read_var};
 
 /// Redacts URL userinfo (credentials) from every URL-like substring inside a
 /// larger text (log lines, driver error messages).

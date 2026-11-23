@@ -89,7 +89,10 @@ pub async fn init_mongodb() -> Result<Arc<MongoDBRepository>, ChainError> {
     let config = MongoDBConfig::default();
     info!("Initializing MongoDB with config: {}", config);
 
-    let client = MongoDBClient::new(config).await?;
+    // The deployment's credentials from secret files (MONGODB_USER_FILE,
+    // MONGODB_PASSWORD_FILE) apply here, on the environment-driven path only.
+    let credentials = crate::infrastructure::mongodb::MongoDBCredentials::from_env()?;
+    let client = MongoDBClient::with_credentials(config, credentials).await?;
     let client_arc = Arc::new(client);
     let repository = Arc::new(MongoDBRepository::new(client_arc));
 

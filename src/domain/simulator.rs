@@ -167,9 +167,14 @@ impl Simulator {
     /// Creates a new simulator instance
     pub fn new() -> Self {
         info!("Creating new simulator instance");
-        let database_config = ClickHouseConfig::default();
-        info!("Connecting to ClickHouse at {}", database_config.host);
-        let database_repo = match ClickHouseClient::new(database_config) {
+        // `from_env` can only fail on an unreadable secret file, and `main`
+        // has already refused to start on one (it validates them first), so
+        // reaching the error arm here means a library caller without that
+        // check: it degrades to no historical source, as before, and says so.
+        let database_repo = match ClickHouseConfig::from_env().and_then(|database_config| {
+            info!("Connecting to ClickHouse at {}", database_config.host);
+            ClickHouseClient::new(database_config)
+        }) {
             Ok(client) => {
                 let client = Arc::new(client);
                 let repo: Arc<dyn HistoricalDataRepository> =

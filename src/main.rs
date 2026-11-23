@@ -67,9 +67,10 @@
 
 use optionchain_simulator::api::start_server;
 use optionchain_simulator::infrastructure::{
-    ClickHouseSnapshotRepository, DEFAULT_PRICING_GATE_KEY, DependencyProbe, MetricsCollector,
-    MongoDbProbe, Readiness, RedisClient, RedisConfig, RedisPricingGate, RedisProbe, ServerConfig,
-    SimulationV2Config, WarehouseProbe, init_logging, init_mongodb, resolve_log_level_from_env,
+    ClickHouseConfig, ClickHouseSnapshotRepository, DEFAULT_PRICING_GATE_KEY, DependencyProbe,
+    MetricsCollector, MongoDbProbe, Readiness, RedisClient, RedisConfig, RedisPricingGate,
+    RedisProbe, ServerConfig, SimulationV2Config, WarehouseProbe, init_logging, init_mongodb,
+    resolve_log_level_from_env,
 };
 use optionchain_simulator::session::{
     DEFAULT_TAPE_KEY_PREFIX, InRedisSessionStore, InRedisSimulationStore, RedisTapeCache,
@@ -160,8 +161,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // nobody asked for: two shards quietly fighting over one port is worse.
     let server = ServerConfig::from_env()?;
 
+    // The ClickHouse secret files are checked HERE, whether snapshot
+    // persistence is on or not: with it off the warehouse is optional and a
+    // failure to reach it degrades quietly, which must not include an
+    // unreadable or empty CLICKHOUSE_*_FILE. A broken secret is a deployment
+    // error and stops the process by name.
+    ClickHouseConfig::from_env()?;
+
     // Create a session store
-    let redis_config = RedisConfig::default();
+    let redis_config = RedisConfig::from_env()?;
     info!("Connecting to Redis at {}", redis_config);
     let redis_client = Arc::new(RedisClient::new(redis_config).await?);
     let redis_client_v2 = Arc::clone(&redis_client);
