@@ -69,13 +69,25 @@ services:
   # Redis service configuration
   redis:
     image: redis:8.10.1-alpine@sha256:becdda6c7f4b3fb42e42fd7f120bbf5c54c4caaaf16f26da24e4563d2c1f0576
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-password}
+    # The password comes from the swarm secret, never from the environment or
+    # a literal in this file.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        exec redis-server --appendonly yes
+        --requirepass "$$(cat /run/secrets/simulator_redis_password)"
+    secrets:
+      - simulator_redis_password
     volumes:
       - redis-data:/data
     networks:
       - optionchain-network
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-password}", "ping"]
+      test:
+        [
+          "CMD-SHELL",
+          "REDISCLI_AUTH=\"$$(cat /run/secrets/simulator_redis_password)\" redis-cli ping | grep -q PONG",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -115,8 +127,11 @@ services:
       - optionchain-network
     environment:
       - MONGO_INITDB_ROOT_USERNAME=${MONGO_USERNAME:-admin}
-      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASSWORD:-password}
+      # Read by the image when it initialises an empty volume.
+      - MONGO_INITDB_ROOT_PASSWORD_FILE=/run/secrets/simulator_mongo_root_password
       - TZ=UTC
+    secrets:
+      - simulator_mongo_root_password
     healthcheck:
       test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
       interval: 10s
@@ -132,7 +147,7 @@ services:
     # Published by .github/workflows/docker-publish.yml on every Cargo.toml
     # version bump, or by `make docker-push` from a workstation. Bump the
     # default tag in the same PR that bumps the crate version.
-    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.5.0}
+    image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.5.1}
     # The binary reads the ClickHouse credentials from the environment only,
     # so they are exported from the swarm secrets before it starts.
     entrypoint: ["/bin/sh", "-c"]
@@ -144,6 +159,10 @@ services:
     secrets:
       - clickhouse_user
       - clickhouse_password
+      # Read by the binary itself (MONGODB_PASSWORD_FILE, REDIS_PASSWORD_FILE),
+      # never exported into the environment.
+      - simulator_mongo_root_password
+      - simulator_redis_password
     deploy:
       # More than one instance is the intended shape: session and simulation
       # state lives in Redis, and the write that decides who advanced a
@@ -185,7 +204,9 @@ services:
       # replica whose warehouse is down reports itself unready. Set it to false
       # to go back to replay-only.
       OCS_SNAPSHOT_PERSISTENCE_ENABLED: ${OCS_SNAPSHOT_PERSISTENCE_ENABLED:-true}
-      MONGODB_URI: ${MONGODB_URI:-mongodb://admin:password@mongodb:27017}
+      # No password in the URI: MONGODB_PASSWORD_FILE wins over it.
+      MONGODB_URI: ${MONGODB_URI:-mongodb://admin@mongodb:27017}
+      MONGODB_PASSWORD_FILE: /run/secrets/simulator_mongo_root_password
       MONGODB_DATABASE: ${MONGODB_DATABASE:-optionchain_simulator}
       MONGODB_STEPS_COLLECTION: ${MONGODB_STEPS_COLLECTION:-steps}
       MONGODB_EVENTS_COLLECTION: ${MONGODB_EVENTS_COLLECTION:-events}
@@ -198,7 +219,7 @@ services:
       # default, which inside a container points at localhost. `:-` covers
       # blank too, which is what the service now means by unset.
       REDIS_USER: ${REDIS_USER:-}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-password}
+      REDIS_PASSWORD_FILE: /run/secrets/simulator_redis_password
       REDIS_HOST: ${REDIS_HOST:-redis}
       # Whole seconds, must parse as an integer >= 1: src/infrastructure/config
       # /redis.rs falls back to these same defaults (30 / 5) on 0, on a
@@ -257,6 +278,12 @@ secrets:
   clickhouse_user:
     external: true
   clickhouse_password:
+    external: true
+  # The stack's own Redis and MongoDB credentials, created once per cluster:
+  #   printf %s "$PW" | docker secret create simulator_redis_password -
+  simulator_redis_password:
+    external: true
+  simulator_mongo_root_password:
     external: true
 
 volumes:
