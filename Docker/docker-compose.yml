@@ -1,6 +1,7 @@
 version: '3.8'
 
-# Deployable stack: the four services the binary actually needs. Redis and
+# Deployable stack: the three services the binary needs from this file, plus
+# the ClickHouse warehouse it shares with the rest of the swarm. Redis and
 # MongoDB are HARD requirements (src/main.rs propagates their connection errors
 # with `?`, so the process exits without them).
 #
@@ -12,6 +13,17 @@ version: '3.8'
 # warehouse is down reports itself unready and takes no work. Set
 # OCS_SNAPSHOT_PERSISTENCE_ENABLED=false to go back to a stack where ClickHouse
 # is only the historical source.
+#
+# The warehouse is NOT deployed by this file. The backend uses the shared
+# ClickHouse of the `infrastructure` stack (CapitalDelta's platform services):
+# it joins that stack's overlay, ${CLICKHOUSE_NETWORK:-capital_delta}, and reads
+# the user and password from the swarm secrets `clickhouse_user` and
+# `clickhouse_password`. The host is the full service name
+# `infrastructure_clickhouse`, not `clickhouse`. For the same reason set
+# REDIS_HOST and the host in MONGODB_URI to this stack's prefixed names (for a
+# stack called `simulator`: `simulator_redis`, `simulator_mongodb`): the shared
+# overlay has services of its own called `redis` and `mongodb`, and a bare
+# name could resolve to them.
 #
 # The admin UIs (mongo-express, redis-commander) and the host-published
 # infrastructure ports live in docker-compose.dev.yml, NOT here: `docker stack
@@ -116,27 +128,22 @@ services:
         condition: any
         delay: 5s
 
-  clickhouse:
-    image: clickhouse/clickhouse-server:26.8.1.2041-alpine@sha256:fd037d424da807c1b36517f3ff6c739286c60a34c928279c229fc1faa0cadaa8
-    environment:
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
-      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
-    volumes:
-      - clickhouse_data:/var/lib/clickhouse
-    networks:
-      - optionchain-network
-    deploy:
-      replicas: 1
-      restart_policy:
-        condition: any
-        delay: 5s
-
   backend:
     # Published by .github/workflows/docker-publish.yml on every Cargo.toml
     # version bump, or by `make docker-push` from a workstation. Bump the
     # default tag in the same PR that bumps the crate version.
     image: ghcr.io/joaquinbejar/optionchain-simulator:${OPTIONCHAIN_VERSION:-0.5.0}
+    # The binary reads the ClickHouse credentials from the environment only,
+    # so they are exported from the swarm secrets before it starts.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        export CLICKHOUSE_USER="$$(cat /run/secrets/clickhouse_user)"
+        CLICKHOUSE_PASSWORD="$$(cat /run/secrets/clickhouse_password)";
+        exec /app/optionchain_simulator
+    secrets:
+      - clickhouse_user
+      - clickhouse_password
     deploy:
       # More than one instance is the intended shape: session and simulation
       # state lives in Redis, and the write that decides who advanced a
@@ -159,12 +166,12 @@ services:
         order: start-first
         failure_action: rollback
     environment:
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-admin}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
-      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-default}
+      # CLICKHOUSE_USER and CLICKHOUSE_PASSWORD come from the secrets, see the
+      # entrypoint below.
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-simulator}
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
-      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
-      # This stack SHIPS the warehouse two services up, so it uses it (issues
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-infrastructure_clickhouse}
+      # The shared warehouse is a dependency of this stack, so it uses it (issues
       # #149 and #152). What it buys is an export that reads back the steps
       # already served instead of re-walking them, which is the expensive half
       # of answering one.
@@ -229,6 +236,7 @@ services:
       - "${OCS_PORT:-7070}:${OCS_PORT:-7070}"
     networks:
       - optionchain-network
+      - warehouse
 
 networks:
   optionchain-network:
@@ -239,6 +247,17 @@ networks:
     # - or as a bridge on a local engine.
     external: true
     name: ${OPTIONCHAIN_NETWORK:-optionchain-network}
+  # The overlay of the `infrastructure` stack, where the shared ClickHouse
+  # lives. External: created by that stack's hosts, never by this file.
+  warehouse:
+    external: true
+    name: ${CLICKHOUSE_NETWORK:-capital_delta}
+
+secrets:
+  clickhouse_user:
+    external: true
+  clickhouse_password:
+    external: true
 
 volumes:
   redis-data:
@@ -246,6 +265,4 @@ volumes:
   mongodb-data:
     driver: local
   mongodb-config:
-    driver: local
-  clickhouse_data:
     driver: local
